@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinHandle;
 use txgen_core::GeneratedTx;
 
 /// Configuration for the sender.
@@ -78,6 +79,8 @@ pub struct Sender {
     semaphore: Arc<Semaphore>,
     /// Per-key queues to ensure ordering.
     key_queues: HashMap<[u8; 20], mpsc::Sender<PendingTx>>,
+    /// Worker task handles for awaiting completion.
+    worker_handles: Vec<JoinHandle<()>>,
     /// Rate limiter tokens.
     rate_limiter: Option<Arc<RateLimiter>>,
 }
@@ -104,6 +107,7 @@ impl Sender {
             metrics,
             semaphore,
             key_queues: HashMap::new(),
+            worker_handles: Vec::new(),
             rate_limiter,
         })
     }
@@ -135,9 +139,10 @@ impl Sender {
                 let semaphore = self.semaphore.clone();
                 let rate_limiter = self.rate_limiter.clone();
 
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     key_worker(receiver, client, rpc_url, metrics, semaphore, rate_limiter).await;
                 });
+                self.worker_handles.push(handle);
 
                 e.insert(sender)
             }
@@ -152,6 +157,11 @@ impl Sender {
     pub async fn flush(&mut self) {
         // Drop all senders to signal workers to stop.
         self.key_queues.clear();
+
+        // Wait for all workers to finish processing.
+        for handle in self.worker_handles.drain(..) {
+            let _ = handle.await;
+        }
     }
 }
 
@@ -199,18 +209,25 @@ async fn key_worker(
                 let latency = start.elapsed();
                 match response.json::<RpcResponse>().await {
                     Ok(rpc_response) => {
-                        if rpc_response.error.is_some() {
+                        if let Some(ref err) = rpc_response.error {
+                            tracing::warn!(
+                                code = err.code,
+                                message = %err.message,
+                                "RPC error"
+                            );
                             metrics.record_failure();
                         } else {
                             metrics.record_success(latency).await;
                         }
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to parse RPC response");
                         metrics.record_failure();
                     }
                 }
             }
-            Err(_) => {
+            Err(e) => {
+                tracing::warn!(error = %e, "HTTP request failed");
                 metrics.record_failure();
             }
         }

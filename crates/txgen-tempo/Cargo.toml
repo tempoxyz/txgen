@@ -19,8 +19,10 @@ alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-signer.workspace = true
 alloy-network.workspace = true
+alloy-provider.workspace = true
 alloy-rlp.workspace = true
 
 # misc
 rand.workspace = true
 eyre.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }

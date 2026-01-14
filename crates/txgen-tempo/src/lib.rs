@@ -1,5 +1,8 @@
+mod nonce;
 mod template;
 mod tempo_tx;
+
+pub use nonce::{NONCE_PRECOMPILE, TempoNonceProvider};
 
 use alloy_primitives::{Address, Bytes, TxKind, U256, keccak256};
 use alloy_signer::SignerSync;
@@ -38,6 +41,76 @@ impl ChainPlugin for TempoPlugin {
 }
 
 impl TempoPlugin {
+    /// Build a Tempo transaction with async nonce fetching support.
+    ///
+    /// If a nonce provider is given, it will be used to fetch nonces for
+    /// scheduling keys that haven't been seen before (including parallel lanes).
+    pub async fn build_with_nonce_provider<P: txgen_core::NonceProvider>(
+        &self,
+        template: TempoTemplate,
+        ctx: &mut BuildContext<'_>,
+        nonce_provider: Option<&P>,
+    ) -> Result<GeneratedTx> {
+        match template.tx_type.as_str() {
+            "tempo" => self.build_tempo_async(template, ctx, nonce_provider).await,
+            _ => {
+                let eth_template = convert_to_ethereum_template(&template)?;
+                self.ethereum.build(eth_template, ctx)
+            }
+        }
+    }
+
+    async fn build_tempo_async<P: txgen_core::NonceProvider>(
+        &self,
+        template: TempoTemplate,
+        ctx: &mut BuildContext<'_>,
+        nonce_provider: Option<&P>,
+    ) -> Result<GeneratedTx> {
+        let (from_address, signer_pool, signer_idx) = {
+            match template.from.select {
+                SelectMode::Random => {
+                    let signer = ctx.accounts.get_random(&template.from.pool, ctx.rng)?;
+                    let addr = signer.address();
+                    let pool = ctx.accounts.get_pool(&template.from.pool)?;
+                    let idx = pool.iter().position(|s| s.address() == addr).unwrap_or(0);
+                    (addr, template.from.pool.clone(), idx)
+                }
+                SelectMode::Index(idx) => {
+                    let signer = ctx.accounts.get_by_index(&template.from.pool, idx)?;
+                    (signer.address(), template.from.pool.clone(), idx)
+                }
+            }
+        };
+
+        let nonce_key: U256 = if let Some(ref nk) = template.nonce_key {
+            let mut resolver = ctx.resolver();
+            resolver.resolve_gen(nk)?
+        } else {
+            U256::ZERO
+        };
+
+        let scheduling_key = compute_scheduling_key(from_address, nonce_key);
+
+        // Fetch nonce from provider if available and not yet tracked
+        let nonce = if let Some(provider) = nonce_provider {
+            ctx.nonces
+                .next_with_provider(scheduling_key, from_address, nonce_key, provider)
+                .await?
+        } else {
+            ctx.next_nonce(scheduling_key)
+        };
+
+        self.build_tempo_inner(
+            template,
+            ctx,
+            from_address,
+            signer_pool,
+            signer_idx,
+            nonce_key,
+            nonce,
+        )
+    }
+
     fn build_tempo(
         &self,
         template: TempoTemplate,
@@ -69,6 +142,30 @@ impl TempoPlugin {
         let scheduling_key = compute_scheduling_key(from_address, nonce_key);
 
         let nonce = ctx.next_nonce(scheduling_key);
+
+        self.build_tempo_inner(
+            template,
+            ctx,
+            from_address,
+            signer_pool,
+            signer_idx,
+            nonce_key,
+            nonce,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_tempo_inner(
+        &self,
+        template: TempoTemplate,
+        ctx: &mut BuildContext<'_>,
+        from_address: Address,
+        signer_pool: String,
+        signer_idx: usize,
+        nonce_key: U256,
+        nonce: u64,
+    ) -> Result<GeneratedTx> {
+        let scheduling_key = compute_scheduling_key(from_address, nonce_key);
 
         let calls = resolve_calls(&template, ctx)?;
 

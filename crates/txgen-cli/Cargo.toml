@@ -20,8 +20,14 @@ clap = { version = "4", features = ["derive"] }
 
 # serde
 serde.workspace = true
+serde_json.workspace = true
 serde_yaml.workspace = true
 
 # misc
 rand.workspace = true
 eyre.workspace = true
+
+# RPC client for nonce fetching
+alloy-provider.workspace = true
+alloy-primitives.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "rt", "time"] }

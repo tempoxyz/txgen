@@ -10,7 +10,7 @@ pub use abi::{ArtifactManager, CallDef, EncodedCall};
 pub use accounts::{
     AccountManager, AccountPoolDef, AccountRef, EcdsaSigner, SelectMode, SignerExt,
 };
-pub use nonce::NonceTracker;
+pub use nonce::{NonceProvider, NonceTracker};
 pub use output::{GeneratedTx, NdjsonWriter};
 pub use plugin::{BuildContext, ChainPlugin};
 pub use spec::{GasConfig, MixEntry, WorkloadSpec};

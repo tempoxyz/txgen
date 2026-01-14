@@ -1,0 +1,63 @@
+# Tempo mainnet spam workload
+# Uses test mnemonic - addresses should be funded with tempo_fundAddress
+#
+# Tempo mainnet does NOT support native value transfers.
+# All transfers must be TIP20 token transfers.
+
+chain_id: 4217
+
+gas:
+  max_fee_per_gas: 10000000000       # 10 gwei
+  max_priority_fee_per_gas: 10000000000
+
+accounts:
+  spammers:
+    mnemonic: "test test test test test test test test test test test junk"
+    range: [300, 400]
+
+artifacts:
+  ERC20: erc20.abi.json
+
+templates:
+  # TIP20 token transfer (USDC on Tempo)
+  tip20_transfer:
+    type: tempo
+    from:
+      pool: spammers
+      select: random
+    gas_limit: 100000
+    max_fee_per_gas: 10000000000
+    max_priority_fee_per_gas: 10000000000
+    call:
+      to: "0x20c000000000000000000000033abb6ac7d235e5"  # USDC on Tempo
+      abi: ERC20
+      function: transfer
+      args:
+        - "0x000000000000000000000000000000000000dEaD"  # burn address
+        - 1  # 1 wei of USDC
+
+  # Parallel nonce for higher throughput
+  # Using high nonce_key range to get fresh lanes
+  tip20_parallel:
+    type: tempo
+    from:
+      pool: spammers
+      select: random
+    gas_limit: 100000
+    max_fee_per_gas: 10000000000
+    max_priority_fee_per_gas: 10000000000
+    nonce_key:
+      uniform: [0, 100]  # 100 lanes per account, reused across txs
+    call:
+      to: "0x20c000000000000000000000033abb6ac7d235e5"  # USDC on Tempo
+      abi: ERC20
+      function: transfer
+      args:
+        - "0x000000000000000000000000000000000000dEaD"  # burn address
+        - 1  # 1 wei of USDC
+
+mix:
+  - template: tip20_transfer
+    weight: 30
+  - template: tip20_parallel
+    weight: 70

@@ -63,6 +63,14 @@ impl AccountManager {
             .get(index)
             .ok_or_else(|| eyre::eyre!("index {} out of range for pool '{}'", index, pool))
     }
+
+    /// Get all addresses grouped by pool name.
+    pub fn all_addresses(&self) -> impl Iterator<Item = (&str, Vec<Address>)> {
+        self.pools.iter().map(|(name, signers)| {
+            let addresses: Vec<Address> = signers.iter().map(Signer::address).collect();
+            (name.as_str(), addresses)
+        })
+    }
 }
 
 /// Definition of an account pool in the workload spec.

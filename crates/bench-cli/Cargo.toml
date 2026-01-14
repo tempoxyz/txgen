@@ -1,0 +1,49 @@
+[package]
+name = "bench-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+# workspace
+bench-core.workspace = true
+txgen-core.workspace = true
+txgen-ethereum.workspace = true
+txgen-tempo.workspace = true
+
+# CLI
+clap.workspace = true
+
+# serde
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+
+# alloy
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-network = "1"
+alloy-rlp.workspace = true
+alloy-provider = { version = "1", features = ["engine-api", "hyper"] }
+alloy-rpc-client = "1"
+alloy-rpc-types-engine = { version = "1", features = ["jwt"] }
+alloy-rpc-types-eth = "1"
+alloy-transport-http = { version = "1", features = ["jwt-auth", "hyper"] }
+
+# async
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "io-std"] }
+
+# http
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# misc
+hex.workspace = true
+eyre.workspace = true
+humantime = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
