@@ -154,24 +154,26 @@ impl TempoTransaction {
 
     /// Encode the signed transaction.
     fn encode_signed(&self, signature: &Signature, out: &mut dyn BufMut) {
-        let sig_payload_len = signature.rlp_rs_len() + signature.v().length();
-        let sig_len = rlp_header(sig_payload_len).length_with_payload();
+        // Signature is encoded as RLP bytes (65-byte compact format: r || s || v)
+        let sig_bytes = signature.as_bytes();
+        let sig_len = sig_bytes.length();
 
-        let fee_payer_len = self.fee_payer_signature.as_ref().map_or(1, |s| {
-            let payload = s.rlp_rs_len() + s.v().length();
-            rlp_header(payload).length_with_payload()
-        });
+        let fee_payer_len = self
+            .fee_payer_signature
+            .as_ref()
+            .map_or(1, |s| s.as_bytes().length());
 
         let payload_length = self.rlp_encoded_fields_length(fee_payer_len, false) + sig_len;
+
+        // Type byte
+        out.put_u8(TEMPO_TX_TYPE_ID);
 
         rlp_header(payload_length).encode(out);
         self.rlp_encode_fields_with_sig(
             out,
             |out| {
                 if let Some(sig) = &self.fee_payer_signature {
-                    let payload = sig.rlp_rs_len() + sig.v().length();
-                    rlp_header(payload).encode(out);
-                    sig.write_rlp_vrs(out, sig.v());
+                    sig.as_bytes().encode(out);
                 } else {
                     out.put_u8(EMPTY_STRING_CODE);
                 }
@@ -179,8 +181,8 @@ impl TempoTransaction {
             false,
         );
 
-        rlp_header(sig_payload_len).encode(out);
-        signature.write_rlp_vrs(out, signature.v());
+        // Encode signature as RLP bytes (compact 65-byte format)
+        sig_bytes.encode(out);
     }
 
     fn rlp_encoded_fields_length(&self, signature_length: usize, skip_fee_token: bool) -> usize {

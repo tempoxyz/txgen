@@ -173,7 +173,6 @@ fn resolve_calls(template: &TempoTemplate, ctx: &mut BuildContext<'_>) -> Result
 fn encode_signed_tempo_tx(tx: &TempoTransaction, signature: alloy_primitives::Signature) -> Bytes {
     let signed = tx.clone().into_signed(signature);
     let mut encoded = Vec::new();
-    encoded.push(TEMPO_TX_TYPE_ID);
     signed.encode_2718(&mut encoded);
     Bytes::from(encoded)
 }
