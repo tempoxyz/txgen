@@ -1,0 +1,24 @@
+[package]
+name = "txgen-ethereum"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# workspace
+txgen-core.workspace = true
+
+# serde
+serde.workspace = true
+serde_yaml.workspace = true
+
+# alloy
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-signer.workspace = true
+alloy-network.workspace = true
+
+# misc
+rand.workspace = true
+eyre.workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "txgen-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "txgen"
+path = "src/main.rs"
+
+[dependencies]
+# workspace
+txgen-core.workspace = true
+txgen-ethereum.workspace = true
+txgen-tempo.workspace = true
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# serde
+serde.workspace = true
+serde_yaml.workspace = true
+
+# misc
+rand.workspace = true
+eyre.workspace = true

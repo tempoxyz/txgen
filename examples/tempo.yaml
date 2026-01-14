@@ -1,0 +1,52 @@
+chain_id: 1
+
+accounts:
+  users:
+    mnemonic: "test test test test test test test test test test test junk"
+    range: [0, 10]
+
+templates:
+  # Tempo native transaction (0x76)
+  tempo_transfer:
+    type: tempo
+    from:
+      pool: users
+      select: random
+    to: "0x0000000000000000000000000000000000000001"
+    value: 1000
+    gas_limit: 21000
+    max_fee_per_gas: 1000000000
+    max_priority_fee_per_gas: 1000000000
+
+  # Tempo with parallel nonce (for higher throughput)
+  tempo_parallel:
+    type: tempo
+    from:
+      pool: users
+      select: random
+    to: "0x0000000000000000000000000000000000000001"
+    value: 500
+    gas_limit: 21000
+    max_fee_per_gas: 1000000000
+    max_priority_fee_per_gas: 1000000000
+    nonce_key: "42"  # Use parallel nonce key
+
+  # EIP-1559 (delegated to ethereum plugin)
+  eip1559_transfer:
+    type: eip1559
+    from:
+      pool: users
+      select: random
+    to: "0x0000000000000000000000000000000000000001"
+    value: 1000
+    gas_limit: 21000
+    max_fee_per_gas: 1000000000
+    max_priority_fee_per_gas: 1000000000
+
+mix:
+  - template: tempo_transfer
+    weight: 50
+  - template: tempo_parallel
+    weight: 30
+  - template: eip1559_transfer
+    weight: 20
