@@ -124,7 +124,7 @@ impl Sender {
             queued_at: Instant::now(),
         };
 
-        self.metrics.record_sent();
+        self.metrics.record_sent().await;
 
         // Get or create the queue for this key.
         let queue = match self.key_queues.entry(pending.key) {
@@ -215,20 +215,20 @@ async fn key_worker(
                                 message = %err.message,
                                 "RPC error"
                             );
-                            metrics.record_failure();
+                            metrics.record_failure().await;
                         } else {
                             metrics.record_success(latency).await;
                         }
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "Failed to parse RPC response");
-                        metrics.record_failure();
+                        metrics.record_failure().await;
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!(error = %e, "HTTP request failed");
-                metrics.record_failure();
+                metrics.record_failure().await;
             }
         }
 

@@ -5,7 +5,7 @@
 //! - JSON (machine-readable)
 //! - ClickHouse (for time-series storage)
 
-use crate::metrics::BenchMetrics;
+use crate::metrics::{BenchMetrics, TimeSeriesMetrics};
 use eyre::{Context, Result};
 use std::io::Write;
 use std::path::Path;
@@ -13,7 +13,11 @@ use std::path::Path;
 /// Reporter trait for outputting benchmark results.
 pub trait Reporter: Send {
     /// Report the final metrics.
-    fn report(&mut self, metrics: &BenchMetrics) -> Result<()>;
+    fn report(
+        &mut self,
+        metrics: &BenchMetrics,
+        time_series: Option<&TimeSeriesMetrics>,
+    ) -> Result<()>;
 
     /// Report periodic progress (optional).
     fn progress(&mut self, _sent: u64, _success: u64, _failed: u64) -> Result<()> {
@@ -56,7 +60,11 @@ impl<W: Write + Send> ConsoleReporter<W> {
 }
 
 impl<W: Write + Send> Reporter for ConsoleReporter<W> {
-    fn report(&mut self, metrics: &BenchMetrics) -> Result<()> {
+    fn report(
+        &mut self,
+        metrics: &BenchMetrics,
+        _time_series: Option<&TimeSeriesMetrics>,
+    ) -> Result<()> {
         writeln!(self.writer)?;
         writeln!(self.writer, "═══════════════════════════════════════")?;
         writeln!(self.writer, "              Benchmark Results")?;
@@ -133,25 +141,73 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
 }
 
 /// JSON output format.
-#[derive(serde::Serialize)]
-struct JsonReport {
-    sent: u64,
-    success: u64,
-    failed: u64,
-    elapsed_secs: f64,
-    tps: f64,
-    success_rate: f64,
-    latency: JsonLatency,
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct JsonReport {
+    /// Total transactions sent.
+    pub sent: u64,
+    /// Successful transactions.
+    pub success: u64,
+    /// Failed transactions.
+    pub failed: u64,
+    /// Elapsed time in seconds.
+    pub elapsed_secs: f64,
+    /// Transactions per second.
+    pub tps: f64,
+    /// Success rate percentage.
+    pub success_rate: f64,
+    /// Latency statistics.
+    pub latency: JsonLatency,
+    /// Time-series data for graphing (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_series: Option<JsonTimeSeries>,
 }
 
-#[derive(serde::Serialize)]
-struct JsonLatency {
-    min_ms: f64,
-    max_ms: f64,
-    mean_ms: f64,
-    p50_ms: f64,
-    p95_ms: f64,
-    p99_ms: f64,
+/// Latency statistics in JSON format.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct JsonLatency {
+    /// Minimum latency in milliseconds.
+    pub min_ms: f64,
+    /// Maximum latency in milliseconds.
+    pub max_ms: f64,
+    /// Mean latency in milliseconds.
+    pub mean_ms: f64,
+    /// P50 latency in milliseconds.
+    pub p50_ms: f64,
+    /// P95 latency in milliseconds.
+    pub p95_ms: f64,
+    /// P99 latency in milliseconds.
+    pub p99_ms: f64,
+}
+
+/// Time-series data in JSON format.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct JsonTimeSeries {
+    /// Per-second throughput samples.
+    pub throughput: Vec<JsonThroughputSample>,
+    /// Individual latency samples.
+    pub latencies: Vec<JsonLatencySample>,
+}
+
+/// Per-second throughput sample.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct JsonThroughputSample {
+    /// Second offset from start.
+    pub second: u64,
+    /// Transactions sent.
+    pub sent: u64,
+    /// Successful transactions.
+    pub success: u64,
+    /// Failed transactions.
+    pub failed: u64,
+}
+
+/// Individual latency sample.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct JsonLatencySample {
+    /// Offset from start in milliseconds.
+    pub offset_ms: u64,
+    /// Latency in milliseconds.
+    pub latency_ms: f64,
 }
 
 /// JSON reporter for machine-readable output.
@@ -184,7 +240,32 @@ impl<W: Write + Send> JsonReporter<W> {
 }
 
 impl<W: Write + Send> Reporter for JsonReporter<W> {
-    fn report(&mut self, metrics: &BenchMetrics) -> Result<()> {
+    fn report(
+        &mut self,
+        metrics: &BenchMetrics,
+        time_series: Option<&TimeSeriesMetrics>,
+    ) -> Result<()> {
+        let ts = time_series.map(|ts| JsonTimeSeries {
+            throughput: ts
+                .throughput
+                .iter()
+                .map(|s| JsonThroughputSample {
+                    second: s.second,
+                    sent: s.sent,
+                    success: s.success,
+                    failed: s.failed,
+                })
+                .collect(),
+            latencies: ts
+                .latencies
+                .iter()
+                .map(|l| JsonLatencySample {
+                    offset_ms: l.offset_ms,
+                    latency_ms: l.latency.as_secs_f64() * 1000.0,
+                })
+                .collect(),
+        });
+
         let report = JsonReport {
             sent: metrics.sent,
             success: metrics.success,
@@ -200,6 +281,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
                 p95_ms: metrics.latency.p95.as_secs_f64() * 1000.0,
                 p99_ms: metrics.latency.p99.as_secs_f64() * 1000.0,
             },
+            time_series: ts,
         };
 
         serde_json::to_writer_pretty(&mut self.writer, &report)?;
@@ -244,7 +326,11 @@ impl ClickHouseReporter {
 }
 
 impl Reporter for ClickHouseReporter {
-    fn report(&mut self, metrics: &BenchMetrics) -> Result<()> {
+    fn report(
+        &mut self,
+        metrics: &BenchMetrics,
+        _time_series: Option<&TimeSeriesMetrics>,
+    ) -> Result<()> {
         // Build ClickHouse insert query.
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -317,7 +403,7 @@ mod tests {
         let mut output = Vec::new();
         {
             let mut reporter = ConsoleReporter::new(&mut output, false);
-            reporter.report(&sample_metrics()).unwrap();
+            reporter.report(&sample_metrics(), None).unwrap();
         }
 
         let output_str = String::from_utf8(output).unwrap();
@@ -331,7 +417,7 @@ mod tests {
         let mut output = Vec::new();
         {
             let mut reporter = JsonReporter::new(&mut output);
-            reporter.report(&sample_metrics()).unwrap();
+            reporter.report(&sample_metrics(), None).unwrap();
         }
 
         let output_str = String::from_utf8(output).unwrap();

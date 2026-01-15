@@ -4,12 +4,14 @@
 //! - `run` - All-in-one: generate + send + report
 //! - `send` - Send from file/stdin
 //! - `replay` - Engine API block replay
+//! - `plot` - Generate plots from JSON report
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eyre::Result;
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod plot;
 mod replay;
 mod run;
 mod send;
@@ -29,6 +31,8 @@ enum Command {
     Send(SendArgs),
     /// Replay blocks via Engine API
     Replay(ReplayArgs),
+    /// Generate plots from JSON report
+    Plot(PlotArgs),
 }
 
 /// Arguments for the `run` subcommand.
@@ -132,6 +136,30 @@ pub struct ReplayArgs {
     pub reports: Vec<String>,
 }
 
+/// Arguments for the `plot` subcommand.
+#[derive(Args)]
+pub struct PlotArgs {
+    /// Input JSON report file
+    #[arg(short, long)]
+    pub input: PathBuf,
+
+    /// Output directory for PNG files
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
+
+    /// Type of plot to generate
+    #[arg(short = 't', long, default_value = "all")]
+    pub plot_type: plot::PlotType,
+
+    /// Chart width in pixels
+    #[arg(long, default_value = "1200")]
+    pub width: u32,
+
+    /// Chart height in pixels
+    #[arg(long, default_value = "600")]
+    pub height: u32,
+}
+
 /// Supported chain types.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ChainType {
@@ -158,5 +186,6 @@ async fn main() -> Result<()> {
         Command::Run(args) => run::execute(args).await,
         Command::Send(args) => send::execute(args).await,
         Command::Replay(args) => replay::execute(args).await,
+        Command::Plot(args) => plot::execute(args),
     }
 }

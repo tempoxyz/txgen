@@ -147,8 +147,8 @@ mod tests {
     fn test_nonce_precompile_address() {
         // "NONCE" in ASCII hex
         assert_eq!(
-            format!("{:?}", NONCE_PRECOMPILE),
-            "0x4E4F4E4345000000000000000000000000000000"
+            format!("{:?}", NONCE_PRECOMPILE).to_lowercase(),
+            "0x4e4f4e4345000000000000000000000000000000"
         );
     }
 

@@ -42,9 +42,10 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     sender.flush().await;
 
     let final_metrics = metrics.finalize().await;
+    let time_series = metrics.time_series().await;
 
     for reporter in &mut reporters {
-        reporter.report(&final_metrics)?;
+        reporter.report(&final_metrics, Some(&time_series))?;
     }
 
     Ok(())

@@ -105,6 +105,38 @@ fn percentile(sorted: &[Duration], p: usize) -> Duration {
     sorted[idx]
 }
 
+/// A timestamped latency sample.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatencySample {
+    /// Offset from benchmark start in milliseconds.
+    pub offset_ms: u64,
+    /// Latency of this request.
+    #[serde(with = "duration_serde")]
+    pub latency: Duration,
+}
+
+/// Per-second throughput snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThroughputSample {
+    /// Second offset from benchmark start (0 = first second).
+    pub second: u64,
+    /// Transactions sent during this second.
+    pub sent: u64,
+    /// Successful transactions during this second.
+    pub success: u64,
+    /// Failed transactions during this second.
+    pub failed: u64,
+}
+
+/// Time-series metrics for graphing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TimeSeriesMetrics {
+    /// Per-second throughput samples.
+    pub throughput: Vec<ThroughputSample>,
+    /// Individual latency samples with timestamps.
+    pub latencies: Vec<LatencySample>,
+}
+
 /// Block-level statistics collected post-run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockStats {
@@ -262,6 +294,28 @@ pub async fn collect_block_stats<P: Provider>(
     Ok(stats)
 }
 
+/// Internal record for a latency with its timestamp.
+#[derive(Debug, Clone)]
+struct TimestampedLatency {
+    offset: Duration,
+    latency: Duration,
+}
+
+/// Internal record for a sent/success/fail event.
+#[derive(Debug, Clone, Copy)]
+enum TxEvent {
+    Sent,
+    Success,
+    Failed,
+}
+
+/// Internal record with timestamp.
+#[derive(Debug, Clone)]
+struct TimestampedEvent {
+    offset: Duration,
+    event: TxEvent,
+}
+
 /// Atomic counters for concurrent metrics collection.
 #[derive(Debug, Default)]
 pub struct MetricsCollector {
@@ -269,7 +323,8 @@ pub struct MetricsCollector {
     success: AtomicU64,
     failed: AtomicU64,
     start: RwLock<Option<Instant>>,
-    latencies: RwLock<Vec<Duration>>,
+    latencies: RwLock<Vec<TimestampedLatency>>,
+    events: RwLock<Vec<TimestampedEvent>>,
 }
 
 impl MetricsCollector {
@@ -284,20 +339,44 @@ impl MetricsCollector {
         *start = Some(Instant::now());
     }
 
+    /// Get the elapsed time since start.
+    async fn elapsed(&self) -> Duration {
+        let start = self.start.read().await;
+        start.map_or(Duration::ZERO, |s| s.elapsed())
+    }
+
     /// Record a sent transaction.
-    pub fn record_sent(&self) {
+    pub async fn record_sent(&self) {
         self.sent.fetch_add(1, Ordering::Relaxed);
+        let offset = self.elapsed().await;
+        self.events.write().await.push(TimestampedEvent {
+            offset,
+            event: TxEvent::Sent,
+        });
     }
 
     /// Record a successful transaction with its latency.
     pub async fn record_success(&self, latency: Duration) {
         self.success.fetch_add(1, Ordering::Relaxed);
-        self.latencies.write().await.push(latency);
+        let offset = self.elapsed().await;
+        self.latencies
+            .write()
+            .await
+            .push(TimestampedLatency { offset, latency });
+        self.events.write().await.push(TimestampedEvent {
+            offset,
+            event: TxEvent::Success,
+        });
     }
 
     /// Record a failed transaction.
-    pub fn record_failure(&self) {
+    pub async fn record_failure(&self) {
         self.failed.fetch_add(1, Ordering::Relaxed);
+        let offset = self.elapsed().await;
+        self.events.write().await.push(TimestampedEvent {
+            offset,
+            event: TxEvent::Failed,
+        });
     }
 
     /// Get the current counts (sent, success, failed).
@@ -315,14 +394,65 @@ impl MetricsCollector {
         let elapsed = start.map_or(Duration::ZERO, |s| s.elapsed());
 
         let mut latencies = self.latencies.write().await;
-        latencies.sort();
+        latencies.sort_by_key(|l| l.latency);
+        let durations: Vec<Duration> = latencies.iter().map(|l| l.latency).collect();
 
         BenchMetrics {
             sent: self.sent.load(Ordering::Relaxed),
             success: self.success.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
             elapsed,
-            latency: LatencyStats::from_sorted(&latencies),
+            latency: LatencyStats::from_sorted(&durations),
+        }
+    }
+
+    /// Extract time-series metrics for graphing.
+    pub async fn time_series(&self) -> TimeSeriesMetrics {
+        let start = self.start.read().await;
+        let total_elapsed = start.map_or(Duration::ZERO, |s| s.elapsed());
+        let total_seconds = total_elapsed.as_secs() + 1;
+
+        let events = self.events.read().await;
+        let latencies = self.latencies.read().await;
+
+        let mut throughput = Vec::with_capacity(total_seconds as usize);
+        for second in 0..total_seconds {
+            let start_offset = Duration::from_secs(second);
+            let end_offset = Duration::from_secs(second + 1);
+
+            let mut sent = 0u64;
+            let mut success = 0u64;
+            let mut failed = 0u64;
+
+            for event in events.iter() {
+                if event.offset >= start_offset && event.offset < end_offset {
+                    match event.event {
+                        TxEvent::Sent => sent += 1,
+                        TxEvent::Success => success += 1,
+                        TxEvent::Failed => failed += 1,
+                    }
+                }
+            }
+
+            throughput.push(ThroughputSample {
+                second,
+                sent,
+                success,
+                failed,
+            });
+        }
+
+        let latency_samples: Vec<LatencySample> = latencies
+            .iter()
+            .map(|l| LatencySample {
+                offset_ms: l.offset.as_millis() as u64,
+                latency: l.latency,
+            })
+            .collect();
+
+        TimeSeriesMetrics {
+            throughput,
+            latencies: latency_samples,
         }
     }
 }
@@ -366,10 +496,10 @@ mod tests {
         let collector = MetricsCollector::new();
         collector.start().await;
 
-        collector.record_sent();
-        collector.record_sent();
+        collector.record_sent().await;
+        collector.record_sent().await;
         collector.record_success(Duration::from_millis(10)).await;
-        collector.record_failure();
+        collector.record_failure().await;
 
         let (sent, success, failed) = collector.counts();
         assert_eq!(sent, 2);
@@ -478,5 +608,52 @@ mod tests {
         assert_eq!(parsed.sent, 100);
         assert_eq!(parsed.elapsed, Duration::from_millis(1500));
         assert_eq!(parsed.latency.p50, Duration::from_millis(40));
+    }
+
+    #[tokio::test]
+    async fn test_time_series_metrics() {
+        let collector = MetricsCollector::new();
+        collector.start().await;
+
+        collector.record_sent().await;
+        collector.record_success(Duration::from_millis(50)).await;
+        collector.record_sent().await;
+        collector.record_failure().await;
+
+        let ts = collector.time_series().await;
+
+        assert!(!ts.throughput.is_empty());
+        assert_eq!(ts.latencies.len(), 1);
+        assert_eq!(ts.latencies[0].latency, Duration::from_millis(50));
+
+        let first_second = &ts.throughput[0];
+        assert_eq!(first_second.second, 0);
+        assert_eq!(first_second.sent, 2);
+        assert_eq!(first_second.success, 1);
+        assert_eq!(first_second.failed, 1);
+    }
+
+    #[test]
+    fn test_time_series_serde() {
+        let ts = TimeSeriesMetrics {
+            throughput: vec![ThroughputSample {
+                second: 0,
+                sent: 100,
+                success: 90,
+                failed: 10,
+            }],
+            latencies: vec![LatencySample {
+                offset_ms: 500,
+                latency: Duration::from_millis(25),
+            }],
+        };
+
+        let json = serde_json::to_string(&ts).unwrap();
+        let parsed: TimeSeriesMetrics = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.throughput.len(), 1);
+        assert_eq!(parsed.throughput[0].sent, 100);
+        assert_eq!(parsed.latencies.len(), 1);
+        assert_eq!(parsed.latencies[0].latency, Duration::from_millis(25));
     }
 }
