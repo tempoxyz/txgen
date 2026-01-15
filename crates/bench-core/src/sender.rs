@@ -148,7 +148,10 @@ impl Sender {
             }
         };
 
-        queue.send(pending).await.ok();
+        if queue.send(pending).await.is_err() {
+            tracing::warn!("Failed to enqueue transaction, worker channel closed");
+            self.metrics.record_failure().await;
+        }
 
         Ok(())
     }
