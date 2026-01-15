@@ -13,7 +13,9 @@ use alloy_provider::{Provider, ProviderBuilder, RootProvider, ext::EngineApi};
 use alloy_rpc_types_engine::{ExecutionPayloadV3, ForkchoiceState, JwtSecret};
 use alloy_rpc_types_eth::Block;
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
-use bench_core::{ReplayBlockStats, Reporter, parse_reporters};
+use bench_core::{
+    LatencyStats, ReplayBlockStats, Reporter, compute_latency_stats, parse_reporters,
+};
 use eyre::{Context, Result, bail};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -106,7 +108,7 @@ where
         let source = self.source_provider.clone();
         let fetch_handle = tokio::spawn(async move { fetch_blocks(source, from, to, tx).await });
 
-        let mut metrics = ReplayMetrics::default();
+        let mut collector = ReplayMetricsCollector::default();
         let mut prev_block_hash: Option<B256> = None;
         let mut finalized_hash: Option<B256> = None;
 
@@ -184,7 +186,7 @@ where
 
             let payload_status_str = payload_status.status.to_string();
 
-            metrics.record_block(BlockMetrics {
+            collector.record_block(BlockMetrics {
                 tx_count,
                 gas_used,
                 new_payload_latency,
@@ -226,7 +228,7 @@ where
 
         fetch_handle.await?;
 
-        Ok(metrics)
+        Ok(collector.finalize())
     }
 }
 
@@ -337,57 +339,55 @@ struct BlockMetrics {
     total_latency: Duration,
 }
 
-/// Aggregated replay metrics.
+/// Aggregated replay metrics (collected during run).
 #[derive(Debug, Default)]
-pub struct ReplayMetrics {
+struct ReplayMetricsCollector {
     blocks_replayed: u64,
     total_txs: u64,
     total_gas: u128,
-    total_new_payload_time: Duration,
-    total_fcu_time: Duration,
     total_execution_time: Duration,
     new_payload_latencies: Vec<Duration>,
     fcu_latencies: Vec<Duration>,
     block_times: Vec<Duration>,
 }
 
-impl ReplayMetrics {
+impl ReplayMetricsCollector {
     fn record_block(&mut self, block: BlockMetrics) {
         self.blocks_replayed += 1;
         self.total_txs += block.tx_count;
         self.total_gas += block.gas_used as u128;
-        self.total_new_payload_time += block.new_payload_latency;
-        self.total_fcu_time += block.fcu_latency;
         self.total_execution_time += block.total_latency;
         self.new_payload_latencies.push(block.new_payload_latency);
         self.fcu_latencies.push(block.fcu_latency);
         self.block_times.push(block.total_latency);
     }
 
-    fn avg_new_payload_time(&self) -> Duration {
-        if self.blocks_replayed == 0 {
-            Duration::ZERO
-        } else {
-            self.total_new_payload_time / self.blocks_replayed as u32
+    fn finalize(self) -> ReplayMetrics {
+        ReplayMetrics {
+            blocks_replayed: self.blocks_replayed,
+            total_txs: self.total_txs,
+            total_gas: self.total_gas,
+            total_execution_time: self.total_execution_time,
+            new_payload_stats: compute_latency_stats(&self.new_payload_latencies),
+            fcu_stats: compute_latency_stats(&self.fcu_latencies),
+            block_time_stats: compute_latency_stats(&self.block_times),
         }
     }
+}
 
-    fn avg_fcu_time(&self) -> Duration {
-        if self.blocks_replayed == 0 {
-            Duration::ZERO
-        } else {
-            self.total_fcu_time / self.blocks_replayed as u32
-        }
-    }
+/// Finalized replay metrics with computed statistics.
+#[derive(Debug)]
+pub struct ReplayMetrics {
+    blocks_replayed: u64,
+    total_txs: u64,
+    total_gas: u128,
+    total_execution_time: Duration,
+    new_payload_stats: LatencyStats,
+    fcu_stats: LatencyStats,
+    block_time_stats: LatencyStats,
+}
 
-    fn avg_block_time(&self) -> Duration {
-        if self.blocks_replayed == 0 {
-            Duration::ZERO
-        } else {
-            self.total_execution_time / self.blocks_replayed as u32
-        }
-    }
-
+impl ReplayMetrics {
     fn blocks_per_second(&self) -> f64 {
         if self.total_execution_time.as_secs_f64() > 0.0 {
             self.blocks_replayed as f64 / self.total_execution_time.as_secs_f64()
@@ -410,24 +410,6 @@ impl ReplayMetrics {
         } else {
             0.0
         }
-    }
-
-    fn percentile(&self, latencies: &[Duration], p: f64) -> Duration {
-        if latencies.is_empty() {
-            return Duration::ZERO;
-        }
-        let mut sorted = latencies.to_vec();
-        sorted.sort();
-        let idx = ((sorted.len() as f64 * p / 100.0) as usize).min(sorted.len() - 1);
-        sorted[idx]
-    }
-
-    fn min(&self, latencies: &[Duration]) -> Duration {
-        latencies.iter().min().copied().unwrap_or(Duration::ZERO)
-    }
-
-    fn max(&self, latencies: &[Duration]) -> Duration {
-        latencies.iter().max().copied().unwrap_or(Duration::ZERO)
     }
 }
 
@@ -458,97 +440,79 @@ fn print_replay_summary(
     eprintln!("  newPayload Latency:");
     eprintln!(
         "    Min:           {:>10.2}ms",
-        metrics.min(&metrics.new_payload_latencies).as_secs_f64() * 1000.0
+        metrics.new_payload_stats.min.as_secs_f64() * 1000.0
     );
     eprintln!(
         "    Max:           {:>10.2}ms",
-        metrics.max(&metrics.new_payload_latencies).as_secs_f64() * 1000.0
+        metrics.new_payload_stats.max.as_secs_f64() * 1000.0
     );
     eprintln!(
-        "    Avg:           {:>10.2}ms",
-        metrics.avg_new_payload_time().as_secs_f64() * 1000.0
+        "    Mean:          {:>10.2}ms",
+        metrics.new_payload_stats.mean.as_secs_f64() * 1000.0
     );
     eprintln!(
         "    P50:           {:>10.2}ms",
-        metrics
-            .percentile(&metrics.new_payload_latencies, 50.0)
-            .as_secs_f64()
-            * 1000.0
+        metrics.new_payload_stats.p50.as_secs_f64() * 1000.0
     );
     eprintln!(
         "    P95:           {:>10.2}ms",
-        metrics
-            .percentile(&metrics.new_payload_latencies, 95.0)
-            .as_secs_f64()
-            * 1000.0
+        metrics.new_payload_stats.p95.as_secs_f64() * 1000.0
     );
     eprintln!(
         "    P99:           {:>10.2}ms",
-        metrics
-            .percentile(&metrics.new_payload_latencies, 99.0)
-            .as_secs_f64()
-            * 1000.0
+        metrics.new_payload_stats.p99.as_secs_f64() * 1000.0
     );
     eprintln!();
     eprintln!("  forkchoiceUpdated Latency:");
     eprintln!(
         "    Min:           {:>10.2}ms",
-        metrics.min(&metrics.fcu_latencies).as_secs_f64() * 1000.0
+        metrics.fcu_stats.min.as_secs_f64() * 1000.0
     );
     eprintln!(
         "    Max:           {:>10.2}ms",
-        metrics.max(&metrics.fcu_latencies).as_secs_f64() * 1000.0
+        metrics.fcu_stats.max.as_secs_f64() * 1000.0
     );
     eprintln!(
-        "    Avg:           {:>10.2}ms",
-        metrics.avg_fcu_time().as_secs_f64() * 1000.0
+        "    Mean:          {:>10.2}ms",
+        metrics.fcu_stats.mean.as_secs_f64() * 1000.0
     );
     eprintln!(
         "    P50:           {:>10.2}ms",
-        metrics
-            .percentile(&metrics.fcu_latencies, 50.0)
-            .as_secs_f64()
-            * 1000.0
+        metrics.fcu_stats.p50.as_secs_f64() * 1000.0
     );
     eprintln!(
         "    P95:           {:>10.2}ms",
-        metrics
-            .percentile(&metrics.fcu_latencies, 95.0)
-            .as_secs_f64()
-            * 1000.0
+        metrics.fcu_stats.p95.as_secs_f64() * 1000.0
     );
     eprintln!(
         "    P99:           {:>10.2}ms",
-        metrics
-            .percentile(&metrics.fcu_latencies, 99.0)
-            .as_secs_f64()
-            * 1000.0
+        metrics.fcu_stats.p99.as_secs_f64() * 1000.0
     );
     eprintln!();
     eprintln!("  Total Block Time:");
     eprintln!(
         "    Min:           {:>10.2}ms",
-        metrics.min(&metrics.block_times).as_secs_f64() * 1000.0
+        metrics.block_time_stats.min.as_secs_f64() * 1000.0
     );
     eprintln!(
         "    Max:           {:>10.2}ms",
-        metrics.max(&metrics.block_times).as_secs_f64() * 1000.0
+        metrics.block_time_stats.max.as_secs_f64() * 1000.0
     );
     eprintln!(
-        "    Avg:           {:>10.2}ms",
-        metrics.avg_block_time().as_secs_f64() * 1000.0
+        "    Mean:          {:>10.2}ms",
+        metrics.block_time_stats.mean.as_secs_f64() * 1000.0
     );
     eprintln!(
         "    P50:           {:>10.2}ms",
-        metrics.percentile(&metrics.block_times, 50.0).as_secs_f64() * 1000.0
+        metrics.block_time_stats.p50.as_secs_f64() * 1000.0
     );
     eprintln!(
         "    P95:           {:>10.2}ms",
-        metrics.percentile(&metrics.block_times, 95.0).as_secs_f64() * 1000.0
+        metrics.block_time_stats.p95.as_secs_f64() * 1000.0
     );
     eprintln!(
         "    P99:           {:>10.2}ms",
-        metrics.percentile(&metrics.block_times, 99.0).as_secs_f64() * 1000.0
+        metrics.block_time_stats.p99.as_secs_f64() * 1000.0
     );
     eprintln!();
     eprintln!("═══════════════════════════════════════════════════════");

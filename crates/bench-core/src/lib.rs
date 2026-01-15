@@ -13,7 +13,7 @@ pub mod source;
 
 pub use metrics::{
     BenchMetrics, BlockStats, LatencySample, LatencyStats, MetricsCollector, ReplayBlockStats,
-    RunStats, ThroughputSample, TimeSeriesMetrics, collect_block_stats,
+    RunStats, ThroughputSample, TimeSeriesMetrics, collect_block_stats, compute_latency_stats,
 };
 pub use reporter::{
     ClickHouseConfig, ClickHouseReporter, ConsoleReporter, JsonBlockStats, JsonLatency,

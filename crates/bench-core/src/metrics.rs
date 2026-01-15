@@ -105,6 +105,19 @@ fn percentile(sorted: &[Duration], p: usize) -> Duration {
     sorted[idx]
 }
 
+/// Compute latency statistics from an unsorted slice of durations.
+///
+/// Returns `LatencyStats` with min, max, mean, p50, p95, p99.
+pub fn compute_latency_stats(samples: &[Duration]) -> LatencyStats {
+    if samples.is_empty() {
+        return LatencyStats::default();
+    }
+
+    let mut sorted = samples.to_vec();
+    sorted.sort();
+    LatencyStats::from_sorted(&sorted)
+}
+
 /// A timestamped latency sample.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatencySample {
