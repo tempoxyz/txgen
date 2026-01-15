@@ -235,6 +235,60 @@ txgen generate -s examples/simple.yaml -c ethereum -n 10 --seed 42
 txgen generate -s examples/tempo.yaml -c tempo -n 10 --seed 42
 ```
 
+## Metrics Collection
+
+The `bench-core` library provides comprehensive metrics collection for benchmarking:
+
+### Runtime Metrics
+
+`MetricsCollector` tracks real-time statistics during transaction sending:
+
+- **sent/success/failed** - Transaction counts
+- **latency** - Per-transaction RPC response times (min, max, mean, p50, p95, p99)
+- **elapsed** - Total benchmark duration
+
+```rust
+let metrics = MetricsCollector::new();
+metrics.start().await;
+
+// ... send transactions ...
+
+let bench_metrics = metrics.finalize().await;
+println!("TPS: {:.2}", bench_metrics.tps());
+println!("Success rate: {:.1}%", bench_metrics.success_rate());
+```
+
+### Block Statistics
+
+Post-run analysis of on-chain block data:
+
+```rust
+let block_stats = collect_block_stats(&provider, start_block, end_block).await?;
+
+for block in &block_stats {
+    println!("Block {}: {} txs, {} gas used", 
+        block.number, block.tx_count, block.gas_used);
+}
+```
+
+Each `BlockStats` includes:
+- Block number, timestamp, tx count, success count
+- Gas used/limit
+- Block time (delta from previous block)
+
+### Run Summary
+
+Aggregate statistics computed from block data:
+
+```rust
+let run_stats = RunStats::from_blocks(&block_stats);
+
+println!("Blocks {}-{}", run_stats.start_block, run_stats.end_block);
+println!("Total txs: {}", run_stats.total_txs);
+println!("Avg TPS: {:.2}", run_stats.avg_tps);
+println!("Block time p50: {}ms", run_stats.block_time_p50_ms);
+```
+
 ## Architecture
 
 ```
@@ -243,7 +297,9 @@ txgen/
 │   ├── txgen-core/       # Core library: spec parsing, account management, output
 │   ├── txgen-ethereum/   # Ethereum plugin: legacy, eip2930, eip1559
 │   ├── txgen-tempo/      # Tempo plugin: 0x76 + delegates to ethereum
-│   └── txgen-cli/        # CLI binary
+│   ├── txgen-cli/        # CLI binary
+│   ├── bench-core/       # Benchmarking: metrics, sender, reporters
+│   └── bench-cli/        # Bench CLI binary
 └── examples/             # Example workload specs
 ```
 
