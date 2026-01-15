@@ -91,7 +91,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
 
                 let (sent, success, failed) = metrics.counts();
                 for reporter in &mut reporters {
-                    reporter.progress(sent, success, failed)?;
+                    reporter.on_progress(sent, success, failed)?;
                 }
             }
             None => {
@@ -108,7 +108,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     let time_series = metrics.time_series().await;
 
     for reporter in &mut reporters {
-        reporter.report(&final_metrics, Some(&time_series))?;
+        reporter.finalize(&final_metrics, Some(&time_series), None)?;
     }
 
     Ok(())

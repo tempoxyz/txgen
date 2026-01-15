@@ -16,8 +16,9 @@ pub use metrics::{
     ThroughputSample, TimeSeriesMetrics, collect_block_stats,
 };
 pub use reporter::{
-    ClickHouseConfig, ClickHouseReporter, ConsoleReporter, JsonLatency, JsonLatencySample,
-    JsonReport, JsonReporter, JsonThroughputSample, JsonTimeSeries, Reporter,
+    ClickHouseConfig, ClickHouseReporter, ConsoleReporter, JsonBlockStats, JsonLatency,
+    JsonLatencySample, JsonReport, JsonReporter, JsonRunStats, JsonThroughputSample,
+    JsonTimeSeries, Reporter,
 };
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource, TxgenSource};

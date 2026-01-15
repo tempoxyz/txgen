@@ -45,7 +45,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     let time_series = metrics.time_series().await;
 
     for reporter in &mut reporters {
-        reporter.report(&final_metrics, Some(&time_series))?;
+        reporter.finalize(&final_metrics, Some(&time_series), None)?;
     }
 
     Ok(())
@@ -62,7 +62,7 @@ async fn send_from_source<S: TxSource>(
 
         let (sent, success, failed) = metrics.counts();
         for reporter in reporters.iter_mut() {
-            reporter.progress(sent, success, failed)?;
+            reporter.on_progress(sent, success, failed)?;
         }
     }
     Ok(())
