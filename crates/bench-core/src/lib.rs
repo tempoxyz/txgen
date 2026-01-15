@@ -12,13 +12,13 @@ pub mod sender;
 pub mod source;
 
 pub use metrics::{
-    BenchMetrics, BlockStats, LatencySample, LatencyStats, MetricsCollector, RunStats,
-    ThroughputSample, TimeSeriesMetrics, collect_block_stats,
+    BenchMetrics, BlockStats, LatencySample, LatencyStats, MetricsCollector, ReplayBlockStats,
+    RunStats, ThroughputSample, TimeSeriesMetrics, collect_block_stats,
 };
 pub use reporter::{
     ClickHouseConfig, ClickHouseReporter, ConsoleReporter, JsonBlockStats, JsonLatency,
-    JsonLatencySample, JsonReport, JsonReporter, JsonRunStats, JsonThroughputSample,
-    JsonTimeSeries, Reporter,
+    JsonLatencySample, JsonReplayBlockStats, JsonReport, JsonReporter, JsonRunStats,
+    JsonThroughputSample, JsonTimeSeries, Reporter,
 };
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource, TxgenSource};

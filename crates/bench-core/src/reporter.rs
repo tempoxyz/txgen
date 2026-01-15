@@ -5,7 +5,7 @@
 //! - JSON (machine-readable)
 //! - ClickHouse (for time-series storage)
 
-use crate::metrics::{BenchMetrics, BlockStats, RunStats, TimeSeriesMetrics};
+use crate::metrics::{BenchMetrics, BlockStats, ReplayBlockStats, RunStats, TimeSeriesMetrics};
 use eyre::{Context, Result};
 use std::io::Write;
 use std::path::Path;
@@ -19,6 +19,11 @@ pub trait Reporter: Send {
 
     /// Called for each block during block stats collection.
     fn on_block(&mut self, _block: &BlockStats) -> Result<()> {
+        Ok(())
+    }
+
+    /// Called for each replayed block during Engine API replay.
+    fn on_replay_block(&mut self, _block: &ReplayBlockStats) -> Result<()> {
         Ok(())
     }
 
@@ -255,6 +260,45 @@ impl From<&BlockStats> for JsonBlockStats {
     }
 }
 
+/// Replay block statistics in JSON format.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct JsonReplayBlockStats {
+    /// Block number.
+    pub number: u64,
+    /// Block timestamp (unix seconds).
+    pub timestamp: u64,
+    /// Total transactions in the block.
+    pub tx_count: usize,
+    /// Gas used by the block.
+    pub gas_used: u64,
+    /// Gas limit of the block.
+    pub gas_limit: u64,
+    /// newPayload latency in milliseconds.
+    pub new_payload_ms: u64,
+    /// forkchoiceUpdated latency in milliseconds.
+    pub fcu_ms: u64,
+    /// Total execution latency in milliseconds.
+    pub total_latency_ms: u64,
+    /// Payload status from newPayload response.
+    pub payload_status: String,
+}
+
+impl From<&ReplayBlockStats> for JsonReplayBlockStats {
+    fn from(b: &ReplayBlockStats) -> Self {
+        Self {
+            number: b.number,
+            timestamp: b.timestamp,
+            tx_count: b.tx_count,
+            gas_used: b.gas_used,
+            gas_limit: b.gas_limit,
+            new_payload_ms: b.new_payload_ms,
+            fcu_ms: b.fcu_ms,
+            total_latency_ms: b.total_latency_ms,
+            payload_status: b.payload_status.clone(),
+        }
+    }
+}
+
 /// Run summary statistics in JSON format.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct JsonRunStats {
@@ -349,6 +393,7 @@ pub struct JsonLatencySample {
 pub struct JsonReporter<W: Write + Send = Box<dyn Write + Send>> {
     writer: W,
     blocks: Vec<JsonBlockStats>,
+    replay_blocks: Vec<JsonReplayBlockStats>,
 }
 
 impl JsonReporter {
@@ -357,6 +402,7 @@ impl JsonReporter {
         Self {
             writer: Box::new(std::io::stdout()),
             blocks: Vec::new(),
+            replay_blocks: Vec::new(),
         }
     }
 
@@ -366,6 +412,7 @@ impl JsonReporter {
         Ok(JsonReporter {
             writer: std::io::BufWriter::new(file),
             blocks: Vec::new(),
+            replay_blocks: Vec::new(),
         })
     }
 }
@@ -376,6 +423,7 @@ impl<W: Write + Send> JsonReporter<W> {
         Self {
             writer,
             blocks: Vec::new(),
+            replay_blocks: Vec::new(),
         }
     }
 }
@@ -383,6 +431,11 @@ impl<W: Write + Send> JsonReporter<W> {
 impl<W: Write + Send> Reporter for JsonReporter<W> {
     fn on_block(&mut self, block: &BlockStats) -> Result<()> {
         self.blocks.push(JsonBlockStats::from(block));
+        Ok(())
+    }
+
+    fn on_replay_block(&mut self, block: &ReplayBlockStats) -> Result<()> {
+        self.replay_blocks.push(JsonReplayBlockStats::from(block));
         Ok(())
     }
 
