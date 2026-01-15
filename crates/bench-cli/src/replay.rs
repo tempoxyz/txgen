@@ -102,20 +102,17 @@ where
     ) -> Result<ReplayMetrics> {
         let BenchMode::Range { from, to } = mode;
 
-        let (tx, mut rx) = mpsc::channel::<FetchedBlock>(DEFAULT_PREFETCH_SIZE);
+        let (tx, mut rx) = mpsc::channel::<Result<FetchedBlock>>(DEFAULT_PREFETCH_SIZE);
 
         let source = self.source_provider.clone();
-        let fetch_handle = tokio::spawn(async move {
-            if let Err(e) = fetch_blocks(source, from, to, tx).await {
-                tracing::error!(error = %e, "Block fetcher failed");
-            }
-        });
+        let fetch_handle = tokio::spawn(async move { fetch_blocks(source, from, to, tx).await });
 
         let mut metrics = ReplayMetrics::default();
         let mut prev_block_hash: Option<B256> = None;
         let mut finalized_hash: Option<B256> = None;
 
-        while let Some(fetched) = rx.recv().await {
+        while let Some(result) = rx.recv().await {
+            let fetched = result?;
             let block_num = fetched.block.header.number;
             let block_hash = fetched.block.header.hash;
 
@@ -244,22 +241,29 @@ async fn fetch_blocks<P: Provider>(
     provider: P,
     from: u64,
     to: u64,
-    tx: mpsc::Sender<FetchedBlock>,
-) -> Result<()> {
+    tx: mpsc::Sender<Result<FetchedBlock>>,
+) {
     for block_num in from..=to {
-        let block = provider
-            .get_block_by_number(block_num.into())
-            .full()
-            .await
-            .wrap_err_with(|| format!("failed to fetch block {}", block_num))?
-            .ok_or_else(|| eyre::eyre!("block {} not found", block_num))?;
+        let result = async {
+            let block = provider
+                .get_block_by_number(block_num.into())
+                .full()
+                .await
+                .wrap_err_with(|| format!("failed to fetch block {}", block_num))?
+                .ok_or_else(|| eyre::eyre!("block {} not found", block_num))?;
+            Ok(FetchedBlock { block })
+        }
+        .await;
 
-        if tx.send(FetchedBlock { block }).await.is_err() {
+        let is_err = result.is_err();
+        if tx.send(result).await.is_err() {
             tracing::debug!("Channel closed, stopping fetcher");
             break;
         }
+        if is_err {
+            break;
+        }
     }
-    Ok(())
 }
 
 /// Convert a block to an ExecutionPayloadV3.
