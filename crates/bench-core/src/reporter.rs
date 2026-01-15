@@ -6,7 +6,7 @@
 //! - ClickHouse (for time-series storage)
 
 use crate::metrics::{BenchMetrics, BlockStats, ReplayBlockStats, RunStats, TimeSeriesMetrics};
-use eyre::{Context, Result};
+use eyre::{Context, Result, bail};
 use std::io::Write;
 use std::path::Path;
 
@@ -602,6 +602,37 @@ impl Reporter for ClickHouseReporter {
 
         Ok(())
     }
+}
+
+/// Parse reporter specifications into boxed reporters.
+///
+/// Supported formats:
+/// - `console` - Human-readable output to stderr
+/// - `json:<path>` - JSON output to file
+/// - `clickhouse:<url>` - ClickHouse (not yet implemented)
+pub fn parse_reporters(specs: &[String]) -> Result<Vec<Box<dyn Reporter>>> {
+    let mut reporters: Vec<Box<dyn Reporter>> = Vec::new();
+
+    if specs.is_empty() {
+        return Ok(reporters);
+    }
+
+    for spec in specs {
+        if spec == "console" {
+            reporters.push(Box::new(ConsoleReporter::stderr(true)));
+        } else if let Some(path) = spec.strip_prefix("json:") {
+            let path = Path::new(path);
+            reporters.push(Box::new(
+                JsonReporter::file(path).wrap_err("failed to create JSON reporter")?,
+            ));
+        } else if let Some(_url) = spec.strip_prefix("clickhouse:") {
+            tracing::warn!("ClickHouse reporter not yet fully implemented");
+        } else {
+            bail!("unknown report format: {}", spec);
+        }
+    }
+
+    Ok(reporters)
 }
 
 #[cfg(test)]

@@ -13,9 +13,8 @@ use alloy_provider::{Provider, ProviderBuilder, RootProvider, ext::EngineApi};
 use alloy_rpc_types_engine::{ExecutionPayloadV3, ForkchoiceState, JwtSecret};
 use alloy_rpc_types_eth::Block;
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
-use bench_core::{ConsoleReporter, JsonReporter, ReplayBlockStats, Reporter};
+use bench_core::{ReplayBlockStats, Reporter, parse_reporters};
 use eyre::{Context, Result, bail};
-use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -555,29 +554,4 @@ fn print_replay_summary(
     eprintln!("═══════════════════════════════════════════════════════");
 
     Ok(())
-}
-
-fn parse_reporters(specs: &[String]) -> Result<Vec<Box<dyn Reporter>>> {
-    let mut reporters: Vec<Box<dyn Reporter>> = Vec::new();
-
-    if specs.is_empty() {
-        return Ok(reporters);
-    }
-
-    for spec in specs {
-        if spec == "console" {
-            reporters.push(Box::new(ConsoleReporter::stderr(true)));
-        } else if let Some(path) = spec.strip_prefix("json:") {
-            let path = Path::new(path);
-            reporters.push(Box::new(
-                JsonReporter::file(path).wrap_err("failed to create JSON reporter")?,
-            ));
-        } else if let Some(_url) = spec.strip_prefix("clickhouse:") {
-            tracing::warn!("ClickHouse reporter not yet fully implemented");
-        } else {
-            bail!("unknown report format: {}", spec);
-        }
-    }
-
-    Ok(reporters)
 }
