@@ -944,7 +944,9 @@ dependencies = [
 name = "bench-core"
 version = "0.1.0"
 dependencies = [
+ "alloy-eips",
  "alloy-primitives",
+ "alloy-provider",
  "eyre",
  "futures",
  "hex",

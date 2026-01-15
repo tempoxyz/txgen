@@ -11,7 +11,9 @@ pub mod reporter;
 pub mod sender;
 pub mod source;
 
-pub use metrics::{BenchMetrics, LatencyStats, MetricsCollector};
+pub use metrics::{
+    BenchMetrics, BlockStats, LatencyStats, MetricsCollector, RunStats, collect_block_stats,
+};
 pub use reporter::{ClickHouseConfig, ClickHouseReporter, ConsoleReporter, JsonReporter, Reporter};
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource, TxgenSource};

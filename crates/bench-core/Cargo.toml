@@ -15,6 +15,8 @@ serde_json.workspace = true
 
 # alloy
 alloy-primitives.workspace = true
+alloy-provider.workspace = true
+alloy-eips.workspace = true
 
 # async
 tokio = { version = "1", features = ["rt", "sync", "time", "process", "io-util", "io-std"] }

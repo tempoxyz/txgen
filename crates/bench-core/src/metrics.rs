@@ -3,14 +3,20 @@
 //! Collects statistics about transaction sending:
 //! - Sent/success/failed counts
 //! - Timing (latencies, throughput)
+//! - Block-level statistics (post-run)
 
+use alloy_eips::BlockNumberOrTag;
+use alloy_provider::Provider;
+
+use eyre::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// Metrics collected during a benchmark run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchMetrics {
     /// Total transactions sent.
     pub sent: u64,
@@ -19,6 +25,7 @@ pub struct BenchMetrics {
     /// Failed transactions (rejected by RPC or network error).
     pub failed: u64,
     /// Total elapsed time.
+    #[serde(with = "duration_serde")]
     pub elapsed: Duration,
     /// Latency statistics.
     pub latency: LatencyStats,
@@ -45,25 +52,31 @@ impl BenchMetrics {
 }
 
 /// Latency statistics.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LatencyStats {
     /// Minimum latency observed.
+    #[serde(with = "duration_serde")]
     pub min: Duration,
     /// Maximum latency observed.
+    #[serde(with = "duration_serde")]
     pub max: Duration,
     /// Mean latency.
+    #[serde(with = "duration_serde")]
     pub mean: Duration,
     /// P50 latency.
+    #[serde(with = "duration_serde")]
     pub p50: Duration,
     /// P95 latency.
+    #[serde(with = "duration_serde")]
     pub p95: Duration,
     /// P99 latency.
+    #[serde(with = "duration_serde")]
     pub p99: Duration,
 }
 
 impl LatencyStats {
     /// Compute latency stats from a sorted slice of durations.
-    fn from_sorted(samples: &[Duration]) -> Self {
+    pub fn from_sorted(samples: &[Duration]) -> Self {
         if samples.is_empty() {
             return Self::default();
         }
@@ -76,11 +89,177 @@ impl LatencyStats {
             min: samples[0],
             max: samples[n - 1],
             mean,
-            p50: samples[n * 50 / 100],
-            p95: samples[n * 95 / 100],
-            p99: samples[n * 99 / 100],
+            p50: percentile(samples, 50),
+            p95: percentile(samples, 95),
+            p99: percentile(samples, 99),
         }
     }
+}
+
+/// Calculate percentile from a sorted slice.
+fn percentile(sorted: &[Duration], p: usize) -> Duration {
+    if sorted.is_empty() {
+        return Duration::ZERO;
+    }
+    let idx = (sorted.len() * p / 100).min(sorted.len() - 1);
+    sorted[idx]
+}
+
+/// Block-level statistics collected post-run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockStats {
+    /// Block number.
+    pub number: u64,
+    /// Block timestamp (unix seconds).
+    pub timestamp: u64,
+    /// Total transactions in the block.
+    pub tx_count: usize,
+    /// Successful transactions in the block.
+    pub success_count: usize,
+    /// Gas used by the block.
+    pub gas_used: u64,
+    /// Gas limit of the block.
+    pub gas_limit: u64,
+    /// Time since previous block in milliseconds.
+    pub block_time_ms: Option<u64>,
+}
+
+/// Run summary statistics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunStats {
+    /// Starting block number.
+    pub start_block: u64,
+    /// Ending block number.
+    pub end_block: u64,
+    /// Total transactions across all blocks.
+    pub total_txs: u64,
+    /// Total gas used across all blocks.
+    pub total_gas: u64,
+    /// Total duration in milliseconds.
+    pub duration_ms: u64,
+    /// Average transactions per second.
+    pub avg_tps: f64,
+    /// Average gas per second.
+    pub avg_gas_per_second: f64,
+    /// P50 block time in milliseconds.
+    pub block_time_p50_ms: u64,
+    /// P95 block time in milliseconds.
+    pub block_time_p95_ms: u64,
+    /// P99 block time in milliseconds.
+    pub block_time_p99_ms: u64,
+}
+
+impl RunStats {
+    /// Compute run stats from a slice of block stats.
+    pub fn from_blocks(blocks: &[BlockStats]) -> Self {
+        if blocks.is_empty() {
+            return Self {
+                start_block: 0,
+                end_block: 0,
+                total_txs: 0,
+                total_gas: 0,
+                duration_ms: 0,
+                avg_tps: 0.0,
+                avg_gas_per_second: 0.0,
+                block_time_p50_ms: 0,
+                block_time_p95_ms: 0,
+                block_time_p99_ms: 0,
+            };
+        }
+
+        let start_block = blocks.first().map(|b| b.number).unwrap_or(0);
+        let end_block = blocks.last().map(|b| b.number).unwrap_or(0);
+
+        let total_txs: u64 = blocks.iter().map(|b| b.tx_count as u64).sum();
+        let total_gas: u64 = blocks.iter().map(|b| b.gas_used).sum();
+
+        let start_ts = blocks.first().map(|b| b.timestamp).unwrap_or(0);
+        let end_ts = blocks.last().map(|b| b.timestamp).unwrap_or(0);
+        let duration_secs = end_ts.saturating_sub(start_ts);
+        let duration_ms = duration_secs * 1000;
+
+        let avg_tps = if duration_secs > 0 {
+            total_txs as f64 / duration_secs as f64
+        } else {
+            0.0
+        };
+
+        let avg_gas_per_second = if duration_secs > 0 {
+            total_gas as f64 / duration_secs as f64
+        } else {
+            0.0
+        };
+
+        let mut block_times: Vec<u64> = blocks.iter().filter_map(|b| b.block_time_ms).collect();
+        block_times.sort();
+
+        let block_time_p50_ms = percentile_u64(&block_times, 50);
+        let block_time_p95_ms = percentile_u64(&block_times, 95);
+        let block_time_p99_ms = percentile_u64(&block_times, 99);
+
+        Self {
+            start_block,
+            end_block,
+            total_txs,
+            total_gas,
+            duration_ms,
+            avg_tps,
+            avg_gas_per_second,
+            block_time_p50_ms,
+            block_time_p95_ms,
+            block_time_p99_ms,
+        }
+    }
+}
+
+fn percentile_u64(sorted: &[u64], p: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = (sorted.len() * p / 100).min(sorted.len() - 1);
+    sorted[idx]
+}
+
+/// Collect block statistics from the chain.
+pub async fn collect_block_stats<P: Provider>(
+    provider: &P,
+    start_block: u64,
+    end_block: u64,
+) -> Result<Vec<BlockStats>> {
+    let mut stats = Vec::with_capacity((end_block - start_block + 1) as usize);
+    let mut prev_timestamp: Option<u64> = None;
+
+    for number in start_block..=end_block {
+        let block = provider
+            .get_block(BlockNumberOrTag::Number(number).into())
+            .await
+            .wrap_err_with(|| format!("failed to fetch block {number}"))?
+            .ok_or_else(|| eyre::eyre!("block {number} not found"))?;
+
+        let receipts = provider
+            .get_block_receipts(BlockNumberOrTag::Number(number).into())
+            .await
+            .wrap_err_with(|| format!("failed to fetch receipts for block {number}"))?
+            .unwrap_or_default();
+
+        let block_time_ms =
+            prev_timestamp.map(|prev| block.header.timestamp.saturating_sub(prev) * 1000);
+        prev_timestamp = Some(block.header.timestamp);
+
+        let success_count = receipts.iter().filter(|r| r.status()).count();
+
+        stats.push(BlockStats {
+            number,
+            timestamp: block.header.timestamp,
+            tx_count: receipts.len(),
+            success_count,
+            gas_used: block.header.gas_used,
+            gas_limit: block.header.gas_limit,
+            block_time_ms,
+        });
+    }
+
+    Ok(stats)
 }
 
 /// Atomic counters for concurrent metrics collection.
@@ -148,6 +327,36 @@ impl MetricsCollector {
     }
 }
 
+mod duration_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::Duration;
+
+    #[derive(Serialize, Deserialize)]
+    struct DurationRepr {
+        secs: u64,
+        nanos: u32,
+    }
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        DurationRepr {
+            secs: duration.as_secs(),
+            nanos: duration.subsec_nanos(),
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let repr = DurationRepr::deserialize(deserializer)?;
+        Ok(Duration::new(repr.secs, repr.nanos))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +404,79 @@ mod tests {
 
         assert!((metrics.tps() - 10.0).abs() < 0.001);
         assert!((metrics.success_rate() - 90.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_run_stats_from_blocks() {
+        let blocks = vec![
+            BlockStats {
+                number: 100,
+                timestamp: 1000,
+                tx_count: 10,
+                success_count: 9,
+                gas_used: 1_000_000,
+                gas_limit: 30_000_000,
+                block_time_ms: None,
+            },
+            BlockStats {
+                number: 101,
+                timestamp: 1012,
+                tx_count: 15,
+                success_count: 15,
+                gas_used: 1_500_000,
+                gas_limit: 30_000_000,
+                block_time_ms: Some(12000),
+            },
+            BlockStats {
+                number: 102,
+                timestamp: 1024,
+                tx_count: 20,
+                success_count: 18,
+                gas_used: 2_000_000,
+                gas_limit: 30_000_000,
+                block_time_ms: Some(12000),
+            },
+        ];
+
+        let run_stats = RunStats::from_blocks(&blocks);
+
+        assert_eq!(run_stats.start_block, 100);
+        assert_eq!(run_stats.end_block, 102);
+        assert_eq!(run_stats.total_txs, 45);
+        assert_eq!(run_stats.total_gas, 4_500_000);
+        assert_eq!(run_stats.duration_ms, 24000);
+    }
+
+    #[test]
+    fn test_run_stats_empty() {
+        let run_stats = RunStats::from_blocks(&[]);
+        assert_eq!(run_stats.start_block, 0);
+        assert_eq!(run_stats.total_txs, 0);
+        assert_eq!(run_stats.avg_tps, 0.0);
+    }
+
+    #[test]
+    fn test_bench_metrics_serde() {
+        let metrics = BenchMetrics {
+            sent: 100,
+            success: 90,
+            failed: 10,
+            elapsed: Duration::from_millis(1500),
+            latency: LatencyStats {
+                min: Duration::from_millis(5),
+                max: Duration::from_millis(200),
+                mean: Duration::from_millis(50),
+                p50: Duration::from_millis(40),
+                p95: Duration::from_millis(150),
+                p99: Duration::from_millis(180),
+            },
+        };
+
+        let json = serde_json::to_string(&metrics).unwrap();
+        let parsed: BenchMetrics = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.sent, 100);
+        assert_eq!(parsed.elapsed, Duration::from_millis(1500));
+        assert_eq!(parsed.latency.p50, Duration::from_millis(40));
     }
 }
