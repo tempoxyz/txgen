@@ -5,7 +5,9 @@
 //! - JSON (machine-readable)
 //! - ClickHouse (for time-series storage)
 
-use crate::metrics::{BenchMetrics, BlockStats, ReplayBlockStats, RunStats, TimeSeriesMetrics};
+use crate::metrics::{
+    BenchMetrics, BlockStats, ReplayBlockStats, ReplayRunStats, RunStats, TimeSeriesMetrics,
+};
 use eyre::{Context, Result, bail};
 use std::io::Write;
 use std::path::Path;
@@ -34,6 +36,11 @@ pub trait Reporter: Send {
         time_series: Option<&TimeSeriesMetrics>,
         run_stats: Option<&RunStats>,
     ) -> Result<()>;
+
+    /// Finalize and output replay benchmark results.
+    fn finalize_replay(&mut self, _stats: &ReplayRunStats) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Console reporter with human-readable output.
@@ -196,6 +203,104 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
 
         Ok(())
     }
+
+    fn finalize_replay(&mut self, stats: &ReplayRunStats) -> Result<()> {
+        writeln!(self.writer)?;
+        writeln!(
+            self.writer,
+            "═══════════════════════════════════════════════════════"
+        )?;
+        writeln!(self.writer, "                  Block Replay Results")?;
+        writeln!(
+            self.writer,
+            "═══════════════════════════════════════════════════════"
+        )?;
+        writeln!(self.writer)?;
+        writeln!(
+            self.writer,
+            "  Blocks Replayed: {:>10}",
+            stats.blocks_replayed
+        )?;
+        writeln!(self.writer, "  Total Txs:       {:>10}", stats.total_txs)?;
+        writeln!(
+            self.writer,
+            "  Total Gas:       {:>10.2} Ggas",
+            stats.total_gas as f64 / 1_000_000_000.0
+        )?;
+        writeln!(self.writer)?;
+        writeln!(
+            self.writer,
+            "  Duration:        {:>10.2}s",
+            stats.total_duration_ms as f64 / 1000.0
+        )?;
+        writeln!(
+            self.writer,
+            "  Blocks/sec:      {:>10.2}",
+            stats.blocks_per_second
+        )?;
+        writeln!(
+            self.writer,
+            "  Mgas/sec:        {:>10.2}",
+            stats.mgas_per_second
+        )?;
+        writeln!(
+            self.writer,
+            "  Ggas/sec:        {:>10.4}",
+            stats.ggas_per_second
+        )?;
+        writeln!(self.writer)?;
+        writeln!(self.writer, "  newPayload Latency:")?;
+        self.write_latency_stats(&stats.new_payload_latency)?;
+        writeln!(self.writer)?;
+        writeln!(self.writer, "  forkchoiceUpdated Latency:")?;
+        self.write_latency_stats(&stats.fcu_latency)?;
+        writeln!(self.writer)?;
+        writeln!(self.writer, "  Total Block Time:")?;
+        self.write_latency_stats(&stats.block_time)?;
+        writeln!(self.writer)?;
+        writeln!(
+            self.writer,
+            "═══════════════════════════════════════════════════════"
+        )?;
+
+        Ok(())
+    }
+}
+
+impl<W: Write + Send> ConsoleReporter<W> {
+    fn write_latency_stats(&mut self, stats: &crate::LatencyStats) -> Result<()> {
+        writeln!(
+            self.writer,
+            "    Min:           {:>10.2}ms",
+            stats.min.as_secs_f64() * 1000.0
+        )?;
+        writeln!(
+            self.writer,
+            "    Max:           {:>10.2}ms",
+            stats.max.as_secs_f64() * 1000.0
+        )?;
+        writeln!(
+            self.writer,
+            "    Mean:          {:>10.2}ms",
+            stats.mean.as_secs_f64() * 1000.0
+        )?;
+        writeln!(
+            self.writer,
+            "    P50:           {:>10.2}ms",
+            stats.p50.as_secs_f64() * 1000.0
+        )?;
+        writeln!(
+            self.writer,
+            "    P95:           {:>10.2}ms",
+            stats.p95.as_secs_f64() * 1000.0
+        )?;
+        writeln!(
+            self.writer,
+            "    P99:           {:>10.2}ms",
+            stats.p99.as_secs_f64() * 1000.0
+        )?;
+        Ok(())
+    }
 }
 
 /// JSON output format.
@@ -339,6 +444,34 @@ impl From<&RunStats> for JsonRunStats {
             block_time_p99_ms: r.block_time_p99_ms,
         }
     }
+}
+
+/// JSON output format for replay benchmarks.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct JsonReplayReport {
+    /// Number of blocks replayed.
+    pub blocks_replayed: u64,
+    /// Total transactions across all blocks.
+    pub total_txs: u64,
+    /// Total gas used (in gas units).
+    pub total_gas: u128,
+    /// Total execution time in milliseconds.
+    pub total_duration_ms: u64,
+    /// Blocks replayed per second.
+    pub blocks_per_second: f64,
+    /// Megagas per second.
+    pub mgas_per_second: f64,
+    /// Gigagas per second.
+    pub ggas_per_second: f64,
+    /// newPayload latency statistics.
+    pub new_payload_latency: JsonLatency,
+    /// forkchoiceUpdated latency statistics.
+    pub fcu_latency: JsonLatency,
+    /// Total block time statistics.
+    pub block_time: JsonLatency,
+    /// Per-block replay statistics (optional).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocks: Option<Vec<JsonReplayBlockStats>>,
 }
 
 /// Latency statistics in JSON format.
@@ -490,6 +623,42 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             time_series: ts,
             blocks,
             run_stats: run_stats.map(JsonRunStats::from),
+        };
+
+        serde_json::to_writer_pretty(&mut self.writer, &report)?;
+        writeln!(self.writer)?;
+
+        Ok(())
+    }
+
+    fn finalize_replay(&mut self, stats: &ReplayRunStats) -> Result<()> {
+        let latency_to_json = |l: &crate::LatencyStats| JsonLatency {
+            min_ms: l.min.as_secs_f64() * 1000.0,
+            max_ms: l.max.as_secs_f64() * 1000.0,
+            mean_ms: l.mean.as_secs_f64() * 1000.0,
+            p50_ms: l.p50.as_secs_f64() * 1000.0,
+            p95_ms: l.p95.as_secs_f64() * 1000.0,
+            p99_ms: l.p99.as_secs_f64() * 1000.0,
+        };
+
+        let blocks = if self.replay_blocks.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.replay_blocks))
+        };
+
+        let report = JsonReplayReport {
+            blocks_replayed: stats.blocks_replayed,
+            total_txs: stats.total_txs,
+            total_gas: stats.total_gas,
+            total_duration_ms: stats.total_duration_ms,
+            blocks_per_second: stats.blocks_per_second,
+            mgas_per_second: stats.mgas_per_second,
+            ggas_per_second: stats.ggas_per_second,
+            new_payload_latency: latency_to_json(&stats.new_payload_latency),
+            fcu_latency: latency_to_json(&stats.fcu_latency),
+            block_time: latency_to_json(&stats.block_time),
+            blocks,
         };
 
         serde_json::to_writer_pretty(&mut self.writer, &report)?;

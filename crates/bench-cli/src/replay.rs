@@ -14,7 +14,8 @@ use alloy_rpc_types_engine::{ExecutionPayloadV3, ForkchoiceState, JwtSecret};
 use alloy_rpc_types_eth::Block;
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    LatencyStats, ReplayBlockStats, Reporter, compute_latency_stats, parse_reporters,
+    ConsoleReporter, LatencyStats, ReplayBlockStats, ReplayRunStats, Reporter,
+    compute_latency_stats, parse_reporters,
 };
 use eyre::{Context, Result, bail};
 use std::time::{Duration, Instant};
@@ -57,6 +58,9 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
 
     let mut reporters = parse_reporters(&args.reports)?;
 
+    // Always add console reporter for summary output
+    let mut console_reporter: Box<dyn Reporter> = Box::new(ConsoleReporter::stderr(false));
+
     let bench = ReplayBench::new(source_provider, engine_provider);
     let mode = BenchMode::Range {
         from: args.from,
@@ -64,7 +68,28 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
     };
 
     let metrics = bench.run(mode, &mut reporters).await?;
-    print_replay_summary(&metrics, &mut reporters)?;
+
+    // Convert to ReplayRunStats for finalization
+    let run_stats = ReplayRunStats {
+        blocks_replayed: metrics.blocks_replayed,
+        total_txs: metrics.total_txs,
+        total_gas: metrics.total_gas,
+        total_duration_ms: metrics.total_execution_time.as_millis() as u64,
+        blocks_per_second: metrics.blocks_per_second(),
+        mgas_per_second: metrics.mgas_per_second(),
+        ggas_per_second: metrics.ggas_per_second(),
+        new_payload_latency: metrics.new_payload_stats.clone(),
+        fcu_latency: metrics.fcu_stats.clone(),
+        block_time: metrics.block_time_stats.clone(),
+    };
+
+    // Finalize all reporters
+    for reporter in reporters.iter_mut() {
+        reporter.finalize_replay(&run_stats)?;
+    }
+
+    // Always output to console
+    console_reporter.finalize_replay(&run_stats)?;
 
     Ok(())
 }
@@ -378,13 +403,13 @@ impl ReplayMetricsCollector {
 /// Finalized replay metrics with computed statistics.
 #[derive(Debug)]
 pub struct ReplayMetrics {
-    blocks_replayed: u64,
-    total_txs: u64,
-    total_gas: u128,
-    total_execution_time: Duration,
-    new_payload_stats: LatencyStats,
-    fcu_stats: LatencyStats,
-    block_time_stats: LatencyStats,
+    pub blocks_replayed: u64,
+    pub total_txs: u64,
+    pub total_gas: u128,
+    pub total_execution_time: Duration,
+    pub new_payload_stats: LatencyStats,
+    pub fcu_stats: LatencyStats,
+    pub block_time_stats: LatencyStats,
 }
 
 impl ReplayMetrics {
@@ -411,111 +436,4 @@ impl ReplayMetrics {
             0.0
         }
     }
-}
-
-fn print_replay_summary(
-    metrics: &ReplayMetrics,
-    _reporters: &mut [Box<dyn Reporter>],
-) -> Result<()> {
-    eprintln!();
-    eprintln!("═══════════════════════════════════════════════════════");
-    eprintln!("                  Block Replay Results");
-    eprintln!("═══════════════════════════════════════════════════════");
-    eprintln!();
-    eprintln!("  Blocks Replayed: {:>10}", metrics.blocks_replayed);
-    eprintln!("  Total Txs:       {:>10}", metrics.total_txs);
-    eprintln!(
-        "  Total Gas:       {:>10.2} Ggas",
-        metrics.total_gas as f64 / 1_000_000_000.0
-    );
-    eprintln!();
-    eprintln!(
-        "  Duration:        {:>10.2}s",
-        metrics.total_execution_time.as_secs_f64()
-    );
-    eprintln!("  Blocks/sec:      {:>10.2}", metrics.blocks_per_second());
-    eprintln!("  Mgas/sec:        {:>10.2}", metrics.mgas_per_second());
-    eprintln!("  Ggas/sec:        {:>10.4}", metrics.ggas_per_second());
-    eprintln!();
-    eprintln!("  newPayload Latency:");
-    eprintln!(
-        "    Min:           {:>10.2}ms",
-        metrics.new_payload_stats.min.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "    Max:           {:>10.2}ms",
-        metrics.new_payload_stats.max.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "    Mean:          {:>10.2}ms",
-        metrics.new_payload_stats.mean.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "    P50:           {:>10.2}ms",
-        metrics.new_payload_stats.p50.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "    P95:           {:>10.2}ms",
-        metrics.new_payload_stats.p95.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "    P99:           {:>10.2}ms",
-        metrics.new_payload_stats.p99.as_secs_f64() * 1000.0
-    );
-    eprintln!();
-    eprintln!("  forkchoiceUpdated Latency:");
-    eprintln!(
-        "    Min:           {:>10.2}ms",
-        metrics.fcu_stats.min.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "    Max:           {:>10.2}ms",
-        metrics.fcu_stats.max.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "    Mean:          {:>10.2}ms",
-        metrics.fcu_stats.mean.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "    P50:           {:>10.2}ms",
-        metrics.fcu_stats.p50.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "    P95:           {:>10.2}ms",
-        metrics.fcu_stats.p95.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "    P99:           {:>10.2}ms",
-        metrics.fcu_stats.p99.as_secs_f64() * 1000.0
-    );
-    eprintln!();
-    eprintln!("  Total Block Time:");
-    eprintln!(
-        "    Min:           {:>10.2}ms",
-        metrics.block_time_stats.min.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "    Max:           {:>10.2}ms",
-        metrics.block_time_stats.max.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "    Mean:          {:>10.2}ms",
-        metrics.block_time_stats.mean.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "    P50:           {:>10.2}ms",
-        metrics.block_time_stats.p50.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "    P95:           {:>10.2}ms",
-        metrics.block_time_stats.p95.as_secs_f64() * 1000.0
-    );
-    eprintln!(
-        "    P99:           {:>10.2}ms",
-        metrics.block_time_stats.p99.as_secs_f64() * 1000.0
-    );
-    eprintln!();
-    eprintln!("═══════════════════════════════════════════════════════");
-
-    Ok(())
 }
