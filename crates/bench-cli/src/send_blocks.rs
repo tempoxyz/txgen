@@ -30,13 +30,13 @@ struct BlockLine {
 }
 
 /// Decoded block metadata extracted from RLP.
-struct BlockMeta {
-    hash: B256,
-    number: u64,
-    timestamp: u64,
-    gas_used: u64,
-    gas_limit: u64,
-    tx_count: usize,
+pub(crate) struct BlockMeta {
+    pub(crate) hash: B256,
+    pub(crate) number: u64,
+    pub(crate) timestamp: u64,
+    pub(crate) gas_used: u64,
+    pub(crate) gas_limit: u64,
+    pub(crate) tx_count: usize,
 }
 
 pub async fn execute(args: SendBlocksArgs) -> Result<()> {
@@ -143,7 +143,7 @@ fn parse_block_line(line: &str) -> Result<Bytes> {
     Ok(block_line.raw)
 }
 
-fn decode_block_meta(rlp_bytes: &[u8]) -> Result<BlockMeta> {
+pub(crate) fn decode_block_meta(rlp_bytes: &[u8]) -> Result<BlockMeta> {
     let mut buf = rlp_bytes;
     let block =
         ConsensusBlock::<TxEnvelope>::decode(&mut buf).wrap_err("failed to RLP-decode block")?;
@@ -160,7 +160,7 @@ fn decode_block_meta(rlp_bytes: &[u8]) -> Result<BlockMeta> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn process_block(
+pub(crate) async fn process_block(
     provider: &(impl Provider + RethApi<Ethereum>),
     block_bytes: Bytes,
     meta: &BlockMeta,
@@ -265,7 +265,7 @@ async fn process_block(
 
 /// Metrics for a single submitted block.
 #[derive(Debug, Clone)]
-struct BlockMetrics {
+pub(crate) struct BlockMetrics {
     tx_count: u64,
     gas_used: u64,
     new_payload_latency: Duration,
@@ -283,7 +283,7 @@ struct BlockMetrics {
 
 /// Aggregated metrics collector.
 #[derive(Debug, Default)]
-struct MetricsCollector {
+pub(crate) struct MetricsCollector {
     blocks_submitted: u64,
     total_txs: u64,
     total_gas: u128,
@@ -294,7 +294,7 @@ struct MetricsCollector {
 }
 
 impl MetricsCollector {
-    fn record_block(&mut self, block: BlockMetrics) {
+    pub(crate) fn record_block(&mut self, block: BlockMetrics) {
         self.blocks_submitted += 1;
         self.total_txs += block.tx_count;
         self.total_gas += block.gas_used as u128;
@@ -304,7 +304,7 @@ impl MetricsCollector {
         self.block_times.push(block.total_latency);
     }
 
-    fn finalize(self) -> FinalMetrics {
+    pub(crate) fn finalize(self) -> FinalMetrics {
         FinalMetrics {
             blocks_submitted: self.blocks_submitted,
             total_txs: self.total_txs,
@@ -319,18 +319,18 @@ impl MetricsCollector {
 
 /// Finalized metrics with computed statistics.
 #[derive(Debug)]
-struct FinalMetrics {
-    blocks_submitted: u64,
-    total_txs: u64,
-    total_gas: u128,
-    total_execution_time: Duration,
-    new_payload_stats: LatencyStats,
-    fcu_stats: LatencyStats,
-    block_time_stats: LatencyStats,
+pub(crate) struct FinalMetrics {
+    pub(crate) blocks_submitted: u64,
+    pub(crate) total_txs: u64,
+    pub(crate) total_gas: u128,
+    pub(crate) total_execution_time: Duration,
+    pub(crate) new_payload_stats: LatencyStats,
+    pub(crate) fcu_stats: LatencyStats,
+    pub(crate) block_time_stats: LatencyStats,
 }
 
 impl FinalMetrics {
-    fn blocks_per_second(&self) -> f64 {
+    pub(crate) fn blocks_per_second(&self) -> f64 {
         if self.total_execution_time.as_secs_f64() > 0.0 {
             self.blocks_submitted as f64 / self.total_execution_time.as_secs_f64()
         } else {
@@ -338,7 +338,7 @@ impl FinalMetrics {
         }
     }
 
-    fn mgas_per_second(&self) -> f64 {
+    pub(crate) fn mgas_per_second(&self) -> f64 {
         if self.total_execution_time.as_secs_f64() > 0.0 {
             (self.total_gas as f64 / 1_000_000.0) / self.total_execution_time.as_secs_f64()
         } else {
@@ -346,7 +346,7 @@ impl FinalMetrics {
         }
     }
 
-    fn ggas_per_second(&self) -> f64 {
+    pub(crate) fn ggas_per_second(&self) -> f64 {
         if self.total_execution_time.as_secs_f64() > 0.0 {
             (self.total_gas as f64 / 1_000_000_000.0) / self.total_execution_time.as_secs_f64()
         } else {
