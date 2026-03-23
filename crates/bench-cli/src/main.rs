@@ -3,6 +3,7 @@
 //! Provides subcommands:
 //! - `run` - All-in-one: generate + send + report
 //! - `send` - Send from file/stdin
+//! - `send-blocks` - Submit blocks via reth Engine API
 //! - `replay` - Engine API block replay
 //! - `plot` - Generate plots from JSON report
 
@@ -15,6 +16,7 @@ mod plot;
 mod replay;
 mod run;
 mod send;
+mod send_blocks;
 
 #[derive(Parser)]
 #[command(name = "bench", about = "Transaction benchmarking tool")]
@@ -29,6 +31,8 @@ enum Command {
     Run(RunArgs),
     /// Send transactions from file or stdin
     Send(SendArgs),
+    /// Submit blocks via reth Engine API
+    SendBlocks(SendBlocksArgs),
     /// Replay blocks via Engine API
     Replay(ReplayArgs),
     /// Generate plots from JSON report
@@ -136,6 +140,26 @@ pub struct ReplayArgs {
     pub reports: Vec<String>,
 }
 
+/// Arguments for the `send-blocks` subcommand.
+#[derive(Args)]
+pub struct SendBlocksArgs {
+    /// Engine API endpoint
+    #[arg(long)]
+    pub engine: String,
+
+    /// Path to JWT secret file
+    #[arg(long)]
+    pub jwt_secret: PathBuf,
+
+    /// Input file (NDJSON). If not specified, reads from stdin.
+    #[arg(short, long)]
+    pub input: Option<PathBuf>,
+
+    /// Report output destinations
+    #[arg(long = "report", value_name = "FORMAT")]
+    pub reports: Vec<String>,
+}
+
 /// Arguments for the `plot` subcommand.
 #[derive(Args)]
 pub struct PlotArgs {
@@ -185,6 +209,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Run(args) => run::execute(args).await,
         Command::Send(args) => send::execute(args).await,
+        Command::SendBlocks(args) => send_blocks::execute(args).await,
         Command::Replay(args) => replay::execute(args).await,
         Command::Plot(args) => plot::execute(args),
     }

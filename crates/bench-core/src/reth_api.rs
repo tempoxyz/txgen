@@ -1,4 +1,4 @@
-//! Types for reth's custom Engine API extensions.
+//! Types and provider extension for reth's custom Engine API.
 //!
 //! reth exposes two custom RPC methods for benchmarking:
 //! - `reth_newPayload` — accepts either standard `ExecutionData` or raw RLP-encoded block bytes
@@ -7,9 +7,15 @@
 //!
 //! These types mirror the definitions in reth's `reth-rpc-api` crate but are kept standalone
 //! to avoid pulling in the full reth dependency tree.
+//!
+//! The [`RethApi`] trait provides a provider extension (like alloy's `DebugApi`) that is
+//! automatically available on any `Provider`.
 
+use alloy_network::Network;
 use alloy_primitives::Bytes;
-use alloy_rpc_types_engine::{ForkchoiceUpdated, PayloadStatus};
+use alloy_provider::Provider;
+use alloy_rpc_types_engine::{ForkchoiceState, ForkchoiceUpdated, PayloadStatus};
+use alloy_transport::TransportResult;
 use serde::{Deserialize, Serialize};
 
 /// Input for `reth_newPayload`.
@@ -59,6 +65,56 @@ pub struct RethPayloadStatus {
 /// does not extend the response, only simplifies the request (no payload
 /// attributes).
 pub type RethForkchoiceUpdated = ForkchoiceUpdated;
+
+/// Provider extension for reth's custom Engine API methods.
+///
+/// Automatically implemented for any type that implements [`Provider`].
+///
+/// # Example
+///
+/// ```ignore
+/// use bench_core::RethApi;
+///
+/// let status = provider.reth_new_payload(input).await?;
+/// let fcu = provider.reth_forkchoice_updated(state).await?;
+/// ```
+#[async_trait::async_trait]
+pub trait RethApi<N: Network>: Send + Sync {
+    /// Submit a new payload via `reth_newPayload`.
+    async fn reth_new_payload(
+        &self,
+        input: RethNewPayloadInput,
+    ) -> TransportResult<RethPayloadStatus>;
+
+    /// Submit a forkchoice update via `reth_forkchoiceUpdated`.
+    async fn reth_forkchoice_updated(
+        &self,
+        forkchoice_state: ForkchoiceState,
+    ) -> TransportResult<RethForkchoiceUpdated>;
+}
+
+#[async_trait::async_trait]
+impl<N, P> RethApi<N> for P
+where
+    N: Network,
+    P: Provider<N>,
+{
+    async fn reth_new_payload(
+        &self,
+        input: RethNewPayloadInput,
+    ) -> TransportResult<RethPayloadStatus> {
+        self.client().request("reth_newPayload", (input,)).await
+    }
+
+    async fn reth_forkchoice_updated(
+        &self,
+        forkchoice_state: ForkchoiceState,
+    ) -> TransportResult<RethForkchoiceUpdated> {
+        self.client()
+            .request("reth_forkchoiceUpdated", (forkchoice_state,))
+            .await
+    }
+}
 
 #[cfg(test)]
 mod tests {
