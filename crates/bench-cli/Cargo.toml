@@ -27,12 +27,11 @@ serde_yaml.workspace = true
 # alloy
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
-alloy-network = "1"
+alloy-network.workspace = true
 alloy-rlp.workspace = true
-alloy-provider = { version = "1", features = ["engine-api", "hyper"] }
+alloy-provider = { version = "1", features = ["hyper"] }
 alloy-rpc-client = "1"
 alloy-rpc-types-engine = { version = "1", features = ["jwt"] }
-alloy-rpc-types-eth = "1"
 alloy-transport-http = { version = "1", features = ["jwt-auth", "hyper"] }
 
 # async

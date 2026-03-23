@@ -1,21 +1,21 @@
-//! `bench replay` - Engine API block replay
+//! `bench replay` - Block replay via reth Engine API
 //!
 //! Replays historical blocks by:
-//! 1. Fetching block data from an archive node (with prefetching)
-//! 2. Sending newPayload + forkchoiceUpdated via Engine API
+//! 1. Fetching raw RLP-encoded block data from an archive node (with prefetching)
+//! 2. Submitting via `reth_newPayload` (BlockRlp) + `reth_forkchoiceUpdated`
 //! 3. Measuring execution time and collecting metrics
 
 use crate::ReplayArgs;
-use alloy_consensus::Transaction as TxTrait;
-use alloy_network::{Ethereum, eip2718::Encodable2718};
-use alloy_primitives::{B256, Bytes, U256};
-use alloy_provider::{Provider, ProviderBuilder, RootProvider, ext::EngineApi};
-use alloy_rpc_types_engine::{ExecutionPayloadV3, ForkchoiceState, JwtSecret};
-use alloy_rpc_types_eth::Block;
+use alloy_consensus::{Block as ConsensusBlock, TxEnvelope};
+use alloy_network::Ethereum;
+use alloy_primitives::{B256, Bytes};
+use alloy_provider::{Provider, ProviderBuilder, RootProvider};
+use alloy_rlp::Decodable;
+use alloy_rpc_types_engine::{ForkchoiceState, JwtSecret};
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    ConsoleReporter, LatencyStats, ReplayBlockStats, ReplayRunStats, Reporter,
-    compute_latency_stats, parse_reporters,
+    ConsoleReporter, LatencyStats, ReplayBlockStats, ReplayRunStats, Reporter, RethApi,
+    RethNewPayloadInput, compute_latency_stats, parse_reporters,
 };
 use eyre::{Context, Result, bail};
 use std::time::{Duration, Instant};
@@ -23,9 +23,6 @@ use tokio::sync::mpsc;
 
 /// Number of blocks to prefetch ahead.
 const DEFAULT_PREFETCH_SIZE: usize = 20;
-
-/// Prague fork timestamp (May 7, 2025 10:05:11 UTC).
-const PRAGUE_TIMESTAMP: u64 = 1746612311;
 
 pub async fn execute(args: ReplayArgs) -> Result<()> {
     if args.from > args.to {
@@ -51,14 +48,12 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
         .await
         .wrap_err("failed to connect to source RPC")?;
 
-    let layer_transport = HyperClient::new().layer(AuthLayer::new(jwt_secret));
-    let http_hyper = Http::with_client(layer_transport, args.engine.parse()?);
-    let rpc_client = alloy_rpc_client::RpcClient::new(http_hyper, true);
-    let engine_provider = RootProvider::<Ethereum>::new(rpc_client);
+    let hyper_client = HyperClient::new().layer(AuthLayer::new(jwt_secret));
+    let transport = Http::with_client(hyper_client, args.engine.parse()?);
+    let engine_provider =
+        RootProvider::<Ethereum>::new(alloy_rpc_client::RpcClient::new(transport, true));
 
     let mut reporters = parse_reporters(&args.reports)?;
-
-    // Always add console reporter for summary output
     let mut console_reporter: Box<dyn Reporter> = Box::new(ConsoleReporter::stderr(false));
 
     let bench = ReplayBench::new(source_provider, engine_provider);
@@ -69,7 +64,6 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
 
     let metrics = bench.run(mode, &mut reporters).await?;
 
-    // Convert to ReplayRunStats for finalization
     let run_stats = ReplayRunStats {
         blocks_replayed: metrics.blocks_replayed,
         total_txs: metrics.total_txs,
@@ -83,12 +77,10 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
         block_time: metrics.block_time_stats.clone(),
     };
 
-    // Finalize all reporters
     for reporter in reporters.iter_mut() {
         reporter.finalize_replay(&run_stats)?;
     }
 
-    // Always output to console
     console_reporter.finalize_replay(&run_stats)?;
 
     Ok(())
@@ -110,7 +102,7 @@ pub struct ReplayBench<S, E> {
 impl<S, E> ReplayBench<S, E>
 where
     S: Provider + Clone + Send + Sync + 'static,
-    E: EngineApi<alloy_network::Ethereum> + Send + Sync,
+    E: RethApi<Ethereum> + Send + Sync,
 {
     /// Create a new replay benchmark.
     pub fn new(source_provider: S, engine_provider: E) -> Self {
@@ -139,81 +131,58 @@ where
 
         while let Some(result) = rx.recv().await {
             let fetched = result?;
-            let block_num = fetched.block.header.number;
-            let block_hash = fetched.block.header.hash;
-
-            let payload = block_to_payload(&fetched.block)?;
-            let versioned_hashes = extract_versioned_hashes(&fetched.block);
-            let parent_beacon_block_root = fetched
-                .block
-                .header
-                .parent_beacon_block_root
-                .unwrap_or_default();
-            let execution_requests = extract_execution_requests(&fetched.block);
+            let input = RethNewPayloadInput::BlockRlp(fetched.rlp_bytes.clone());
 
             let new_payload_start = Instant::now();
-            let payload_status = if fetched.block.header.timestamp >= PRAGUE_TIMESTAMP {
-                self.engine_provider
-                    .new_payload_v4(
-                        payload,
-                        versioned_hashes,
-                        parent_beacon_block_root,
-                        execution_requests,
-                    )
-                    .await
-                    .wrap_err("newPayloadV4 failed")?
-            } else {
-                self.engine_provider
-                    .new_payload_v3(payload, versioned_hashes, parent_beacon_block_root)
-                    .await
-                    .wrap_err("newPayloadV3 failed")?
-            };
+            let payload_status = self
+                .engine_provider
+                .reth_new_payload(input)
+                .await
+                .wrap_err("reth_newPayload failed")?;
             let new_payload_latency = new_payload_start.elapsed();
 
-            if !payload_status.is_valid() && !payload_status.is_syncing() {
+            if !payload_status.status.is_valid() && !payload_status.status.is_syncing() {
                 tracing::warn!(
-                    block = block_num,
-                    status = ?payload_status,
-                    "newPayload returned non-VALID status"
+                    block = fetched.meta.number,
+                    status = ?payload_status.status,
+                    "reth_newPayload returned non-VALID status"
                 );
             }
 
-            let safe_hash = prev_block_hash.unwrap_or(block_hash);
+            let safe_hash = prev_block_hash.unwrap_or(fetched.meta.hash);
             if finalized_hash.is_none() {
-                finalized_hash = Some(block_hash);
+                finalized_hash = Some(fetched.meta.hash);
             }
 
             let forkchoice_state = ForkchoiceState {
-                head_block_hash: block_hash,
+                head_block_hash: fetched.meta.hash,
                 safe_block_hash: safe_hash,
-                finalized_block_hash: finalized_hash.unwrap_or(block_hash),
+                // SAFETY: finalized_hash is always Some after the check above
+                finalized_block_hash: finalized_hash.unwrap(),
             };
 
             let fcu_start = Instant::now();
             let fcu_result = self
                 .engine_provider
-                .fork_choice_updated_v3(forkchoice_state, None)
+                .reth_forkchoice_updated(forkchoice_state)
                 .await
-                .wrap_err("forkchoiceUpdatedV3 failed")?;
+                .wrap_err("reth_forkchoiceUpdated failed")?;
             let fcu_latency = fcu_start.elapsed();
 
             if !fcu_result.is_valid() && !fcu_result.is_syncing() {
                 tracing::warn!(
-                    block = block_num,
+                    block = fetched.meta.number,
                     status = ?fcu_result.payload_status,
-                    "forkchoiceUpdated returned non-VALID status"
+                    "reth_forkchoiceUpdated returned non-VALID status"
                 );
             }
 
-            let tx_count = fetched.block.transactions.len() as u64;
-            let gas_used = fetched.block.header.gas_used;
             let total_latency = new_payload_latency + fcu_latency;
-
-            let payload_status_str = payload_status.status.to_string();
+            let payload_status_str = payload_status.status.status.to_string();
 
             collector.record_block(BlockMetrics {
-                tx_count,
-                gas_used,
+                tx_count: fetched.meta.tx_count as u64,
+                gas_used: fetched.meta.gas_used,
                 new_payload_latency,
                 fcu_latency,
                 total_latency,
@@ -221,11 +190,11 @@ where
 
             for reporter in reporters.iter_mut() {
                 reporter.on_replay_block(&ReplayBlockStats {
-                    number: block_num,
-                    timestamp: fetched.block.header.timestamp,
-                    tx_count: tx_count as usize,
-                    gas_used,
-                    gas_limit: fetched.block.header.gas_limit,
+                    number: fetched.meta.number,
+                    timestamp: fetched.meta.timestamp,
+                    tx_count: fetched.meta.tx_count,
+                    gas_used: fetched.meta.gas_used,
+                    gas_limit: fetched.meta.gas_limit,
                     new_payload_ms: new_payload_latency.as_millis() as u64,
                     fcu_ms: fcu_latency.as_millis() as u64,
                     total_latency_ms: total_latency.as_millis() as u64,
@@ -234,20 +203,21 @@ where
             }
 
             tracing::info!(
-                block = block_num,
-                txs = tx_count,
-                gas = gas_used,
+                block = fetched.meta.number,
+                txs = fetched.meta.tx_count,
+                gas = fetched.meta.gas_used,
                 new_payload_ms = new_payload_latency.as_millis(),
                 fcu_ms = fcu_latency.as_millis(),
                 total_ms = total_latency.as_millis(),
+                server_latency_us = payload_status.latency_us,
                 status = %payload_status_str,
                 "Replayed block"
             );
 
-            prev_block_hash = Some(block_hash);
+            prev_block_hash = Some(fetched.meta.hash);
 
-            if block_num % 32 == 0 {
-                finalized_hash = Some(block_hash);
+            if fetched.meta.number % 32 == 0 {
+                finalized_hash = Some(fetched.meta.hash);
             }
         }
 
@@ -259,10 +229,21 @@ where
 
 /// A fetched block ready for replay.
 struct FetchedBlock {
-    block: Block,
+    rlp_bytes: Bytes,
+    meta: BlockMeta,
 }
 
-/// Fetch blocks from source provider and send to channel.
+/// Decoded block metadata extracted from RLP.
+struct BlockMeta {
+    hash: B256,
+    number: u64,
+    timestamp: u64,
+    gas_used: u64,
+    gas_limit: u64,
+    tx_count: usize,
+}
+
+/// Fetch raw RLP-encoded blocks from source provider and send to channel.
 async fn fetch_blocks<P: Provider>(
     provider: P,
     from: u64,
@@ -271,13 +252,12 @@ async fn fetch_blocks<P: Provider>(
 ) {
     for block_num in from..=to {
         let result = async {
-            let block = provider
-                .get_block_by_number(block_num.into())
-                .full()
+            let rlp_bytes: Bytes = provider
+                .raw_request("debug_getRawBlock".into(), (format!("0x{block_num:x}"),))
                 .await
-                .wrap_err_with(|| format!("failed to fetch block {}", block_num))?
-                .ok_or_else(|| eyre::eyre!("block {} not found", block_num))?;
-            Ok(FetchedBlock { block })
+                .wrap_err_with(|| format!("failed to fetch raw block {block_num}"))?;
+            let meta = decode_block_meta(&rlp_bytes)?;
+            Ok(FetchedBlock { rlp_bytes, meta })
         }
         .await;
 
@@ -292,66 +272,21 @@ async fn fetch_blocks<P: Provider>(
     }
 }
 
-/// Convert a block to an ExecutionPayloadV3.
-fn block_to_payload(block: &Block) -> Result<ExecutionPayloadV3> {
-    let header = &block.header;
-    let txs: Vec<Bytes> = block
-        .transactions
-        .txns()
-        .map(|tx| tx.inner.inner().encoded_2718().into())
-        .collect();
+/// Decode block metadata from RLP-encoded block bytes.
+fn decode_block_meta(rlp_bytes: &[u8]) -> Result<BlockMeta> {
+    let mut buf = rlp_bytes;
+    let block =
+        ConsensusBlock::<TxEnvelope>::decode(&mut buf).wrap_err("failed to RLP-decode block")?;
+    let hash = block.header.hash_slow();
 
-    Ok(ExecutionPayloadV3 {
-        payload_inner: alloy_rpc_types_engine::ExecutionPayloadV2 {
-            payload_inner: alloy_rpc_types_engine::ExecutionPayloadV1 {
-                parent_hash: header.parent_hash,
-                fee_recipient: header.beneficiary,
-                state_root: header.state_root,
-                receipts_root: header.receipts_root,
-                logs_bloom: header.logs_bloom,
-                prev_randao: header.mix_hash,
-                block_number: header.number,
-                gas_limit: header.gas_limit,
-                gas_used: header.gas_used,
-                timestamp: header.timestamp,
-                extra_data: header.extra_data.clone(),
-                base_fee_per_gas: U256::from(header.base_fee_per_gas.unwrap_or_default()),
-                block_hash: block.header.hash,
-                transactions: txs,
-            },
-            withdrawals: block.withdrawals.clone().unwrap_or_default().into_inner(),
-        },
-        blob_gas_used: header.blob_gas_used.unwrap_or_default(),
-        excess_blob_gas: header.excess_blob_gas.unwrap_or_default(),
+    Ok(BlockMeta {
+        hash,
+        number: block.header.number,
+        timestamp: block.header.timestamp,
+        gas_used: block.header.gas_used,
+        gas_limit: block.header.gas_limit,
+        tx_count: block.body.transactions.len(),
     })
-}
-
-/// Extract blob versioned hashes from block transactions.
-fn extract_versioned_hashes(block: &Block) -> Vec<B256> {
-    block
-        .transactions
-        .txns()
-        .flat_map(|tx| {
-            tx.inner
-                .inner()
-                .blob_versioned_hashes()
-                .unwrap_or_default()
-                .to_vec()
-        })
-        .collect()
-}
-
-/// Extract EIP-7685 execution requests from block.
-///
-/// For Prague blocks, this includes deposit requests, withdrawal requests,
-/// and consolidation requests. Pre-Prague blocks return empty.
-///
-/// Note: The execution requests are not available in the RPC block response.
-/// When replaying historical blocks, we pass an empty list. The execution layer
-/// will compute the requests from transaction execution and validate against
-/// the block header's requests root.
-fn extract_execution_requests(_block: &Block) -> Vec<Bytes> {
-    vec![]
 }
 
 /// Metrics for a single replayed block.
