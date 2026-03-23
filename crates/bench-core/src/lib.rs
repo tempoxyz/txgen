@@ -7,7 +7,9 @@
 //! - [`reporter`] - Output (console, JSON, ClickHouse)
 //! - [`reth_api`] - reth custom Engine API types (`reth_newPayload`, `reth_forkchoiceUpdated`)
 //! - [`reth_testing`] - reth testing RPC types (`testing_buildBlockV1`)
+//! - [`historical`] - Historical transaction fetching from archive RPC
 
+pub mod historical;
 pub mod metrics;
 pub mod reporter;
 pub mod reth_api;
@@ -15,6 +17,7 @@ pub mod reth_testing;
 pub mod sender;
 pub mod source;
 
+pub use historical::{HistoricalFetcher, HistoricalFetcherConfig, HistoricalTx};
 pub use metrics::{
     BenchMetrics, BlockStats, LatencySample, LatencyStats, MetricsCollector, ReplayBlockStats,
     ReplayRunStats, RunStats, ThroughputSample, TimeSeriesMetrics, collect_block_stats,
