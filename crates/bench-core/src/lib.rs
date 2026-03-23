@@ -6,10 +6,12 @@
 //! - [`metrics`] - Collection (sent/success/failed counts, timing)
 //! - [`reporter`] - Output (console, JSON, ClickHouse)
 //! - [`reth_api`] - reth custom Engine API types (`reth_newPayload`, `reth_forkchoiceUpdated`)
+//! - [`reth_testing`] - reth testing RPC types (`testing_buildBlockV1`)
 
 pub mod metrics;
 pub mod reporter;
 pub mod reth_api;
+pub mod reth_testing;
 pub mod sender;
 pub mod source;
 
@@ -24,5 +26,6 @@ pub use reporter::{
     JsonThroughputSample, JsonTimeSeries, Reporter, parse_reporters,
 };
 pub use reth_api::{RethForkchoiceUpdated, RethNewPayloadInput, RethPayloadStatus};
+pub use reth_testing::{TestingBuildBlockRequestV1, TestingBuildBlockResponse, build_block_v1};
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource, TxgenSource};
