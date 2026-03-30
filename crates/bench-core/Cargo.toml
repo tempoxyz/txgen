@@ -16,6 +16,7 @@ serde_json.workspace = true
 # alloy
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
+alloy-rpc-types-engine = "1"
 alloy-eips.workspace = true
 
 # async

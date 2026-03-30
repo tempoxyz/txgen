@@ -954,6 +954,7 @@ dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "alloy-provider",
+ "alloy-rpc-types-engine",
  "eyre",
  "futures",
  "hex",

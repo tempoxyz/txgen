@@ -5,9 +5,11 @@
 //! - [`sender`] - Sending with scheduling key ordering + rate limiting
 //! - [`metrics`] - Collection (sent/success/failed counts, timing)
 //! - [`reporter`] - Output (console, JSON, ClickHouse)
+//! - [`reth_api`] - reth custom Engine API types (`reth_newPayload`, `reth_forkchoiceUpdated`)
 
 pub mod metrics;
 pub mod reporter;
+pub mod reth_api;
 pub mod sender;
 pub mod source;
 
@@ -21,5 +23,6 @@ pub use reporter::{
     JsonLatencySample, JsonReplayBlockStats, JsonReport, JsonReporter, JsonRunStats,
     JsonThroughputSample, JsonTimeSeries, Reporter, parse_reporters,
 };
+pub use reth_api::{RethForkchoiceUpdated, RethNewPayloadInput, RethPayloadStatus};
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource, TxgenSource};
