@@ -980,10 +980,13 @@ name = "bench-core"
 version = "0.1.0"
 dependencies = [
  "alloy-eips",
+ "alloy-network",
  "alloy-primitives",
  "alloy-provider",
  "alloy-rpc-client",
  "alloy-rpc-types-engine",
+ "alloy-transport",
+ "async-trait",
  "eyre",
  "futures",
  "hex",

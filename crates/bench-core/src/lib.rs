@@ -25,7 +25,7 @@ pub use reporter::{
     JsonLatencySample, JsonReplayBlockStats, JsonReport, JsonReporter, JsonRunStats,
     JsonThroughputSample, JsonTimeSeries, Reporter, parse_reporters,
 };
-pub use reth_api::{RethForkchoiceUpdated, RethNewPayloadInput, RethPayloadStatus};
+pub use reth_api::{RethApi, RethForkchoiceUpdated, RethNewPayloadInput, RethPayloadStatus};
 pub use reth_testing::{TestingBuildBlockRequestV1, TestingBuildBlockResponse, build_block_v1};
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource, TxgenSource};
