@@ -1,8 +1,13 @@
 use alloy_consensus::{Block as ConsensusBlock, TxEnvelope};
 use alloy_eips::BlockNumberOrTag;
-use alloy_primitives::Bytes;
-use alloy_provider::{Provider, ProviderBuilder, ext::DebugApi, network::Ethereum};
-use alloy_rlp::Decodable;
+use alloy_primitives::{Address, B256, Bytes};
+use alloy_provider::{
+    Provider, ProviderBuilder, ext::DebugApi, ext::TestingApi, network::Ethereum,
+};
+use alloy_rlp::{Decodable, Encodable};
+use alloy_rpc_types_engine::{
+    ExecutionPayload, ExecutionPayloadSidecar, PayloadAttributes, TestingBuildBlockRequestV1,
+};
 use clap::{Args, Parser, Subcommand};
 use eyre::{Result, WrapErr, bail};
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -10,8 +15,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use txgen_core::{
-    AccountManager, ArtifactManager, BuildContext, ChainPlugin, GasConfig, GeneratedTx,
-    NdjsonWriter, NonceTracker, WorkloadSpec,
+    AccountManager, ArtifactManager, BlockTxEntry, BuildContext, ChainPlugin, GasConfig,
+    GeneratedTx, NdjsonWriter, NonceTracker, WorkloadMode, WorkloadSpec,
 };
 use txgen_ethereum::{EthereumPlugin, EthereumTemplate};
 use txgen_tempo::{TempoNonceProvider, TempoPlugin, TempoTemplate};
@@ -164,6 +169,27 @@ async fn run_generate(args: GenerateArgs) -> Result<()> {
         None => StdRng::from_os_rng(),
     };
 
+    // Block generation mode: uses testing_buildBlockV1 RPC to build valid blocks
+    if spec.mode == WorkloadMode::Blocks {
+        let rpc_url = args
+            .rpc
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("--rpc is required for block generation mode"))?;
+        return run_generate_blocks(
+            &spec,
+            args.count,
+            args.output,
+            &accounts,
+            &artifacts,
+            &gas,
+            &mut nonces,
+            &mut rng,
+            rpc_url,
+            &args.chain,
+        )
+        .await;
+    }
+
     match args.chain.as_str() {
         "ethereum" => generate_with_plugin::<EthereumPlugin, EthereumTemplate>(
             EthereumPlugin,
@@ -306,6 +332,268 @@ async fn generate_tempo_txs<W: Write, P: txgen_core::NonceProvider>(
     }
     writer.flush()?;
     Ok(())
+}
+
+/// Generate blocks using `testing_buildBlockV1`.
+///
+/// For each block: generate signed transactions using the chain plugin, send them
+/// to the node via `testing_buildBlockV1` (which executes the txs against real state
+/// and computes valid roots), then output the resulting block as NDJSON `{raw, key}`.
+///
+/// NOTE: reth does NOT trust any header fields from submitted blocks — it re-executes
+/// every transaction and validates all computed roots (`state_root`, `receipts_root`,
+/// `transactions_root`, `gas_used`, etc.) against the header. See:
+/// - State root check: payload_validator.rs#L783-L804
+/// - Post-execution: payload_validator.rs#L1346-L1412
+///
+/// This is why we use `testing_buildBlockV1` to let the node build valid blocks
+/// rather than assembling them client-side.
+#[allow(clippy::too_many_arguments)]
+async fn run_generate_blocks(
+    spec: &WorkloadSpec,
+    count: u64,
+    output: Option<PathBuf>,
+    accounts: &AccountManager,
+    artifacts: &ArtifactManager,
+    gas: &GasConfig,
+    nonces: &mut NonceTracker,
+    rng: &mut StdRng,
+    rpc_url: &str,
+    chain: &str,
+) -> Result<()> {
+    let block_total_weight = spec.block_total_weight();
+    if block_total_weight == 0 {
+        bail!("no block templates in block_mix (total weight is 0)");
+    }
+    let tx_total_weight = spec.total_weight();
+
+    let provider = ProviderBuilder::<_, _, Ethereum>::new()
+        .connect_http(rpc_url.parse().wrap_err("invalid RPC URL")?);
+
+    // Get the latest block to use as parent
+    let latest = provider
+        .get_block_by_number(BlockNumberOrTag::Latest)
+        .await
+        .wrap_err("failed to fetch latest block")?
+        .ok_or_else(|| eyre::eyre!("no latest block found"))?;
+    let mut parent_hash = latest.header.hash;
+    let mut timestamp = latest.header.timestamp;
+
+    let mut ctx = BuildContext::new(spec.chain_id, gas, accounts, artifacts, nonces, rng);
+
+    match output {
+        Some(path) => {
+            let file = std::fs::File::create(&path)
+                .wrap_err_with(|| format!("failed to create output file: {}", path.display()))?;
+            let mut writer = std::io::BufWriter::new(file);
+            generate_blocks(
+                spec,
+                count,
+                block_total_weight,
+                tx_total_weight,
+                &mut ctx,
+                &provider,
+                &mut parent_hash,
+                &mut timestamp,
+                &mut writer,
+                chain,
+            )
+            .await?;
+            eprintln!("wrote {} blocks to {}", count, path.display());
+        }
+        None => {
+            let mut writer = std::io::stdout();
+            generate_blocks(
+                spec,
+                count,
+                block_total_weight,
+                tx_total_weight,
+                &mut ctx,
+                &provider,
+                &mut parent_hash,
+                &mut timestamp,
+                &mut writer,
+                chain,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Generate blocks and write as NDJSON.
+#[allow(clippy::too_many_arguments)]
+async fn generate_blocks<W: Write>(
+    spec: &WorkloadSpec,
+    count: u64,
+    block_total_weight: u64,
+    tx_total_weight: u64,
+    ctx: &mut BuildContext<'_>,
+    provider: &impl TestingApi<Ethereum>,
+    parent_hash: &mut B256,
+    timestamp: &mut u64,
+    writer: &mut W,
+    chain: &str,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+
+    for i in 0..count {
+        let block_template_name = pick_block_template(spec, ctx.rng, block_total_weight)?;
+        let block_template = spec
+            .block_templates
+            .get(&block_template_name)
+            .ok_or_else(|| eyre::eyre!("block template '{}' not found", block_template_name))?;
+
+        // Generate all transactions for this block
+        let mut raw_txs: Vec<Bytes> = Vec::new();
+        for tx_entry in &block_template.txs {
+            let entry_txs = generate_block_tx_entry(tx_entry, spec, ctx, tx_total_weight, chain)?;
+            raw_txs.extend(entry_txs);
+        }
+
+        // Advance timestamp (12s per block for increment strategy)
+        *timestamp += 12;
+
+        let fee_recipient = block_template.engine.fee_recipient.unwrap_or(Address::ZERO);
+
+        let request = TestingBuildBlockRequestV1 {
+            parent_block_hash: *parent_hash,
+            payload_attributes: PayloadAttributes {
+                timestamp: *timestamp,
+                prev_randao: B256::ZERO,
+                suggested_fee_recipient: fee_recipient,
+                withdrawals: Some(vec![]),
+                parent_beacon_block_root: Some(B256::ZERO),
+            },
+            transactions: raw_txs,
+            extra_data: None,
+        };
+
+        let envelope = provider.build_block_v1(request).await.wrap_err_with(|| {
+            format!(
+                "testing_buildBlockV1 failed for block {} (template '{}')",
+                i + 1,
+                block_template_name
+            )
+        })?;
+
+        // Convert payload to consensus block for RLP encoding
+        let payload = ExecutionPayload::V3(envelope.execution_payload);
+        let block_hash = payload.block_hash();
+
+        let sidecar = ExecutionPayloadSidecar::v4(
+            alloy_rpc_types_engine::CancunPayloadFields {
+                parent_beacon_block_root: B256::ZERO,
+                versioned_hashes: envelope.blobs_bundle.versioned_hashes(),
+            },
+            alloy_rpc_types_engine::PraguePayloadFields::new(envelope.execution_requests),
+        );
+        let block = payload
+            .into_block_with_sidecar_raw(&sidecar)
+            .wrap_err("failed to convert payload to block")?;
+
+        let mut rlp_buf = Vec::new();
+        block.encode(&mut rlp_buf);
+
+        // Write NDJSON {raw, key}
+        let raw_hex = format!("0x{}", hex::encode(&rlp_buf));
+        let key_hex = format!("{block_hash}");
+        let line = BlockOutputLine {
+            raw: &raw_hex,
+            key: &key_hex,
+        };
+        serde_json::to_writer(&mut *writer, &line)?;
+        writer.write_all(b"\n")?;
+
+        *parent_hash = block_hash;
+
+        let elapsed = start.elapsed().as_secs_f64();
+        let bps = (i + 1) as f64 / elapsed;
+        eprintln!(
+            "built block {}/{} (template '{}', {} txs) - {:.1} blocks/s",
+            i + 1,
+            count,
+            block_template_name,
+            block.body.transactions.len(),
+            bps
+        );
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+/// Generate transactions for a single block tx entry.
+fn generate_block_tx_entry(
+    entry: &BlockTxEntry,
+    spec: &WorkloadSpec,
+    ctx: &mut BuildContext<'_>,
+    tx_total_weight: u64,
+    chain: &str,
+) -> Result<Vec<Bytes>> {
+    let mut raw_txs = Vec::with_capacity(entry.count as usize);
+
+    for _ in 0..entry.count {
+        // Determine which template to use
+        let template_name = if entry.mix.unwrap_or(false) {
+            if tx_total_weight == 0 {
+                bail!("block tx entry uses mix but no tx templates in mix");
+            }
+            pick_template(spec, ctx.rng, tx_total_weight)?
+        } else if let Some(ref name) = entry.template {
+            name.clone()
+        } else {
+            bail!("block tx entry must specify either 'template' or 'mix: true'");
+        };
+
+        let template_value = spec
+            .templates
+            .get(&template_name)
+            .ok_or_else(|| eyre::eyre!("template '{}' not found", template_name))?;
+
+        // Build the transaction using the appropriate chain plugin
+        let tx: GeneratedTx = match chain {
+            "ethereum" => {
+                let template: EthereumTemplate = serde_yaml::from_value(template_value.clone())
+                    .wrap_err_with(|| format!("failed to parse template '{}'", template_name))?;
+                EthereumPlugin.build(template, ctx).wrap_err_with(|| {
+                    format!("failed to build tx from template '{}'", template_name)
+                })?
+            }
+            "tempo" => {
+                let template: TempoTemplate = serde_yaml::from_value(template_value.clone())
+                    .wrap_err_with(|| format!("failed to parse template '{}'", template_name))?;
+                TempoPlugin::default()
+                    .build(template, ctx)
+                    .wrap_err_with(|| {
+                        format!("failed to build tx from template '{}'", template_name)
+                    })?
+            }
+            other => bail!("unsupported chain plugin: {}", other),
+        };
+
+        raw_txs.push(tx.raw);
+    }
+
+    Ok(raw_txs)
+}
+
+/// Pick a block template by weighted random selection.
+fn pick_block_template(spec: &WorkloadSpec, rng: &mut StdRng, total_weight: u64) -> Result<String> {
+    let roll = rng.random_range(0..total_weight);
+    let mut cumulative = 0;
+    for entry in &spec.block_mix {
+        cumulative += entry.weight;
+        if roll < cumulative {
+            return Ok(entry.template.clone());
+        }
+    }
+    // SAFETY: Should not reach here if total_weight > 0 and block_mix is non-empty
+    unreachable!(
+        "block template selection failed with roll={} total_weight={}",
+        roll, total_weight
+    )
 }
 
 /// Fetch protocol nonces (nonce_key=0) for all accounts from the RPC.
