@@ -33,7 +33,7 @@ The workspace provides two binaries: `txgen` for transaction generation and `ben
 
 #### `txgen generate`
 
-Generate transactions from a workload spec.
+Generate transactions from a workload spec. When `mode: blocks` is set in the spec, generates full blocks instead (see [Block Templates](#block-templates)).
 
 ```bash
 # Generate 1000 Ethereum transactions
@@ -47,19 +47,24 @@ txgen generate -s workload.yaml -c ethereum -n 1000 --rpc http://localhost:8545
 
 # Output to file
 txgen generate -s workload.yaml -c ethereum -n 1000 -o transactions.ndjson
+
+# Generate 10 blocks (mode: blocks in spec, --rpc required)
+txgen generate -s blocks.yaml -c ethereum -n 10 --rpc http://localhost:8545
 ```
 
 | Flag | Description |
 |------|-------------|
 | `-s, --spec <PATH>` | Workload specification file (YAML) |
 | `-c, --chain <CHAIN>` | Chain plugin: `ethereum`, `tempo` |
-| `-n, --count <N>` | Number of transactions to generate |
+| `-n, --count <N>` | Number of transactions (or blocks in block mode) to generate |
 | `-o, --output <PATH>` | Output file (default: stdout) |
-| `--rpc <URL>` | RPC endpoint for fetching current nonces |
+| `--rpc <URL>` | RPC endpoint (optional for tx mode, **required** for block mode) |
 | `--rpc-rps <N>` | Rate limit for RPC requests per second (0 = unbounded) |
 | `--seed <SEED>` | RNG seed for reproducibility |
 
-**Required RPC methods:** `eth_getTransactionCount` (only when `--rpc` is provided)
+**Required RPC methods:**
+- Tx mode: `eth_getTransactionCount` (only when `--rpc` is provided)
+- Block mode: `eth_getTransactionCount`, `eth_getBlockByNumber`, `testing_buildBlockV1` (requires `--http.api testing` on the node)
 
 #### `txgen addresses`
 
@@ -461,14 +466,15 @@ Summary of which RPC methods are required by each feature:
 | RPC Method | Required By |
 |------------|-------------|
 | `eth_getTransactionCount` | `txgen generate --rpc` |
+| `eth_getBlockByNumber` | `txgen generate` (block mode), `bench run` (block stats) |
+| `testing_buildBlockV1` | `txgen generate` (block mode) |
 | `eth_sendRawTransaction` | `bench run`, `bench send` |
-| `eth_getBlockByNumber` | `bench run` (block stats collection) |
 | `eth_getBlockReceipts` | `bench run` (block stats collection) |
 | `debug_getRawBlock` | `txgen extract`, `bench replay` (source RPC) |
 | `reth_newPayload` | `bench send-blocks`, `bench replay` (engine) |
 | `reth_forkchoiceUpdated` | `bench send-blocks`, `bench replay` (engine) |
 
-> **Note:** `debug_*` methods require a node with the debug namespace enabled (typically archive nodes). `reth_*` methods are custom reth Engine API extensions.
+> **Note:** `debug_*` methods require a node with the debug namespace enabled (typically archive nodes). `reth_*` methods are custom reth Engine API extensions. `testing_*` methods require `--http.api testing` on the reth node.
 
 ## Examples
 
@@ -487,6 +493,13 @@ txgen generate -s examples/simple.yaml -c ethereum -n 10 --seed 42
 
 # Run the Tempo example
 txgen generate -s examples/tempo.yaml -c tempo -n 10 --seed 42
+
+# Generate blocks (requires a running reth node with --http.api testing)
+txgen generate -s examples/blocks-simple.yaml -c ethereum -n 5 --rpc http://localhost:8545
+
+# Generate blocks and pipe to bench send-blocks
+txgen generate -s examples/blocks-simple.yaml -c ethereum -n 10 --rpc http://localhost:8545 \
+  | bench send-blocks --engine http://localhost:8551 --jwt-secret /path/to/jwt.hex
 ```
 
 ## Architecture
