@@ -12,7 +12,7 @@ use alloy_primitives::Bytes;
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_engine::JwtSecret;
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
-use bench_core::{ConsoleReporter, ReplayRunStats, Reporter, parse_reporters};
+use bench_core::{ConsoleReporter, ReplayRunStats, Reporter, WaitForPersistence, parse_reporters};
 use eyre::{Context, Result, bail};
 use tokio::sync::mpsc;
 
@@ -61,6 +61,7 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
     let mut collector = send_blocks::MetricsCollector::default();
     let mut prev_block_hash = None;
     let mut finalized_hash = None;
+    let persistence_policy = WaitForPersistence::Always;
 
     while let Some(result) = rx.recv().await {
         let rlp_bytes = result?;
@@ -74,6 +75,7 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
             &mut reporters,
             &mut prev_block_hash,
             &mut finalized_hash,
+            &persistence_policy,
         )
         .await?;
     }

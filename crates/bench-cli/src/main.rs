@@ -155,6 +155,14 @@ pub struct SendBlocksArgs {
     #[arg(short, long)]
     pub input: Option<PathBuf>,
 
+    /// Wait for persistence policy: always, never, or every:N
+    ///
+    /// Controls whether reth_newPayload blocks until the persistence
+    /// threshold is crossed. Default is every:2 (matching reth's
+    /// DEFAULT_PERSISTENCE_THRESHOLD).
+    #[arg(long, default_value = "every:2", value_parser = parse_wait_for_persistence)]
+    pub wait_for_persistence: bench_core::WaitForPersistence,
+
     /// Report output destinations
     #[arg(long = "report", value_name = "FORMAT")]
     pub reports: Vec<String>,
@@ -193,6 +201,27 @@ pub enum ChainType {
 
 fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
     humantime::parse_duration(s)
+}
+
+fn parse_wait_for_persistence(s: &str) -> Result<bench_core::WaitForPersistence, String> {
+    match s {
+        "always" => Ok(bench_core::WaitForPersistence::Always),
+        "never" => Ok(bench_core::WaitForPersistence::Never),
+        s if s.starts_with("every:") => {
+            let n = s
+                .strip_prefix("every:")
+                .unwrap_or("0")
+                .parse::<u64>()
+                .map_err(|e| format!("invalid number in every:N: {e}"))?;
+            if n == 0 {
+                return Err("every:N requires N > 0".to_string());
+            }
+            Ok(bench_core::WaitForPersistence::EveryN(n))
+        }
+        _ => Err(format!(
+            "invalid value '{s}': expected 'always', 'never', or 'every:N'"
+        )),
+    }
 }
 
 #[tokio::main]

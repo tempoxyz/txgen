@@ -15,7 +15,7 @@ use alloy_rpc_types_engine::{ForkchoiceState, JwtSecret};
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
     ConsoleReporter, LatencyStats, ReplayBlockStats, ReplayRunStats, Reporter, RethApi,
-    RethNewPayloadInput, compute_latency_stats, parse_reporters,
+    RethNewPayloadInput, WaitForPersistence, compute_latency_stats, parse_reporters,
 };
 use eyre::{Context, Result};
 use std::io::BufRead;
@@ -46,9 +46,12 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let jwt_secret =
         JwtSecret::from_hex(jwt_secret_hex.trim()).wrap_err("invalid JWT secret hex")?;
 
+    let persistence_policy = args.wait_for_persistence;
+
     tracing::info!(
         engine = %args.engine,
         input = args.input.as_ref().map_or("<stdin>", |p| p.to_str().unwrap_or("?")),
+        wait_for_persistence = ?persistence_policy,
         "Starting block submission"
     );
 
@@ -80,6 +83,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                 &mut reporters,
                 &mut prev_block_hash,
                 &mut finalized_hash,
+                &persistence_policy,
             )
             .await?;
         }
@@ -109,6 +113,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                 &mut reporters,
                 &mut prev_block_hash,
                 &mut finalized_hash,
+                &persistence_policy,
             )
             .await?;
         }
@@ -168,12 +173,14 @@ pub(crate) async fn process_block(
     reporters: &mut [Box<dyn Reporter>],
     prev_block_hash: &mut Option<B256>,
     finalized_hash: &mut Option<B256>,
+    persistence_policy: &WaitForPersistence,
 ) -> Result<()> {
     let input = RethNewPayloadInput::BlockRlp(block_bytes);
+    let wait = persistence_policy.should_wait(collector.blocks_submitted);
 
     let new_payload_start = Instant::now();
     let payload_status = provider
-        .reth_new_payload(input)
+        .reth_new_payload(input, wait)
         .await
         .wrap_err("reth_newPayload failed")?;
     let new_payload_latency = new_payload_start.elapsed();
