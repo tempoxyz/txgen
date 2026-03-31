@@ -2,10 +2,10 @@
 
 use crate::SendArgs;
 use bench_core::{
-    ConsoleReporter, FileSource, JsonReporter, MetricsCollector, Reporter, Sender, SenderConfig,
-    StdinSource, TxSource,
+    ConsoleReporter, FileSource, MetricsCollector, Reporter, Sender, SenderConfig, StdinSource,
+    TxSource, parse_reporters,
 };
-use eyre::{Context, Result, bail};
+use eyre::{Context, Result};
 
 pub async fn execute(args: SendArgs) -> Result<()> {
     tracing::info!(
@@ -25,6 +25,9 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     let mut sender = Sender::new(config, metrics.clone())?;
 
     let mut reporters = parse_reporters(&args.reports)?;
+    if reporters.is_empty() {
+        reporters.push(Box::new(ConsoleReporter::stderr(true)));
+    }
 
     metrics.start().await;
 
@@ -66,30 +69,4 @@ async fn send_from_source<S: TxSource>(
         }
     }
     Ok(())
-}
-
-fn parse_reporters(specs: &[String]) -> Result<Vec<Box<dyn Reporter>>> {
-    let mut reporters: Vec<Box<dyn Reporter>> = Vec::new();
-
-    if specs.is_empty() {
-        reporters.push(Box::new(ConsoleReporter::stderr(true)));
-        return Ok(reporters);
-    }
-
-    for spec in specs {
-        if spec == "console" {
-            reporters.push(Box::new(ConsoleReporter::stderr(true)));
-        } else if let Some(path) = spec.strip_prefix("json:") {
-            let path = std::path::Path::new(path);
-            reporters.push(Box::new(
-                JsonReporter::file(path).wrap_err("failed to create JSON reporter")?,
-            ));
-        } else if let Some(_url) = spec.strip_prefix("clickhouse:") {
-            tracing::warn!("ClickHouse reporter not yet fully implemented");
-        } else {
-            bail!("unknown report format: {}", spec);
-        }
-    }
-
-    Ok(reporters)
 }
