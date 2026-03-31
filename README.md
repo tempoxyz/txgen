@@ -239,13 +239,16 @@ Transactions are output as NDJSON with two fields:
 
 ## Workload Specification
 
-Workload specs are YAML files that define accounts, templates, and mix ratios.
+Workload specs are YAML files that define accounts, templates, and mix ratios. Specs support two generation modes: **transaction mode** (default) generates individual transactions, and **block mode** generates full blocks composed of transactions.
 
 ### Structure
 
 ```yaml
 # Chain ID for transaction signing
 chain_id: 1
+
+# Generation mode: txs (default) or blocks
+mode: txs
 
 # Default gas configuration
 gas:
@@ -340,6 +343,62 @@ templates:
       value: 0
 ```
 
+### Block Templates
+
+When `mode: blocks`, the spec defines block templates that compose transaction templates into full blocks. Each block template specifies which transactions to include and engine-level configuration.
+
+```yaml
+mode: blocks
+
+# Transaction templates (same as tx mode)
+templates:
+  transfer:
+    type: eip1559
+    from: { pool: users, select: random }
+    to: "0x..."
+    value: 1000
+    gas_limit: 21000
+
+# Tx-level mix (used by block tx entries with `mix: true`)
+mix:
+  - template: transfer
+    weight: 100
+
+# Block templates define block composition
+block_templates:
+  full_block:
+    txs:
+      - template: transfer    # Explicit template reference
+        count: 200
+      - mix: true              # Random selection from tx mix
+        count: 50
+    engine:
+      gas_limit: 36000000
+      timestamp: increment     # increment (default) or wallclock
+      fee_recipient: "0x..."
+
+# Weighted mix of block templates
+block_mix:
+  - template: full_block
+    weight: 100
+```
+
+**Block tx entries** specify transactions to include in a block:
+
+| Field | Description |
+|-------|-------------|
+| `template` | Explicit tx template name (mutually exclusive with `mix`) |
+| `mix` | Set to `true` to pick from the weighted tx `mix` (mutually exclusive with `template`) |
+| `count` | Number of transactions to generate from this entry (default: 1) |
+
+**Engine configuration** controls block-level parameters:
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `gas_limit` | `30000000` | Block gas limit |
+| `timestamp` | `increment` | Timestamp strategy: `increment` or `wallclock` |
+| `fee_recipient` | `None` | Fee recipient address |
+
 ## Supported Chains
 
 ### Ethereum (`-c ethereum`)
@@ -418,6 +477,8 @@ See the `examples/` directory:
 - `simple.yaml` — Basic Ethereum transfers
 - `tempo.yaml` — Tempo transactions with parallel nonces
 - `tempo-mainnet-spam.yaml` — Tempo mainnet workload
+- `blocks-simple.yaml` — Simple block generation
+- `blocks-mixed.yaml` — Mixed block templates with varied composition
 - `erc20.abi.json` — ERC-20 ABI artifact
 
 ```bash

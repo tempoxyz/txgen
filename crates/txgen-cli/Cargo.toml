@@ -27,11 +27,12 @@ serde_yaml.workspace = true
 rand.workspace = true
 eyre.workspace = true
 
-# RPC client for nonce fetching
+# RPC client for nonce fetching + block building
 alloy-provider.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-rlp.workspace = true
+alloy-rpc-types-engine.workspace = true
 hex.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "rt", "sync", "time"] }

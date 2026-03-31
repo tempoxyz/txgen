@@ -13,5 +13,8 @@ pub use accounts::{
 pub use nonce::{NonceProvider, NonceTracker};
 pub use output::{GeneratedTx, NdjsonWriter};
 pub use plugin::{BuildContext, ChainPlugin};
-pub use spec::{GasConfig, MixEntry, WorkloadSpec};
+pub use spec::{
+    BlockMixEntry, BlockTemplate, BlockTxEntry, EngineConfig, GasConfig, MixEntry,
+    TimestampStrategy, WorkloadMode, WorkloadSpec,
+};
 pub use value::{FromGenerator, GenValue, Generator, ValueResolver};

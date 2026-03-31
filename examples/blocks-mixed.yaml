@@ -1,0 +1,89 @@
+# Mixed block generation example
+# Generates varied blocks: some with explicit tx composition, others
+# randomly sampled from the weighted tx mix.
+#
+# Usage:
+#   txgen generate -s examples/blocks-mixed.yaml -c ethereum -n 10
+
+chain_id: 1
+mode: blocks
+
+accounts:
+  users:
+    mnemonic: "test test test test test test test test test test test junk"
+    range: [0, 50]
+
+artifacts:
+  ERC20: erc20.abi.json
+
+templates:
+  transfer:
+    type: eip1559
+    from:
+      pool: users
+      select: random
+    to: "0x0000000000000000000000000000000000000001"
+    value: 1000
+    gas_limit: 21000
+    max_fee_per_gas: 1000000000
+    max_priority_fee_per_gas: 1000000000
+
+  erc20_transfer:
+    type: eip1559
+    from:
+      pool: users
+      select: random
+    gas_limit: 65000
+    max_fee_per_gas: 1000000000
+    max_priority_fee_per_gas: 1000000000
+    call:
+      to: "0x0000000000000000000000000000000000000002"
+      abi: ERC20
+      function: transfer
+      args:
+        - "0x000000000000000000000000000000000000dEaD"
+        - 1000000
+
+# Tx-level mix (used by block templates with `mix: true`)
+mix:
+  - template: transfer
+    weight: 70
+  - template: erc20_transfer
+    weight: 30
+
+block_templates:
+  # Heavy block: explicit composition of specific tx types
+  heavy:
+    txs:
+      - template: transfer
+        count: 200
+      - template: erc20_transfer
+        count: 100
+    engine:
+      gas_limit: 36000000
+      timestamp: increment
+      fee_recipient: "0x0000000000000000000000000000000000000001"
+
+  # Light block: fewer transactions, randomly picked from tx mix
+  light:
+    txs:
+      - mix: true
+        count: 50
+    engine:
+      gas_limit: 30000000
+
+  # Realistic block: mix of explicit and random transactions
+  realistic:
+    txs:
+      - template: transfer
+        count: 100
+      - mix: true
+        count: 50
+
+block_mix:
+  - template: heavy
+    weight: 20
+  - template: light
+    weight: 30
+  - template: realistic
+    weight: 50

@@ -32,7 +32,8 @@ alloy-signer = "1"
 alloy-signer-local = "1"
 alloy-consensus = "1"
 alloy-network = "1"
-alloy-provider = { version = "1", features = ["debug-api"] }
+alloy-provider = { version = "1", features = ["debug-api", "engine-api"] }
+alloy-rpc-types-engine = "1"
 alloy-rpc-types-eth = "1"
 alloy-eips = "1"
 alloy-rlp = "0.3"
