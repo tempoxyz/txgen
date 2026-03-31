@@ -2,8 +2,7 @@
 
 use crate::{ChainType, RunArgs};
 use bench_core::{
-    ConsoleReporter, MetricsCollector, Sender, SenderConfig, TxSource, TxgenSource,
-    parse_reporters,
+    ConsoleReporter, MetricsCollector, Sender, SenderConfig, TxSource, TxgenSource, parse_reporters,
 };
 use eyre::{Context, Result, bail};
 use std::time::Instant;
