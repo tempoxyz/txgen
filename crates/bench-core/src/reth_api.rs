@@ -59,6 +59,36 @@ pub struct RethPayloadStatus {
     pub sparse_trie_wait_us: Option<u64>,
 }
 
+/// Default persistence threshold matching reth's `DEFAULT_PERSISTENCE_THRESHOLD`.
+pub const DEFAULT_PERSISTENCE_THRESHOLD: u64 = 2;
+
+/// Policy for when to wait for persistence during `reth_newPayload`.
+#[derive(Debug, Clone)]
+pub enum WaitForPersistence {
+    /// Always wait for persistence on every block.
+    Always,
+    /// Never wait for persistence.
+    Never,
+    /// Wait for persistence every N blocks.
+    EveryN(u64),
+}
+
+impl WaitForPersistence {
+    /// Returns the `wait_for_persistence` flag for a given block index (0-based).
+    pub fn should_wait(&self, block_index: u64) -> Option<bool> {
+        match self {
+            Self::Always => Some(true),
+            Self::Never => Some(false),
+            Self::EveryN(n) => {
+                if *n == 0 {
+                    return Some(false);
+                }
+                Some((block_index + 1) % n == 0)
+            }
+        }
+    }
+}
+
 /// Response from `reth_forkchoiceUpdated`.
 ///
 /// This is the standard [`ForkchoiceUpdated`] type — reth's custom endpoint
@@ -75,15 +105,19 @@ pub type RethForkchoiceUpdated = ForkchoiceUpdated;
 /// ```ignore
 /// use bench_core::RethApi;
 ///
-/// let status = provider.reth_new_payload(input).await?;
+/// let status = provider.reth_new_payload(input, None).await?;
 /// let fcu = provider.reth_forkchoice_updated(state).await?;
 /// ```
 #[async_trait::async_trait]
 pub trait RethApi<N: Network>: Send + Sync {
     /// Submit a new payload via `reth_newPayload`.
+    ///
+    /// `wait_for_persistence` controls whether the server blocks until
+    /// in-flight persistence completes before processing.
     async fn reth_new_payload(
         &self,
         input: RethNewPayloadInput,
+        wait_for_persistence: Option<bool>,
     ) -> TransportResult<RethPayloadStatus>;
 
     /// Submit a forkchoice update via `reth_forkchoiceUpdated`.
@@ -102,8 +136,14 @@ where
     async fn reth_new_payload(
         &self,
         input: RethNewPayloadInput,
+        wait_for_persistence: Option<bool>,
     ) -> TransportResult<RethPayloadStatus> {
-        self.client().request("reth_newPayload", (input,)).await
+        self.client()
+            .request(
+                "reth_newPayload",
+                (input, wait_for_persistence, None::<bool>),
+            )
+            .await
     }
 
     async fn reth_forkchoice_updated(
