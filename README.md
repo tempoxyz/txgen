@@ -16,6 +16,7 @@ txgen generates signed, RLP-encoded transactions from YAML workload specificatio
 
 ```bash
 cargo install --path crates/txgen-cli
+cargo install --path crates/bench-cli
 ```
 
 Or build from source:
@@ -24,7 +25,15 @@ Or build from source:
 cargo build --release
 ```
 
-## Usage
+## CLI Tools
+
+The workspace provides two binaries: `txgen` for transaction generation and `bench` for benchmarking.
+
+### `txgen`
+
+#### `txgen generate`
+
+Generate transactions from a workload spec.
 
 ```bash
 # Generate 1000 Ethereum transactions
@@ -33,11 +42,12 @@ txgen generate -s workload.yaml -c ethereum -n 1000
 # Generate Tempo transactions with reproducible seed
 txgen generate -s workload.yaml -c tempo -n 1000 --seed 42
 
+# Fetch nonces from chain before generating
+txgen generate -s workload.yaml -c ethereum -n 1000 --rpc http://localhost:8545
+
 # Output to file
 txgen generate -s workload.yaml -c ethereum -n 1000 -o transactions.ndjson
 ```
-
-### Options
 
 | Flag | Description |
 |------|-------------|
@@ -45,7 +55,172 @@ txgen generate -s workload.yaml -c ethereum -n 1000 -o transactions.ndjson
 | `-c, --chain <CHAIN>` | Chain plugin: `ethereum`, `tempo` |
 | `-n, --count <N>` | Number of transactions to generate |
 | `-o, --output <PATH>` | Output file (default: stdout) |
+| `--rpc <URL>` | RPC endpoint for fetching current nonces |
+| `--rpc-rps <N>` | Rate limit for RPC requests per second (0 = unbounded) |
 | `--seed <SEED>` | RNG seed for reproducibility |
+
+**Required RPC methods:** `eth_getTransactionCount` (only when `--rpc` is provided)
+
+#### `txgen addresses`
+
+List all addresses from a workload spec (useful for funding).
+
+```bash
+txgen addresses -s workload.yaml
+txgen addresses -s workload.yaml -f json
+txgen addresses -s workload.yaml -f shell   # space-separated for xargs
+```
+
+| Flag | Description |
+|------|-------------|
+| `-s, --spec <PATH>` | Workload specification file (YAML) |
+| `-f, --format <FMT>` | Output format: `plain`, `json`, `shell` (default: `plain`) |
+
+**Required RPC methods:** None (offline)
+
+#### `txgen extract`
+
+Extract raw RLP-encoded blocks from an archive node as NDJSON.
+
+```bash
+txgen extract --rpc http://localhost:8545 --from 1000 --to 2000 -o blocks.ndjson
+```
+
+| Flag | Description |
+|------|-------------|
+| `--rpc <URL>` | RPC endpoint (archive node) |
+| `--from <N>` | First block number (inclusive) |
+| `--to <N>` | Last block number (inclusive) |
+| `-o, --output <PATH>` | Output file (default: stdout) |
+| `--buffer-size <N>` | Number of blocks to prefetch ahead (default: 20) |
+
+**Required RPC methods:** `debug_getRawBlock`
+
+### `bench`
+
+#### `bench run`
+
+All-in-one: generate transactions, send them, and report results.
+
+```bash
+# Send for a duration
+bench run -s workload.yaml -c ethereum --rpc http://localhost:8545 --duration 30s --tps 100
+
+# Send a fixed count
+bench run -s workload.yaml -c tempo --rpc http://localhost:8545 -n 1000 --tps 500
+
+# With JSON report output
+bench run -s workload.yaml -c ethereum --rpc http://localhost:8545 -n 1000 --report json:report.json
+```
+
+| Flag | Description |
+|------|-------------|
+| `-s, --spec <PATH>` | Workload specification file (YAML) |
+| `-c, --chain <CHAIN>` | Chain plugin: `ethereum`, `tempo` |
+| `--rpc <URL>` | RPC endpoint (default: `http://localhost:8545`) |
+| `--tps <N>` | Target transactions per second (0 = unlimited) |
+| `--duration <DUR>` | Benchmark duration (e.g. `30s`, `5m`) |
+| `-n, --count <N>` | Number of transactions (alternative to duration) |
+| `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
+| `--max-concurrent <N>` | Maximum concurrent requests (default: 100) |
+| `--timeout <DUR>` | Request timeout (default: 30s) |
+| `--seed <SEED>` | RNG seed for reproducibility |
+
+**Required RPC methods:** `eth_sendRawTransaction`, `eth_getBlockByNumber`, `eth_getBlockReceipts`
+
+#### `bench send`
+
+Send pre-generated transactions from NDJSON file or stdin.
+
+```bash
+# From file
+bench send --input transactions.ndjson --rpc http://localhost:8545 --tps 500
+
+# From stdin (pipe from txgen)
+txgen generate -s workload.yaml -c ethereum -n 1000 | bench send --rpc http://localhost:8545
+```
+
+| Flag | Description |
+|------|-------------|
+| `-i, --input <PATH>` | Input NDJSON file (default: stdin) |
+| `--rpc <URL>` | RPC endpoint (default: `http://localhost:8545`) |
+| `--tps <N>` | Target transactions per second (0 = unlimited) |
+| `--max-concurrent <N>` | Maximum concurrent requests (default: 100) |
+| `--timeout <DUR>` | Request timeout (default: 30s) |
+| `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
+
+**Required RPC methods:** `eth_sendRawTransaction`
+
+#### `bench send-blocks`
+
+Submit RLP-encoded blocks via reth Engine API.
+
+```bash
+bench send-blocks --engine http://localhost:8551 --jwt-secret /path/to/jwt.hex --input blocks.ndjson
+```
+
+| Flag | Description |
+|------|-------------|
+| `--engine <URL>` | Engine API endpoint |
+| `--jwt-secret <PATH>` | Path to JWT secret file |
+| `-i, --input <PATH>` | Input NDJSON file (default: stdin) |
+| `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
+
+**Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API)
+
+#### `bench replay`
+
+Replay blocks from a source archive node via Engine API. Equivalent to `txgen extract ... | bench send-blocks ...` but avoids serialization overhead.
+
+```bash
+bench replay \
+  --rpc-source http://archive:8545 \
+  --engine http://localhost:8551 \
+  --jwt-secret /path/to/jwt.hex \
+  --from 1000 --to 2000
+```
+
+| Flag | Description |
+|------|-------------|
+| `--rpc-source <URL>` | Source RPC endpoint (archive node) |
+| `--engine <URL>` | Engine API endpoint |
+| `--jwt-secret <PATH>` | Path to JWT secret file |
+| `--from <N>` | Starting block number |
+| `--to <N>` | Ending block number |
+| `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
+
+**Required RPC methods:**
+- Source RPC: `debug_getRawBlock`
+- Engine API: `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API)
+
+#### `bench plot`
+
+Generate PNG charts from a JSON report.
+
+```bash
+bench plot --input report.json --output ./charts
+bench plot --input report.json -t throughput
+```
+
+| Flag | Description |
+|------|-------------|
+| `-i, --input <PATH>` | Input JSON report file |
+| `-o, --output <PATH>` | Output directory for PNGs (default: `.`) |
+| `-t, --plot-type <TYPE>` | `throughput`, `latency`, `cumulative`, `all` (default: `all`) |
+| `--width <PX>` | Chart width (default: 1200) |
+| `--height <PX>` | Chart height (default: 600) |
+
+**Required RPC methods:** None (offline)
+
+### Reporters
+
+Report destinations are specified with `--report` and can be repeated:
+
+| Format | Description |
+|--------|-------------|
+| `console` | Print summary to stderr (default if no reporters specified) |
+| `json:<path>` | Write JSON report to file |
+| `clickhouse:<url>` | Push time-series data to ClickHouse |
 
 ## Output Format
 
@@ -220,12 +395,30 @@ templates:
 
 **Parallel nonces:** Using different `nonce_key` values allows transactions from the same sender to be sent in parallel without nonce conflicts.
 
+## RPC Methods
+
+Summary of which RPC methods are required by each feature:
+
+| RPC Method | Required By |
+|------------|-------------|
+| `eth_getTransactionCount` | `txgen generate --rpc` |
+| `eth_sendRawTransaction` | `bench run`, `bench send` |
+| `eth_getBlockByNumber` | `bench run` (block stats collection) |
+| `eth_getBlockReceipts` | `bench run` (block stats collection) |
+| `debug_getRawBlock` | `txgen extract`, `bench replay` (source RPC) |
+| `reth_newPayload` | `bench send-blocks`, `bench replay` (engine) |
+| `reth_forkchoiceUpdated` | `bench send-blocks`, `bench replay` (engine) |
+
+> **Note:** `debug_*` methods require a node with the debug namespace enabled (typically archive nodes). `reth_*` methods are custom reth Engine API extensions.
+
 ## Examples
 
 See the `examples/` directory:
 
-- `simple.yaml` - Basic Ethereum transfers
-- `tempo.yaml` - Tempo transactions with parallel nonces
+- `simple.yaml` — Basic Ethereum transfers
+- `tempo.yaml` — Tempo transactions with parallel nonces
+- `tempo-mainnet-spam.yaml` — Tempo mainnet workload
+- `erc20.abi.json` — ERC-20 ABI artifact
 
 ```bash
 # Run the simple example
@@ -233,60 +426,6 @@ txgen generate -s examples/simple.yaml -c ethereum -n 10 --seed 42
 
 # Run the Tempo example
 txgen generate -s examples/tempo.yaml -c tempo -n 10 --seed 42
-```
-
-## Metrics Collection
-
-The `bench-core` library provides comprehensive metrics collection for benchmarking:
-
-### Runtime Metrics
-
-`MetricsCollector` tracks real-time statistics during transaction sending:
-
-- **sent/success/failed** - Transaction counts
-- **latency** - Per-transaction RPC response times (min, max, mean, p50, p95, p99)
-- **elapsed** - Total benchmark duration
-
-```rust
-let metrics = MetricsCollector::new();
-metrics.start().await;
-
-// ... send transactions ...
-
-let bench_metrics = metrics.finalize().await;
-println!("TPS: {:.2}", bench_metrics.tps());
-println!("Success rate: {:.1}%", bench_metrics.success_rate());
-```
-
-### Block Statistics
-
-Post-run analysis of on-chain block data:
-
-```rust
-let block_stats = collect_block_stats(&provider, start_block, end_block).await?;
-
-for block in &block_stats {
-    println!("Block {}: {} txs, {} gas used", 
-        block.number, block.tx_count, block.gas_used);
-}
-```
-
-Each `BlockStats` includes:
-- Block number, timestamp, tx count, success count
-- Gas used/limit
-- Block time (delta from previous block)
-
-### Run Summary
-
-Aggregate statistics computed from block data:
-
-```rust
-let run_stats = RunStats::from_blocks(&block_stats);
-
-println!("Blocks {}-{}", run_stats.start_block, run_stats.end_block);
-println!("Total txs: {}", run_stats.total_txs);
-println!("Avg TPS: {:.2}", run_stats.avg_tps);
-println!("Block time p50: {}ms", run_stats.block_time_p50_ms);
 ```
 
 ## Architecture
@@ -297,9 +436,9 @@ txgen/
 │   ├── txgen-core/       # Core library: spec parsing, account management, output
 │   ├── txgen-ethereum/   # Ethereum plugin: legacy, eip2930, eip1559
 │   ├── txgen-tempo/      # Tempo plugin: 0x76 + delegates to ethereum
-│   ├── txgen-cli/        # CLI binary
+│   ├── txgen-cli/        # CLI binary (txgen)
 │   ├── bench-core/       # Benchmarking: metrics, sender, reporters
-│   └── bench-cli/        # Bench CLI binary
+│   └── bench-cli/        # Bench CLI binary (bench)
 └── examples/             # Example workload specs
 ```
 
