@@ -1,0 +1,92 @@
+chain_id: 1
+
+accounts:
+  users:
+    mnemonic: "test test test test test test test test test test test junk"
+    range: [0, 5]
+  sponsors:
+    mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    range: [0, 2]
+
+templates:
+  legacy_transfer:
+    type: legacy
+    from:
+      pool: users
+      select: random
+    to: "0x0000000000000000000000000000000000000001"
+    value: 1000
+    gas_limit: 21000
+    gas_price: 1000000000
+
+  eip2930_transfer:
+    type: eip2930
+    from:
+      pool: users
+      select: random
+    to: "0x0000000000000000000000000000000000000001"
+    value: 1000
+    gas_limit: 21000
+    gas_price: 1000000000
+
+  eip1559_transfer:
+    type: eip1559
+    from:
+      pool: users
+      select: random
+    to: "0x0000000000000000000000000000000000000001"
+    value: 1000
+    gas_limit: 21000
+    max_fee_per_gas: 1000000000
+    max_priority_fee_per_gas: 1000000000
+
+  tempo_transfer:
+    type: tempo
+    from:
+      pool: users
+      select: random
+    to: "0x0000000000000000000000000000000000000001"
+    value: 1000
+    gas_limit: 21000
+    max_fee_per_gas: 1000000000
+    max_priority_fee_per_gas: 1000000000
+
+  tempo_parallel:
+    type: tempo
+    from:
+      pool: users
+      select: random
+    to: "0x0000000000000000000000000000000000000001"
+    value: 500
+    gas_limit: 21000
+    max_fee_per_gas: 1000000000
+    max_priority_fee_per_gas: 1000000000
+    nonce_key: "42"
+
+  tempo_sponsored:
+    type: tempo
+    from:
+      pool: users
+      select: random
+    to: "0x0000000000000000000000000000000000000001"
+    value: 100
+    gas_limit: 21000
+    max_fee_per_gas: 1000000000
+    max_priority_fee_per_gas: 1000000000
+    sponsor:
+      pool: sponsors
+      select: random
+
+mix:
+  - template: legacy_transfer
+    weight: 10
+  - template: eip2930_transfer
+    weight: 10
+  - template: eip1559_transfer
+    weight: 10
+  - template: tempo_transfer
+    weight: 25
+  - template: tempo_parallel
+    weight: 25
+  - template: tempo_sponsored
+    weight: 20

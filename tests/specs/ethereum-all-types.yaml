@@ -1,0 +1,46 @@
+chain_id: 1
+
+accounts:
+  users:
+    mnemonic: "test test test test test test test test test test test junk"
+    range: [0, 5]
+
+templates:
+  legacy_transfer:
+    type: legacy
+    from:
+      pool: users
+      select: random
+    to: "0x0000000000000000000000000000000000000001"
+    value: 1000
+    gas_limit: 21000
+    gas_price: 1000000000
+
+  eip2930_transfer:
+    type: eip2930
+    from:
+      pool: users
+      select: random
+    to: "0x0000000000000000000000000000000000000001"
+    value: 1000
+    gas_limit: 21000
+    gas_price: 1000000000
+
+  eip1559_transfer:
+    type: eip1559
+    from:
+      pool: users
+      select: random
+    to: "0x0000000000000000000000000000000000000001"
+    value: 1000
+    gas_limit: 21000
+    max_fee_per_gas: 1000000000
+    max_priority_fee_per_gas: 1000000000
+
+mix:
+  - template: legacy_transfer
+    weight: 34
+  - template: eip2930_transfer
+    weight: 33
+  - template: eip1559_transfer
+    weight: 33
