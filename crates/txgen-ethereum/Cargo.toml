@@ -5,9 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "txgen-ethereum"
+path = "src/bin/main.rs"
+
 [dependencies]
 # workspace
 txgen-core.workspace = true
+txgen-cli.workspace = true
+
+# async
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 # serde
 serde.workspace = true

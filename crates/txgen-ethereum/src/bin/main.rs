@@ -1,0 +1,22 @@
+use eyre::Result;
+use txgen_cli::{GenerateArgs, GenerateContext, TxgenNetwork};
+use txgen_ethereum::EthereumPlugin;
+
+struct EthereumNetwork;
+
+impl TxgenNetwork for EthereumNetwork {
+    async fn generate(&self, args: GenerateArgs) -> Result<()> {
+        let mut ctx = GenerateContext::from_args(&args)?;
+
+        if let Some(ref rpc_url) = args.rpc {
+            txgen_cli::fetch_protocol_nonces(&ctx.accounts, &mut ctx.nonces, rpc_url).await?;
+        }
+
+        txgen_cli::generate_with_plugin(EthereumPlugin, &mut ctx, args.count, args.output)
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    txgen_cli::run(EthereumNetwork).await
+}
