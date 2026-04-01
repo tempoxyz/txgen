@@ -2,12 +2,21 @@ use alloy_primitives::{Address, U256};
 use serde::Deserialize;
 use txgen_core::{AccountRef, CallDef, GenValue};
 
+/// Ethereum transaction type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EthTxType {
+    Legacy,
+    Eip2930,
+    Eip1559,
+}
+
 /// Template for Ethereum transactions.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EthereumTemplate {
-    /// Transaction type: "legacy", "eip2930", "eip1559", "eip4844", "eip7702"
+    /// Transaction type.
     #[serde(rename = "type")]
-    pub tx_type: String,
+    pub tx_type: EthTxType,
 
     /// Sender account reference.
     pub from: AccountRef,
