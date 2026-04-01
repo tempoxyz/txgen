@@ -34,11 +34,20 @@ jobs:
       - run: cargo test --workspace
 
   decode-tx:
-    name: decode-tx
+    name: decode-tx (${{ matrix.network }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
+    strategy:
+      matrix:
+        include:
+          - network: ethereum
+            bin: txgen-ethereum
+            spec: tests/specs/ethereum-all-types.yaml
+          - network: tempo
+            bin: txgen-tempo
+            spec: tests/specs/tempo-all-types.yaml
     steps:
       - uses: actions/checkout@v6
         with:
@@ -52,4 +61,4 @@ jobs:
           curl -L https://github.com/tempoxyz/tempo/releases/latest/download/cast-x86_64-unknown-linux-gnu.tar.gz \
             | tar xz -C /usr/local/bin
       - name: Generate and decode transactions
-        run: ./tests/decode-tx.sh
+        run: ./tests/decode-tx.sh ${{ matrix.bin }} ${{ matrix.spec }}
