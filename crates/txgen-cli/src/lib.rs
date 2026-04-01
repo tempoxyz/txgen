@@ -1,7 +1,7 @@
 use alloy_consensus::{Block as ConsensusBlock, TxEnvelope};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::Bytes;
-use alloy_provider::{Provider, ProviderBuilder, ext::DebugApi, network::Ethereum};
+use alloy_provider::{Provider, ext::DebugApi};
 use alloy_rlp::Decodable;
 use clap::{Args, Parser, Subcommand};
 use eyre::{Result, WrapErr, bail};
@@ -10,8 +10,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use txgen_core::{
-    AccountManager, ArtifactManager, BuildContext, ChainPlugin, GasConfig, GeneratedTx,
-    NdjsonWriter, NonceTracker, WorkloadSpec,
+    AccountManager, ArtifactManager, BuildContext, ChainPlugin, GeneratedTx, NdjsonWriter,
+    NonceTracker, WorkloadSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -84,12 +84,11 @@ pub struct ExtractArgs {
 // ---------------------------------------------------------------------------
 
 pub struct GenerateContext {
-    pub spec: WorkloadSpec,
-    pub accounts: AccountManager,
-    pub artifacts: ArtifactManager,
-    pub gas: GasConfig,
-    pub nonces: NonceTracker,
-    pub rng: StdRng,
+    spec: WorkloadSpec,
+    accounts: AccountManager,
+    artifacts: ArtifactManager,
+    nonces: NonceTracker,
+    rng: StdRng,
 }
 
 impl GenerateContext {
@@ -102,7 +101,6 @@ impl GenerateContext {
             .unwrap_or_else(|| std::path::Path::new("."));
         let accounts = AccountManager::from_spec(&spec.accounts)?;
         let artifacts = ArtifactManager::load(&spec.artifacts, base_path)?;
-        let gas = spec.gas.clone();
         let nonces = NonceTracker::new();
         let rng = match args.seed {
             Some(seed) => StdRng::seed_from_u64(seed),
@@ -112,10 +110,31 @@ impl GenerateContext {
             spec,
             accounts,
             artifacts,
-            gas,
             nonces,
             rng,
         })
+    }
+
+    pub fn spec(&self) -> &WorkloadSpec {
+        &self.spec
+    }
+
+    pub fn accounts(&self) -> &AccountManager {
+        &self.accounts
+    }
+
+    pub fn nonces_mut(&mut self) -> &mut NonceTracker {
+        &mut self.nonces
+    }
+
+    /// Borrow accounts and nonces simultaneously for prefetching.
+    pub fn accounts_and_nonces(&mut self) -> (&AccountManager, &mut NonceTracker) {
+        (&self.accounts, &mut self.nonces)
+    }
+
+    /// Borrow spec, accounts, and nonces simultaneously for prefetching.
+    pub fn prefetch_state(&mut self) -> (&WorkloadSpec, &AccountManager, &mut NonceTracker) {
+        (&self.spec, &self.accounts, &mut self.nonces)
     }
 }
 
@@ -168,53 +187,20 @@ pub async fn run(network: impl TxgenNetwork) -> Result<()> {
 // Public helpers — used by per-network generate implementations
 // ---------------------------------------------------------------------------
 
-pub fn pick_template(spec: &WorkloadSpec, rng: &mut StdRng, total_weight: u64) -> Result<String> {
-    let roll = rng.random_range(0..total_weight);
-    let mut cumulative = 0;
-    for entry in &spec.mix {
-        cumulative += entry.weight;
-        if roll < cumulative {
-            return Ok(entry.template.clone());
-        }
-    }
-    // SAFETY: Should not reach here if total_weight > 0 and mix is non-empty
-    unreachable!(
-        "template selection failed with roll={} total_weight={}",
-        roll, total_weight
-    )
-}
-
-pub fn generate_txs<P, T, W>(
-    plugin: &P,
+/// Pick a random template and deserialize it from the spec.
+pub fn load_template<T: serde::de::DeserializeOwned>(
     spec: &WorkloadSpec,
-    count: u64,
+    rng: &mut StdRng,
     total_weight: u64,
-    ctx: &mut BuildContext<'_>,
-    writer: &mut NdjsonWriter<W>,
-) -> Result<()>
-where
-    P: ChainPlugin<Template = T>,
-    T: serde::de::DeserializeOwned,
-    W: Write,
-{
-    for _ in 0..count {
-        let template_name = pick_template(spec, ctx.rng, total_weight)?;
-        let template_value = spec
-            .templates
-            .get(&template_name)
-            .ok_or_else(|| eyre::eyre!("template '{}' not found", template_name))?;
-
-        let template: T = serde_yaml::from_value(template_value.clone())
-            .wrap_err_with(|| format!("failed to parse template '{}'", template_name))?;
-
-        let tx: GeneratedTx = plugin
-            .build(template, ctx)
-            .wrap_err_with(|| format!("failed to build tx from template '{}'", template_name))?;
-
-        writer.write(&tx)?;
-    }
-    writer.flush()?;
-    Ok(())
+) -> Result<(String, T)> {
+    let name = pick_template(spec, rng, total_weight)?;
+    let value = spec
+        .templates
+        .get(&name)
+        .ok_or_else(|| eyre::eyre!("template '{}' not found", name))?;
+    let template: T = serde_yaml::from_value(value.clone())
+        .wrap_err_with(|| format!("failed to parse template '{}'", name))?;
+    Ok((name, template))
 }
 
 pub fn generate_with_plugin<P, T>(
@@ -234,7 +220,7 @@ where
 
     let mut build_ctx = BuildContext::new(
         ctx.spec.chain_id,
-        &ctx.gas,
+        &ctx.spec.gas,
         &ctx.accounts,
         &ctx.artifacts,
         &mut ctx.nonces,
@@ -270,53 +256,49 @@ where
     Ok(())
 }
 
-pub async fn fetch_protocol_nonces(
-    accounts: &AccountManager,
-    nonces: &mut NonceTracker,
-    rpc_url: &str,
-) -> Result<()> {
-    let provider = ProviderBuilder::<_, _, Ethereum>::new()
-        .connect_http(rpc_url.parse().wrap_err("invalid RPC URL")?);
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
 
-    for (pool_name, addresses) in accounts.all_addresses() {
-        let total = addresses.len();
-        for (idx, address) in addresses.iter().enumerate() {
-            eprintln!(
-                "fetching nonce for {}[{}/{}] ({})...",
-                pool_name,
-                idx + 1,
-                total,
-                address
-            );
-
-            let nonce = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                provider.get_transaction_count(*address),
-            )
-            .await
-            .wrap_err_with(|| format!("timeout fetching nonce for {}[{}]", pool_name, idx))?
-            .wrap_err_with(|| {
-                format!(
-                    "failed to fetch nonce for {}[{}] ({})",
-                    pool_name, idx, address
-                )
-            })?;
-
-            // Protocol nonce scheduling key = sender address
-            let scheduling_key = address.0.0;
-            nonces.reset(scheduling_key, nonce);
-
-            eprintln!(
-                "fetched nonce for {}[{}/{}] ({}): {}",
-                pool_name,
-                idx + 1,
-                total,
-                address,
-                nonce
-            );
+fn pick_template(spec: &WorkloadSpec, rng: &mut StdRng, total_weight: u64) -> Result<String> {
+    let roll = rng.random_range(0..total_weight);
+    let mut cumulative = 0;
+    for entry in &spec.mix {
+        cumulative += entry.weight;
+        if roll < cumulative {
+            return Ok(entry.template.clone());
         }
     }
+    // SAFETY: Should not reach here if total_weight > 0 and mix is non-empty
+    unreachable!(
+        "template selection failed with roll={} total_weight={}",
+        roll, total_weight
+    )
+}
 
+fn generate_txs<P, T, W>(
+    plugin: &P,
+    spec: &WorkloadSpec,
+    count: u64,
+    total_weight: u64,
+    ctx: &mut BuildContext<'_>,
+    writer: &mut NdjsonWriter<W>,
+) -> Result<()>
+where
+    P: ChainPlugin<Template = T>,
+    T: serde::de::DeserializeOwned,
+    W: Write,
+{
+    for _ in 0..count {
+        let (name, template) = load_template::<T>(spec, ctx.rng, total_weight)?;
+
+        let tx: GeneratedTx = plugin
+            .build(template, ctx)
+            .wrap_err_with(|| format!("failed to build tx from template '{}'", name))?;
+
+        writer.write(&tx)?;
+    }
+    writer.flush()?;
     Ok(())
 }
 
@@ -364,8 +346,9 @@ async fn run_extract(args: ExtractArgs) -> Result<()> {
         bail!("--from must be <= --to");
     }
 
-    let provider = ProviderBuilder::<_, _, Ethereum>::new()
-        .connect_http(args.rpc.parse().wrap_err("invalid RPC URL")?);
+    let provider =
+        alloy_provider::ProviderBuilder::<_, _, alloy_provider::network::Ethereum>::new()
+            .connect_http(args.rpc.parse().wrap_err("invalid RPC URL")?);
 
     let (tx, mut rx) = mpsc::channel::<Result<FetchedBlock>>(args.buffer_size);
 

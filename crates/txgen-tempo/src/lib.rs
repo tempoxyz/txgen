@@ -2,7 +2,8 @@ mod nonce;
 mod template;
 mod tempo_tx;
 
-pub use nonce::{NONCE_PRECOMPILE, TempoNonceProvider};
+pub use nonce::{NONCE_PRECOMPILE, TempoNonceProvider, prefetch_parallel_nonces};
+pub use txgen_ethereum::fetch_protocol_nonces;
 
 use alloy_primitives::{Address, Bytes, TxKind, U256, keccak256};
 use alloy_signer::SignerSync;
@@ -214,7 +215,7 @@ impl TempoPlugin {
     }
 }
 
-fn compute_scheduling_key(sender: Address, nonce_key: U256) -> [u8; 20] {
+pub(crate) fn compute_scheduling_key(sender: Address, nonce_key: U256) -> [u8; 20] {
     if nonce_key.is_zero() {
         sender.0.0
     } else {

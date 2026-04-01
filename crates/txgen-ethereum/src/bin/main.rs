@@ -9,7 +9,8 @@ impl TxgenNetwork for EthereumNetwork {
         let mut ctx = GenerateContext::from_args(&args)?;
 
         if let Some(ref rpc_url) = args.rpc {
-            txgen_cli::fetch_protocol_nonces(&ctx.accounts, &mut ctx.nonces, rpc_url).await?;
+            let (accounts, nonces) = ctx.accounts_and_nonces();
+            txgen_ethereum::fetch_protocol_nonces(accounts, nonces, rpc_url).await?;
         }
 
         txgen_cli::generate_with_plugin(EthereumPlugin, &mut ctx, args.count, args.output)

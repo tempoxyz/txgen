@@ -1,4 +1,7 @@
+mod nonces;
 mod template;
+
+pub use nonces::fetch_protocol_nonces;
 
 use alloy_consensus::{
     SignableTransaction, TxEip1559, TxEip2930, TxLegacy, transaction::RlpEcdsaEncodableTx,

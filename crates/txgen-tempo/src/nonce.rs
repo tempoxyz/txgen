@@ -125,6 +125,75 @@ where
     }
 }
 
+/// Prefetch parallel lane nonces for all (account, nonce_key) pairs found in templates.
+///
+/// Scans the spec templates for literal `nonce_key` values and fetches the current
+/// nonce from the nonce precompile for each (sender, nonce_key) combination.
+/// Protocol nonces (key=0) are skipped — use [`txgen_ethereum::fetch_protocol_nonces`]
+/// for those.
+pub async fn prefetch_parallel_nonces<P: Provider<Ethereum> + Clone + Send + Sync>(
+    provider: &P,
+    accounts: &txgen_core::AccountManager,
+    spec: &txgen_core::WorkloadSpec,
+    nonces: &mut txgen_core::NonceTracker,
+) -> Result<()> {
+    use crate::TempoTemplate;
+    use crate::compute_scheduling_key;
+    use std::collections::HashSet;
+    use txgen_core::GenValue;
+
+    // Collect unique literal nonce_keys from templates referenced in the mix
+    let mut nonce_keys = HashSet::new();
+    for entry in &spec.mix {
+        if let Some(value) = spec.templates.get(&entry.template) {
+            if let Ok(template) = serde_yaml::from_value::<TempoTemplate>(value.clone()) {
+                if let Some(GenValue::Literal(key)) = &template.nonce_key {
+                    if !key.is_zero() {
+                        nonce_keys.insert(*key);
+                    }
+                }
+            }
+        }
+    }
+
+    if nonce_keys.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!(
+        "prefetching nonces for {} parallel lane(s)...",
+        nonce_keys.len()
+    );
+
+    for (pool_name, addresses) in accounts.all_addresses() {
+        for address in addresses {
+            for &nonce_key in &nonce_keys {
+                let storage_key = compute_nonce_storage_key(address, nonce_key);
+                let storage_value = provider
+                    .get_storage_at(NONCE_PRECOMPILE, storage_key)
+                    .await
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to fetch parallel nonce for {} lane {} ({})",
+                            pool_name, nonce_key, address
+                        )
+                    })?;
+
+                let nonce = storage_value.to::<u64>();
+                let scheduling_key = compute_scheduling_key(address, nonce_key);
+                nonces.reset(scheduling_key, nonce);
+
+                eprintln!(
+                    "fetched lane nonce: {} lane={} nonce={}",
+                    address, nonce_key, nonce
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Compute the storage key for a (address, nonce_key) pair in the nonce precompile.
 /// Storage key = keccak256(abi.encode(address, nonce_key))
 fn compute_nonce_storage_key(address: Address, nonce_key: U256) -> U256 {
