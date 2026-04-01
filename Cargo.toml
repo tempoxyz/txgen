@@ -14,6 +14,7 @@ bench-core = { path = "crates/bench-core" }
 txgen-core = { path = "crates/txgen-core" }
 txgen-ethereum = { path = "crates/txgen-ethereum" }
 txgen-tempo = { path = "crates/txgen-tempo" }
+txgen-cli = { path = "crates/txgen-cli" }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

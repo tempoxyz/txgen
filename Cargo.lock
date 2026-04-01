@@ -4836,8 +4836,6 @@ dependencies = [
  "serde_yaml",
  "tokio",
  "txgen-core",
- "txgen-ethereum",
- "txgen-tempo",
 ]
 
 [[package]]
