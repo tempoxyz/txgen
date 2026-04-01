@@ -77,6 +77,20 @@ templates:
       pool: sponsors
       select: random
 
+  tempo_expiring:
+    type: tempo
+    from:
+      pool: users
+      select: random
+    to: "0x0000000000000000000000000000000000000001"
+    value: 100
+    gas_limit: 34000
+    max_fee_per_gas: 1000000000
+    max_priority_fee_per_gas: 1000000000
+    # nonce_key = U256::MAX signals expiring nonce (TIP-1009)
+    nonce_key: "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+    valid_before: 9999999999
+
 mix:
   - template: legacy_transfer
     weight: 10
@@ -85,8 +99,10 @@ mix:
   - template: eip1559_transfer
     weight: 10
   - template: tempo_transfer
-    weight: 25
-  - template: tempo_parallel
-    weight: 25
-  - template: tempo_sponsored
     weight: 20
+  - template: tempo_parallel
+    weight: 20
+  - template: tempo_sponsored
+    weight: 15
+  - template: tempo_expiring
+    weight: 15
