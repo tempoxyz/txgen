@@ -38,6 +38,10 @@ alloy-rpc-types-eth = "1"
 alloy-eips = "1"
 alloy-rlp = "0.3"
 
+# tempo
+tempo-alloy = "1"
+tempo-primitives = "1"
+
 # misc
 hex = "0.4"
 rand = "0.9"

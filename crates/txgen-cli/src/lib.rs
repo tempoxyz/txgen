@@ -10,8 +10,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use txgen_core::{
-    AccountManager, ArtifactManager, BuildContext, ChainPlugin, GeneratedTx, NdjsonWriter,
-    NonceTracker, WorkloadSpec,
+    AccountManager, ArtifactManager, BuildContext, GeneratedTx, NdjsonWriter, NonceTracker,
+    WorkloadSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -139,14 +139,31 @@ impl GenerateContext {
 }
 
 // ---------------------------------------------------------------------------
-// TxgenNetwork trait — implemented by per-network binaries
+// NetworkAdapter trait — implemented by per-network binaries
 // ---------------------------------------------------------------------------
 
-pub trait TxgenNetwork {
-    fn generate(
-        &self,
-        args: GenerateArgs,
-    ) -> impl std::future::Future<Output = Result<()>> + Send + '_;
+/// Trait for network-specific transaction generation.
+///
+/// Each network (Ethereum, Tempo, etc.) implements this trait to handle
+/// its specific transaction types, signing, and encoding.
+pub trait NetworkAdapter: Send + Sync {
+    /// The template type deserialized from YAML.
+    type Template: serde::de::DeserializeOwned + Send;
+
+    /// Build a signed, encoded transaction from a template.
+    fn build_tx(&self, template: Self::Template, ctx: &mut BuildContext<'_>)
+    -> Result<GeneratedTx>;
+
+    /// Prefetch nonces from the chain before generation.
+    ///
+    /// Called when `--rpc` is provided. Default is no-op.
+    fn prefetch_nonces<'a>(
+        &'a self,
+        _ctx: &'a mut GenerateContext,
+        _rpc: &'a str,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async { Ok(()) }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -174,13 +191,26 @@ enum Command {
 // Public entrypoint
 // ---------------------------------------------------------------------------
 
-pub async fn run(network: impl TxgenNetwork) -> Result<()> {
+pub async fn run(adapter: impl NetworkAdapter) -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Generate(args) => network.generate(args).await,
+        Command::Generate(args) => run_generate(adapter, args).await,
         Command::Addresses(args) => run_addresses(args),
         Command::Extract(args) => run_extract(args).await,
     }
+}
+
+async fn run_generate(adapter: impl NetworkAdapter, args: GenerateArgs) -> Result<()> {
+    let count = args.count;
+    let output = args.output.clone();
+    let rpc = args.rpc.clone();
+    let mut ctx = GenerateContext::from_args(&args)?;
+
+    if let Some(ref rpc) = rpc {
+        adapter.prefetch_nonces(&mut ctx, rpc).await?;
+    }
+
+    generate_loop(&adapter, &mut ctx, count, output)
 }
 
 // ---------------------------------------------------------------------------
@@ -203,16 +233,16 @@ pub fn load_template<T: serde::de::DeserializeOwned>(
     Ok((name, template))
 }
 
-pub fn generate_with_plugin<P, T>(
-    plugin: P,
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+fn generate_loop<A: NetworkAdapter>(
+    adapter: &A,
     ctx: &mut GenerateContext,
     count: u64,
     output: Option<PathBuf>,
-) -> Result<()>
-where
-    P: ChainPlugin<Template = T>,
-    T: serde::de::DeserializeOwned,
-{
+) -> Result<()> {
     let total_weight = ctx.spec.total_weight();
     if total_weight == 0 {
         bail!("no templates in mix (total weight is 0)");
@@ -231,7 +261,7 @@ where
         Some(path) => {
             let mut writer = txgen_core::output::file_writer(&path)?;
             generate_txs(
-                &plugin,
+                adapter,
                 &ctx.spec,
                 count,
                 total_weight,
@@ -243,7 +273,7 @@ where
         None => {
             let mut writer = txgen_core::output::stdout_writer();
             generate_txs(
-                &plugin,
+                adapter,
                 &ctx.spec,
                 count,
                 total_weight,
@@ -255,10 +285,6 @@ where
 
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Private helpers
-// ---------------------------------------------------------------------------
 
 fn pick_template(spec: &WorkloadSpec, rng: &mut StdRng, total_weight: u64) -> Result<String> {
     let roll = rng.random_range(0..total_weight);
@@ -276,24 +302,19 @@ fn pick_template(spec: &WorkloadSpec, rng: &mut StdRng, total_weight: u64) -> Re
     )
 }
 
-fn generate_txs<P, T, W>(
-    plugin: &P,
+fn generate_txs<A: NetworkAdapter, W: Write>(
+    adapter: &A,
     spec: &WorkloadSpec,
     count: u64,
     total_weight: u64,
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
-) -> Result<()>
-where
-    P: ChainPlugin<Template = T>,
-    T: serde::de::DeserializeOwned,
-    W: Write,
-{
+) -> Result<()> {
     for _ in 0..count {
-        let (name, template) = load_template::<T>(spec, ctx.rng, total_weight)?;
+        let (name, template) = load_template::<A::Template>(spec, ctx.rng, total_weight)?;
 
-        let tx: GeneratedTx = plugin
-            .build(template, ctx)
+        let tx = adapter
+            .build_tx(template, ctx)
             .wrap_err_with(|| format!("failed to build tx from template '{}'", name))?;
 
         writer.write(&tx)?;

@@ -1,137 +1,77 @@
 mod nonce;
 mod template;
-mod tempo_tx;
 
 pub use nonce::{NONCE_PRECOMPILE, TempoNonceProvider, prefetch_parallel_nonces};
 pub use txgen_ethereum::fetch_protocol_nonces;
 
+use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Bytes, TxKind, U256, keccak256};
 use alloy_signer::SignerSync;
 use eyre::Result;
-use txgen_core::{BuildContext, ChainPlugin, GeneratedTx, SelectMode};
-use txgen_ethereum::{EthereumPlugin, EthereumTemplate};
+use tempo_primitives::{TempoSignature, TempoTransaction, transaction::Call};
+use txgen_cli::{GenerateContext, NetworkAdapter};
+use txgen_core::{BuildContext, GeneratedTx, SelectMode};
+use txgen_ethereum::{EthereumAdapter, EthereumTemplate};
 
 pub use template::TempoTemplate;
-pub use tempo_tx::{Call, TEMPO_TX_TYPE_ID, TempoTransaction};
 
-/// Tempo transaction generation plugin.
+/// Tempo network adapter for transaction generation.
 ///
-/// Supports all Ethereum transaction types (delegated to EthereumPlugin)
+/// Supports all Ethereum transaction types (delegated to [`EthereumAdapter`])
 /// plus Tempo native 0x76 transactions.
-#[derive(Debug, Default)]
-pub struct TempoPlugin {
-    ethereum: EthereumPlugin,
+pub struct TempoAdapter {
+    ethereum: EthereumAdapter,
 }
 
-impl ChainPlugin for TempoPlugin {
+impl Default for TempoAdapter {
+    fn default() -> Self {
+        Self {
+            ethereum: EthereumAdapter,
+        }
+    }
+}
+
+impl NetworkAdapter for TempoAdapter {
     type Template = TempoTemplate;
 
-    fn name(&self) -> &'static str {
-        "tempo"
-    }
-
-    fn build(&self, template: Self::Template, ctx: &mut BuildContext<'_>) -> Result<GeneratedTx> {
+    fn build_tx(
+        &self,
+        template: Self::Template,
+        ctx: &mut BuildContext<'_>,
+    ) -> Result<GeneratedTx> {
         match template.tx_type.as_str() {
             "tempo" => self.build_tempo(template, ctx),
             _ => {
                 let eth_template = convert_to_ethereum_template(&template)?;
-                self.ethereum.build(eth_template, ctx)
+                self.ethereum.build_tx(eth_template, ctx)
             }
         }
+    }
+
+    async fn prefetch_nonces(&self, ctx: &mut GenerateContext, rpc: &str) -> Result<()> {
+        use alloy_provider::{ProviderBuilder, network::Ethereum};
+        use eyre::WrapErr;
+
+        let provider = ProviderBuilder::<_, _, Ethereum>::new()
+            .connect_http(rpc.parse().wrap_err("invalid RPC URL")?);
+
+        let (accounts, nonces) = ctx.accounts_and_nonces();
+        fetch_protocol_nonces(accounts, nonces, rpc).await?;
+
+        let (spec, accounts, nonces) = ctx.prefetch_state();
+        prefetch_parallel_nonces(&provider, accounts, spec, nonces).await?;
+
+        Ok(())
     }
 }
 
-impl TempoPlugin {
-    /// Build a Tempo transaction with async nonce fetching support.
-    ///
-    /// If a nonce provider is given, it will be used to fetch nonces for
-    /// scheduling keys that haven't been seen before (including parallel lanes).
-    pub async fn build_with_nonce_provider<P: txgen_core::NonceProvider>(
-        &self,
-        template: TempoTemplate,
-        ctx: &mut BuildContext<'_>,
-        nonce_provider: Option<&P>,
-    ) -> Result<GeneratedTx> {
-        match template.tx_type.as_str() {
-            "tempo" => self.build_tempo_async(template, ctx, nonce_provider).await,
-            _ => {
-                let eth_template = convert_to_ethereum_template(&template)?;
-                self.ethereum.build(eth_template, ctx)
-            }
-        }
-    }
-
-    async fn build_tempo_async<P: txgen_core::NonceProvider>(
-        &self,
-        template: TempoTemplate,
-        ctx: &mut BuildContext<'_>,
-        nonce_provider: Option<&P>,
-    ) -> Result<GeneratedTx> {
-        let (from_address, signer_pool, signer_idx) = {
-            match template.from.select {
-                SelectMode::Random => {
-                    let signer = ctx.accounts.get_random(&template.from.pool, ctx.rng)?;
-                    let addr = signer.address();
-                    let pool = ctx.accounts.get_pool(&template.from.pool)?;
-                    let idx = pool.iter().position(|s| s.address() == addr).unwrap_or(0);
-                    (addr, template.from.pool.clone(), idx)
-                }
-                SelectMode::Index(idx) => {
-                    let signer = ctx.accounts.get_by_index(&template.from.pool, idx)?;
-                    (signer.address(), template.from.pool.clone(), idx)
-                }
-            }
-        };
-
-        let nonce_key: U256 = if let Some(ref nk) = template.nonce_key {
-            let mut resolver = ctx.resolver();
-            resolver.resolve_gen(nk)?
-        } else {
-            U256::ZERO
-        };
-
-        let scheduling_key = compute_scheduling_key(from_address, nonce_key);
-
-        // Fetch nonce from provider if available and not yet tracked
-        let nonce = if let Some(provider) = nonce_provider {
-            ctx.nonces
-                .next_with_provider(scheduling_key, from_address, nonce_key, provider)
-                .await?
-        } else {
-            ctx.next_nonce(scheduling_key)
-        };
-
-        self.build_tempo_inner(
-            template,
-            ctx,
-            from_address,
-            signer_pool,
-            signer_idx,
-            nonce_key,
-            nonce,
-        )
-    }
-
+impl TempoAdapter {
     fn build_tempo(
         &self,
         template: TempoTemplate,
         ctx: &mut BuildContext<'_>,
     ) -> Result<GeneratedTx> {
-        let (from_address, signer_pool, signer_idx) = {
-            match template.from.select {
-                SelectMode::Random => {
-                    let signer = ctx.accounts.get_random(&template.from.pool, ctx.rng)?;
-                    let addr = signer.address();
-                    let pool = ctx.accounts.get_pool(&template.from.pool)?;
-                    let idx = pool.iter().position(|s| s.address() == addr).unwrap_or(0);
-                    (addr, template.from.pool.clone(), idx)
-                }
-                SelectMode::Index(idx) => {
-                    let signer = ctx.accounts.get_by_index(&template.from.pool, idx)?;
-                    (signer.address(), template.from.pool.clone(), idx)
-                }
-            }
-        };
+        let selected = ctx.select_signer(&template.from)?;
 
         let nonce_key: U256 = if let Some(ref nk) = template.nonce_key {
             let mut resolver = ctx.resolver();
@@ -140,34 +80,8 @@ impl TempoPlugin {
             U256::ZERO
         };
 
-        let scheduling_key = compute_scheduling_key(from_address, nonce_key);
-
+        let scheduling_key = compute_scheduling_key(selected.address, nonce_key);
         let nonce = ctx.next_nonce(scheduling_key);
-
-        self.build_tempo_inner(
-            template,
-            ctx,
-            from_address,
-            signer_pool,
-            signer_idx,
-            nonce_key,
-            nonce,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn build_tempo_inner(
-        &self,
-        template: TempoTemplate,
-        ctx: &mut BuildContext<'_>,
-        from_address: Address,
-        signer_pool: String,
-        signer_idx: usize,
-        nonce_key: U256,
-        nonce: u64,
-    ) -> Result<GeneratedTx> {
-        let scheduling_key = compute_scheduling_key(from_address, nonce_key);
-
         let calls = resolve_calls(&template, ctx)?;
 
         let max_fee_per_gas = template.max_fee_per_gas.unwrap_or(ctx.gas.max_fee_per_gas);
@@ -187,26 +101,26 @@ impl TempoPlugin {
             fee_payer_signature: None,
             valid_before: template.valid_before,
             valid_after: template.valid_after,
+            ..Default::default()
         };
 
-        let signer = ctx.accounts.get_by_index(&signer_pool, signer_idx)?;
+        let signer = ctx.accounts.get_by_index(&selected.pool, selected.index)?;
         let sig_hash = tx.signature_hash();
         let sender_signature = signer.sign_hash_sync(&sig_hash)?;
 
-        let raw = if let Some(ref sponsor_ref) = template.sponsor {
+        if let Some(ref sponsor_ref) = template.sponsor {
             let sponsor_signer = match sponsor_ref.select {
                 SelectMode::Random => ctx.accounts.get_random(&sponsor_ref.pool, ctx.rng)?,
                 SelectMode::Index(idx) => ctx.accounts.get_by_index(&sponsor_ref.pool, idx)?,
             };
-
-            let fee_payer_hash = tx.fee_payer_signature_hash(from_address);
+            let fee_payer_hash = tx.fee_payer_signature_hash(selected.address);
             let fee_payer_sig = sponsor_signer.sign_hash_sync(&fee_payer_hash)?;
             tx.fee_payer_signature = Some(fee_payer_sig);
+        }
 
-            encode_signed_tempo_tx(&tx, sender_signature)
-        } else {
-            encode_signed_tempo_tx(&tx, sender_signature)
-        };
+        let tempo_sig = TempoSignature::from(sender_signature);
+        let signed = tx.into_signed(tempo_sig);
+        let raw = Bytes::from(signed.encoded_2718());
 
         Ok(GeneratedTx {
             raw,
@@ -268,13 +182,6 @@ fn resolve_calls(template: &TempoTemplate, ctx: &mut BuildContext<'_>) -> Result
     }
 }
 
-fn encode_signed_tempo_tx(tx: &TempoTransaction, signature: alloy_primitives::Signature) -> Bytes {
-    let signed = tx.clone().into_signed(signature);
-    let mut encoded = Vec::new();
-    signed.encode_2718(&mut encoded);
-    Bytes::from(encoded)
-}
-
 fn convert_to_ethereum_template(template: &TempoTemplate) -> Result<EthereumTemplate> {
     Ok(EthereumTemplate {
         tx_type: template.tx_type.clone(),
@@ -295,9 +202,10 @@ mod tests {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use std::collections::HashMap;
+    use tempo_primitives::TEMPO_TX_TYPE_ID;
     use txgen_core::{
         AccountManager, AccountPoolDef, AccountRef, ArtifactManager, GasConfig, GenValue,
-        NonceTracker,
+        NonceTracker, SelectMode,
     };
 
     const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -342,11 +250,11 @@ mod tests {
             calls: None,
         };
 
-        let plugin = TempoPlugin::default();
-        let tx = plugin.build(template, &mut ctx).unwrap();
+        let adapter = TempoAdapter::default();
+        let tx = adapter.build_tx(template, &mut ctx).unwrap();
 
         assert!(!tx.raw.is_empty());
-        assert_eq!(tx.raw[0], 0x76);
+        assert_eq!(tx.raw[0], TEMPO_TX_TYPE_ID);
     }
 
     #[test]
@@ -389,11 +297,11 @@ mod tests {
             calls: None,
         };
 
-        let plugin = TempoPlugin::default();
-        let tx = plugin.build(template, &mut ctx).unwrap();
+        let adapter = TempoAdapter::default();
+        let tx = adapter.build_tx(template, &mut ctx).unwrap();
 
         assert!(!tx.raw.is_empty());
-        assert_eq!(tx.raw[0], 0x76);
+        assert_eq!(tx.raw[0], TEMPO_TX_TYPE_ID);
     }
 
     #[test]
@@ -436,8 +344,8 @@ mod tests {
             calls: None,
         };
 
-        let plugin = TempoPlugin::default();
-        let tx = plugin.build(template, &mut ctx).unwrap();
+        let adapter = TempoAdapter::default();
+        let tx = adapter.build_tx(template, &mut ctx).unwrap();
 
         assert!(!tx.raw.is_empty());
         assert_eq!(tx.raw[0], 0x02);
