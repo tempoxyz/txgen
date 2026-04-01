@@ -1005,9 +1005,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "txgen-core",
- "txgen-ethereum",
- "txgen-tempo",
 ]
 
 [[package]]
