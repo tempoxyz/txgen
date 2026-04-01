@@ -32,3 +32,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+
+  decode-tx:
+    name: decode-tx
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Tempo cast
+        run: |
+          curl -L https://github.com/tempoxyz/tempo/releases/latest/download/cast-x86_64-unknown-linux-gnu.tar.gz \
+            | tar xz -C /usr/local/bin
+      - name: Generate and decode transactions
+        run: ./tests/decode-tx.sh
