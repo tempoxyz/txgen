@@ -25,7 +25,9 @@ eyre.workspace = true
 alloy-provider.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
+alloy-network.workspace = true
+alloy-signer.workspace = true
 alloy-eips.workspace = true
 alloy-rlp.workspace = true
 hex.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "rt", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "rt", "sync", "time"] }

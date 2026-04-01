@@ -24,8 +24,9 @@ serde_yaml.workspace = true
 # alloy
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
-alloy-signer.workspace = true
+alloy-eips.workspace = true
 alloy-network.workspace = true
+alloy-rpc-types-eth.workspace = true
 alloy-provider.workspace = true
 
 # misc

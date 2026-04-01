@@ -3,6 +3,10 @@ use serde::Deserialize;
 use txgen_core::{AccountRef, CallDef, GenValue};
 
 /// Template for Tempo transactions.
+///
+/// Supports all EVM transaction types (legacy, eip2930, eip1559) plus
+/// Tempo native 0x76 transactions with parallel nonces, sponsorship,
+/// fee tokens, and batched calls.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TempoTemplate {
     /// Transaction type: "legacy", "eip2930", "eip1559", "tempo"

@@ -1,16 +1,11 @@
-mod nonces;
 mod template;
 
-pub use nonces::fetch_protocol_nonces;
-
-use alloy_consensus::{
-    SignableTransaction, TxEip1559, TxEip2930, TxLegacy, transaction::RlpEcdsaEncodableTx,
-};
-use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, Bytes, TxKind, U256};
+use alloy_network::{Ethereum, TransactionBuilder};
+use alloy_primitives::{Bytes, TxKind, U256};
+use alloy_rpc_types_eth::TransactionRequest;
 use eyre::{Result, bail};
-use txgen_cli::{GenerateContext, NetworkAdapter};
-use txgen_core::{BuildContext, GenValue, GeneratedTx, ValueResolver};
+use txgen_cli::{GenerateContext, NetworkAdapter, TxRequest};
+use txgen_core::BuildContext;
 
 pub use template::EthereumTemplate;
 
@@ -21,26 +16,59 @@ pub struct EthereumAdapter;
 
 impl NetworkAdapter for EthereumAdapter {
     type Template = EthereumTemplate;
+    type Network = Ethereum;
 
-    fn build_tx(
+    fn build_request(
         &self,
         template: Self::Template,
         ctx: &mut BuildContext<'_>,
-    ) -> Result<GeneratedTx> {
+    ) -> Result<TxRequest<TransactionRequest>> {
         let selected = ctx.select_signer(&template.from)?;
         let key: [u8; 20] = selected.address.0.0;
         let nonce = ctx.next_nonce(key);
+
         let (to, value, input) = resolve_call_data(&template, ctx)?;
-        let signer = ctx.accounts.get_by_index(&selected.pool, selected.index)?;
 
-        let raw = match template.tx_type.as_str() {
-            "legacy" => build_legacy(&template, ctx, nonce, to, value, input, signer)?,
-            "eip2930" => build_eip2930(&template, ctx, nonce, to, value, input, signer)?,
-            "eip1559" => build_eip1559(&template, ctx, nonce, to, value, input, signer)?,
+        let mut req = TransactionRequest::default();
+        req.set_chain_id(ctx.chain_id);
+        req.set_nonce(nonce);
+        req.set_gas_limit(template.gas_limit);
+
+        if let TxKind::Call(addr) = to {
+            req.set_to(addr);
+        }
+        req.set_value(value);
+        if !input.is_empty() {
+            req.set_input(input);
+        }
+
+        match template.tx_type.as_str() {
+            "legacy" => {
+                req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
+            }
+            "eip2930" => {
+                req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
+                req.set_access_list(Default::default());
+            }
+            "eip1559" => {
+                req.set_max_fee_per_gas(
+                    template.max_fee_per_gas.unwrap_or(ctx.gas.max_fee_per_gas),
+                );
+                req.set_max_priority_fee_per_gas(
+                    template
+                        .max_priority_fee_per_gas
+                        .unwrap_or(ctx.gas.max_priority_fee_per_gas),
+                );
+            }
             other => bail!("unsupported transaction type: {}", other),
-        };
+        }
 
-        Ok(GeneratedTx { raw, key })
+        Ok(TxRequest {
+            request: req,
+            signer_pool: selected.pool,
+            signer_index: selected.index,
+            key,
+        })
     }
 
     #[allow(clippy::manual_async_fn)]
@@ -51,7 +79,7 @@ impl NetworkAdapter for EthereumAdapter {
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
         async move {
             let (accounts, nonces) = ctx.accounts_and_nonces();
-            fetch_protocol_nonces(accounts, nonces, rpc).await
+            txgen_cli::fetch_protocol_nonces(accounts, nonces, rpc).await
         }
     }
 }
@@ -61,135 +89,27 @@ fn resolve_call_data(
     ctx: &mut BuildContext<'_>,
 ) -> Result<(TxKind, U256, Bytes)> {
     if let Some(ref call) = template.call {
-        // Get artifacts reference before creating resolver
-        let artifacts = ctx.artifacts;
-        let mut resolver = ctx.resolver();
-        let encoded = call.encode(artifacts, &mut resolver)?;
+        let encoded = ctx.encode_call(call)?;
         Ok((TxKind::Call(encoded.to), encoded.value, encoded.input))
     } else {
-        // Simple transfer or contract creation
-        let mut resolver = ctx.resolver();
-        let to = resolve_to(&template.to, &mut resolver)?;
-        let value = resolver.resolve_gen(&template.value)?;
+        let to = ctx.resolve_to(&template.to)?;
+        let value = ctx.resolve_value(&template.value)?;
         Ok((to, value, Bytes::new()))
     }
-}
-
-fn resolve_to(to: &Option<GenValue<Address>>, resolver: &mut ValueResolver<'_>) -> Result<TxKind> {
-    match to {
-        Some(gen_value) => {
-            let addr: Address = resolver.resolve_gen(gen_value)?;
-            Ok(TxKind::Call(addr))
-        }
-        None => Ok(TxKind::Create),
-    }
-}
-
-fn build_legacy(
-    template: &EthereumTemplate,
-    ctx: &BuildContext<'_>,
-    nonce: u64,
-    to: TxKind,
-    value: U256,
-    input: Bytes,
-    signer: &txgen_core::EcdsaSigner,
-) -> Result<Bytes> {
-    let gas_price = template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas);
-
-    let tx = TxLegacy {
-        chain_id: Some(ctx.chain_id),
-        nonce,
-        gas_price,
-        gas_limit: template.gas_limit,
-        to,
-        value,
-        input,
-    };
-
-    let signature = signer.sign_transaction_sync(&mut tx.clone())?;
-    let signed = tx.into_signed(signature);
-
-    let mut encoded = Vec::new();
-    signed.tx().eip2718_encode(signed.signature(), &mut encoded);
-
-    Ok(Bytes::from(encoded))
-}
-
-fn build_eip2930(
-    template: &EthereumTemplate,
-    ctx: &BuildContext<'_>,
-    nonce: u64,
-    to: TxKind,
-    value: U256,
-    input: Bytes,
-    signer: &txgen_core::EcdsaSigner,
-) -> Result<Bytes> {
-    let gas_price = template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas);
-
-    let tx = TxEip2930 {
-        chain_id: ctx.chain_id,
-        nonce,
-        gas_price,
-        gas_limit: template.gas_limit,
-        to,
-        value,
-        input,
-        access_list: Default::default(),
-    };
-
-    let signature = signer.sign_transaction_sync(&mut tx.clone())?;
-    let signed = tx.into_signed(signature);
-
-    let mut encoded = Vec::new();
-    signed.tx().eip2718_encode(signed.signature(), &mut encoded);
-
-    Ok(Bytes::from(encoded))
-}
-
-fn build_eip1559(
-    template: &EthereumTemplate,
-    ctx: &BuildContext<'_>,
-    nonce: u64,
-    to: TxKind,
-    value: U256,
-    input: Bytes,
-    signer: &txgen_core::EcdsaSigner,
-) -> Result<Bytes> {
-    let max_fee_per_gas = template.max_fee_per_gas.unwrap_or(ctx.gas.max_fee_per_gas);
-    let max_priority_fee_per_gas = template
-        .max_priority_fee_per_gas
-        .unwrap_or(ctx.gas.max_priority_fee_per_gas);
-
-    let tx = TxEip1559 {
-        chain_id: ctx.chain_id,
-        nonce,
-        max_fee_per_gas,
-        max_priority_fee_per_gas,
-        gas_limit: template.gas_limit,
-        to,
-        value,
-        input,
-        access_list: Default::default(),
-    };
-
-    let signature = signer.sign_transaction_sync(&mut tx.clone())?;
-    let signed = tx.into_signed(signature);
-
-    let mut encoded = Vec::new();
-    signed.tx().eip2718_encode(signed.signature(), &mut encoded);
-
-    Ok(Bytes::from(encoded))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::SignableTransaction;
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_network::TxSignerSync;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use std::collections::HashMap;
     use txgen_core::{
-        AccountManager, AccountPoolDef, AccountRef, ArtifactManager, GasConfig, NonceTracker,
-        SelectMode,
+        AccountManager, AccountPoolDef, AccountRef, ArtifactManager, GasConfig, GenValue,
+        NonceTracker, SelectMode,
     };
 
     const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -221,7 +141,7 @@ mod tests {
             },
             gas_limit: 21000,
             value: GenValue::Literal(U256::from(1000)),
-            to: Some(GenValue::Literal(Address::ZERO)),
+            to: Some(GenValue::Literal(alloy_primitives::Address::ZERO)),
             call: None,
             gas_price: None,
             max_fee_per_gas: Some(1_000_000_000),
@@ -229,11 +149,22 @@ mod tests {
         };
 
         let adapter = EthereumAdapter;
-        let tx = adapter.build_tx(template, &mut ctx).unwrap();
+        let tx_req = adapter.build_request(template, &mut ctx).unwrap();
+
+        let mut unsigned = tx_req.request.build_unsigned().unwrap();
+        let signer = ctx
+            .accounts
+            .get_by_index(&tx_req.signer_pool, tx_req.signer_index)
+            .unwrap();
+        let sig = signer.sign_transaction_sync(&mut unsigned).unwrap();
+        let signed = unsigned.into_signed(sig);
+        let envelope =
+            <alloy_consensus::TxEnvelope as From<alloy_consensus::Signed<_>>>::from(signed);
+        let raw = Bytes::from(envelope.encoded_2718());
 
         // Verify we got a non-empty transaction
-        assert!(!tx.raw.is_empty());
+        assert!(!raw.is_empty());
         // EIP-1559 transactions start with 0x02
-        assert_eq!(tx.raw[0], 0x02);
+        assert_eq!(raw[0], 0x02);
     }
 }
