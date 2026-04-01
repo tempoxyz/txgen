@@ -1,22 +1,17 @@
+use alloy_primitives::Address;
 use eyre::Result;
 use rand::rngs::StdRng;
-use serde::de::DeserializeOwned;
 
-use crate::{AccountManager, ArtifactManager, GasConfig, GeneratedTx, NonceTracker};
+use crate::{AccountManager, AccountRef, ArtifactManager, GasConfig, NonceTracker, SelectMode};
 
-/// Trait for chain-specific transaction generation plugins.
-///
-/// Each chain (Ethereum, Tempo, etc.) implements this trait to handle
-/// its specific transaction types and encoding.
-pub trait ChainPlugin: Send + Sync {
-    /// The template type that this plugin can deserialize from YAML.
-    type Template: DeserializeOwned;
-
-    /// Returns the plugin name (e.g., "ethereum", "tempo").
-    fn name(&self) -> &'static str;
-
-    /// Build a signed transaction from a template.
-    fn build(&self, template: Self::Template, ctx: &mut BuildContext<'_>) -> Result<GeneratedTx>;
+/// Result of selecting a signer from a pool.
+pub struct SelectedSigner {
+    /// Signer address.
+    pub address: Address,
+    /// Pool name.
+    pub pool: String,
+    /// Index within the pool.
+    pub index: usize,
 }
 
 /// Context passed to plugins during transaction generation.
@@ -72,47 +67,91 @@ impl<'a> BuildContext<'a> {
             rng: self.rng,
         }
     }
+
+    /// Select a signer from a pool based on the account reference.
+    pub fn select_signer(&mut self, from: &AccountRef) -> Result<SelectedSigner> {
+        match from.select {
+            SelectMode::Random => {
+                let signer = self.accounts.get_random(&from.pool, self.rng)?;
+                let addr = signer.address();
+                let pool = self.accounts.get_pool(&from.pool)?;
+                // SAFETY: the signer came from this pool, so it must be present
+                let idx = pool.iter().position(|s| s.address() == addr).unwrap_or(0);
+                Ok(SelectedSigner {
+                    address: addr,
+                    pool: from.pool.clone(),
+                    index: idx,
+                })
+            }
+            SelectMode::Index(idx) => {
+                let signer = self.accounts.get_by_index(&from.pool, idx)?;
+                Ok(SelectedSigner {
+                    address: signer.address(),
+                    pool: from.pool.clone(),
+                    index: idx,
+                })
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AccountPoolDef;
     use rand::SeedableRng;
-
-    struct MockPlugin;
-
-    impl ChainPlugin for MockPlugin {
-        type Template = serde_yaml::Value;
-
-        fn name(&self) -> &'static str {
-            "mock"
-        }
-
-        fn build(
-            &self,
-            _template: Self::Template,
-            _ctx: &mut BuildContext<'_>,
-        ) -> Result<GeneratedTx> {
-            Ok(GeneratedTx {
-                raw: alloy_primitives::Bytes::new(),
-                key: [0u8; 20],
-            })
-        }
-    }
+    use std::collections::HashMap;
 
     #[test]
-    fn test_plugin_trait() {
-        let plugin = MockPlugin;
-        assert_eq!(plugin.name(), "mock");
-
+    fn test_select_signer_by_index() {
+        let pool_def = AccountPoolDef {
+            mnemonic: "test test test test test test test test test test test junk".into(),
+            index: None,
+            range: Some([0, 3]),
+        };
+        let accounts =
+            AccountManager::from_spec(&HashMap::from([("default".to_string(), pool_def)])).unwrap();
         let gas = GasConfig::default();
-        let accounts = AccountManager::empty();
         let artifacts = ArtifactManager::empty();
         let mut nonces = NonceTracker::new();
         let mut rng = StdRng::seed_from_u64(42);
 
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
-        let tx = plugin.build(serde_yaml::Value::Null, &mut ctx).unwrap();
-        assert!(tx.raw.is_empty());
+
+        let account_ref = AccountRef {
+            pool: "default".into(),
+            select: SelectMode::Index(1),
+        };
+        let selected = ctx.select_signer(&account_ref).unwrap();
+        assert_eq!(selected.index, 1);
+        assert_eq!(selected.pool, "default");
+
+        let expected = accounts.get_by_index("default", 1).unwrap().address();
+        assert_eq!(selected.address, expected);
+    }
+
+    #[test]
+    fn test_select_signer_random() {
+        let pool_def = AccountPoolDef {
+            mnemonic: "test test test test test test test test test test test junk".into(),
+            index: None,
+            range: Some([0, 3]),
+        };
+        let accounts =
+            AccountManager::from_spec(&HashMap::from([("default".to_string(), pool_def)])).unwrap();
+        let gas = GasConfig::default();
+        let artifacts = ArtifactManager::empty();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let account_ref = AccountRef {
+            pool: "default".into(),
+            select: SelectMode::Random,
+        };
+        let selected = ctx.select_signer(&account_ref).unwrap();
+        assert_eq!(selected.pool, "default");
+        assert!(selected.index < 3);
     }
 }

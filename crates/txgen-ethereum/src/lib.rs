@@ -9,55 +9,30 @@ use alloy_consensus::{
 use alloy_network::TxSignerSync;
 use alloy_primitives::{Address, Bytes, TxKind, U256};
 use eyre::{Result, bail};
-use txgen_core::{BuildContext, ChainPlugin, GenValue, GeneratedTx, SelectMode, ValueResolver};
+use txgen_cli::{GenerateContext, NetworkAdapter};
+use txgen_core::{BuildContext, GenValue, GeneratedTx, ValueResolver};
 
 pub use template::EthereumTemplate;
 
-/// Ethereum transaction generation plugin.
+/// Ethereum network adapter for transaction generation.
 ///
 /// Supports legacy, EIP-2930, and EIP-1559 transaction types.
-#[derive(Debug, Default)]
-pub struct EthereumPlugin;
+pub struct EthereumAdapter;
 
-impl ChainPlugin for EthereumPlugin {
+impl NetworkAdapter for EthereumAdapter {
     type Template = EthereumTemplate;
 
-    fn name(&self) -> &'static str {
-        "ethereum"
-    }
-
-    fn build(&self, template: Self::Template, ctx: &mut BuildContext<'_>) -> Result<GeneratedTx> {
-        // Resolve the sender - get address and index first
-        let (from_address, signer_pool, signer_idx) = {
-            match template.from.select {
-                SelectMode::Random => {
-                    let signer = ctx.accounts.get_random(&template.from.pool, ctx.rng)?;
-                    let addr = signer.address();
-                    // Find the index - for random we need to scan
-                    let pool = ctx.accounts.get_pool(&template.from.pool)?;
-                    let idx = pool.iter().position(|s| s.address() == addr).unwrap_or(0);
-                    (addr, template.from.pool.clone(), idx)
-                }
-                SelectMode::Index(idx) => {
-                    let signer = ctx.accounts.get_by_index(&template.from.pool, idx)?;
-                    (signer.address(), template.from.pool.clone(), idx)
-                }
-            }
-        };
-
-        // Scheduling key is the sender address
-        let key: [u8; 20] = from_address.0.0;
-
-        // Get nonce for this sender
+    fn build_tx(
+        &self,
+        template: Self::Template,
+        ctx: &mut BuildContext<'_>,
+    ) -> Result<GeneratedTx> {
+        let selected = ctx.select_signer(&template.from)?;
+        let key: [u8; 20] = selected.address.0.0;
         let nonce = ctx.next_nonce(key);
-
-        // Resolve call data if present
         let (to, value, input) = resolve_call_data(&template, ctx)?;
+        let signer = ctx.accounts.get_by_index(&selected.pool, selected.index)?;
 
-        // Get signer again for signing
-        let signer = ctx.accounts.get_by_index(&signer_pool, signer_idx)?;
-
-        // Build and sign the transaction based on type
         let raw = match template.tx_type.as_str() {
             "legacy" => build_legacy(&template, ctx, nonce, to, value, input, signer)?,
             "eip2930" => build_eip2930(&template, ctx, nonce, to, value, input, signer)?,
@@ -66,6 +41,18 @@ impl ChainPlugin for EthereumPlugin {
         };
 
         Ok(GeneratedTx { raw, key })
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn prefetch_nonces<'a>(
+        &'a self,
+        ctx: &'a mut GenerateContext,
+        rpc: &'a str,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move {
+            let (accounts, nonces) = ctx.accounts_and_nonces();
+            fetch_protocol_nonces(accounts, nonces, rpc).await
+        }
     }
 }
 
@@ -202,6 +189,7 @@ mod tests {
     use std::collections::HashMap;
     use txgen_core::{
         AccountManager, AccountPoolDef, AccountRef, ArtifactManager, GasConfig, NonceTracker,
+        SelectMode,
     };
 
     const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -240,8 +228,8 @@ mod tests {
             max_priority_fee_per_gas: Some(1_000_000_000),
         };
 
-        let plugin = EthereumPlugin;
-        let tx = plugin.build(template, &mut ctx).unwrap();
+        let adapter = EthereumAdapter;
+        let tx = adapter.build_tx(template, &mut ctx).unwrap();
 
         // Verify we got a non-empty transaction
         assert!(!tx.raw.is_empty());

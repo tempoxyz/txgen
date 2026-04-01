@@ -12,6 +12,6 @@ pub use accounts::{
 };
 pub use nonce::{NonceProvider, NonceTracker};
 pub use output::{GeneratedTx, NdjsonWriter};
-pub use plugin::{BuildContext, ChainPlugin};
+pub use plugin::{BuildContext, SelectedSigner};
 pub use spec::{GasConfig, MixEntry, WorkloadSpec};
 pub use value::{FromGenerator, GenValue, Generator, ValueResolver};
