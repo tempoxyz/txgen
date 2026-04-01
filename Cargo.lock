@@ -5391,9 +5391,11 @@ version = "0.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
+ "alloy-network",
  "alloy-primitives",
  "alloy-provider",
  "alloy-rlp",
+ "alloy-signer",
  "clap",
  "eyre",
  "hex",
@@ -5429,10 +5431,11 @@ name = "txgen-ethereum"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips",
  "alloy-network",
  "alloy-primitives",
  "alloy-provider",
- "alloy-signer",
+ "alloy-rpc-types-eth",
  "eyre",
  "rand 0.9.2",
  "serde",
@@ -5462,7 +5465,6 @@ dependencies = [
  "tokio",
  "txgen-cli",
  "txgen-core",
- "txgen-ethereum",
 ]
 
 [[package]]

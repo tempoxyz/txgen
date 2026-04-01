@@ -1,5 +1,6 @@
-use alloy_consensus::{Block as ConsensusBlock, TxEnvelope};
-use alloy_eips::BlockNumberOrTag;
+use alloy_consensus::{Block as ConsensusBlock, SignableTransaction, Signed, TxEnvelope};
+use alloy_eips::{BlockNumberOrTag, eip2718::Encodable2718};
+use alloy_network::{Network, TransactionBuilder, TxSignerSync};
 use alloy_primitives::Bytes;
 use alloy_provider::{Provider, ext::DebugApi};
 use alloy_rlp::Decodable;
@@ -142,17 +143,36 @@ impl GenerateContext {
 // NetworkAdapter trait — implemented by per-network binaries
 // ---------------------------------------------------------------------------
 
+/// Output from [`NetworkAdapter::into_request`].
+pub struct TxRequest<R> {
+    /// The network-specific transaction request.
+    pub request: R,
+    /// Signer pool name.
+    pub signer_pool: String,
+    /// Signer index within the pool.
+    pub signer_index: usize,
+    /// Scheduling key (e.g. sender address or hash of sender+nonce_key).
+    pub key: [u8; 20],
+}
+
 /// Trait for network-specific transaction generation.
 ///
-/// Each network (Ethereum, Tempo, etc.) implements this trait to handle
-/// its specific transaction types, signing, and encoding.
+/// Each network (Ethereum, Tempo, etc.) implements this trait to map
+/// templates into network-specific transaction requests. The generic
+/// generation loop handles building, signing, and encoding.
 pub trait NetworkAdapter: Send + Sync {
     /// The template type deserialized from YAML.
     type Template: serde::de::DeserializeOwned + Send;
 
-    /// Build a signed, encoded transaction from a template.
-    fn build_tx(&self, template: Self::Template, ctx: &mut BuildContext<'_>)
-    -> Result<GeneratedTx>;
+    /// The alloy [`Network`] whose types are used.
+    type Network: Network;
+
+    /// Map a template to a network-specific transaction request.
+    fn build_request(
+        &self,
+        template: Self::Template,
+        ctx: &mut BuildContext<'_>,
+    ) -> Result<TxRequest<<Self::Network as Network>::TransactionRequest>>;
 
     /// Prefetch nonces from the chain before generation.
     ///
@@ -191,7 +211,12 @@ enum Command {
 // Public entrypoint
 // ---------------------------------------------------------------------------
 
-pub async fn run(adapter: impl NetworkAdapter) -> Result<()> {
+pub async fn run<A: NetworkAdapter>(adapter: A) -> Result<()>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
     let cli = Cli::parse();
     match cli.command {
         Command::Generate(args) => run_generate(adapter, args).await,
@@ -200,7 +225,12 @@ pub async fn run(adapter: impl NetworkAdapter) -> Result<()> {
     }
 }
 
-async fn run_generate(adapter: impl NetworkAdapter, args: GenerateArgs) -> Result<()> {
+async fn run_generate<A: NetworkAdapter>(adapter: A, args: GenerateArgs) -> Result<()>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
     let count = args.count;
     let output = args.output.clone();
     let rpc = args.rpc.clone();
@@ -233,6 +263,61 @@ pub fn load_template<T: serde::de::DeserializeOwned>(
     Ok((name, template))
 }
 
+/// Fetch protocol nonces (nonce_key=0) for all accounts from an EVM RPC.
+///
+/// Uses `eth_getTransactionCount` to fetch the current nonce for each
+/// account address and stores it in the tracker with the sender address
+/// as the scheduling key.
+pub async fn fetch_protocol_nonces(
+    accounts: &AccountManager,
+    nonces: &mut NonceTracker,
+    rpc_url: &str,
+) -> Result<()> {
+    let provider =
+        alloy_provider::ProviderBuilder::<_, _, alloy_provider::network::Ethereum>::new()
+            .connect_http(rpc_url.parse().wrap_err("invalid RPC URL")?);
+
+    for (pool_name, addresses) in accounts.all_addresses() {
+        let total = addresses.len();
+        for (idx, address) in addresses.iter().enumerate() {
+            eprintln!(
+                "fetching nonce for {}[{}/{}] ({})...",
+                pool_name,
+                idx + 1,
+                total,
+                address
+            );
+
+            let nonce = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                Provider::get_transaction_count(&provider, *address),
+            )
+            .await
+            .wrap_err_with(|| format!("timeout fetching nonce for {}[{}]", pool_name, idx))?
+            .wrap_err_with(|| {
+                format!(
+                    "failed to fetch nonce for {}[{}] ({})",
+                    pool_name, idx, address
+                )
+            })?;
+
+            let scheduling_key = address.0.0;
+            nonces.reset(scheduling_key, nonce);
+
+            eprintln!(
+                "fetched nonce for {}[{}/{}] ({}): {}",
+                pool_name,
+                idx + 1,
+                total,
+                address,
+                nonce
+            );
+        }
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
@@ -242,7 +327,12 @@ fn generate_loop<A: NetworkAdapter>(
     ctx: &mut GenerateContext,
     count: u64,
     output: Option<PathBuf>,
-) -> Result<()> {
+) -> Result<()>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
     let total_weight = ctx.spec.total_weight();
     if total_weight == 0 {
         bail!("no templates in mix (total weight is 0)");
@@ -309,15 +399,39 @@ fn generate_txs<A: NetworkAdapter, W: Write>(
     total_weight: u64,
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
-) -> Result<()> {
+) -> Result<()>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
     for _ in 0..count {
         let (name, template) = load_template::<A::Template>(spec, ctx.rng, total_weight)?;
 
-        let tx = adapter
-            .build_tx(template, ctx)
-            .wrap_err_with(|| format!("failed to build tx from template '{}'", name))?;
+        let tx_req = adapter
+            .build_request(template, ctx)
+            .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
 
-        writer.write(&tx)?;
+        let mut unsigned = tx_req
+            .request
+            .build_unsigned()
+            .map_err(|e| eyre::eyre!("failed to build unsigned tx from template '{name}': {e}"))?;
+
+        let signer = ctx
+            .accounts
+            .get_by_index(&tx_req.signer_pool, tx_req.signer_index)?;
+        let sig = signer
+            .sign_transaction_sync(&mut unsigned)
+            .map_err(|e| eyre::eyre!("failed to sign tx from template '{name}': {e}"))?;
+
+        let signed = unsigned.into_signed(sig);
+        let envelope = <A::Network as Network>::TxEnvelope::from(signed);
+        let raw = Bytes::from(envelope.encoded_2718());
+
+        writer.write(&GeneratedTx {
+            raw,
+            key: tx_req.key,
+        })?;
     }
     writer.flush()?;
     Ok(())

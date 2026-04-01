@@ -2,50 +2,146 @@ mod nonce;
 mod template;
 
 pub use nonce::{NONCE_PRECOMPILE, TempoNonceProvider, prefetch_parallel_nonces};
-pub use txgen_ethereum::fetch_protocol_nonces;
+pub use txgen_cli::fetch_protocol_nonces;
 
-use alloy_eips::eip2718::Encodable2718;
+use alloy_network::TransactionBuilder;
 use alloy_primitives::{Address, Bytes, TxKind, U256, keccak256};
 use alloy_signer::SignerSync;
 use eyre::Result;
-use tempo_primitives::{TempoSignature, TempoTransaction, transaction::Call};
-use txgen_cli::{GenerateContext, NetworkAdapter};
-use txgen_core::{BuildContext, GeneratedTx, SelectMode};
-use txgen_ethereum::{EthereumAdapter, EthereumTemplate};
+use tempo_alloy::TempoNetwork;
+use tempo_alloy::rpc::TempoTransactionRequest;
+use tempo_primitives::transaction::Call;
+use txgen_cli::{GenerateContext, NetworkAdapter, TxRequest};
+use txgen_core::BuildContext;
 
 pub use template::TempoTemplate;
 
 /// Tempo network adapter for transaction generation.
 ///
-/// Supports all Ethereum transaction types (delegated to [`EthereumAdapter`])
+/// Supports all Ethereum transaction types (legacy, EIP-2930, EIP-1559)
 /// plus Tempo native 0x76 transactions.
-pub struct TempoAdapter {
-    ethereum: EthereumAdapter,
-}
-
-impl Default for TempoAdapter {
-    fn default() -> Self {
-        Self {
-            ethereum: EthereumAdapter,
-        }
-    }
-}
+pub struct TempoAdapter;
 
 impl NetworkAdapter for TempoAdapter {
     type Template = TempoTemplate;
+    type Network = TempoNetwork;
 
-    fn build_tx(
+    fn build_request(
         &self,
         template: Self::Template,
         ctx: &mut BuildContext<'_>,
-    ) -> Result<GeneratedTx> {
+    ) -> Result<TxRequest<TempoTransactionRequest>> {
+        let selected = ctx.select_signer(&template.from)?;
+
+        let nonce_key: U256 = if let Some(ref nk) = template.nonce_key {
+            ctx.resolve_value(nk)?
+        } else {
+            U256::ZERO
+        };
+
+        let is_tempo = template.tx_type == "tempo";
+        let scheduling_key = if is_tempo {
+            compute_scheduling_key(selected.address, nonce_key)
+        } else {
+            selected.address.0.0
+        };
+        let nonce = ctx.next_nonce(scheduling_key);
+
+        let (to, value, input, calls) = resolve_call_data(&template, is_tempo, ctx)?;
+
+        let mut req = TempoTransactionRequest::default();
+        req.set_chain_id(ctx.chain_id);
+        req.set_nonce(nonce);
+        req.set_gas_limit(template.gas_limit);
+
         match template.tx_type.as_str() {
-            "tempo" => self.build_tempo(template, ctx),
-            _ => {
-                let eth_template = convert_to_ethereum_template(&template)?;
-                self.ethereum.build_tx(eth_template, ctx)
+            "tempo" => {
+                req.set_max_fee_per_gas(
+                    template.max_fee_per_gas.unwrap_or(ctx.gas.max_fee_per_gas),
+                );
+                req.set_max_priority_fee_per_gas(
+                    template
+                        .max_priority_fee_per_gas
+                        .unwrap_or(ctx.gas.max_priority_fee_per_gas),
+                );
+
+                req.calls = calls;
+
+                if !nonce_key.is_zero() {
+                    req.set_nonce_key(nonce_key);
+                }
+                if let Some(fee_token) = template.fee_token {
+                    req.set_fee_token(fee_token);
+                }
+                if let Some(valid_before) = template.valid_before {
+                    req.set_valid_before(valid_before);
+                }
+                if let Some(valid_after) = template.valid_after {
+                    req.set_valid_after(valid_after);
+                }
+
+                // Handle sponsor signing: build a temporary TempoTransaction to
+                // compute the fee_payer_signature_hash, sign it, then set on the request.
+                if let Some(ref sponsor_ref) = template.sponsor {
+                    let temp_tx = req
+                        .clone()
+                        .build_aa()
+                        .map_err(|e| eyre::eyre!("failed to build AA tx for sponsor: {e}"))?;
+
+                    let sponsor = ctx.select_signer(sponsor_ref)?;
+                    let sponsor_signer = ctx.accounts.get_by_index(&sponsor.pool, sponsor.index)?;
+                    let fee_payer_hash = temp_tx.fee_payer_signature_hash(selected.address);
+                    let fee_payer_sig = sponsor_signer.sign_hash_sync(&fee_payer_hash)?;
+                    req.set_fee_payer_signature(fee_payer_sig);
+                }
             }
+            "legacy" => {
+                req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
+                if let TxKind::Call(addr) = to {
+                    req.set_to(addr);
+                }
+                req.set_value(value);
+                if !input.is_empty() {
+                    req.set_input(input);
+                }
+            }
+            "eip2930" => {
+                req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
+                req.set_access_list(Default::default());
+                if let TxKind::Call(addr) = to {
+                    req.set_to(addr);
+                }
+                req.set_value(value);
+                if !input.is_empty() {
+                    req.set_input(input);
+                }
+            }
+            "eip1559" => {
+                req.set_max_fee_per_gas(
+                    template.max_fee_per_gas.unwrap_or(ctx.gas.max_fee_per_gas),
+                );
+                req.set_max_priority_fee_per_gas(
+                    template
+                        .max_priority_fee_per_gas
+                        .unwrap_or(ctx.gas.max_priority_fee_per_gas),
+                );
+                if let TxKind::Call(addr) = to {
+                    req.set_to(addr);
+                }
+                req.set_value(value);
+                if !input.is_empty() {
+                    req.set_input(input);
+                }
+            }
+            other => eyre::bail!("unsupported transaction type: {}", other),
         }
+
+        Ok(TxRequest {
+            request: req,
+            signer_pool: selected.pool,
+            signer_index: selected.index,
+            key: scheduling_key,
+        })
     }
 
     async fn prefetch_nonces(&self, ctx: &mut GenerateContext, rpc: &str) -> Result<()> {
@@ -56,76 +152,12 @@ impl NetworkAdapter for TempoAdapter {
             .connect_http(rpc.parse().wrap_err("invalid RPC URL")?);
 
         let (accounts, nonces) = ctx.accounts_and_nonces();
-        fetch_protocol_nonces(accounts, nonces, rpc).await?;
+        txgen_cli::fetch_protocol_nonces(accounts, nonces, rpc).await?;
 
         let (spec, accounts, nonces) = ctx.prefetch_state();
         prefetch_parallel_nonces(&provider, accounts, spec, nonces).await?;
 
         Ok(())
-    }
-}
-
-impl TempoAdapter {
-    fn build_tempo(
-        &self,
-        template: TempoTemplate,
-        ctx: &mut BuildContext<'_>,
-    ) -> Result<GeneratedTx> {
-        let selected = ctx.select_signer(&template.from)?;
-
-        let nonce_key: U256 = if let Some(ref nk) = template.nonce_key {
-            let mut resolver = ctx.resolver();
-            resolver.resolve_gen(nk)?
-        } else {
-            U256::ZERO
-        };
-
-        let scheduling_key = compute_scheduling_key(selected.address, nonce_key);
-        let nonce = ctx.next_nonce(scheduling_key);
-        let calls = resolve_calls(&template, ctx)?;
-
-        let max_fee_per_gas = template.max_fee_per_gas.unwrap_or(ctx.gas.max_fee_per_gas);
-        let max_priority_fee_per_gas = template
-            .max_priority_fee_per_gas
-            .unwrap_or(ctx.gas.max_priority_fee_per_gas);
-
-        let mut tx = TempoTransaction {
-            chain_id: ctx.chain_id,
-            fee_token: template.fee_token,
-            max_priority_fee_per_gas,
-            max_fee_per_gas,
-            gas_limit: template.gas_limit,
-            calls,
-            nonce_key,
-            nonce,
-            fee_payer_signature: None,
-            valid_before: template.valid_before,
-            valid_after: template.valid_after,
-            ..Default::default()
-        };
-
-        let signer = ctx.accounts.get_by_index(&selected.pool, selected.index)?;
-        let sig_hash = tx.signature_hash();
-        let sender_signature = signer.sign_hash_sync(&sig_hash)?;
-
-        if let Some(ref sponsor_ref) = template.sponsor {
-            let sponsor_signer = match sponsor_ref.select {
-                SelectMode::Random => ctx.accounts.get_random(&sponsor_ref.pool, ctx.rng)?,
-                SelectMode::Index(idx) => ctx.accounts.get_by_index(&sponsor_ref.pool, idx)?,
-            };
-            let fee_payer_hash = tx.fee_payer_signature_hash(selected.address);
-            let fee_payer_sig = sponsor_signer.sign_hash_sync(&fee_payer_hash)?;
-            tx.fee_payer_signature = Some(fee_payer_sig);
-        }
-
-        let tempo_sig = TempoSignature::from(sender_signature);
-        let signed = tx.into_signed(tempo_sig);
-        let raw = Bytes::from(signed.encoded_2718());
-
-        Ok(GeneratedTx {
-            raw,
-            key: scheduling_key,
-        })
     }
 }
 
@@ -143,62 +175,74 @@ pub(crate) fn compute_scheduling_key(sender: Address, nonce_key: U256) -> [u8; 2
     }
 }
 
-fn resolve_calls(template: &TempoTemplate, ctx: &mut BuildContext<'_>) -> Result<Vec<Call>> {
+/// Resolve call data from the template into (to, value, input, calls).
+///
+/// For tempo transactions, the result is returned as `calls`; for EVM types
+/// it is returned as `(to, value, input)`.
+fn resolve_call_data(
+    template: &TempoTemplate,
+    is_tempo: bool,
+    ctx: &mut BuildContext<'_>,
+) -> Result<(TxKind, U256, Bytes, Vec<Call>)> {
     if let Some(ref call_defs) = template.calls {
         let mut calls = Vec::with_capacity(call_defs.len());
         for call_def in call_defs {
-            let artifacts = ctx.artifacts;
-            let mut resolver = ctx.resolver();
-            let encoded = call_def.encode(artifacts, &mut resolver)?;
+            let encoded = ctx.encode_call(call_def)?;
             calls.push(Call {
                 to: TxKind::Call(encoded.to),
                 value: encoded.value,
                 input: encoded.input,
             });
         }
-        Ok(calls)
+        Ok((TxKind::Create, U256::ZERO, Bytes::new(), calls))
     } else if let Some(ref call_def) = template.call {
-        let artifacts = ctx.artifacts;
-        let mut resolver = ctx.resolver();
-        let encoded = call_def.encode(artifacts, &mut resolver)?;
-        Ok(vec![Call {
-            to: TxKind::Call(encoded.to),
-            value: encoded.value,
-            input: encoded.input,
-        }])
-    } else {
-        let mut resolver = ctx.resolver();
-        let to = if let Some(ref to_gen) = template.to {
-            TxKind::Call(resolver.resolve_gen(to_gen)?)
+        let encoded = ctx.encode_call(call_def)?;
+        if is_tempo {
+            Ok((
+                TxKind::Create,
+                U256::ZERO,
+                Bytes::new(),
+                vec![Call {
+                    to: TxKind::Call(encoded.to),
+                    value: encoded.value,
+                    input: encoded.input,
+                }],
+            ))
         } else {
-            TxKind::Create
-        };
-        let value: U256 = resolver.resolve_gen(&template.value)?;
-        Ok(vec![Call {
-            to,
-            value,
-            input: Bytes::new(),
-        }])
+            Ok((
+                TxKind::Call(encoded.to),
+                encoded.value,
+                encoded.input,
+                Vec::new(),
+            ))
+        }
+    } else {
+        let to = ctx.resolve_to(&template.to)?;
+        let value: U256 = ctx.resolve_value(&template.value)?;
+        if is_tempo {
+            Ok((
+                TxKind::Create,
+                U256::ZERO,
+                Bytes::new(),
+                vec![Call {
+                    to,
+                    value,
+                    input: Bytes::new(),
+                }],
+            ))
+        } else {
+            Ok((to, value, Bytes::new(), Vec::new()))
+        }
     }
-}
-
-fn convert_to_ethereum_template(template: &TempoTemplate) -> Result<EthereumTemplate> {
-    Ok(EthereumTemplate {
-        tx_type: template.tx_type.clone(),
-        from: template.from.clone(),
-        gas_limit: template.gas_limit,
-        value: template.value.clone(),
-        to: template.to.clone(),
-        call: template.call.clone(),
-        gas_price: template.gas_price,
-        max_fee_per_gas: template.max_fee_per_gas,
-        max_priority_fee_per_gas: template.max_priority_fee_per_gas,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::SignableTransaction;
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_network::TxSignerSync;
+    use alloy_primitives::Address;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use std::collections::HashMap;
@@ -209,6 +253,29 @@ mod tests {
     };
 
     const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
+
+    fn sign_and_encode<A: NetworkAdapter>(
+        adapter: &A,
+        template: A::Template,
+        ctx: &mut BuildContext<'_>,
+    ) -> Bytes
+    where
+        <A::Network as alloy_network::Network>::UnsignedTx:
+            SignableTransaction<alloy_primitives::Signature>,
+        <A::Network as alloy_network::Network>::TxEnvelope: From<alloy_consensus::Signed<<A::Network as alloy_network::Network>::UnsignedTx>>
+            + Encodable2718,
+    {
+        let tx_req = adapter.build_request(template, ctx).unwrap();
+        let mut unsigned = tx_req.request.build_unsigned().unwrap();
+        let signer = ctx
+            .accounts
+            .get_by_index(&tx_req.signer_pool, tx_req.signer_index)
+            .unwrap();
+        let sig = signer.sign_transaction_sync(&mut unsigned).unwrap();
+        let signed = unsigned.into_signed(sig);
+        let envelope = <A::Network as alloy_network::Network>::TxEnvelope::from(signed);
+        Bytes::from(envelope.encoded_2718())
+    }
 
     #[test]
     fn test_build_tempo_transfer() {
@@ -250,11 +317,10 @@ mod tests {
             calls: None,
         };
 
-        let adapter = TempoAdapter::default();
-        let tx = adapter.build_tx(template, &mut ctx).unwrap();
+        let raw = sign_and_encode(&TempoAdapter, template, &mut ctx);
 
-        assert!(!tx.raw.is_empty());
-        assert_eq!(tx.raw[0], TEMPO_TX_TYPE_ID);
+        assert!(!raw.is_empty());
+        assert_eq!(raw[0], TEMPO_TX_TYPE_ID);
     }
 
     #[test]
@@ -297,11 +363,10 @@ mod tests {
             calls: None,
         };
 
-        let adapter = TempoAdapter::default();
-        let tx = adapter.build_tx(template, &mut ctx).unwrap();
+        let raw = sign_and_encode(&TempoAdapter, template, &mut ctx);
 
-        assert!(!tx.raw.is_empty());
-        assert_eq!(tx.raw[0], TEMPO_TX_TYPE_ID);
+        assert!(!raw.is_empty());
+        assert_eq!(raw[0], TEMPO_TX_TYPE_ID);
     }
 
     #[test]
@@ -344,11 +409,10 @@ mod tests {
             calls: None,
         };
 
-        let adapter = TempoAdapter::default();
-        let tx = adapter.build_tx(template, &mut ctx).unwrap();
+        let raw = sign_and_encode(&TempoAdapter, template, &mut ctx);
 
-        assert!(!tx.raw.is_empty());
-        assert_eq!(tx.raw[0], 0x02);
+        assert!(!raw.is_empty());
+        assert_eq!(raw[0], 0x02);
     }
 
     #[test]

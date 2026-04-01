@@ -12,7 +12,6 @@ path = "src/bin/main.rs"
 [dependencies]
 # workspace
 txgen-core.workspace = true
-txgen-ethereum.workspace = true
 txgen-cli.workspace = true
 
 # serde

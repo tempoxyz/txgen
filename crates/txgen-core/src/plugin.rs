@@ -1,4 +1,4 @@
-use alloy_primitives::Address;
+use alloy_primitives::{Address, TxKind};
 use eyre::Result;
 use rand::rngs::StdRng;
 
@@ -92,6 +92,34 @@ impl<'a> BuildContext<'a> {
                 })
             }
         }
+    }
+
+    /// Encode a contract call definition into calldata.
+    pub fn encode_call(&mut self, call_def: &crate::CallDef) -> Result<crate::EncodedCall> {
+        let artifacts = self.artifacts;
+        let mut resolver = self.resolver();
+        call_def.encode(artifacts, &mut resolver)
+    }
+
+    /// Resolve an optional address to a transaction target.
+    pub fn resolve_to(&mut self, to: &Option<crate::GenValue<Address>>) -> Result<TxKind> {
+        match to {
+            Some(gen_value) => {
+                let mut resolver = self.resolver();
+                let addr: Address = resolver.resolve_gen(gen_value)?;
+                Ok(TxKind::Call(addr))
+            }
+            None => Ok(TxKind::Create),
+        }
+    }
+
+    /// Resolve a generator value to its concrete type.
+    pub fn resolve_value<T: Clone + serde::de::DeserializeOwned + crate::FromGenerator>(
+        &mut self,
+        value: &crate::GenValue<T>,
+    ) -> Result<T> {
+        let mut resolver = self.resolver();
+        resolver.resolve_gen(value)
     }
 }
 
