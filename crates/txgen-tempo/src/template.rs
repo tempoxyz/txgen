@@ -2,6 +2,16 @@ use alloy_primitives::{Address, U256};
 use serde::Deserialize;
 use txgen_core::{AccountRef, CallDef, GenValue};
 
+/// Tempo transaction type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TempoTxType {
+    Legacy,
+    Eip2930,
+    Eip1559,
+    Tempo,
+}
+
 /// Template for Tempo transactions.
 ///
 /// Supports all EVM transaction types (legacy, eip2930, eip1559) plus
@@ -9,9 +19,9 @@ use txgen_core::{AccountRef, CallDef, GenValue};
 /// fee tokens, and batched calls.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TempoTemplate {
-    /// Transaction type: "legacy", "eip2930", "eip1559", "tempo"
+    /// Transaction type.
     #[serde(rename = "type")]
-    pub tx_type: String,
+    pub tx_type: TempoTxType,
 
     /// Sender account reference.
     pub from: AccountRef,

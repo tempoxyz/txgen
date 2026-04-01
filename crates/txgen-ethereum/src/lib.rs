@@ -3,11 +3,11 @@ mod template;
 use alloy_network::{Ethereum, TransactionBuilder};
 use alloy_primitives::{Bytes, TxKind, U256};
 use alloy_rpc_types_eth::TransactionRequest;
-use eyre::{Result, bail};
+use eyre::Result;
 use txgen_cli::{GenerateContext, NetworkAdapter, TxRequest};
 use txgen_core::BuildContext;
 
-pub use template::EthereumTemplate;
+pub use template::{EthTxType, EthereumTemplate};
 
 /// Ethereum network adapter for transaction generation.
 ///
@@ -42,15 +42,15 @@ impl NetworkAdapter for EthereumAdapter {
             req.set_input(input);
         }
 
-        match template.tx_type.as_str() {
-            "legacy" => {
+        match template.tx_type {
+            EthTxType::Legacy => {
                 req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
             }
-            "eip2930" => {
+            EthTxType::Eip2930 => {
                 req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
                 req.set_access_list(Default::default());
             }
-            "eip1559" => {
+            EthTxType::Eip1559 => {
                 req.set_max_fee_per_gas(
                     template.max_fee_per_gas.unwrap_or(ctx.gas.max_fee_per_gas),
                 );
@@ -60,7 +60,6 @@ impl NetworkAdapter for EthereumAdapter {
                         .unwrap_or(ctx.gas.max_priority_fee_per_gas),
                 );
             }
-            other => bail!("unsupported transaction type: {}", other),
         }
 
         Ok(TxRequest {
@@ -134,7 +133,7 @@ mod tests {
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
 
         let template = EthereumTemplate {
-            tx_type: "eip1559".to_string(),
+            tx_type: EthTxType::Eip1559,
             from: AccountRef {
                 pool: "users".to_string(),
                 select: SelectMode::Index(0),

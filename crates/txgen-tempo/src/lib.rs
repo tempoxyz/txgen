@@ -14,7 +14,7 @@ use tempo_primitives::transaction::Call;
 use txgen_cli::{GenerateContext, NetworkAdapter, TxRequest};
 use txgen_core::BuildContext;
 
-pub use template::TempoTemplate;
+pub use template::{TempoTemplate, TempoTxType};
 
 /// Tempo network adapter for transaction generation.
 ///
@@ -39,7 +39,7 @@ impl NetworkAdapter for TempoAdapter {
             U256::ZERO
         };
 
-        let is_tempo = template.tx_type == "tempo";
+        let is_tempo = template.tx_type == TempoTxType::Tempo;
         let scheduling_key = if is_tempo {
             compute_scheduling_key(selected.address, nonce_key)
         } else {
@@ -54,8 +54,8 @@ impl NetworkAdapter for TempoAdapter {
         req.set_nonce(nonce);
         req.set_gas_limit(template.gas_limit);
 
-        match template.tx_type.as_str() {
-            "tempo" => {
+        match template.tx_type {
+            TempoTxType::Tempo => {
                 req.set_max_fee_per_gas(
                     template.max_fee_per_gas.unwrap_or(ctx.gas.max_fee_per_gas),
                 );
@@ -95,7 +95,7 @@ impl NetworkAdapter for TempoAdapter {
                     req.set_fee_payer_signature(fee_payer_sig);
                 }
             }
-            "legacy" => {
+            TempoTxType::Legacy => {
                 req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
                 if let TxKind::Call(addr) = to {
                     req.set_to(addr);
@@ -105,7 +105,7 @@ impl NetworkAdapter for TempoAdapter {
                     req.set_input(input);
                 }
             }
-            "eip2930" => {
+            TempoTxType::Eip2930 => {
                 req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
                 req.set_access_list(Default::default());
                 if let TxKind::Call(addr) = to {
@@ -116,7 +116,7 @@ impl NetworkAdapter for TempoAdapter {
                     req.set_input(input);
                 }
             }
-            "eip1559" => {
+            TempoTxType::Eip1559 => {
                 req.set_max_fee_per_gas(
                     template.max_fee_per_gas.unwrap_or(ctx.gas.max_fee_per_gas),
                 );
@@ -133,7 +133,6 @@ impl NetworkAdapter for TempoAdapter {
                     req.set_input(input);
                 }
             }
-            other => eyre::bail!("unsupported transaction type: {}", other),
         }
 
         Ok(TxRequest {
@@ -297,7 +296,7 @@ mod tests {
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
 
         let template = TempoTemplate {
-            tx_type: "tempo".to_string(),
+            tx_type: TempoTxType::Tempo,
             from: AccountRef {
                 pool: "users".to_string(),
                 select: SelectMode::Index(0),
@@ -343,7 +342,7 @@ mod tests {
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
 
         let template = TempoTemplate {
-            tx_type: "tempo".to_string(),
+            tx_type: TempoTxType::Tempo,
             from: AccountRef {
                 pool: "users".to_string(),
                 select: SelectMode::Index(0),
@@ -389,7 +388,7 @@ mod tests {
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
 
         let template = TempoTemplate {
-            tx_type: "eip1559".to_string(),
+            tx_type: TempoTxType::Eip1559,
             from: AccountRef {
                 pool: "users".to_string(),
                 select: SelectMode::Index(0),
