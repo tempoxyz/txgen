@@ -64,8 +64,10 @@ async fn send_from_source<S: TxSource>(
         sender.send(tx).await?;
 
         let (sent, success, failed) = metrics.counts();
-        for reporter in reporters.iter_mut() {
-            reporter.on_progress(sent, success, failed)?;
+        if sent % 1000 == 0 {
+            for reporter in reporters.iter_mut() {
+                reporter.on_progress(sent, success, failed)?;
+            }
         }
     }
     Ok(())
