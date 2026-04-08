@@ -14,7 +14,7 @@ templates:
       select: random
     to: "0x0000000000000000000000000000000000000001"
     value: 1000
-    gas_limit: 21000
+    gas_limit: 300000
     max_fee_per_gas: 1000000000
     max_priority_fee_per_gas: 1000000000
 
@@ -26,7 +26,7 @@ templates:
       select: random
     to: "0x0000000000000000000000000000000000000001"
     value: 500
-    gas_limit: 21000
+    gas_limit: 300000
     max_fee_per_gas: 1000000000
     max_priority_fee_per_gas: 1000000000
     nonce_key: "42"  # Use parallel nonce key
