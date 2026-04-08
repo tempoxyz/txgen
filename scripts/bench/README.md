@@ -4,13 +4,50 @@ End-to-end benchmarking for a local Tempo dev node. Starts a node, funds
 accounts, generates transactions, sends them with metrics scraping, waits
 for the txpool to drain, and produces a 15-panel matplotlib dashboard.
 
-## Prerequisites
+## Setup
 
-- Tempo binary (`~/.tempo/bin/tempo` or `$TEMPO_BIN`)
-- Genesis file at `/tmp/txgen-localnet/genesis.json` (from `tempo-xtask generate-genesis`)
-- Built binaries: `cargo build --release -p bench-cli -p txgen-tempo`
-- Python 3 (for scraping and plotting)
-- [uv](https://github.com/astral-sh/uv) (for running plot.py with matplotlib)
+### 1. Install Tempo
+
+```bash
+# Install tempoup
+curl -L https://tempo.xyz/install | bash
+
+# Install Tempo (use a version with faucet + dev mode support)
+tempoup --version 1.5.1
+```
+
+The binary is installed to `~/.tempo/bin/tempo`. Override with `$TEMPO_BIN`
+or `--tempo-bin`.
+
+### 2. Generate genesis
+
+The bench spec uses 10,000 accounts from the test mnemonic. Generate a
+genesis with enough pre-funded accounts from the **tempo** repo:
+
+```bash
+# In the tempo repo:
+cargo run -p tempo-xtask -- generate-genesis \
+  -a 11000 \
+  --output /tmp/txgen-localnet \
+  --no-dkg-in-genesis
+```
+
+This creates `/tmp/txgen-localnet/genesis.json` with chain ID 1337. The
+`setup.sh` script automatically patches the genesis timestamp to the
+current time before each node start (required for dev mode).
+
+### 3. Build txgen binaries
+
+```bash
+# In the txgen repo:
+cargo build --release -p bench-cli -p txgen-tempo
+```
+
+### 4. Other dependencies
+
+- Python 3 (for `scrape.py` and `plot.py`)
+- [uv](https://github.com/astral-sh/uv) (for running `plot.py` with matplotlib)
+- `curl` (for RPC calls and metrics scraping)
 
 ## Quick Start
 
@@ -59,3 +96,14 @@ All outputs go to a temp datadir (path stored in `/tmp/txgen-bench-datadir`):
 - `bench_plots.png` — matplotlib dashboard
 - `metric_keys.txt` — list of all available metric keys
 - `tempo.log` — node logs
+
+## Notes
+
+- `--dev.block-time` and `--dev.block-max-transactions` are **mutually
+  exclusive** — the node exits with code 2 if both are given.
+- The default workload (`bench-spec.yaml`) sends TIP20 `transfer()` calls
+  at ~50k gas each. With the default 3B gas limit and a ~420M payment gas
+  limit, the builder caps at ~8,400 txs/block.
+- The faucet funds accounts via `tempo_fundAddress` RPC. The ~20k
+  "invalid_tx" skipped at startup in the metrics are from the funding
+  phase (10k accounts × 2 token addresses) — this is expected.
