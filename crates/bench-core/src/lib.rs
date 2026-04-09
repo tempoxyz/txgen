@@ -11,6 +11,7 @@
 pub mod clock;
 pub mod historical;
 pub mod metrics;
+pub mod prometheus;
 pub mod reporter;
 pub mod reth_api;
 pub mod sample;
@@ -24,6 +25,7 @@ pub use metrics::{
     ReplayRunStats, RunStats, ThroughputSample, TimeSeriesMetrics, collect_block_stats,
     compute_latency_stats,
 };
+pub use prometheus::parse_prometheus_text;
 pub use reporter::{
     ClickHouseConfig, ClickHouseReporter, ConsoleReporter, JsonBlockStats, JsonLatency,
     JsonLatencySample, JsonReplayBlockStats, JsonReport, JsonReporter, JsonRunStats,
