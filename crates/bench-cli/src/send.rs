@@ -10,14 +10,14 @@ use eyre::{Context, Result};
 pub async fn execute(args: SendArgs) -> Result<()> {
     tracing::info!(
         input = args.input.as_ref().map(|p| p.display().to_string()).as_deref().unwrap_or("stdin"),
-        rpc = %args.rpc,
+        rpc_urls = ?args.rpc_urls,
         tps = args.tps,
         "Starting send"
     );
 
     let metrics = MetricsCollector::new();
     let config = SenderConfig {
-        rpc_url: args.rpc.clone(),
+        rpc_urls: args.rpc_urls.clone(),
         rate_limit: args.tps,
         max_concurrent: args.max_concurrent,
         timeout: args.timeout,

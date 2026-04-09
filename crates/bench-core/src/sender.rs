@@ -7,6 +7,7 @@
 use crate::metrics::MetricsCollector;
 use alloy_primitives::Bytes;
 use eyre::{Context, Result};
+use rand::seq::IndexedRandom;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,8 +18,8 @@ use txgen_core::GeneratedTx;
 /// Configuration for the sender.
 #[derive(Debug, Clone)]
 pub struct SenderConfig {
-    /// RPC endpoint URL.
-    pub rpc_url: String,
+    /// RPC endpoint URLs. Transactions are randomly distributed across these.
+    pub rpc_urls: Vec<String>,
     /// Maximum transactions per second (0 = unlimited).
     pub rate_limit: u64,
     /// Maximum concurrent requests.
@@ -30,7 +31,7 @@ pub struct SenderConfig {
 impl Default for SenderConfig {
     fn default() -> Self {
         Self {
-            rpc_url: "http://localhost:8545".to_string(),
+            rpc_urls: vec!["http://localhost:8545".to_string()],
             rate_limit: 0,
             max_concurrent: 100,
             timeout: Duration::from_secs(30),
@@ -141,12 +142,12 @@ impl Sender {
 
                 // Spawn a worker for this key.
                 let client = self.client.clone();
-                let rpc_url = self.config.rpc_url.clone();
+                let rpc_urls = self.config.rpc_urls.clone();
                 let metrics = self.metrics.clone();
                 let semaphore = self.semaphore.clone();
 
                 let handle = tokio::spawn(async move {
-                    key_worker(receiver, client, rpc_url, metrics, semaphore).await;
+                    key_worker(receiver, client, rpc_urls, metrics, semaphore).await;
                 });
                 self.worker_handles.push(handle);
 
@@ -184,7 +185,7 @@ const RETRY_BACKOFFS_US: [u64; 6] = [100, 500, 1_000, 5_000, 10_000, 50_000];
 async fn key_worker(
     mut receiver: mpsc::Receiver<PendingTx>,
     client: reqwest::Client,
-    rpc_url: String,
+    rpc_urls: Vec<String>,
     metrics: Arc<MetricsCollector>,
     semaphore: Arc<Semaphore>,
 ) {
@@ -197,6 +198,10 @@ async fn key_worker(
         request_id += 1;
         let raw_hex = format!("0x{}", hex::encode(&pending.raw));
 
+        // Pick a random RPC URL for this request.
+        // SAFETY: `rpc_urls` is guaranteed to be non-empty by construction.
+        let rpc_url = rpc_urls.choose(&mut rand::rng()).unwrap();
+
         let mut attempt = 0u32;
         loop {
             let start = Instant::now();
@@ -208,7 +213,7 @@ async fn key_worker(
             };
 
             let result = client
-                .post(&rpc_url)
+                .post(rpc_url)
                 .json(&request)
                 .send()
                 .await
@@ -246,7 +251,10 @@ async fn key_worker(
                                 metrics.record_failure().await;
                             } else {
                                 if attempt > 0 {
-                                    tracing::debug!(attempts = attempt + 1, "Succeeded after retry");
+                                    tracing::debug!(
+                                        attempts = attempt + 1,
+                                        "Succeeded after retry"
+                                    );
                                 }
                                 metrics.record_success(latency).await;
                             }
@@ -261,8 +269,7 @@ async fn key_worker(
                     // Retry on HTTP errors (429, connection reset, etc.)
                     attempt += 1;
                     if attempt <= MAX_RETRIES {
-                        let backoff_idx =
-                            (attempt as usize - 1).min(RETRY_BACKOFFS_US.len() - 1);
+                        let backoff_idx = (attempt as usize - 1).min(RETRY_BACKOFFS_US.len() - 1);
                         let backoff = Duration::from_micros(RETRY_BACKOFFS_US[backoff_idx]);
                         tracing::debug!(
                             attempt,
@@ -322,7 +329,7 @@ mod tests {
     #[test]
     fn test_sender_config_default() {
         let config = SenderConfig::default();
-        assert_eq!(config.rpc_url, "http://localhost:8545");
+        assert_eq!(config.rpc_urls, vec!["http://localhost:8545"]);
         assert_eq!(config.rate_limit, 0);
         assert_eq!(config.max_concurrent, 100);
     }
