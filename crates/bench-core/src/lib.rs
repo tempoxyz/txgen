@@ -29,8 +29,8 @@ pub use metrics::{
 };
 pub use prometheus::parse_prometheus_text;
 pub use reporter::{
-    ClickHouseConfig, ClickHouseReporter, ConsoleReporter, JsonBlockStats, JsonLatency,
-    JsonLatencySample, JsonReplayBlockStats, JsonReport, JsonReporter, JsonRunStats,
+    ClickHouseConfig, ClickHouseReporter, ConsoleReporter, FinalReport, JsonBlockStats,
+    JsonLatency, JsonLatencySample, JsonReplayBlockStats, JsonReport, JsonReporter, JsonRunStats,
     JsonThroughputSample, JsonTimeSeries, ProgressState, Reporter, parse_reporters,
 };
 pub use reth_api::{

@@ -12,7 +12,9 @@ use alloy_primitives::Bytes;
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_engine::JwtSecret;
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
-use bench_core::{ConsoleReporter, ReplayRunStats, Reporter, WaitForPersistence, parse_reporters};
+use bench_core::{
+    ConsoleReporter, FinalReport, ReplayRunStats, Reporter, WaitForPersistence, parse_reporters,
+};
 use eyre::{Context, Result, bail};
 use tokio::sync::mpsc;
 
@@ -97,10 +99,15 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
         block_time: metrics.block_time_stats.clone(),
     };
 
+    let report = FinalReport {
+        replay_stats: Some(run_stats),
+        ..Default::default()
+    };
+
     for reporter in reporters.iter_mut() {
-        reporter.finalize_replay(&run_stats)?;
+        reporter.finalize(&report)?;
     }
-    console_reporter.finalize_replay(&run_stats)?;
+    console_reporter.finalize(&report)?;
 
     Ok(())
 }
