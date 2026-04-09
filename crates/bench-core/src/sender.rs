@@ -7,10 +7,8 @@
 use crate::metrics::MetricsCollector;
 use alloy_network::Ethereum;
 use alloy_primitives::Bytes;
-use alloy_provider::{DynProvider, Provider, ProviderBuilder};
-use alloy_rpc_client::RpcClient;
-use alloy_transport::layers::RetryBackoffLayer;
-use eyre::{Context, Result};
+use alloy_provider::{DynProvider, Provider};
+use eyre::Result;
 use rand::seq::IndexedRandom;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,23 +20,23 @@ use txgen_core::GeneratedTx;
 /// Configuration for the sender.
 #[derive(Debug, Clone)]
 pub struct SenderConfig {
-    /// RPC endpoint URLs. Transactions are randomly distributed across these.
-    pub rpc_urls: Vec<String>,
-    /// Maximum transactions per second (0 = unlimited).
+    /// Maximum transactions submitted per second (0 = unlimited).
+    ///
+    /// Controls throughput via a token bucket. Provides backpressure to the
+    /// transaction source before enqueueing.
     pub rate_limit: u64,
-    /// Maximum concurrent requests.
+    /// Maximum number of RPC requests in flight simultaneously.
+    ///
+    /// Controls parallelism via a semaphore. Limits how many connections are
+    /// open at once, independently of the rate limit.
     pub max_concurrent: usize,
-    /// Request timeout.
-    pub timeout: Duration,
 }
 
 impl Default for SenderConfig {
     fn default() -> Self {
         Self {
-            rpc_urls: vec!["http://localhost:8545".to_string()],
             rate_limit: 0,
             max_concurrent: 100,
-            timeout: Duration::from_secs(30),
         }
     }
 }
@@ -64,18 +62,11 @@ pub struct Sender {
 
 impl Sender {
     /// Create a new sender.
-    pub fn new(config: SenderConfig, metrics: Arc<MetricsCollector>) -> Result<Self> {
-        let retry_layer = RetryBackoffLayer::new(10, 100, 1000);
-        let providers: Vec<DynProvider<Ethereum>> = config
-            .rpc_urls
-            .iter()
-            .map(|url| {
-                let url = url.parse().context("failed to parse RPC URL")?;
-                let client = RpcClient::builder().layer(retry_layer.clone()).http(url);
-                Ok(ProviderBuilder::new().connect_client(client).erased())
-            })
-            .collect::<Result<_>>()?;
-
+    pub fn new(
+        providers: Vec<DynProvider<Ethereum>>,
+        config: SenderConfig,
+        metrics: Arc<MetricsCollector>,
+    ) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
 
         let rate_limiter = if config.rate_limit > 0 {
@@ -84,14 +75,14 @@ impl Sender {
             None
         };
 
-        Ok(Self {
+        Self {
             providers,
             metrics,
             semaphore,
             key_queues: HashMap::new(),
             worker_handles: Vec::new(),
             rate_limiter,
-        })
+        }
     }
 
     /// Send a transaction.
@@ -222,7 +213,6 @@ mod tests {
     #[test]
     fn test_sender_config_default() {
         let config = SenderConfig::default();
-        assert_eq!(config.rpc_urls, vec!["http://localhost:8545"]);
         assert_eq!(config.rate_limit, 0);
         assert_eq!(config.max_concurrent, 100);
     }
