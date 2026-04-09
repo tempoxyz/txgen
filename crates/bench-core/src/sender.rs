@@ -5,7 +5,9 @@
 //! - Applying rate limiting
 
 use crate::metrics::MetricsCollector;
+use alloy_network::Ethereum;
 use alloy_primitives::Bytes;
+use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use eyre::{Context, Result};
 use rand::seq::IndexedRandom;
 use std::collections::HashMap;
@@ -43,39 +45,11 @@ impl Default for SenderConfig {
 struct PendingTx {
     raw: Bytes,
     key: [u8; 20],
-    queued_at: Instant,
-}
-
-/// JSON-RPC request for eth_sendRawTransaction.
-#[derive(serde::Serialize)]
-struct RpcRequest<'a> {
-    jsonrpc: &'a str,
-    method: &'a str,
-    params: [&'a str; 1],
-    id: u64,
-}
-
-/// JSON-RPC response.
-#[derive(serde::Deserialize)]
-struct RpcResponse {
-    #[allow(dead_code)]
-    result: Option<serde_json::Value>,
-    error: Option<RpcError>,
-}
-
-/// JSON-RPC error.
-#[derive(serde::Deserialize)]
-struct RpcError {
-    #[allow(dead_code)]
-    code: i64,
-    #[allow(dead_code)]
-    message: String,
 }
 
 /// Transaction sender.
 pub struct Sender {
-    config: SenderConfig,
-    client: reqwest::Client,
+    providers: Vec<DynProvider<Ethereum>>,
     metrics: Arc<MetricsCollector>,
     semaphore: Arc<Semaphore>,
     /// Per-key queues to ensure ordering.
@@ -89,10 +63,14 @@ pub struct Sender {
 impl Sender {
     /// Create a new sender.
     pub fn new(config: SenderConfig, metrics: Arc<MetricsCollector>) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .context("failed to create HTTP client")?;
+        let providers: Vec<DynProvider<Ethereum>> = config
+            .rpc_urls
+            .iter()
+            .map(|url| {
+                let url = url.parse().context("failed to parse RPC URL")?;
+                Ok(ProviderBuilder::new().connect_http(url).erased())
+            })
+            .collect::<Result<_>>()?;
 
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
 
@@ -103,8 +81,7 @@ impl Sender {
         };
 
         Ok(Self {
-            config,
-            client,
+            providers,
             metrics,
             semaphore,
             key_queues: HashMap::new(),
@@ -129,7 +106,6 @@ impl Sender {
         let pending = PendingTx {
             raw: tx.raw,
             key: tx.key,
-            queued_at: Instant::now(),
         };
 
         self.metrics.record_sent().await;
@@ -141,13 +117,12 @@ impl Sender {
                 let (sender, receiver) = mpsc::channel(1024);
 
                 // Spawn a worker for this key.
-                let client = self.client.clone();
-                let rpc_urls = self.config.rpc_urls.clone();
+                let providers = self.providers.clone();
                 let metrics = self.metrics.clone();
                 let semaphore = self.semaphore.clone();
 
                 let handle = tokio::spawn(async move {
-                    key_worker(receiver, client, rpc_urls, metrics, semaphore).await;
+                    key_worker(receiver, providers, metrics, semaphore).await;
                 });
                 self.worker_handles.push(handle);
 
@@ -184,89 +159,31 @@ const RETRY_BACKOFFS_US: [u64; 6] = [100, 500, 1_000, 5_000, 10_000, 50_000];
 /// Worker that processes transactions for a single scheduling key.
 async fn key_worker(
     mut receiver: mpsc::Receiver<PendingTx>,
-    client: reqwest::Client,
-    rpc_urls: Vec<String>,
+    providers: Vec<DynProvider<Ethereum>>,
     metrics: Arc<MetricsCollector>,
     semaphore: Arc<Semaphore>,
 ) {
-    let mut request_id = 0u64;
-
     while let Some(pending) = receiver.recv().await {
         // Acquire semaphore permit.
         let _permit = semaphore.acquire().await;
 
-        request_id += 1;
-        let raw_hex = format!("0x{}", hex::encode(&pending.raw));
-
-        // Pick a random RPC URL for this request.
-        // SAFETY: `rpc_urls` is guaranteed to be non-empty by construction.
-        let rpc_url = rpc_urls.choose(&mut rand::rng()).unwrap();
+        // Pick a random provider for this request.
+        // SAFETY: `providers` is guaranteed to be non-empty by construction.
+        let provider = providers.choose(&mut rand::rng()).unwrap();
 
         let mut attempt = 0u32;
         loop {
             let start = Instant::now();
-            let request = RpcRequest {
-                jsonrpc: "2.0",
-                method: "eth_sendRawTransaction",
-                params: [&raw_hex],
-                id: request_id,
-            };
 
-            let result = client
-                .post(rpc_url)
-                .json(&request)
-                .send()
-                .await
-                .and_then(|r| r.error_for_status());
-
-            match result {
-                Ok(response) => {
+            match provider.send_raw_transaction(&pending.raw).await {
+                Ok(_pending_tx) => {
                     let latency = start.elapsed();
-                    match response.json::<RpcResponse>().await {
-                        Ok(rpc_response) => {
-                            if let Some(ref err) = rpc_response.error {
-                                // Retry on transient RPC errors (txpool full, etc.)
-                                attempt += 1;
-                                if attempt <= MAX_RETRIES {
-                                    let backoff_idx =
-                                        (attempt as usize - 1).min(RETRY_BACKOFFS_US.len() - 1);
-                                    let backoff =
-                                        Duration::from_micros(RETRY_BACKOFFS_US[backoff_idx]);
-                                    tracing::debug!(
-                                        attempt,
-                                        code = err.code,
-                                        message = %err.message,
-                                        backoff_us = backoff.as_micros() as u64,
-                                        "Retrying RPC error"
-                                    );
-                                    tokio::time::sleep(backoff).await;
-                                    continue;
-                                }
-                                tracing::warn!(
-                                    code = err.code,
-                                    message = %err.message,
-                                    attempts = attempt,
-                                    "RPC error (exhausted retries)"
-                                );
-                                metrics.record_failure().await;
-                            } else {
-                                if attempt > 0 {
-                                    tracing::debug!(
-                                        attempts = attempt + 1,
-                                        "Succeeded after retry"
-                                    );
-                                }
-                                metrics.record_success(latency).await;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Failed to parse RPC response");
-                            metrics.record_failure().await;
-                        }
+                    if attempt > 0 {
+                        tracing::debug!(attempts = attempt + 1, "Succeeded after retry");
                     }
+                    metrics.record_success(latency).await;
                 }
                 Err(e) => {
-                    // Retry on HTTP errors (429, connection reset, etc.)
                     attempt += 1;
                     if attempt <= MAX_RETRIES {
                         let backoff_idx = (attempt as usize - 1).min(RETRY_BACKOFFS_US.len() - 1);
@@ -275,12 +192,12 @@ async fn key_worker(
                             attempt,
                             error = %e,
                             backoff_us = backoff.as_micros() as u64,
-                            "Retrying HTTP error"
+                            "Retrying RPC error"
                         );
                         tokio::time::sleep(backoff).await;
                         continue;
                     }
-                    tracing::warn!(error = %e, attempts = attempt, "HTTP request failed (exhausted retries)");
+                    tracing::warn!(error = %e, attempts = attempt, "RPC request failed (exhausted retries)");
                     metrics.record_failure().await;
                 }
             }
