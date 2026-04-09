@@ -7,7 +7,7 @@
 # Options:
 #   --tps <N>              Target TPS (default: 5000)
 #   --max-concurrent <N>   Max concurrent HTTP requests (default: 500)
-#   --rpc <URL>            RPC endpoint (default: http://localhost:8545)
+#   --rpc-url <URL>        RPC endpoint (default: http://localhost:8545)
 #   --datadir <PATH>       Datadir (default: read from /tmp/txgen-bench-datadir)
 #   --input <PATH>         Tx file (default: $DATADIR/txs.ndjson)
 #   --scrape-interval <S>  Metrics scrape interval (default: 0.3)
@@ -32,7 +32,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --tps)              TPS="$2"; shift 2 ;;
     --max-concurrent)   MAX_CONCURRENT="$2"; shift 2 ;;
-    --rpc)              RPC="$2"; shift 2 ;;
+    --rpc-url)          RPC="$2"; shift 2 ;;
     --datadir)          DATADIR="$2"; shift 2 ;;
     --input)            INPUT="$2"; shift 2 ;;
     --scrape-interval)  SCRAPE_INTERVAL="$2"; shift 2 ;;
@@ -76,7 +76,7 @@ echo ""
 START_TIME=$(date +%s)
 
 "$BENCH_BIN" send \
-  --rpc "$RPC" \
+  --rpc-url "$RPC" \
   --tps "$TPS" \
   --max-concurrent "$MAX_CONCURRENT" \
   --input "$INPUT" \
