@@ -13,6 +13,7 @@ pub mod historical;
 pub mod metrics;
 pub mod reporter;
 pub mod reth_api;
+pub mod sample;
 pub mod sender;
 pub mod source;
 
@@ -32,5 +33,6 @@ pub use reth_api::{
     DEFAULT_PERSISTENCE_THRESHOLD, RethApi, RethForkchoiceUpdated, RethNewPayloadInput,
     RethPayloadStatus, WaitForPersistence,
 };
+pub use sample::{Sample, SampleStore};
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource, TxgenSource};
