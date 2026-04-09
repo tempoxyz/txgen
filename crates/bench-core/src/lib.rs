@@ -8,6 +8,7 @@
 //! - [`reth_api`] - reth custom Engine API types (`reth_newPayload`, `reth_forkchoiceUpdated`)
 //! - [`historical`] - Historical transaction fetching from archive RPC
 
+pub mod clock;
 pub mod historical;
 pub mod metrics;
 pub mod reporter;
@@ -15,6 +16,7 @@ pub mod reth_api;
 pub mod sender;
 pub mod source;
 
+pub use clock::RunClock;
 pub use historical::{HistoricalFetcher, HistoricalFetcherConfig, HistoricalTx};
 pub use metrics::{
     BenchMetrics, BlockStats, LatencySample, LatencyStats, MetricsCollector, ReplayBlockStats,

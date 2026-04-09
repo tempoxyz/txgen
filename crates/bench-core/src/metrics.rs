@@ -5,6 +5,7 @@
 //! - Timing (latencies, throughput)
 //! - Block-level statistics (post-run)
 
+use crate::clock::RunClock;
 use alloy_eips::BlockNumberOrTag;
 use alloy_provider::Provider;
 
@@ -12,7 +13,7 @@ use eyre::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Metrics collected during a benchmark run.
@@ -367,52 +368,48 @@ struct TimestampedEvent {
 }
 
 /// Atomic counters for concurrent metrics collection.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MetricsCollector {
     sent: AtomicU64,
     success: AtomicU64,
     failed: AtomicU64,
-    /// Start instant, set once via [`Self::start`] and read lock-free
-    /// thereafter.
-    start_instant: std::sync::OnceLock<Instant>,
-    start: RwLock<Option<Instant>>,
+    clock: RunClock,
     latencies: RwLock<Vec<TimestampedLatency>>,
     events: RwLock<Vec<TimestampedEvent>>,
 }
 
 impl MetricsCollector {
-    /// Create a new metrics collector.
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+    /// Create a new metrics collector with a shared [`RunClock`].
+    pub fn new(clock: RunClock) -> Arc<Self> {
+        Arc::new(Self {
+            sent: AtomicU64::new(0),
+            success: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            clock,
+            latencies: RwLock::new(Vec::new()),
+            events: RwLock::new(Vec::new()),
+        })
     }
 
-    /// Mark the start of the benchmark.
-    pub async fn start(&self) {
-        let now = Instant::now();
-        let _ = self.start_instant.set(now);
-        let mut start = self.start.write().await;
-        *start = Some(now);
+    /// Get a reference to the shared [`RunClock`].
+    pub fn clock(&self) -> &RunClock {
+        &self.clock
     }
 
     /// Get the elapsed time since start (lock-free).
-    ///
-    /// Returns [`Duration::ZERO`] if [`Self::start`] has not been called.
     pub fn elapsed_since_start(&self) -> Duration {
-        self.start_instant
-            .get()
-            .map_or(Duration::ZERO, |s| s.elapsed())
+        self.clock.elapsed()
     }
 
     /// Get the elapsed time since start.
-    async fn elapsed(&self) -> Duration {
-        let start = self.start.read().await;
-        start.map_or(Duration::ZERO, |s| s.elapsed())
+    fn elapsed(&self) -> Duration {
+        self.clock.elapsed()
     }
 
     /// Record a sent transaction.
     pub async fn record_sent(&self) {
         self.sent.fetch_add(1, Ordering::Relaxed);
-        let offset = self.elapsed().await;
+        let offset = self.elapsed();
         self.events.write().await.push(TimestampedEvent {
             offset,
             event: TxEvent::Sent,
@@ -422,7 +419,7 @@ impl MetricsCollector {
     /// Record a successful transaction with its latency.
     pub async fn record_success(&self, latency: Duration) {
         self.success.fetch_add(1, Ordering::Relaxed);
-        let offset = self.elapsed().await;
+        let offset = self.elapsed();
         self.latencies
             .write()
             .await
@@ -436,7 +433,7 @@ impl MetricsCollector {
     /// Record a failed transaction.
     pub async fn record_failure(&self) {
         self.failed.fetch_add(1, Ordering::Relaxed);
-        let offset = self.elapsed().await;
+        let offset = self.elapsed();
         self.events.write().await.push(TimestampedEvent {
             offset,
             event: TxEvent::Failed,
@@ -454,8 +451,7 @@ impl MetricsCollector {
 
     /// Compute final metrics.
     pub async fn finalize(&self) -> BenchMetrics {
-        let start = self.start.read().await;
-        let elapsed = start.map_or(Duration::ZERO, |s| s.elapsed());
+        let elapsed = self.clock.elapsed();
 
         let mut latencies = self.latencies.write().await;
         latencies.sort_by_key(|l| l.latency);
@@ -472,8 +468,7 @@ impl MetricsCollector {
 
     /// Extract time-series metrics for graphing.
     pub async fn time_series(&self) -> TimeSeriesMetrics {
-        let start = self.start.read().await;
-        let total_elapsed = start.map_or(Duration::ZERO, |s| s.elapsed());
+        let total_elapsed = self.clock.elapsed();
         let total_seconds = total_elapsed.as_secs() + 1;
 
         let events = self.events.read().await;
@@ -557,8 +552,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_collection() {
-        let collector = MetricsCollector::new();
-        collector.start().await;
+        let collector = MetricsCollector::new(RunClock::new());
 
         collector.record_sent().await;
         collector.record_sent().await;
@@ -673,8 +667,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_time_series_metrics() {
-        let collector = MetricsCollector::new();
-        collector.start().await;
+        let collector = MetricsCollector::new(RunClock::new());
 
         collector.record_sent().await;
         collector.record_success(Duration::from_millis(50)).await;
