@@ -29,6 +29,11 @@ pub trait Reporter: Send {
         Ok(())
     }
 
+    /// Set user-provided metadata key/value pairs on the report.
+    fn set_metadata(&mut self, _metadata: std::collections::HashMap<String, String>) -> Result<()> {
+        Ok(())
+    }
+
     /// Finalize and output the benchmark results.
     fn finalize(
         &mut self,
@@ -329,6 +334,9 @@ pub struct JsonReport {
     /// Run summary statistics (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_stats: Option<JsonRunStats>,
+    /// User-provided metadata key/value pairs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Block statistics in JSON format.
@@ -527,6 +535,7 @@ pub struct JsonReporter<W: Write + Send = Box<dyn Write + Send>> {
     writer: W,
     blocks: Vec<JsonBlockStats>,
     replay_blocks: Vec<JsonReplayBlockStats>,
+    metadata: Option<std::collections::HashMap<String, String>>,
 }
 
 impl JsonReporter {
@@ -536,6 +545,7 @@ impl JsonReporter {
             writer: Box::new(std::io::stdout()),
             blocks: Vec::new(),
             replay_blocks: Vec::new(),
+            metadata: None,
         }
     }
 
@@ -546,6 +556,7 @@ impl JsonReporter {
             writer: std::io::BufWriter::new(file),
             blocks: Vec::new(),
             replay_blocks: Vec::new(),
+            metadata: None,
         })
     }
 }
@@ -557,6 +568,7 @@ impl<W: Write + Send> JsonReporter<W> {
             writer,
             blocks: Vec::new(),
             replay_blocks: Vec::new(),
+            metadata: None,
         }
     }
 }
@@ -569,6 +581,15 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
 
     fn on_replay_block(&mut self, block: &ReplayBlockStats) -> Result<()> {
         self.replay_blocks.push(JsonReplayBlockStats::from(block));
+        Ok(())
+    }
+
+    fn set_metadata(&mut self, metadata: std::collections::HashMap<String, String>) -> Result<()> {
+        if metadata.is_empty() {
+            self.metadata = None;
+        } else {
+            self.metadata = Some(metadata);
+        }
         Ok(())
     }
 
@@ -623,6 +644,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             time_series: ts,
             blocks,
             run_stats: run_stats.map(JsonRunStats::from),
+            metadata: self.metadata.take(),
         };
 
         serde_json::to_writer_pretty(&mut self.writer, &report)?;

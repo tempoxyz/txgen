@@ -49,6 +49,13 @@ pub struct SendArgs {
     /// Report output destinations
     #[arg(long = "report", value_name = "FORMAT")]
     pub reports: Vec<String>,
+
+    /// Metadata key=value pairs to include in the report.
+    ///
+    /// Can be specified multiple times. Example:
+    ///   --metadata build-sha=abcdef --metadata build-profile=perf
+    #[arg(short = 'm', long = "metadata", value_name = "KEY=VALUE")]
+    pub metadata: Vec<String>,
 }
 
 /// Arguments for the `replay` subcommand.

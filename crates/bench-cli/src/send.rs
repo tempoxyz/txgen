@@ -8,7 +8,8 @@ use bench_core::{
     ConsoleReporter, FileSource, MetricsCollector, Reporter, Sender, SenderConfig, StdinSource,
     TxSource, parse_reporters,
 };
-use eyre::{Context, Result};
+use eyre::{Context, Result, bail};
+use std::collections::HashMap;
 
 pub async fn execute(args: SendArgs) -> Result<()> {
     tracing::info!(
@@ -17,6 +18,8 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         tps = args.tps,
         "Starting send"
     );
+
+    let metadata = parse_metadata(&args.metadata)?;
 
     // CU/s set to u64::MAX to disable the layer's built-in rate limiting
     // while keeping retry-on-429 behavior. The benchmarking tool has its own
@@ -44,6 +47,12 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         reporters.push(Box::new(ConsoleReporter::stderr(true)));
     }
 
+    if !metadata.is_empty() {
+        for reporter in &mut reporters {
+            reporter.set_metadata(metadata.clone())?;
+        }
+    }
+
     metrics.start().await;
 
     match &args.input {
@@ -67,6 +76,21 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Parse `key=value` metadata strings into a HashMap.
+fn parse_metadata(args: &[String]) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    for arg in args {
+        let (key, value) = arg
+            .split_once('=')
+            .ok_or_else(|| eyre::eyre!("invalid metadata format: {arg}"))?;
+        if key.is_empty() {
+            bail!("metadata key cannot be empty: {arg}");
+        }
+        map.insert(key.to_string(), value.to_string());
+    }
+    Ok(map)
 }
 
 async fn send_from_source<S: TxSource>(
