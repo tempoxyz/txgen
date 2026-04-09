@@ -7,6 +7,7 @@ set -euo pipefail
 BIN="${1:?usage: $0 <binary> <spec> [count]}"
 SPEC="${2:?usage: $0 <binary> <spec> [count]}"
 COUNT="${3:-50}"
+NETWORK="${BIN#txgen-}"
 
 echo "=== $BIN -s $SPEC -n $COUNT ==="
 
@@ -17,7 +18,7 @@ FAILED=0
 
 while IFS= read -r raw; do
   TOTAL=$((TOTAL + 1))
-  if ! cast decode-tx "$raw" >/dev/null 2>&1; then
+  if ! cast decode-tx --network "$NETWORK" "$raw" >/dev/null 2>&1; then
     echo "FAIL: $raw"
     FAILED=$((FAILED + 1))
   fi
