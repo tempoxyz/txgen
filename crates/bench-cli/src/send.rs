@@ -6,10 +6,12 @@ use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     ConsoleReporter, FileSource, FinalReport, MetricsCollector, ProgressState, Reporter, RunClock,
-    RunStats, Sender, SenderConfig, StdinSource, TxSource, collect_block_stats, parse_reporters,
+    RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, StdinSource, TxSource,
+    collect_block_stats, parse_reporters, start_scraper,
 };
 use eyre::{Context, Result, bail};
 use std::collections::HashMap;
+use std::time::Duration;
 
 pub async fn execute(args: SendArgs) -> Result<()> {
     tracing::info!(
@@ -36,7 +38,35 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
 
     let clock = RunClock::new();
-    let metrics = MetricsCollector::new(clock);
+    let store = SampleStore::new();
+    let metrics = MetricsCollector::new(clock.clone());
+
+    // Start background scraper + internal snapshotter if metrics URL is configured.
+    let scraper_handle = if let Some(ref url) = args.metrics_url {
+        let scraper_config =
+            ScraperConfig::new(url).with_interval(Duration::from_millis(args.scrape_interval_ms));
+        let handle = start_scraper(scraper_config, clock.clone(), store.clone());
+
+        // Spawn internal metric snapshotter on the same interval.
+        let snap_metrics = metrics.clone();
+        let snap_store = store.clone();
+        let snap_interval = Duration::from_millis(args.scrape_interval_ms);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(snap_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let samples = snap_metrics.snapshot_samples();
+                snap_store.push_batch(samples).await;
+            }
+        });
+
+        tracing::info!(url, "Started metrics scraper");
+        Some(handle)
+    } else {
+        None
+    };
+
     let config = SenderConfig {
         rate_limit: args.tps,
         max_concurrent: args.max_concurrent,
@@ -69,8 +99,21 @@ pub async fn execute(args: SendArgs) -> Result<()> {
 
     sender.flush().await;
 
+    // Stop the scraper before finalizing.
+    if let Some(handle) = scraper_handle {
+        tracing::info!(
+            scrapes = handle.scrape_count(),
+            errors = handle.error_count(),
+            "Stopping metrics scraper"
+        );
+        handle.stop().await;
+    }
+
     let final_metrics = metrics.finalize().await;
     let time_series = metrics.time_series().await;
+
+    // Drain all collected samples and apply metadata as labels.
+    let samples = store.drain().await;
 
     // Collect per-block stats from the chain. The range starts one block after
     // the block that was current before sending (start_block is the last
@@ -82,11 +125,14 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         .wrap_err("failed to get ending block number")?;
 
     let mut report = FinalReport {
-        metadata,
+        metadata: metadata.clone(),
         bench_metrics: Some(final_metrics),
         time_series: Some(time_series),
+        samples,
         ..Default::default()
     };
+
+    report.apply_labels(&metadata);
 
     if end_block > start_block {
         let block_range_start = start_block + 1;
