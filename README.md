@@ -98,58 +98,36 @@ txgen extract --rpc http://localhost:8545 --from 1000 --to 2000 -o blocks.ndjson
 
 ### `bench`
 
-#### `bench run`
-
-All-in-one: generate transactions, send them, and report results.
-
-```bash
-# Send for a duration
-bench run -s workload.yaml -c ethereum --rpc http://localhost:8545 --duration 30s --tps 100
-
-# Send a fixed count
-bench run -s workload.yaml -c tempo --rpc http://localhost:8545 -n 1000 --tps 500
-
-# With JSON report output
-bench run -s workload.yaml -c ethereum --rpc http://localhost:8545 -n 1000 --report json:report.json
-```
-
-| Flag | Description |
-|------|-------------|
-| `-s, --spec <PATH>` | Workload specification file (YAML) |
-| `-c, --chain <CHAIN>` | Chain plugin: `ethereum`, `tempo` |
-| `--rpc <URL>` | RPC endpoint (default: `http://localhost:8545`) |
-| `--tps <N>` | Target transactions per second (0 = unlimited) |
-| `--duration <DUR>` | Benchmark duration (e.g. `30s`, `5m`) |
-| `-n, --count <N>` | Number of transactions (alternative to duration) |
-| `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
-| `--max-concurrent <N>` | Maximum concurrent requests (default: 100) |
-| `--timeout <DUR>` | Request timeout (default: 30s) |
-| `--seed <SEED>` | RNG seed for reproducibility |
-
-**Required RPC methods:** `eth_sendRawTransaction`, `eth_getBlockByNumber`, `eth_getBlockReceipts`
-
 #### `bench send`
 
 Send pre-generated transactions from NDJSON file or stdin.
 
+After sending completes, queries the node for per-block statistics (transaction count, gas used, success/failure counts from receipts) and includes them in the report.
+
 ```bash
 # From file
-bench send --input transactions.ndjson --rpc http://localhost:8545 --tps 500
+bench send --input transactions.ndjson --rpc-url http://localhost:8545 --tps 500
 
 # From stdin (pipe from txgen)
-txgen generate -s workload.yaml -c ethereum -n 1000 | bench send --rpc http://localhost:8545
+txgen generate -s workload.yaml -c ethereum -n 1000 | bench send --rpc-url http://localhost:8545
+
+# With JSON report and metadata
+bench send -i txs.ndjson --rpc-url http://localhost:8545 \
+  --report json:report.json \
+  -m build-sha=abcdef -m build-profile=perf
 ```
 
 | Flag | Description |
 |------|-------------|
 | `-i, --input <PATH>` | Input NDJSON file (default: stdin) |
-| `--rpc <URL>` | RPC endpoint (default: `http://localhost:8545`) |
+| `--rpc-url <URL>` | RPC endpoint URLs, comma-separated or repeated (default: `http://localhost:8545`) |
 | `--tps <N>` | Target transactions per second (0 = unlimited) |
 | `--max-concurrent <N>` | Maximum concurrent requests (default: 100) |
 | `--timeout <DUR>` | Request timeout (default: 30s) |
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
+| `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
 
-**Required RPC methods:** `eth_sendRawTransaction`
+**Required RPC methods:** `eth_sendRawTransaction`, `eth_getBlockByNumber`, `eth_getBlockReceipts`
 
 #### `bench send-blocks`
 
@@ -164,6 +142,7 @@ bench send-blocks --engine http://localhost:8551 --jwt-secret /path/to/jwt.hex -
 | `--engine <URL>` | Engine API endpoint |
 | `--jwt-secret <PATH>` | Path to JWT secret file |
 | `-i, --input <PATH>` | Input NDJSON file (default: stdin) |
+| `--wait-for-persistence <POLICY>` | Persistence wait policy: `always`, `never`, or `every:N` (default: `every:2`) |
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
 
 **Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API)
@@ -402,9 +381,9 @@ Summary of which RPC methods are required by each feature:
 | RPC Method | Required By |
 |------------|-------------|
 | `eth_getTransactionCount` | `txgen generate --rpc` |
-| `eth_sendRawTransaction` | `bench run`, `bench send` |
-| `eth_getBlockByNumber` | `bench run` (block stats collection) |
-| `eth_getBlockReceipts` | `bench run` (block stats collection) |
+| `eth_sendRawTransaction` | `bench send` |
+| `eth_getBlockByNumber` | `bench send` (per-block stats collection) |
+| `eth_getBlockReceipts` | `bench send` (per-block stats collection) |
 | `debug_getRawBlock` | `txgen extract`, `bench replay` (source RPC) |
 | `reth_newPayload` | `bench send-blocks`, `bench replay` (engine) |
 | `reth_forkchoiceUpdated` | `bench send-blocks`, `bench replay` (engine) |
