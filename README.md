@@ -172,25 +172,6 @@ bench replay \
 - Source RPC: `debug_getRawBlock`
 - Engine API: `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API)
 
-#### `bench plot`
-
-Generate PNG charts from a JSON report.
-
-```bash
-bench plot --input report.json --output ./charts
-bench plot --input report.json -t throughput
-```
-
-| Flag | Description |
-|------|-------------|
-| `-i, --input <PATH>` | Input JSON report file |
-| `-o, --output <PATH>` | Output directory for PNGs (default: `.`) |
-| `-t, --plot-type <TYPE>` | `throughput`, `latency`, `cumulative`, `all` (default: `all`) |
-| `--width <PX>` | Chart width (default: 1200) |
-| `--height <PX>` | Chart height (default: 600) |
-
-**Required RPC methods:** None (offline)
-
 ### Live Progress
 
 During `bench send`, the console reporter displays a live progress line:

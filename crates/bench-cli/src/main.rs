@@ -4,14 +4,13 @@
 //! - `send` - Send from file/stdin
 //! - `send-blocks` - Submit blocks via reth Engine API
 //! - `replay` - Engine API block replay
-//! - `plot` - Generate plots from JSON report
+//! - `view` - Print an existing JSON report
 
 use clap::{Args, Parser, Subcommand};
 use eyre::Result;
 use std::path::PathBuf;
 use std::time::Duration;
 
-mod plot;
 mod replay;
 mod send;
 mod send_blocks;
@@ -114,30 +113,6 @@ pub struct SendBlocksArgs {
     pub reports: Vec<String>,
 }
 
-/// Arguments for the `plot` subcommand.
-#[derive(Args)]
-pub struct PlotArgs {
-    /// Input JSON report file
-    #[arg(short, long)]
-    pub input: PathBuf,
-
-    /// Output directory for PNG files
-    #[arg(short, long)]
-    pub output: Option<PathBuf>,
-
-    /// Type of plot to generate
-    #[arg(short = 't', long, default_value = "all")]
-    pub plot_type: plot::PlotType,
-
-    /// Chart width in pixels
-    #[arg(long, default_value = "1200")]
-    pub width: u32,
-
-    /// Chart height in pixels
-    #[arg(long, default_value = "600")]
-    pub height: u32,
-}
-
 #[derive(Parser)]
 #[command(name = "bench", about = "Transaction benchmarking tool")]
 struct Cli {
@@ -153,8 +128,6 @@ enum Command {
     SendBlocks(SendBlocksArgs),
     /// Replay blocks via Engine API
     Replay(ReplayArgs),
-    /// Generate plots from JSON report
-    Plot(PlotArgs),
 }
 
 fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
@@ -197,6 +170,5 @@ async fn main() -> Result<()> {
         Command::Send(args) => send::execute(args).await,
         Command::SendBlocks(args) => send_blocks::execute(args).await,
         Command::Replay(args) => replay::execute(args).await,
-        Command::Plot(args) => plot::execute(args),
     }
 }
