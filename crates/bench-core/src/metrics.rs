@@ -159,8 +159,6 @@ pub struct BlockStats {
     pub timestamp: u64,
     /// Total transactions in the block.
     pub tx_count: usize,
-    /// Successful transactions in the block.
-    pub success_count: usize,
     /// Gas used by the block.
     pub gas_used: u64,
     /// Gas limit of the block.
@@ -329,23 +327,14 @@ pub async fn collect_block_stats<P: Provider>(
             .wrap_err_with(|| format!("failed to fetch block {number}"))?
             .ok_or_else(|| eyre::eyre!("block {number} not found"))?;
 
-        let receipts = provider
-            .get_block_receipts(BlockNumberOrTag::Number(number).into())
-            .await
-            .wrap_err_with(|| format!("failed to fetch receipts for block {number}"))?
-            .unwrap_or_default();
-
         let block_time_ms =
             prev_timestamp.map(|prev| block.header.timestamp.saturating_sub(prev) * 1000);
         prev_timestamp = Some(block.header.timestamp);
 
-        let success_count = receipts.iter().filter(|r| r.status()).count();
-
         stats.push(BlockStats {
             number,
             timestamp: block.header.timestamp,
-            tx_count: receipts.len(),
-            success_count,
+            tx_count: block.transactions.len(),
             gas_used: block.header.gas_used,
             gas_limit: block.header.gas_limit,
             block_time_ms,
@@ -618,7 +607,6 @@ mod tests {
                 number: 100,
                 timestamp: 1000,
                 tx_count: 10,
-                success_count: 9,
                 gas_used: 1_000_000,
                 gas_limit: 30_000_000,
                 block_time_ms: None,
@@ -627,7 +615,6 @@ mod tests {
                 number: 101,
                 timestamp: 1012,
                 tx_count: 15,
-                success_count: 15,
                 gas_used: 1_500_000,
                 gas_limit: 30_000_000,
                 block_time_ms: Some(12000),
@@ -636,7 +623,6 @@ mod tests {
                 number: 102,
                 timestamp: 1024,
                 tx_count: 20,
-                success_count: 18,
                 gas_used: 2_000_000,
                 gas_limit: 30_000_000,
                 block_time_ms: Some(12000),
