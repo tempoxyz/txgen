@@ -6,11 +6,13 @@
 //! - Block-level statistics (post-run)
 
 use crate::clock::RunClock;
+use crate::sample::Sample;
 use alloy_eips::BlockNumberOrTag;
 use alloy_provider::Provider;
 
 use eyre::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -449,6 +451,51 @@ impl MetricsCollector {
         )
     }
 
+    /// Snapshot internal counters as unified [`Sample`]s.
+    ///
+    /// Returns samples for all txgen internal metrics at the current point
+    /// in time. Intended to be called periodically on the scrape ticker.
+    pub fn snapshot_samples(&self) -> Vec<Sample> {
+        let sent = self.sent.load(Ordering::Relaxed);
+        let success = self.success.load(Ordering::Relaxed);
+        let failed = self.failed.load(Ordering::Relaxed);
+        let inflight = sent.saturating_sub(success + failed);
+        let offset_ms = self.clock.offset_ms();
+        let unix_ms = self.clock.unix_ms();
+        let labels = BTreeMap::new();
+
+        vec![
+            Sample {
+                name: "txgen_transactions_sent_total".to_string(),
+                labels: labels.clone(),
+                value: sent as f64,
+                offset_ms,
+                unix_ms,
+            },
+            Sample {
+                name: "txgen_transactions_success_total".to_string(),
+                labels: labels.clone(),
+                value: success as f64,
+                offset_ms,
+                unix_ms,
+            },
+            Sample {
+                name: "txgen_transactions_failed_total".to_string(),
+                labels: labels.clone(),
+                value: failed as f64,
+                offset_ms,
+                unix_ms,
+            },
+            Sample {
+                name: "txgen_transactions_inflight".to_string(),
+                labels,
+                value: inflight as f64,
+                offset_ms,
+                unix_ms,
+            },
+        ]
+    }
+
     /// Compute final metrics.
     pub async fn finalize(&self) -> BenchMetrics {
         let elapsed = self.clock.elapsed();
@@ -563,6 +610,32 @@ mod tests {
         assert_eq!(sent, 2);
         assert_eq!(success, 1);
         assert_eq!(failed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_samples() {
+        let collector = MetricsCollector::new(RunClock::new());
+
+        collector.record_sent().await;
+        collector.record_sent().await;
+        collector.record_sent().await;
+        collector.record_success(Duration::from_millis(5)).await;
+        collector.record_failure().await;
+
+        let samples = collector.snapshot_samples();
+        assert_eq!(samples.len(), 4);
+
+        let by_name: std::collections::HashMap<&str, f64> =
+            samples.iter().map(|s| (s.name.as_str(), s.value)).collect();
+
+        assert_eq!(by_name["txgen_transactions_sent_total"], 3.0);
+        assert_eq!(by_name["txgen_transactions_success_total"], 1.0);
+        assert_eq!(by_name["txgen_transactions_failed_total"], 1.0);
+        assert_eq!(by_name["txgen_transactions_inflight"], 1.0);
+
+        // All samples share the same timestamp.
+        let offset = samples[0].offset_ms;
+        assert!(samples.iter().all(|s| s.offset_ms == offset));
     }
 
     #[test]
