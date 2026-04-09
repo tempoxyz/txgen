@@ -172,6 +172,21 @@ bench replay \
 - Source RPC: `debug_getRawBlock`
 - Engine API: `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API)
 
+#### `bench view`
+
+Print an existing JSON report to the console.
+
+```bash
+bench view
+bench view report.json
+```
+
+| Argument | Description |
+|----------|-------------|
+| `<INPUT>` | JSON report file (default: `report.json`) |
+
+**Required RPC methods:** None (offline)
+
 ### Live Progress
 
 During `bench send`, the console reporter displays a live progress line:

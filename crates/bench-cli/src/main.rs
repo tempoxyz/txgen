@@ -4,7 +4,7 @@
 //! - `send` - Send from file/stdin
 //! - `send-blocks` - Submit blocks via reth Engine API
 //! - `replay` - Engine API block replay
-//! - `view` - Print an existing JSON report
+//! - `view` - Print an existing JSON report to console
 
 use clap::{Args, Parser, Subcommand};
 use eyre::Result;
@@ -14,6 +14,7 @@ use std::time::Duration;
 mod replay;
 mod send;
 mod send_blocks;
+mod view;
 
 /// Arguments for the `send` subcommand.
 #[derive(Args)]
@@ -113,6 +114,14 @@ pub struct SendBlocksArgs {
     pub reports: Vec<String>,
 }
 
+/// Arguments for the `view` subcommand.
+#[derive(Args)]
+pub struct ViewArgs {
+    /// Input JSON report file
+    #[arg(default_value = "report.json")]
+    pub input: PathBuf,
+}
+
 #[derive(Parser)]
 #[command(name = "bench", about = "Transaction benchmarking tool")]
 struct Cli {
@@ -128,6 +137,8 @@ enum Command {
     SendBlocks(SendBlocksArgs),
     /// Replay blocks via Engine API
     Replay(ReplayArgs),
+    /// Print an existing JSON report to the console
+    View(ViewArgs),
 }
 
 fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
@@ -170,5 +181,6 @@ async fn main() -> Result<()> {
         Command::Send(args) => send::execute(args).await,
         Command::SendBlocks(args) => send_blocks::execute(args).await,
         Command::Replay(args) => replay::execute(args).await,
+        Command::View(args) => view::execute(args),
     }
 }

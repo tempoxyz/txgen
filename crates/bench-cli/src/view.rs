@@ -1,0 +1,49 @@
+//! `bench view` - Print an existing JSON report with the console reporter.
+
+use bench_core::{BenchMetrics, ConsoleReporter, JsonReport, LatencyStats, Reporter, RunStats};
+use eyre::{Context, Result};
+use std::fs;
+use std::time::Duration;
+
+use crate::ViewArgs;
+
+pub fn execute(args: ViewArgs) -> Result<()> {
+    let content = fs::read_to_string(&args.input)
+        .wrap_err_with(|| format!("failed to read {}", args.input.display()))?;
+
+    let report: JsonReport =
+        serde_json::from_str(&content).wrap_err("failed to parse JSON report")?;
+
+    let metrics = BenchMetrics {
+        sent: report.sent,
+        success: report.success,
+        failed: report.failed,
+        elapsed: Duration::from_secs_f64(report.elapsed_secs),
+        latency: LatencyStats {
+            min: Duration::from_secs_f64(report.latency.min_ms / 1000.0),
+            max: Duration::from_secs_f64(report.latency.max_ms / 1000.0),
+            mean: Duration::from_secs_f64(report.latency.mean_ms / 1000.0),
+            p50: Duration::from_secs_f64(report.latency.p50_ms / 1000.0),
+            p95: Duration::from_secs_f64(report.latency.p95_ms / 1000.0),
+            p99: Duration::from_secs_f64(report.latency.p99_ms / 1000.0),
+        },
+    };
+
+    let run_stats = report.run_stats.map(|rs| RunStats {
+        start_block: rs.start_block,
+        end_block: rs.end_block,
+        total_txs: rs.total_txs,
+        total_gas: rs.total_gas,
+        duration_ms: rs.duration_ms,
+        avg_tps: rs.avg_tps,
+        avg_gas_per_second: rs.avg_gas_per_second,
+        block_time_p50_ms: rs.block_time_p50_ms,
+        block_time_p95_ms: rs.block_time_p95_ms,
+        block_time_p99_ms: rs.block_time_p99_ms,
+    });
+
+    let mut reporter = ConsoleReporter::stderr(false);
+    reporter.finalize(&metrics, None, run_stats.as_ref())?;
+
+    Ok(())
+}
