@@ -12,8 +12,12 @@ use alloy_primitives::Bytes;
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_engine::JwtSecret;
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
-use bench_core::{ConsoleReporter, FinalReport, Reporter, WaitForPersistence, parse_reporters};
+use bench_core::{
+    ConsoleReporter, FinalReport, Reporter, RunClock, SampleStore, ScraperConfig,
+    WaitForPersistence, parse_reporters, start_scraper,
+};
 use eyre::{Context, Result, bail};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Number of blocks to prefetch ahead.
@@ -51,6 +55,20 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
     let mut reporters = parse_reporters(&args.reports)?;
     let mut console_reporter: Box<dyn Reporter> = Box::new(ConsoleReporter::stderr(false));
 
+    let clock = RunClock::new();
+    let store = SampleStore::new();
+
+    // Start background scraper if metrics URL is configured.
+    let scraper_handle = if let Some(ref url) = args.metrics_url {
+        let scraper_config =
+            ScraperConfig::new(url).with_interval(Duration::from_millis(args.scrape_interval_ms));
+        let handle = start_scraper(scraper_config, clock.clone(), store.clone());
+        tracing::info!(url, "Started metrics scraper");
+        Some(handle)
+    } else {
+        None
+    };
+
     // Fetch blocks in background (same pattern as `txgen extract`)
     let (tx, mut rx) = mpsc::channel::<Result<Bytes>>(DEFAULT_PREFETCH_SIZE);
     let fetch_handle = tokio::spawn(async move {
@@ -59,6 +77,7 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
 
     // Process blocks through the send-blocks pipeline
     let mut collector = send_blocks::MetricsCollector::default();
+    let mut replay_markers = Vec::new();
     let mut prev_block_hash = None;
     let mut finalized_hash = None;
     let persistence_policy = WaitForPersistence::Always;
@@ -71,7 +90,9 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
             &engine_provider,
             rlp_bytes,
             &meta,
+            &clock,
             &mut collector,
+            &mut replay_markers,
             &mut prev_block_hash,
             &mut finalized_hash,
             &persistence_policy,
@@ -81,7 +102,23 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
 
     fetch_handle.await?;
 
-    let report = FinalReport::default();
+    // Stop the scraper before finalizing.
+    if let Some(handle) = scraper_handle {
+        tracing::info!(
+            scrapes = handle.scrape_count(),
+            errors = handle.error_count(),
+            "Stopping metrics scraper"
+        );
+        handle.stop().await;
+    }
+
+    let samples = store.drain().await;
+
+    let report = FinalReport {
+        samples,
+        block_markers: replay_markers,
+        ..Default::default()
+    };
 
     for reporter in reporters.iter_mut() {
         reporter.finalize(&report)?;

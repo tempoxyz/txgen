@@ -56,6 +56,17 @@ pub struct SendArgs {
     ///   --metadata build-sha=abcdef --metadata build-profile=perf
     #[arg(short = 'm', long = "metadata", value_name = "KEY=VALUE")]
     pub metadata: Vec<String>,
+
+    /// Prometheus metrics endpoint to scrape during the benchmark.
+    ///
+    /// If set, a background scraper fetches node metrics at the configured
+    /// interval and includes them in the final report.
+    #[arg(long)]
+    pub metrics_url: Option<String>,
+
+    /// Scrape interval in milliseconds for the metrics scraper.
+    #[arg(long, default_value = "500")]
+    pub scrape_interval_ms: u64,
 }
 
 /// Arguments for the `replay` subcommand.
@@ -84,6 +95,14 @@ pub struct ReplayArgs {
     /// Report output destinations
     #[arg(long = "report", value_name = "FORMAT")]
     pub reports: Vec<String>,
+
+    /// Prometheus metrics endpoint to scrape during the benchmark.
+    #[arg(long)]
+    pub metrics_url: Option<String>,
+
+    /// Scrape interval in milliseconds for the metrics scraper.
+    #[arg(long, default_value = "500")]
+    pub scrape_interval_ms: u64,
 }
 
 /// Arguments for the `send-blocks` subcommand.
@@ -112,6 +131,14 @@ pub struct SendBlocksArgs {
     /// Report output destinations
     #[arg(long = "report", value_name = "FORMAT")]
     pub reports: Vec<String>,
+
+    /// Prometheus metrics endpoint to scrape during the benchmark.
+    #[arg(long)]
+    pub metrics_url: Option<String>,
+
+    /// Scrape interval in milliseconds for the metrics scraper.
+    #[arg(long, default_value = "500")]
+    pub scrape_interval_ms: u64,
 }
 
 /// Arguments for the `view` subcommand.

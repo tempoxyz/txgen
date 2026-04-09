@@ -14,12 +14,12 @@ use alloy_rlp::Decodable;
 use alloy_rpc_types_engine::{ForkchoiceState, JwtSecret};
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    ConsoleReporter, FinalReport, Reporter, RethApi, RethNewPayloadInput, WaitForPersistence,
-    parse_reporters,
+    BlockMarker, ConsoleReporter, FinalReport, Reporter, RethApi, RethNewPayloadInput, RunClock,
+    SampleStore, ScraperConfig, WaitForPersistence, parse_reporters, start_scraper,
 };
 use eyre::{Context, Result};
 use std::io::BufRead;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// NDJSON line from the block source.
@@ -62,7 +62,22 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let mut reporters = parse_reporters(&args.reports)?;
     let mut console_reporter: Box<dyn Reporter> = Box::new(ConsoleReporter::stderr(false));
 
+    let clock = RunClock::new();
+    let store = SampleStore::new();
+
+    // Start background scraper if metrics URL is configured.
+    let scraper_handle = if let Some(ref url) = args.metrics_url {
+        let scraper_config =
+            ScraperConfig::new(url).with_interval(Duration::from_millis(args.scrape_interval_ms));
+        let handle = start_scraper(scraper_config, clock.clone(), store.clone());
+        tracing::info!(url, "Started metrics scraper");
+        Some(handle)
+    } else {
+        None
+    };
+
     let mut collector = MetricsCollector::default();
+    let mut replay_markers = Vec::new();
     let mut prev_block_hash: Option<B256> = None;
     let mut finalized_hash: Option<B256> = None;
 
@@ -79,7 +94,9 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                 &provider,
                 block_bytes,
                 &meta,
+                &clock,
                 &mut collector,
+                &mut replay_markers,
                 &mut prev_block_hash,
                 &mut finalized_hash,
                 &persistence_policy,
@@ -108,7 +125,9 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                 &provider,
                 block_bytes,
                 &meta,
+                &clock,
                 &mut collector,
+                &mut replay_markers,
                 &mut prev_block_hash,
                 &mut finalized_hash,
                 &persistence_policy,
@@ -117,7 +136,23 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         }
     }
 
-    let report = FinalReport::default();
+    // Stop the scraper before finalizing.
+    if let Some(handle) = scraper_handle {
+        tracing::info!(
+            scrapes = handle.scrape_count(),
+            errors = handle.error_count(),
+            "Stopping metrics scraper"
+        );
+        handle.stop().await;
+    }
+
+    let samples = store.drain().await;
+
+    let report = FinalReport {
+        samples,
+        block_markers: replay_markers,
+        ..Default::default()
+    };
 
     for reporter in reporters.iter_mut() {
         reporter.finalize(&report)?;
@@ -153,7 +188,9 @@ pub(crate) async fn process_block(
     provider: &(impl Provider + RethApi<Ethereum>),
     block_bytes: Bytes,
     meta: &BlockMeta,
+    clock: &RunClock,
     collector: &mut MetricsCollector,
+    replay_markers: &mut Vec<BlockMarker>,
     prev_block_hash: &mut Option<B256>,
     finalized_hash: &mut Option<B256>,
     persistence_policy: &WaitForPersistence,
@@ -161,12 +198,14 @@ pub(crate) async fn process_block(
     let input = RethNewPayloadInput::BlockRlp(block_bytes);
     let wait = persistence_policy.should_wait(collector.blocks_submitted);
 
+    let submit_start_offset_ms = clock.offset_ms();
     let new_payload_start = Instant::now();
     let payload_status = provider
         .reth_new_payload(input, wait)
         .await
         .wrap_err("reth_newPayload failed")?;
     let new_payload_latency = new_payload_start.elapsed();
+    let new_payload_done_offset_ms = clock.offset_ms();
 
     if !payload_status.status.is_valid() && !payload_status.status.is_syncing() {
         tracing::warn!(
@@ -203,8 +242,17 @@ pub(crate) async fn process_block(
         );
     }
 
+    let fcu_done_offset_ms = clock.offset_ms();
     let total_latency = new_payload_latency + fcu_latency;
     let payload_status_str = payload_status.status.status.to_string();
+
+    replay_markers.push(BlockMarker {
+        number: meta.number,
+        chain_timestamp: Some(meta.timestamp),
+        offset_ms: submit_start_offset_ms,
+        new_payload_done_offset_ms: Some(new_payload_done_offset_ms),
+        fcu_done_offset_ms: Some(fcu_done_offset_ms),
+    });
 
     collector.record_block();
 
