@@ -15,6 +15,7 @@ pub mod prometheus;
 pub mod reporter;
 pub mod reth_api;
 pub mod sample;
+pub mod scraper;
 pub mod sender;
 pub mod source;
 
@@ -36,5 +37,6 @@ pub use reth_api::{
     RethPayloadStatus, WaitForPersistence,
 };
 pub use sample::{Sample, SampleStore};
+pub use scraper::{ScraperConfig, ScraperHandle, start_scraper};
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource, TxgenSource};
