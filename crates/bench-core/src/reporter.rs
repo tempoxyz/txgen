@@ -392,8 +392,6 @@ pub struct JsonBlockStats {
     pub timestamp: u64,
     /// Total transactions in the block.
     pub tx_count: usize,
-    /// Successful transactions in the block.
-    pub success_count: usize,
     /// Gas used by the block.
     pub gas_used: u64,
     /// Gas limit of the block.
@@ -409,7 +407,6 @@ impl From<&BlockStats> for JsonBlockStats {
             number: b.number,
             timestamp: b.timestamp,
             tx_count: b.tx_count,
-            success_count: b.success_count,
             gas_used: b.gas_used,
             gas_limit: b.gas_limit,
             block_time_ms: b.block_time_ms,
@@ -931,7 +928,6 @@ mod tests {
                     number: 100,
                     timestamp: 1000,
                     tx_count: 10,
-                    success_count: 9,
                     gas_used: 1_000_000,
                     gas_limit: 30_000_000,
                     block_time_ms: Some(12000),

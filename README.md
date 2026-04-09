@@ -102,7 +102,7 @@ txgen extract --rpc http://localhost:8545 --from 1000 --to 2000 -o blocks.ndjson
 
 Send pre-generated transactions from NDJSON file or stdin.
 
-After sending completes, queries the node for per-block statistics (transaction count, gas used, success/failure counts from receipts) and includes them in the report.
+After sending completes, queries the node for per-block statistics (transaction count, gas used) and includes them in the report.
 
 ```bash
 # From file
@@ -127,7 +127,7 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
 | `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
 
-**Required RPC methods:** `eth_sendRawTransaction`, `eth_getBlockByNumber`, `eth_getBlockReceipts`
+**Required RPC methods:** `eth_sendRawTransaction`, `eth_getBlockByNumber`
 
 #### `bench send-blocks`
 
@@ -405,7 +405,6 @@ Summary of which RPC methods are required by each feature:
 | `eth_getTransactionCount` | `txgen generate --rpc` |
 | `eth_sendRawTransaction` | `bench send` |
 | `eth_getBlockByNumber` | `bench send` (per-block stats collection) |
-| `eth_getBlockReceipts` | `bench send` (per-block stats collection) |
 | `debug_getRawBlock` | `txgen extract`, `bench replay` (source RPC) |
 | `reth_newPayload` | `bench send-blocks`, `bench replay` (engine) |
 | `reth_forkchoiceUpdated` | `bench send-blocks`, `bench replay` (engine) |
