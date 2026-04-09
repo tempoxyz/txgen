@@ -5,8 +5,8 @@ use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
-    ConsoleReporter, FileSource, MetricsCollector, Reporter, Sender, SenderConfig, StdinSource,
-    TxSource, parse_reporters,
+    ConsoleReporter, FileSource, MetricsCollector, Reporter, RunStats, Sender, SenderConfig,
+    StdinSource, TxSource, collect_block_stats, parse_reporters,
 };
 use eyre::{Context, Result, bail};
 use std::collections::HashMap;
@@ -40,7 +40,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         rate_limit: args.tps,
         max_concurrent: args.max_concurrent,
     };
-    let mut sender = Sender::new(providers, config, metrics.clone());
+    let mut sender = Sender::new(providers.clone(), config, metrics.clone());
 
     let mut reporters = parse_reporters(&args.reports)?;
     if reporters.is_empty() {
@@ -52,6 +52,14 @@ pub async fn execute(args: SendArgs) -> Result<()> {
             reporter.set_metadata(metadata.clone())?;
         }
     }
+
+    // Record the block number before sending so we can collect per-block stats
+    // afterwards. Use the first provider for block queries.
+    let query_provider = &providers[0];
+    let start_block = query_provider
+        .get_block_number()
+        .await
+        .wrap_err("failed to get starting block number")?;
 
     metrics.start().await;
 
@@ -71,8 +79,38 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     let final_metrics = metrics.finalize().await;
     let time_series = metrics.time_series().await;
 
+    // Collect per-block stats from the chain. The range starts one block after
+    // the block that was current before sending (start_block is the last
+    // existing block at that point, so start_block+1 is the first block that
+    // could contain our transactions) and ends at the current latest block.
+    let end_block = query_provider
+        .get_block_number()
+        .await
+        .wrap_err("failed to get ending block number")?;
+
+    let run_stats = if end_block > start_block {
+        let block_range_start = start_block + 1;
+        tracing::info!(
+            start = block_range_start,
+            end = end_block,
+            "Collecting per-block stats"
+        );
+
+        let block_stats = collect_block_stats(query_provider, block_range_start, end_block).await?;
+
+        for block in &block_stats {
+            for reporter in reporters.iter_mut() {
+                reporter.on_block(block)?;
+            }
+        }
+
+        Some(RunStats::from_blocks(&block_stats))
+    } else {
+        None
+    };
+
     for reporter in &mut reporters {
-        reporter.finalize(&final_metrics, Some(&time_series), None)?;
+        reporter.finalize(&final_metrics, Some(&time_series), run_stats.as_ref())?;
     }
 
     Ok(())
