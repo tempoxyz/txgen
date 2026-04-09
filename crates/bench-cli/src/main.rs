@@ -27,11 +27,18 @@ pub struct SendArgs {
     #[arg(long = "rpc-url", value_delimiter = ',', default_values_t = vec!["http://localhost:8545".to_string()])]
     pub rpc_urls: Vec<String>,
 
-    /// Target transactions per second (0 = unlimited)
+    /// Maximum transactions submitted per second (0 = unlimited).
+    ///
+    /// Controls throughput via a token bucket. Provides backpressure to the
+    /// transaction source before enqueueing. If max-concurrent is too low,
+    /// actual throughput may be lower than this target.
     #[arg(long, default_value = "0")]
     pub tps: u64,
 
-    /// Maximum concurrent requests
+    /// Maximum number of RPC requests in flight simultaneously.
+    ///
+    /// Controls parallelism independently of --tps. Limits how many
+    /// connections are open at once to avoid overwhelming the RPC endpoint.
     #[arg(long, default_value = "100")]
     pub max_concurrent: usize,
 
