@@ -14,8 +14,8 @@ use alloy_rlp::Decodable;
 use alloy_rpc_types_engine::{ForkchoiceState, JwtSecret};
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    ConsoleReporter, LatencyStats, ReplayBlockStats, ReplayRunStats, Reporter, RethApi,
-    RethNewPayloadInput, WaitForPersistence, compute_latency_stats, parse_reporters,
+    ConsoleReporter, FinalReport, LatencyStats, ReplayBlockStats, ReplayRunStats, Reporter,
+    RethApi, RethNewPayloadInput, WaitForPersistence, compute_latency_stats, parse_reporters,
 };
 use eyre::{Context, Result};
 use std::io::BufRead;
@@ -134,10 +134,15 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         block_time: metrics.block_time_stats.clone(),
     };
 
+    let report = FinalReport {
+        replay_stats: Some(run_stats),
+        ..Default::default()
+    };
+
     for reporter in reporters.iter_mut() {
-        reporter.finalize_replay(&run_stats)?;
+        reporter.finalize(&report)?;
     }
-    console_reporter.finalize_replay(&run_stats)?;
+    console_reporter.finalize(&report)?;
 
     Ok(())
 }

@@ -1,6 +1,8 @@
 //! `bench view` - Print an existing JSON report with the console reporter.
 
-use bench_core::{BenchMetrics, ConsoleReporter, JsonReport, LatencyStats, Reporter, RunStats};
+use bench_core::{
+    BenchMetrics, ConsoleReporter, FinalReport, JsonReport, LatencyStats, Reporter, RunStats,
+};
 use eyre::{Context, Result};
 use std::fs;
 use std::time::Duration;
@@ -42,8 +44,14 @@ pub fn execute(args: ViewArgs) -> Result<()> {
         block_time_p99_ms: rs.block_time_p99_ms,
     });
 
+    let final_report = FinalReport {
+        bench_metrics: Some(metrics),
+        run_stats,
+        ..Default::default()
+    };
+
     let mut reporter = ConsoleReporter::stderr(false);
-    reporter.finalize(&metrics, None, run_stats.as_ref())?;
+    reporter.finalize(&final_report)?;
 
     Ok(())
 }

@@ -5,8 +5,8 @@ use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
-    ConsoleReporter, FileSource, MetricsCollector, ProgressState, Reporter, RunClock, RunStats,
-    Sender, SenderConfig, StdinSource, TxSource, collect_block_stats, parse_reporters,
+    ConsoleReporter, FileSource, FinalReport, MetricsCollector, ProgressState, Reporter, RunClock,
+    RunStats, Sender, SenderConfig, StdinSource, TxSource, collect_block_stats, parse_reporters,
 };
 use eyre::{Context, Result, bail};
 use std::collections::HashMap;
@@ -48,12 +48,6 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         reporters.push(Box::new(ConsoleReporter::stderr(true)));
     }
 
-    if !metadata.is_empty() {
-        for reporter in &mut reporters {
-            reporter.set_metadata(metadata.clone())?;
-        }
-    }
-
     // Record the block number before sending so we can collect per-block stats
     // afterwards. Use the first provider for block queries.
     let query_provider = &providers[0];
@@ -87,7 +81,14 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         .await
         .wrap_err("failed to get ending block number")?;
 
-    let run_stats = if end_block > start_block {
+    let mut report = FinalReport {
+        metadata,
+        bench_metrics: Some(final_metrics),
+        time_series: Some(time_series),
+        ..Default::default()
+    };
+
+    if end_block > start_block {
         let block_range_start = start_block + 1;
         tracing::info!(
             start = block_range_start,
@@ -103,13 +104,12 @@ pub async fn execute(args: SendArgs) -> Result<()> {
             }
         }
 
-        Some(RunStats::from_blocks(&block_stats))
-    } else {
-        None
-    };
+        report.run_stats = Some(RunStats::from_blocks(&block_stats));
+        report.blocks = block_stats;
+    }
 
     for reporter in &mut reporters {
-        reporter.finalize(&final_metrics, Some(&time_series), run_stats.as_ref())?;
+        reporter.finalize(&report)?;
     }
 
     Ok(())

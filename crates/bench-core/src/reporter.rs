@@ -8,9 +8,40 @@
 use crate::metrics::{
     BenchMetrics, BlockStats, ReplayBlockStats, ReplayRunStats, RunStats, TimeSeriesMetrics,
 };
+use crate::sample::Sample;
+use crate::timeline::{BlockMarker, ReplayBlockMarker};
 use eyre::{Context, Result, bail};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
+
+/// Unified final report passed to reporters at finalization.
+///
+/// Contains both typed aggregates (for console/JSON reporters) and
+/// the raw unified sample stream (for TSDB reporters).
+#[derive(Debug, Default)]
+pub struct FinalReport {
+    /// User-provided metadata key/value pairs.
+    pub metadata: HashMap<String, String>,
+    /// Typed transaction metrics (send mode).
+    pub bench_metrics: Option<BenchMetrics>,
+    /// Per-second throughput + latency time-series (send mode).
+    pub time_series: Option<TimeSeriesMetrics>,
+    /// Block-level run summary (send mode).
+    pub run_stats: Option<RunStats>,
+    /// Replay run summary (replay/send-blocks mode).
+    pub replay_stats: Option<ReplayRunStats>,
+    /// Unified time-series samples (internal + node).
+    pub samples: Vec<Sample>,
+    /// Block observation markers (send mode).
+    pub block_markers: Vec<BlockMarker>,
+    /// Block submission markers (replay/send-blocks mode).
+    pub replay_block_markers: Vec<ReplayBlockMarker>,
+    /// Per-block chain stats (send mode).
+    pub blocks: Vec<BlockStats>,
+    /// Per-block replay stats (replay/send-blocks mode).
+    pub replay_blocks: Vec<ReplayBlockStats>,
+}
 
 /// Snapshot of progress state passed to reporters.
 pub struct ProgressState {
@@ -62,23 +93,8 @@ pub trait Reporter: Send {
         Ok(())
     }
 
-    /// Set user-provided metadata key/value pairs on the report.
-    fn set_metadata(&mut self, _metadata: std::collections::HashMap<String, String>) -> Result<()> {
-        Ok(())
-    }
-
-    /// Finalize and output the benchmark results.
-    fn finalize(
-        &mut self,
-        metrics: &BenchMetrics,
-        time_series: Option<&TimeSeriesMetrics>,
-        run_stats: Option<&RunStats>,
-    ) -> Result<()>;
-
-    /// Finalize and output replay benchmark results.
-    fn finalize_replay(&mut self, _stats: &ReplayRunStats) -> Result<()> {
-        Ok(())
-    }
+    /// Finalize and output results from the unified [`FinalReport`].
+    fn finalize(&mut self, report: &FinalReport) -> Result<()>;
 }
 
 /// Console reporter with human-readable output.
@@ -153,164 +169,159 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
         Ok(())
     }
 
-    fn finalize(
-        &mut self,
-        metrics: &BenchMetrics,
-        _time_series: Option<&TimeSeriesMetrics>,
-        run_stats: Option<&RunStats>,
-    ) -> Result<()> {
-        writeln!(self.writer)?;
-        writeln!(self.writer, "═══════════════════════════════════════")?;
-        writeln!(self.writer, "              Benchmark Results")?;
-        writeln!(self.writer, "═══════════════════════════════════════")?;
-        writeln!(self.writer)?;
-        writeln!(self.writer, "  Total Sent:      {:>10}", metrics.sent)?;
-        writeln!(self.writer, "  Successful:      {:>10}", metrics.success)?;
-        writeln!(self.writer, "  Failed:          {:>10}", metrics.failed)?;
-        writeln!(self.writer)?;
-        writeln!(
-            self.writer,
-            "  Duration:        {:>10.2}s",
-            metrics.elapsed.as_secs_f64()
-        )?;
-        writeln!(
-            self.writer,
-            "  Throughput:      {:>10.2} tx/s",
-            metrics.tps()
-        )?;
-        writeln!(
-            self.writer,
-            "  Success Rate:    {:>10.1}%",
-            metrics.success_rate()
-        )?;
-        writeln!(self.writer)?;
-        writeln!(self.writer, "  Latency:")?;
-        writeln!(
-            self.writer,
-            "    Min:           {:>10.2}ms",
-            metrics.latency.min.as_secs_f64() * 1000.0
-        )?;
-        writeln!(
-            self.writer,
-            "    Max:           {:>10.2}ms",
-            metrics.latency.max.as_secs_f64() * 1000.0
-        )?;
-        writeln!(
-            self.writer,
-            "    Mean:          {:>10.2}ms",
-            metrics.latency.mean.as_secs_f64() * 1000.0
-        )?;
-        writeln!(
-            self.writer,
-            "    P50:           {:>10.2}ms",
-            metrics.latency.p50.as_secs_f64() * 1000.0
-        )?;
-        writeln!(
-            self.writer,
-            "    P95:           {:>10.2}ms",
-            metrics.latency.p95.as_secs_f64() * 1000.0
-        )?;
-        writeln!(
-            self.writer,
-            "    P99:           {:>10.2}ms",
-            metrics.latency.p99.as_secs_f64() * 1000.0
-        )?;
-
-        if let Some(run) = run_stats {
+    fn finalize(&mut self, report: &FinalReport) -> Result<()> {
+        if let Some(metrics) = &report.bench_metrics {
             writeln!(self.writer)?;
-            writeln!(self.writer, "  Blocks:")?;
+            writeln!(self.writer, "═══════════════════════════════════════")?;
+            writeln!(self.writer, "              Benchmark Results")?;
+            writeln!(self.writer, "═══════════════════════════════════════")?;
+            writeln!(self.writer)?;
+            writeln!(self.writer, "  Total Sent:      {:>10}", metrics.sent)?;
+            writeln!(self.writer, "  Successful:      {:>10}", metrics.success)?;
+            writeln!(self.writer, "  Failed:          {:>10}", metrics.failed)?;
+            writeln!(self.writer)?;
             writeln!(
                 self.writer,
-                "    Range:         {:>10} - {}",
-                run.start_block, run.end_block
-            )?;
-            writeln!(self.writer, "    Avg TPS:       {:>10.2}", run.avg_tps)?;
-            writeln!(
-                self.writer,
-                "    Avg Gas/s:     {:>10.2}",
-                run.avg_gas_per_second
-            )?;
-            writeln!(
-                self.writer,
-                "    Block Time P50:{:>10}ms",
-                run.block_time_p50_ms
+                "  Duration:        {:>10.2}s",
+                metrics.elapsed.as_secs_f64()
             )?;
             writeln!(
                 self.writer,
-                "    Block Time P95:{:>10}ms",
-                run.block_time_p95_ms
+                "  Throughput:      {:>10.2} tx/s",
+                metrics.tps()
             )?;
             writeln!(
                 self.writer,
-                "    Block Time P99:{:>10}ms",
-                run.block_time_p99_ms
+                "  Success Rate:    {:>10.1}%",
+                metrics.success_rate()
             )?;
+            writeln!(self.writer)?;
+            writeln!(self.writer, "  Latency:")?;
+            writeln!(
+                self.writer,
+                "    Min:           {:>10.2}ms",
+                metrics.latency.min.as_secs_f64() * 1000.0
+            )?;
+            writeln!(
+                self.writer,
+                "    Max:           {:>10.2}ms",
+                metrics.latency.max.as_secs_f64() * 1000.0
+            )?;
+            writeln!(
+                self.writer,
+                "    Mean:          {:>10.2}ms",
+                metrics.latency.mean.as_secs_f64() * 1000.0
+            )?;
+            writeln!(
+                self.writer,
+                "    P50:           {:>10.2}ms",
+                metrics.latency.p50.as_secs_f64() * 1000.0
+            )?;
+            writeln!(
+                self.writer,
+                "    P95:           {:>10.2}ms",
+                metrics.latency.p95.as_secs_f64() * 1000.0
+            )?;
+            writeln!(
+                self.writer,
+                "    P99:           {:>10.2}ms",
+                metrics.latency.p99.as_secs_f64() * 1000.0
+            )?;
+
+            if let Some(run) = &report.run_stats {
+                writeln!(self.writer)?;
+                writeln!(self.writer, "  Blocks:")?;
+                writeln!(
+                    self.writer,
+                    "    Range:         {:>10} - {}",
+                    run.start_block, run.end_block
+                )?;
+                writeln!(self.writer, "    Avg TPS:       {:>10.2}", run.avg_tps)?;
+                writeln!(
+                    self.writer,
+                    "    Avg Gas/s:     {:>10.2}",
+                    run.avg_gas_per_second
+                )?;
+                writeln!(
+                    self.writer,
+                    "    Block Time P50:{:>10}ms",
+                    run.block_time_p50_ms
+                )?;
+                writeln!(
+                    self.writer,
+                    "    Block Time P95:{:>10}ms",
+                    run.block_time_p95_ms
+                )?;
+                writeln!(
+                    self.writer,
+                    "    Block Time P99:{:>10}ms",
+                    run.block_time_p99_ms
+                )?;
+            }
+
+            writeln!(self.writer)?;
+            writeln!(self.writer, "═══════════════════════════════════════")?;
         }
 
-        writeln!(self.writer)?;
-        writeln!(self.writer, "═══════════════════════════════════════")?;
-
-        Ok(())
-    }
-
-    fn finalize_replay(&mut self, stats: &ReplayRunStats) -> Result<()> {
-        writeln!(self.writer)?;
-        writeln!(
-            self.writer,
-            "═══════════════════════════════════════════════════════"
-        )?;
-        writeln!(self.writer, "                  Block Replay Results")?;
-        writeln!(
-            self.writer,
-            "═══════════════════════════════════════════════════════"
-        )?;
-        writeln!(self.writer)?;
-        writeln!(
-            self.writer,
-            "  Blocks Replayed: {:>10}",
-            stats.blocks_replayed
-        )?;
-        writeln!(self.writer, "  Total Txs:       {:>10}", stats.total_txs)?;
-        writeln!(
-            self.writer,
-            "  Total Gas:       {:>10.2} Ggas",
-            stats.total_gas as f64 / 1_000_000_000.0
-        )?;
-        writeln!(self.writer)?;
-        writeln!(
-            self.writer,
-            "  Duration:        {:>10.2}s",
-            stats.total_duration_ms as f64 / 1000.0
-        )?;
-        writeln!(
-            self.writer,
-            "  Blocks/sec:      {:>10.2}",
-            stats.blocks_per_second
-        )?;
-        writeln!(
-            self.writer,
-            "  Mgas/sec:        {:>10.2}",
-            stats.mgas_per_second
-        )?;
-        writeln!(
-            self.writer,
-            "  Ggas/sec:        {:>10.4}",
-            stats.ggas_per_second
-        )?;
-        writeln!(self.writer)?;
-        writeln!(self.writer, "  newPayload Latency:")?;
-        self.write_latency_stats(&stats.new_payload_latency)?;
-        writeln!(self.writer)?;
-        writeln!(self.writer, "  forkchoiceUpdated Latency:")?;
-        self.write_latency_stats(&stats.fcu_latency)?;
-        writeln!(self.writer)?;
-        writeln!(self.writer, "  Total Block Time:")?;
-        self.write_latency_stats(&stats.block_time)?;
-        writeln!(self.writer)?;
-        writeln!(
-            self.writer,
-            "═══════════════════════════════════════════════════════"
-        )?;
+        if let Some(stats) = &report.replay_stats {
+            writeln!(self.writer)?;
+            writeln!(
+                self.writer,
+                "═══════════════════════════════════════════════════════"
+            )?;
+            writeln!(self.writer, "                  Block Replay Results")?;
+            writeln!(
+                self.writer,
+                "═══════════════════════════════════════════════════════"
+            )?;
+            writeln!(self.writer)?;
+            writeln!(
+                self.writer,
+                "  Blocks Replayed: {:>10}",
+                stats.blocks_replayed
+            )?;
+            writeln!(self.writer, "  Total Txs:       {:>10}", stats.total_txs)?;
+            writeln!(
+                self.writer,
+                "  Total Gas:       {:>10.2} Ggas",
+                stats.total_gas as f64 / 1_000_000_000.0
+            )?;
+            writeln!(self.writer)?;
+            writeln!(
+                self.writer,
+                "  Duration:        {:>10.2}s",
+                stats.total_duration_ms as f64 / 1000.0
+            )?;
+            writeln!(
+                self.writer,
+                "  Blocks/sec:      {:>10.2}",
+                stats.blocks_per_second
+            )?;
+            writeln!(
+                self.writer,
+                "  Mgas/sec:        {:>10.2}",
+                stats.mgas_per_second
+            )?;
+            writeln!(
+                self.writer,
+                "  Ggas/sec:        {:>10.4}",
+                stats.ggas_per_second
+            )?;
+            writeln!(self.writer)?;
+            writeln!(self.writer, "  newPayload Latency:")?;
+            self.write_latency_stats(&stats.new_payload_latency)?;
+            writeln!(self.writer)?;
+            writeln!(self.writer, "  forkchoiceUpdated Latency:")?;
+            self.write_latency_stats(&stats.fcu_latency)?;
+            writeln!(self.writer)?;
+            writeln!(self.writer, "  Total Block Time:")?;
+            self.write_latency_stats(&stats.block_time)?;
+            writeln!(self.writer)?;
+            writeln!(
+                self.writer,
+                "═══════════════════════════════════════════════════════"
+            )?;
+        }
 
         Ok(())
     }
@@ -574,9 +585,6 @@ pub struct JsonLatencySample {
 /// JSON reporter for machine-readable output.
 pub struct JsonReporter<W: Write + Send = Box<dyn Write + Send>> {
     writer: W,
-    blocks: Vec<JsonBlockStats>,
-    replay_blocks: Vec<JsonReplayBlockStats>,
-    metadata: Option<std::collections::HashMap<String, String>>,
 }
 
 impl JsonReporter {
@@ -584,9 +592,6 @@ impl JsonReporter {
     pub fn stdout() -> Self {
         Self {
             writer: Box::new(std::io::stdout()),
-            blocks: Vec::new(),
-            replay_blocks: Vec::new(),
-            metadata: None,
         }
     }
 
@@ -595,9 +600,6 @@ impl JsonReporter {
         let file = std::fs::File::create(path).context("failed to create output file")?;
         Ok(JsonReporter {
             writer: std::io::BufWriter::new(file),
-            blocks: Vec::new(),
-            replay_blocks: Vec::new(),
-            metadata: None,
         })
     }
 }
@@ -605,127 +607,110 @@ impl JsonReporter {
 impl<W: Write + Send> JsonReporter<W> {
     /// Create a new JSON reporter with a custom writer.
     pub fn new(writer: W) -> Self {
-        Self {
-            writer,
-            blocks: Vec::new(),
-            replay_blocks: Vec::new(),
-            metadata: None,
-        }
+        Self { writer }
     }
 }
 
 impl<W: Write + Send> Reporter for JsonReporter<W> {
-    fn on_block(&mut self, block: &BlockStats) -> Result<()> {
-        self.blocks.push(JsonBlockStats::from(block));
-        Ok(())
-    }
+    fn finalize(&mut self, report: &FinalReport) -> Result<()> {
+        if let Some(metrics) = &report.bench_metrics {
+            let ts = report.time_series.as_ref().map(|ts| JsonTimeSeries {
+                throughput: ts
+                    .throughput
+                    .iter()
+                    .map(|s| JsonThroughputSample {
+                        second: s.second,
+                        sent: s.sent,
+                        success: s.success,
+                        failed: s.failed,
+                    })
+                    .collect(),
+                latencies: ts
+                    .latencies
+                    .iter()
+                    .map(|l| JsonLatencySample {
+                        offset_ms: l.offset_ms,
+                        latency_ms: l.latency.as_secs_f64() * 1000.0,
+                    })
+                    .collect(),
+            });
 
-    fn on_replay_block(&mut self, block: &ReplayBlockStats) -> Result<()> {
-        self.replay_blocks.push(JsonReplayBlockStats::from(block));
-        Ok(())
-    }
+            let blocks = if report.blocks.is_empty() {
+                None
+            } else {
+                Some(report.blocks.iter().map(JsonBlockStats::from).collect())
+            };
 
-    fn set_metadata(&mut self, metadata: std::collections::HashMap<String, String>) -> Result<()> {
-        if metadata.is_empty() {
-            self.metadata = None;
-        } else {
-            self.metadata = Some(metadata);
+            let metadata = if report.metadata.is_empty() {
+                None
+            } else {
+                Some(report.metadata.clone())
+            };
+
+            let json_report = JsonReport {
+                sent: metrics.sent,
+                success: metrics.success,
+                failed: metrics.failed,
+                elapsed_secs: metrics.elapsed.as_secs_f64(),
+                tps: metrics.tps(),
+                success_rate: metrics.success_rate(),
+                latency: JsonLatency {
+                    min_ms: metrics.latency.min.as_secs_f64() * 1000.0,
+                    max_ms: metrics.latency.max.as_secs_f64() * 1000.0,
+                    mean_ms: metrics.latency.mean.as_secs_f64() * 1000.0,
+                    p50_ms: metrics.latency.p50.as_secs_f64() * 1000.0,
+                    p95_ms: metrics.latency.p95.as_secs_f64() * 1000.0,
+                    p99_ms: metrics.latency.p99.as_secs_f64() * 1000.0,
+                },
+                time_series: ts,
+                blocks,
+                run_stats: report.run_stats.as_ref().map(JsonRunStats::from),
+                metadata,
+            };
+
+            serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
+            writeln!(self.writer)?;
         }
-        Ok(())
-    }
 
-    fn finalize(
-        &mut self,
-        metrics: &BenchMetrics,
-        time_series: Option<&TimeSeriesMetrics>,
-        run_stats: Option<&RunStats>,
-    ) -> Result<()> {
-        let ts = time_series.map(|ts| JsonTimeSeries {
-            throughput: ts
-                .throughput
-                .iter()
-                .map(|s| JsonThroughputSample {
-                    second: s.second,
-                    sent: s.sent,
-                    success: s.success,
-                    failed: s.failed,
-                })
-                .collect(),
-            latencies: ts
-                .latencies
-                .iter()
-                .map(|l| JsonLatencySample {
-                    offset_ms: l.offset_ms,
-                    latency_ms: l.latency.as_secs_f64() * 1000.0,
-                })
-                .collect(),
-        });
+        if let Some(stats) = &report.replay_stats {
+            let latency_to_json = |l: &crate::LatencyStats| JsonLatency {
+                min_ms: l.min.as_secs_f64() * 1000.0,
+                max_ms: l.max.as_secs_f64() * 1000.0,
+                mean_ms: l.mean.as_secs_f64() * 1000.0,
+                p50_ms: l.p50.as_secs_f64() * 1000.0,
+                p95_ms: l.p95.as_secs_f64() * 1000.0,
+                p99_ms: l.p99.as_secs_f64() * 1000.0,
+            };
 
-        let blocks = if self.blocks.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut self.blocks))
-        };
+            let blocks = if report.replay_blocks.is_empty() {
+                None
+            } else {
+                Some(
+                    report
+                        .replay_blocks
+                        .iter()
+                        .map(JsonReplayBlockStats::from)
+                        .collect(),
+                )
+            };
 
-        let report = JsonReport {
-            sent: metrics.sent,
-            success: metrics.success,
-            failed: metrics.failed,
-            elapsed_secs: metrics.elapsed.as_secs_f64(),
-            tps: metrics.tps(),
-            success_rate: metrics.success_rate(),
-            latency: JsonLatency {
-                min_ms: metrics.latency.min.as_secs_f64() * 1000.0,
-                max_ms: metrics.latency.max.as_secs_f64() * 1000.0,
-                mean_ms: metrics.latency.mean.as_secs_f64() * 1000.0,
-                p50_ms: metrics.latency.p50.as_secs_f64() * 1000.0,
-                p95_ms: metrics.latency.p95.as_secs_f64() * 1000.0,
-                p99_ms: metrics.latency.p99.as_secs_f64() * 1000.0,
-            },
-            time_series: ts,
-            blocks,
-            run_stats: run_stats.map(JsonRunStats::from),
-            metadata: self.metadata.take(),
-        };
+            let json_report = JsonReplayReport {
+                blocks_replayed: stats.blocks_replayed,
+                total_txs: stats.total_txs,
+                total_gas: stats.total_gas,
+                total_duration_ms: stats.total_duration_ms,
+                blocks_per_second: stats.blocks_per_second,
+                mgas_per_second: stats.mgas_per_second,
+                ggas_per_second: stats.ggas_per_second,
+                new_payload_latency: latency_to_json(&stats.new_payload_latency),
+                fcu_latency: latency_to_json(&stats.fcu_latency),
+                block_time: latency_to_json(&stats.block_time),
+                blocks,
+            };
 
-        serde_json::to_writer_pretty(&mut self.writer, &report)?;
-        writeln!(self.writer)?;
-
-        Ok(())
-    }
-
-    fn finalize_replay(&mut self, stats: &ReplayRunStats) -> Result<()> {
-        let latency_to_json = |l: &crate::LatencyStats| JsonLatency {
-            min_ms: l.min.as_secs_f64() * 1000.0,
-            max_ms: l.max.as_secs_f64() * 1000.0,
-            mean_ms: l.mean.as_secs_f64() * 1000.0,
-            p50_ms: l.p50.as_secs_f64() * 1000.0,
-            p95_ms: l.p95.as_secs_f64() * 1000.0,
-            p99_ms: l.p99.as_secs_f64() * 1000.0,
-        };
-
-        let blocks = if self.replay_blocks.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut self.replay_blocks))
-        };
-
-        let report = JsonReplayReport {
-            blocks_replayed: stats.blocks_replayed,
-            total_txs: stats.total_txs,
-            total_gas: stats.total_gas,
-            total_duration_ms: stats.total_duration_ms,
-            blocks_per_second: stats.blocks_per_second,
-            mgas_per_second: stats.mgas_per_second,
-            ggas_per_second: stats.ggas_per_second,
-            new_payload_latency: latency_to_json(&stats.new_payload_latency),
-            fcu_latency: latency_to_json(&stats.fcu_latency),
-            block_time: latency_to_json(&stats.block_time),
-            blocks,
-        };
-
-        serde_json::to_writer_pretty(&mut self.writer, &report)?;
-        writeln!(self.writer)?;
+            serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
+            writeln!(self.writer)?;
+        }
 
         Ok(())
     }
@@ -777,59 +762,56 @@ impl Reporter for ClickHouseReporter {
         Ok(())
     }
 
-    fn finalize(
-        &mut self,
-        metrics: &BenchMetrics,
-        _time_series: Option<&TimeSeriesMetrics>,
-        run_stats: Option<&RunStats>,
-    ) -> Result<()> {
-        // SAFETY: SystemTime::now() is always after UNIX_EPOCH
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+    fn finalize(&mut self, report: &FinalReport) -> Result<()> {
+        if let Some(metrics) = &report.bench_metrics {
+            // SAFETY: SystemTime::now() is always after UNIX_EPOCH
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
 
-        let tags_json = serde_json::to_string(&self.config.tags)?;
+            let tags_json = serde_json::to_string(&self.config.tags)?;
 
-        let query = format!(
-            "INSERT INTO {}.{} (timestamp, run_id, sent, success, failed, elapsed_secs, tps, success_rate, latency_min_ms, latency_max_ms, latency_mean_ms, latency_p50_ms, latency_p95_ms, latency_p99_ms, tags) VALUES ({}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, '{}')",
-            self.config.database,
-            self.config.table,
-            timestamp,
-            self.config.run_id,
-            metrics.sent,
-            metrics.success,
-            metrics.failed,
-            metrics.elapsed.as_secs_f64(),
-            metrics.tps(),
-            metrics.success_rate(),
-            metrics.latency.min.as_secs_f64() * 1000.0,
-            metrics.latency.max.as_secs_f64() * 1000.0,
-            metrics.latency.mean.as_secs_f64() * 1000.0,
-            metrics.latency.p50.as_secs_f64() * 1000.0,
-            metrics.latency.p95.as_secs_f64() * 1000.0,
-            metrics.latency.p99.as_secs_f64() * 1000.0,
-            tags_json.replace('\'', "\\'"),
-        );
+            let query = format!(
+                "INSERT INTO {}.{} (timestamp, run_id, sent, success, failed, elapsed_secs, tps, success_rate, latency_min_ms, latency_max_ms, latency_mean_ms, latency_p50_ms, latency_p95_ms, latency_p99_ms, tags) VALUES ({}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, '{}')",
+                self.config.database,
+                self.config.table,
+                timestamp,
+                self.config.run_id,
+                metrics.sent,
+                metrics.success,
+                metrics.failed,
+                metrics.elapsed.as_secs_f64(),
+                metrics.tps(),
+                metrics.success_rate(),
+                metrics.latency.min.as_secs_f64() * 1000.0,
+                metrics.latency.max.as_secs_f64() * 1000.0,
+                metrics.latency.mean.as_secs_f64() * 1000.0,
+                metrics.latency.p50.as_secs_f64() * 1000.0,
+                metrics.latency.p95.as_secs_f64() * 1000.0,
+                metrics.latency.p99.as_secs_f64() * 1000.0,
+                tags_json.replace('\'', "\\'"),
+            );
 
-        tracing::info!(
-            run_id = %self.config.run_id,
-            sent = metrics.sent,
-            success = metrics.success,
-            tps = metrics.tps(),
-            "Would insert to ClickHouse: {}",
-            query
-        );
-
-        if let Some(run) = run_stats {
             tracing::info!(
                 run_id = %self.config.run_id,
-                start_block = run.start_block,
-                end_block = run.end_block,
-                avg_tps = run.avg_tps,
-                avg_gas_per_second = run.avg_gas_per_second,
-                "Would insert run stats to ClickHouse"
+                sent = metrics.sent,
+                success = metrics.success,
+                tps = metrics.tps(),
+                "Would insert to ClickHouse: {}",
+                query
             );
+
+            if let Some(run) = &report.run_stats {
+                tracing::info!(
+                    run_id = %self.config.run_id,
+                    start_block = run.start_block,
+                    end_block = run.end_block,
+                    avg_tps = run.avg_tps,
+                    avg_gas_per_second = run.avg_gas_per_second,
+                    "Would insert run stats to ClickHouse"
+                );
+            }
         }
 
         Ok(())
@@ -890,12 +872,19 @@ mod tests {
         }
     }
 
+    fn sample_report() -> FinalReport {
+        FinalReport {
+            bench_metrics: Some(sample_metrics()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn test_console_reporter() {
         let mut output = Vec::new();
         {
             let mut reporter = ConsoleReporter::new(&mut output, false);
-            reporter.finalize(&sample_metrics(), None, None).unwrap();
+            reporter.finalize(&sample_report()).unwrap();
         }
 
         let output_str = String::from_utf8(output).unwrap();
@@ -909,7 +898,7 @@ mod tests {
         let mut output = Vec::new();
         {
             let mut reporter = JsonReporter::new(&mut output);
-            reporter.finalize(&sample_metrics(), None, None).unwrap();
+            reporter.finalize(&sample_report()).unwrap();
         }
 
         let output_str = String::from_utf8(output).unwrap();
@@ -923,17 +912,16 @@ mod tests {
         let mut output = Vec::new();
         {
             let mut reporter = JsonReporter::new(&mut output);
-            reporter
-                .on_block(&BlockStats {
-                    number: 100,
-                    timestamp: 1000,
-                    tx_count: 10,
-                    gas_used: 1_000_000,
-                    gas_limit: 30_000_000,
-                    block_time_ms: Some(12000),
-                })
-                .unwrap();
-            reporter.finalize(&sample_metrics(), None, None).unwrap();
+            let mut report = sample_report();
+            report.blocks = vec![BlockStats {
+                number: 100,
+                timestamp: 1000,
+                tx_count: 10,
+                gas_used: 1_000_000,
+                gas_limit: 30_000_000,
+                block_time_ms: Some(12000),
+            }];
+            reporter.finalize(&report).unwrap();
         }
 
         let output_str = String::from_utf8(output).unwrap();
