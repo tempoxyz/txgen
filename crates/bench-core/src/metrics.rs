@@ -383,6 +383,9 @@ pub struct MetricsCollector {
     sent: AtomicU64,
     success: AtomicU64,
     failed: AtomicU64,
+    /// Start instant, set once via [`Self::start`] and read lock-free
+    /// thereafter.
+    start_instant: std::sync::OnceLock<Instant>,
     start: RwLock<Option<Instant>>,
     latencies: RwLock<Vec<TimestampedLatency>>,
     events: RwLock<Vec<TimestampedEvent>>,
@@ -396,8 +399,19 @@ impl MetricsCollector {
 
     /// Mark the start of the benchmark.
     pub async fn start(&self) {
+        let now = Instant::now();
+        let _ = self.start_instant.set(now);
         let mut start = self.start.write().await;
-        *start = Some(Instant::now());
+        *start = Some(now);
+    }
+
+    /// Get the elapsed time since start (lock-free).
+    ///
+    /// Returns [`Duration::ZERO`] if [`Self::start`] has not been called.
+    pub fn elapsed_since_start(&self) -> Duration {
+        self.start_instant
+            .get()
+            .map_or(Duration::ZERO, |s| s.elapsed())
     }
 
     /// Get the elapsed time since start.

@@ -12,10 +12,43 @@ use eyre::{Context, Result, bail};
 use std::io::Write;
 use std::path::Path;
 
+/// Snapshot of progress state passed to reporters.
+pub struct ProgressState {
+    /// Total transactions submitted to the sender.
+    pub sent: u64,
+    /// Transactions that received an RPC response (success).
+    pub success: u64,
+    /// Transactions that failed.
+    pub failed: u64,
+    /// Elapsed time since benchmark start.
+    pub elapsed: std::time::Duration,
+    /// Configured `--max-concurrent` limit.
+    pub max_concurrent: usize,
+    /// Configured `--tps` target (`None` = unlimited).
+    pub target_tps: Option<u64>,
+}
+
+impl ProgressState {
+    /// Number of transactions currently in flight (sent but not yet resolved).
+    pub fn inflight(&self) -> u64 {
+        self.sent.saturating_sub(self.success + self.failed)
+    }
+
+    /// Actual send rate in transactions per second.
+    pub fn actual_tps(&self) -> f64 {
+        let secs = self.elapsed.as_secs_f64();
+        if secs > 0.0 {
+            self.sent as f64 / secs
+        } else {
+            0.0
+        }
+    }
+}
+
 /// Reporter trait for outputting benchmark results.
 pub trait Reporter: Send {
-    /// Called periodically during send with current counts.
-    fn on_progress(&mut self, _sent: u64, _success: u64, _failed: u64) -> Result<()> {
+    /// Called periodically during send with current progress.
+    fn on_progress(&mut self, _state: &ProgressState) -> Result<()> {
         Ok(())
     }
 
@@ -83,13 +116,24 @@ impl<W: Write + Send> ConsoleReporter<W> {
 }
 
 impl<W: Write + Send> Reporter for ConsoleReporter<W> {
-    fn on_progress(&mut self, sent: u64, success: u64, failed: u64) -> Result<()> {
+    fn on_progress(&mut self, state: &ProgressState) -> Result<()> {
         if self.show_progress {
+            let inflight = state.inflight();
+            let actual_tps = state.actual_tps();
+
             write!(
                 self.writer,
-                "\r  Sent: {} | Success: {} | Failed: {}",
-                sent, success, failed
+                "\r  Sent: {} | OK: {} | Fail: {} | Inflight: {}/{}",
+                state.sent, state.success, state.failed, inflight, state.max_concurrent
             )?;
+
+            write!(self.writer, " | Rate: {:.0}", actual_tps)?;
+
+            if let Some(target) = state.target_tps {
+                write!(self.writer, "/{}", target)?;
+            }
+
+            write!(self.writer, " tps")?;
             self.writer.flush()?;
         }
         Ok(())
@@ -907,12 +951,44 @@ mod tests {
         let mut output = Vec::new();
         {
             let mut reporter = ConsoleReporter::new(&mut output, true);
-            reporter.on_progress(100, 90, 10).unwrap();
+            let state = ProgressState {
+                sent: 100,
+                success: 90,
+                failed: 10,
+                elapsed: Duration::from_secs(10),
+                max_concurrent: 200,
+                target_tps: Some(1000),
+            };
+            reporter.on_progress(&state).unwrap();
         }
 
         let output_str = String::from_utf8(output).unwrap();
-        assert!(output_str.contains("100"));
-        assert!(output_str.contains("90"));
-        assert!(output_str.contains("10"));
+        assert!(output_str.contains("Sent: 100"));
+        assert!(output_str.contains("OK: 90"));
+        assert!(output_str.contains("Fail: 10"));
+        assert!(output_str.contains("Inflight: 0/200"));
+        assert!(output_str.contains("10/1000 tps"));
+    }
+
+    #[test]
+    fn test_console_reporter_on_progress_unlimited() {
+        let mut output = Vec::new();
+        {
+            let mut reporter = ConsoleReporter::new(&mut output, true);
+            let state = ProgressState {
+                sent: 5000,
+                success: 4800,
+                failed: 50,
+                elapsed: Duration::from_secs(5),
+                max_concurrent: 100,
+                target_tps: None,
+            };
+            reporter.on_progress(&state).unwrap();
+        }
+
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(output_str.contains("Inflight: 150/100"));
+        assert!(output_str.contains("1000 tps"));
+        assert!(!output_str.contains("1000/"));
     }
 }

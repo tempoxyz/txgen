@@ -5,8 +5,8 @@ use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
-    ConsoleReporter, FileSource, MetricsCollector, Reporter, RunStats, Sender, SenderConfig,
-    StdinSource, TxSource, collect_block_stats, parse_reporters,
+    ConsoleReporter, FileSource, MetricsCollector, ProgressState, Reporter, RunStats, Sender,
+    SenderConfig, StdinSource, TxSource, collect_block_stats, parse_reporters,
 };
 use eyre::{Context, Result, bail};
 use std::collections::HashMap;
@@ -40,7 +40,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         rate_limit: args.tps,
         max_concurrent: args.max_concurrent,
     };
-    let mut sender = Sender::new(providers.clone(), config, metrics.clone());
+    let mut sender = Sender::new(providers.clone(), config.clone(), metrics.clone());
 
     let mut reporters = parse_reporters(&args.reports)?;
     if reporters.is_empty() {
@@ -66,11 +66,11 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     match &args.input {
         Some(path) => {
             let mut source = FileSource::new(path).wrap_err("failed to open input file")?;
-            send_from_source(&mut source, &mut sender, &metrics, &mut reporters).await?;
+            send_from_source(&mut source, &mut sender, &metrics, &config, &mut reporters).await?;
         }
         None => {
             let mut source = StdinSource::new();
-            send_from_source(&mut source, &mut sender, &metrics, &mut reporters).await?;
+            send_from_source(&mut source, &mut sender, &metrics, &config, &mut reporters).await?;
         }
     }
 
@@ -135,6 +135,7 @@ async fn send_from_source<S: TxSource>(
     source: &mut S,
     sender: &mut Sender,
     metrics: &MetricsCollector,
+    config: &SenderConfig,
     reporters: &mut [Box<dyn Reporter>],
 ) -> Result<()> {
     while let Some(tx) = source.next_tx().await? {
@@ -142,8 +143,16 @@ async fn send_from_source<S: TxSource>(
 
         let (sent, success, failed) = metrics.counts();
         if sent % 1000 == 0 {
+            let state = ProgressState {
+                sent,
+                success,
+                failed,
+                elapsed: metrics.elapsed_since_start(),
+                max_concurrent: config.max_concurrent,
+                target_tps: (config.rate_limit > 0).then_some(config.rate_limit),
+            };
             for reporter in reporters.iter_mut() {
-                reporter.on_progress(sent, success, failed)?;
+                reporter.on_progress(&state)?;
             }
         }
     }
