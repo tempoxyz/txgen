@@ -43,6 +43,23 @@ pub struct FinalReport {
     pub replay_blocks: Vec<ReplayBlockStats>,
 }
 
+impl FinalReport {
+    /// Merge run-level labels into all samples.
+    ///
+    /// Labels from `extra` are added to each sample. If a sample already
+    /// has a label with the same key, the existing (node) value wins.
+    pub fn apply_labels(&mut self, extra: &HashMap<String, String>) {
+        if extra.is_empty() {
+            return;
+        }
+        for sample in &mut self.samples {
+            for (k, v) in extra {
+                sample.labels.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+}
+
 /// Snapshot of progress state passed to reporters.
 pub struct ProgressState {
     /// Total transactions submitted to the sender.
@@ -974,5 +991,47 @@ mod tests {
         assert!(output_str.contains("Inflight: 150/100"));
         assert!(output_str.contains("1000 tps"));
         assert!(!output_str.contains("1000/"));
+    }
+
+    #[test]
+    fn test_apply_labels() {
+        use crate::sample::Sample;
+        use std::collections::BTreeMap;
+
+        let mut report = FinalReport {
+            samples: vec![
+                Sample {
+                    name: "txgen_sent_total".to_string(),
+                    labels: BTreeMap::new(),
+                    value: 100.0,
+                    offset_ms: 0,
+                    unix_ms: 0,
+                },
+                Sample {
+                    name: "reth_metric".to_string(),
+                    labels: BTreeMap::from([("host".to_string(), "node-1".to_string())]),
+                    value: 42.0,
+                    offset_ms: 0,
+                    unix_ms: 0,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let labels = HashMap::from([
+            ("run_id".to_string(), "abc123".to_string()),
+            ("host".to_string(), "override-me".to_string()),
+        ]);
+        report.apply_labels(&labels);
+
+        // run_id added to both.
+        assert_eq!(report.samples[0].labels["run_id"], "abc123");
+        assert_eq!(report.samples[1].labels["run_id"], "abc123");
+
+        // Node label "host" preserved (not overwritten).
+        assert_eq!(report.samples[1].labels["host"], "node-1");
+
+        // No prior "host" label → gets the new value.
+        assert_eq!(report.samples[0].labels["host"], "override-me");
     }
 }
