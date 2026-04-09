@@ -56,7 +56,7 @@ while [[ $# -gt 0 ]]; do
     --spec|--count|--genesis|--tempo-bin|--block-time|--gas-limit|--max-tasks|--txpool-size|--seed|--datadir)
       SETUP_ARGS+=("$1" "$2"); shift 2 ;;
     # Run-only flags
-    --tps|--max-concurrent|--scrape-interval|--drain-timeout)
+    --tps|--max-concurrent|--rpc-url|--scrape-interval|--drain-timeout)
       RUN_ARGS+=("$1" "$2"); shift 2 ;;
     -h|--help)
       head -32 "$0" | tail -31; exit 0 ;;
