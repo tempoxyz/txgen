@@ -8,6 +8,8 @@ use crate::metrics::MetricsCollector;
 use alloy_network::Ethereum;
 use alloy_primitives::Bytes;
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
+use alloy_rpc_client::RpcClient;
+use alloy_transport::layers::RetryBackoffLayer;
 use eyre::{Context, Result};
 use rand::seq::IndexedRandom;
 use std::collections::HashMap;
@@ -63,12 +65,14 @@ pub struct Sender {
 impl Sender {
     /// Create a new sender.
     pub fn new(config: SenderConfig, metrics: Arc<MetricsCollector>) -> Result<Self> {
+        let retry_layer = RetryBackoffLayer::new(10, 100, 1000);
         let providers: Vec<DynProvider<Ethereum>> = config
             .rpc_urls
             .iter()
             .map(|url| {
                 let url = url.parse().context("failed to parse RPC URL")?;
-                Ok(ProviderBuilder::new().connect_http(url).erased())
+                let client = RpcClient::builder().layer(retry_layer.clone()).http(url);
+                Ok(ProviderBuilder::new().connect_client(client).erased())
             })
             .collect::<Result<_>>()?;
 
@@ -150,12 +154,6 @@ impl Sender {
     }
 }
 
-/// Maximum number of retries per transaction.
-const MAX_RETRIES: u32 = 10;
-
-/// Retry backoff delays (microseconds): 100µs, 500µs, 1ms, 5ms, 10ms, ...
-const RETRY_BACKOFFS_US: [u64; 6] = [100, 500, 1_000, 5_000, 10_000, 50_000];
-
 /// Worker that processes transactions for a single scheduling key.
 async fn key_worker(
     mut receiver: mpsc::Receiver<PendingTx>,
@@ -171,37 +169,15 @@ async fn key_worker(
         // SAFETY: `providers` is guaranteed to be non-empty by construction.
         let provider = providers.choose(&mut rand::rng()).unwrap();
 
-        let mut attempt = 0u32;
-        loop {
-            let start = Instant::now();
-
-            match provider.send_raw_transaction(&pending.raw).await {
-                Ok(_pending_tx) => {
-                    let latency = start.elapsed();
-                    if attempt > 0 {
-                        tracing::debug!(attempts = attempt + 1, "Succeeded after retry");
-                    }
-                    metrics.record_success(latency).await;
-                }
-                Err(e) => {
-                    attempt += 1;
-                    if attempt <= MAX_RETRIES {
-                        let backoff_idx = (attempt as usize - 1).min(RETRY_BACKOFFS_US.len() - 1);
-                        let backoff = Duration::from_micros(RETRY_BACKOFFS_US[backoff_idx]);
-                        tracing::debug!(
-                            attempt,
-                            error = %e,
-                            backoff_us = backoff.as_micros() as u64,
-                            "Retrying RPC error"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        continue;
-                    }
-                    tracing::warn!(error = %e, attempts = attempt, "RPC request failed (exhausted retries)");
-                    metrics.record_failure().await;
-                }
+        let start = Instant::now();
+        match provider.send_raw_transaction(&pending.raw).await {
+            Ok(_pending_tx) => {
+                metrics.record_success(start.elapsed()).await;
             }
-            break;
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to send transaction");
+                metrics.record_failure().await;
+            }
         }
     }
 }
