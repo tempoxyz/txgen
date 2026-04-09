@@ -5,8 +5,8 @@ use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
-    ConsoleReporter, FileSource, MetricsCollector, ProgressState, Reporter, RunStats, Sender,
-    SenderConfig, StdinSource, TxSource, collect_block_stats, parse_reporters,
+    ConsoleReporter, FileSource, MetricsCollector, ProgressState, Reporter, RunClock, RunStats,
+    Sender, SenderConfig, StdinSource, TxSource, collect_block_stats, parse_reporters,
 };
 use eyre::{Context, Result, bail};
 use std::collections::HashMap;
@@ -35,7 +35,8 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let metrics = MetricsCollector::new();
+    let clock = RunClock::new();
+    let metrics = MetricsCollector::new(clock);
     let config = SenderConfig {
         rate_limit: args.tps,
         max_concurrent: args.max_concurrent,
@@ -60,8 +61,6 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         .get_block_number()
         .await
         .wrap_err("failed to get starting block number")?;
-
-    metrics.start().await;
 
     match &args.input {
         Some(path) => {
