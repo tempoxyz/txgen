@@ -24,7 +24,7 @@ pub use metrics::{
 pub use reporter::{
     ClickHouseConfig, ClickHouseReporter, ConsoleReporter, JsonBlockStats, JsonLatency,
     JsonLatencySample, JsonReplayBlockStats, JsonReport, JsonReporter, JsonRunStats,
-    JsonThroughputSample, JsonTimeSeries, Reporter, parse_reporters,
+    JsonThroughputSample, JsonTimeSeries, ProgressState, Reporter, parse_reporters,
 };
 pub use reth_api::{
     DEFAULT_PERSISTENCE_THRESHOLD, RethApi, RethForkchoiceUpdated, RethNewPayloadInput,

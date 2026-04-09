@@ -191,6 +191,28 @@ bench plot --input report.json -t throughput
 
 **Required RPC methods:** None (offline)
 
+### Live Progress
+
+During `bench send`, the console reporter displays a live progress line:
+
+```
+  Sent: 5000 | OK: 4800 | Fail: 50 | Inflight: 150/200 | Rate: 980/1000 tps
+```
+
+| Field | Description |
+|-------|-------------|
+| `Sent` | Total transactions submitted to the sender |
+| `OK` | Successful RPC responses |
+| `Fail` | Failed RPC responses |
+| `Inflight` | Transactions sent but not yet resolved (current/`--max-concurrent`) |
+| `Rate` | Actual send rate (current/`--tps` target) |
+
+**Reading backpressure:**
+
+- **Concurrency-bound**: `Inflight` is at or near `--max-concurrent`. The RPC endpoint can't keep up — responses are slow relative to the send rate. Increase `--max-concurrent` or reduce `--tps`.
+- **Rate-limited**: `Rate` matches the `--tps` target and `Inflight` is well below `--max-concurrent`. The rate limiter is the bottleneck (working as intended).
+- **Source-bound**: `Rate` is below `--tps` and `Inflight` is low. The transaction source (file I/O or stdin pipe) is the bottleneck.
+
 ### Reporters
 
 Report destinations are specified with `--report` and can be repeated:
