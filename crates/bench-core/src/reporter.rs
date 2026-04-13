@@ -300,6 +300,12 @@ pub struct JsonReport {
     /// User-provided metadata key/value pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<std::collections::HashMap<String, String>>,
+    /// Unified time-series samples (internal + node metrics).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub samples: Vec<Sample>,
+    /// Block observation markers.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub block_markers: Vec<BlockMarker>,
 }
 
 /// Block statistics in JSON format.
@@ -507,6 +513,8 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
                 blocks,
                 run_stats: report.run_stats.as_ref().map(JsonRunStats::from),
                 metadata,
+                samples: report.samples.clone(),
+                block_markers: report.block_markers.clone(),
             };
 
             serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
