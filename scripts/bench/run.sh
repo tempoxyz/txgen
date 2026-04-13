@@ -108,6 +108,16 @@ done
 
 TOTAL_ELAPSED=$(( $(date +%s) - START_TIME ))
 
+# ── Kill tempo ───────────────────────────────────────────────────────
+if [[ -f "$DATADIR/tempo.pid" ]]; then
+  TEMPO_PID=$(cat "$DATADIR/tempo.pid")
+  if kill -0 "$TEMPO_PID" 2>/dev/null; then
+    echo "Stopping tempo (PID $TEMPO_PID)..."
+    kill "$TEMPO_PID"
+    wait "$TEMPO_PID" 2>/dev/null || true
+  fi
+fi
+
 echo ""
 echo "=== Run complete ==="
 echo "  Total time:   ${TOTAL_ELAPSED}s"
