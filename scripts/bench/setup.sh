@@ -141,8 +141,24 @@ echo "$ADDRESSES" | tr ' ' '\n' | xargs -P 50 -I{} \
   curl -sf -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","method":"tempo_fundAddress","params":["{}"],"id":1}' \
   http://localhost:8545 -o /dev/null
-echo "Funded. Waiting 5s for mining..."
-sleep 5
+echo "Funded. Waiting for txpool to drain..."
+ZERO_COUNT=0
+for i in $(seq 1 120); do
+  pending=$(curl -sf -X POST -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","method":"txpool_status","params":[],"id":1}' \
+    http://localhost:8545 2>/dev/null | python3 -c "import sys,json; print(int(json.load(sys.stdin)['result']['pending'],16))" 2>/dev/null || echo "?")
+  if [[ "$pending" == "0" ]]; then
+    ZERO_COUNT=$((ZERO_COUNT + 1))
+    if [[ $ZERO_COUNT -ge 3 ]]; then
+      echo "Txpool drained after ${i}s"
+      break
+    fi
+  else
+    ZERO_COUNT=0
+  fi
+  [[ $((i % 10)) -eq 0 ]] && echo "  pending: $pending"
+  sleep 1
+done
 
 # ── Generate transactions ───────────────────────────────────────────
 echo "Generating $COUNT transactions (seed=$SEED)..."
