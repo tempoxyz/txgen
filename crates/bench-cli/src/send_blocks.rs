@@ -6,6 +6,7 @@
 //! metrics from [`RethPayloadStatus`].
 
 use crate::SendBlocksArgs;
+use crate::send::parse_metadata;
 use alloy_consensus::{Block as ConsensusBlock, TxEnvelope};
 use alloy_network::Ethereum;
 use alloy_primitives::{B256, Bytes};
@@ -46,6 +47,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let jwt_secret =
         JwtSecret::from_hex(jwt_secret_hex.trim()).wrap_err("invalid JWT secret hex")?;
 
+    let metadata = parse_metadata(&args.metadata)?;
     let persistence_policy = args.wait_for_persistence;
 
     tracing::info!(
@@ -148,11 +150,14 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
 
     let samples = store.drain().await;
 
-    let report = FinalReport {
+    let mut report = FinalReport {
+        metadata: metadata.clone(),
         samples,
         block_markers: replay_markers,
         ..Default::default()
     };
+
+    report.apply_labels(&metadata);
 
     for reporter in reporters.iter_mut() {
         reporter.finalize(&report)?;

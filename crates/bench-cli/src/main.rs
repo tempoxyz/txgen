@@ -96,6 +96,10 @@ pub struct ReplayArgs {
     #[arg(long = "report", value_name = "FORMAT")]
     pub reports: Vec<String>,
 
+    /// Metadata key=value pairs to include in the report.
+    #[arg(short = 'm', long = "metadata", value_name = "KEY=VALUE")]
+    pub metadata: Vec<String>,
+
     /// Prometheus metrics endpoint to scrape during the benchmark.
     #[arg(long)]
     pub metrics_url: Option<String>,
@@ -131,6 +135,10 @@ pub struct SendBlocksArgs {
     /// Report output destinations
     #[arg(long = "report", value_name = "FORMAT")]
     pub reports: Vec<String>,
+
+    /// Metadata key=value pairs to include in the report.
+    #[arg(short = 'm', long = "metadata", value_name = "KEY=VALUE")]
+    pub metadata: Vec<String>,
 
     /// Prometheus metrics endpoint to scrape during the benchmark.
     #[arg(long)]

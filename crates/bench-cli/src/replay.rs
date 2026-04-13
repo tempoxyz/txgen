@@ -6,6 +6,7 @@
 //! NDJSON serialization/deserialization overhead.
 
 use crate::ReplayArgs;
+use crate::send::parse_metadata;
 use crate::send_blocks;
 use alloy_network::Ethereum;
 use alloy_primitives::Bytes;
@@ -27,6 +28,8 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
     if args.from > args.to {
         bail!("--from must be <= --to");
     }
+
+    let metadata = parse_metadata(&args.metadata)?;
 
     let jwt_secret_hex = tokio::fs::read_to_string(&args.jwt_secret)
         .await
@@ -114,11 +117,14 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
 
     let samples = store.drain().await;
 
-    let report = FinalReport {
+    let mut report = FinalReport {
+        metadata: metadata.clone(),
         samples,
         block_markers: replay_markers,
         ..Default::default()
     };
+
+    report.apply_labels(&metadata);
 
     for reporter in reporters.iter_mut() {
         reporter.finalize(&report)?;

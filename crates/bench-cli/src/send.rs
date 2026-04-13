@@ -162,7 +162,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
 }
 
 /// Parse `key=value` metadata strings into a HashMap.
-fn parse_metadata(args: &[String]) -> Result<HashMap<String, String>> {
+pub(crate) fn parse_metadata(args: &[String]) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
     for arg in args {
         let (key, value) = arg
