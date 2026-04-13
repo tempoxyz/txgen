@@ -14,12 +14,12 @@ use alloy_rlp::Decodable;
 use alloy_rpc_types_engine::{ForkchoiceState, JwtSecret};
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    ConsoleReporter, FinalReport, LatencyStats, ReplayBlockStats, ReplayRunStats, Reporter,
-    RethApi, RethNewPayloadInput, WaitForPersistence, compute_latency_stats, parse_reporters,
+    ConsoleReporter, FinalReport, Reporter, RethApi, RethNewPayloadInput, WaitForPersistence,
+    parse_reporters,
 };
 use eyre::{Context, Result};
 use std::io::BufRead;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// NDJSON line from the block source.
@@ -33,9 +33,9 @@ struct BlockLine {
 pub(crate) struct BlockMeta {
     pub(crate) hash: B256,
     pub(crate) number: u64,
+    #[allow(dead_code)]
     pub(crate) timestamp: u64,
     pub(crate) gas_used: u64,
-    pub(crate) gas_limit: u64,
     pub(crate) tx_count: usize,
 }
 
@@ -80,7 +80,6 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                 block_bytes,
                 &meta,
                 &mut collector,
-                &mut reporters,
                 &mut prev_block_hash,
                 &mut finalized_hash,
                 &persistence_policy,
@@ -110,7 +109,6 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                 block_bytes,
                 &meta,
                 &mut collector,
-                &mut reporters,
                 &mut prev_block_hash,
                 &mut finalized_hash,
                 &persistence_policy,
@@ -119,25 +117,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         }
     }
 
-    let metrics = collector.finalize();
-
-    let run_stats = ReplayRunStats {
-        blocks_replayed: metrics.blocks_submitted,
-        total_txs: metrics.total_txs,
-        total_gas: metrics.total_gas,
-        total_duration_ms: metrics.total_execution_time.as_millis() as u64,
-        blocks_per_second: metrics.blocks_per_second(),
-        mgas_per_second: metrics.mgas_per_second(),
-        ggas_per_second: metrics.ggas_per_second(),
-        new_payload_latency: metrics.new_payload_stats.clone(),
-        fcu_latency: metrics.fcu_stats.clone(),
-        block_time: metrics.block_time_stats.clone(),
-    };
-
-    let report = FinalReport {
-        replay_stats: Some(run_stats),
-        ..Default::default()
-    };
+    let report = FinalReport::default();
 
     for reporter in reporters.iter_mut() {
         reporter.finalize(&report)?;
@@ -164,7 +144,6 @@ pub(crate) fn decode_block_meta(rlp_bytes: &[u8]) -> Result<BlockMeta> {
         number: block.header.number,
         timestamp: block.header.timestamp,
         gas_used: block.header.gas_used,
-        gas_limit: block.header.gas_limit,
         tx_count: block.body.transactions.len(),
     })
 }
@@ -175,7 +154,6 @@ pub(crate) async fn process_block(
     block_bytes: Bytes,
     meta: &BlockMeta,
     collector: &mut MetricsCollector,
-    reporters: &mut [Box<dyn Reporter>],
     prev_block_hash: &mut Option<B256>,
     finalized_hash: &mut Option<B256>,
     persistence_policy: &WaitForPersistence,
@@ -228,31 +206,7 @@ pub(crate) async fn process_block(
     let total_latency = new_payload_latency + fcu_latency;
     let payload_status_str = payload_status.status.status.to_string();
 
-    collector.record_block(BlockMetrics {
-        tx_count: meta.tx_count as u64,
-        gas_used: meta.gas_used,
-        new_payload_latency,
-        fcu_latency,
-        total_latency,
-        server_latency_us: payload_status.latency_us,
-        server_persistence_wait_us: payload_status.persistence_wait_us,
-        server_execution_cache_wait_us: payload_status.execution_cache_wait_us,
-        server_sparse_trie_wait_us: payload_status.sparse_trie_wait_us,
-    });
-
-    for reporter in reporters.iter_mut() {
-        reporter.on_replay_block(&ReplayBlockStats {
-            number: meta.number,
-            timestamp: meta.timestamp,
-            tx_count: meta.tx_count,
-            gas_used: meta.gas_used,
-            gas_limit: meta.gas_limit,
-            new_payload_ms: new_payload_latency.as_millis() as u64,
-            fcu_ms: fcu_latency.as_millis() as u64,
-            total_latency_ms: total_latency.as_millis() as u64,
-            payload_status: payload_status_str.clone(),
-        })?;
-    }
+    collector.record_block();
 
     tracing::info!(
         block = meta.number,
@@ -275,94 +229,16 @@ pub(crate) async fn process_block(
     Ok(())
 }
 
-/// Metrics for a single submitted block.
-#[derive(Debug, Clone)]
-pub(crate) struct BlockMetrics {
-    tx_count: u64,
-    gas_used: u64,
-    new_payload_latency: Duration,
-    fcu_latency: Duration,
-    total_latency: Duration,
-    #[allow(dead_code)]
-    server_latency_us: u64,
-    #[allow(dead_code)]
-    server_persistence_wait_us: Option<u64>,
-    #[allow(dead_code)]
-    server_execution_cache_wait_us: Option<u64>,
-    #[allow(dead_code)]
-    server_sparse_trie_wait_us: Option<u64>,
-}
-
 /// Aggregated metrics collector.
+///
+/// Tracks `blocks_submitted` for the persistence policy.
 #[derive(Debug, Default)]
 pub(crate) struct MetricsCollector {
     blocks_submitted: u64,
-    total_txs: u64,
-    total_gas: u128,
-    total_execution_time: Duration,
-    new_payload_latencies: Vec<Duration>,
-    fcu_latencies: Vec<Duration>,
-    block_times: Vec<Duration>,
 }
 
 impl MetricsCollector {
-    pub(crate) fn record_block(&mut self, block: BlockMetrics) {
+    pub(crate) fn record_block(&mut self) {
         self.blocks_submitted += 1;
-        self.total_txs += block.tx_count;
-        self.total_gas += block.gas_used as u128;
-        self.total_execution_time += block.total_latency;
-        self.new_payload_latencies.push(block.new_payload_latency);
-        self.fcu_latencies.push(block.fcu_latency);
-        self.block_times.push(block.total_latency);
-    }
-
-    pub(crate) fn finalize(self) -> FinalMetrics {
-        FinalMetrics {
-            blocks_submitted: self.blocks_submitted,
-            total_txs: self.total_txs,
-            total_gas: self.total_gas,
-            total_execution_time: self.total_execution_time,
-            new_payload_stats: compute_latency_stats(&self.new_payload_latencies),
-            fcu_stats: compute_latency_stats(&self.fcu_latencies),
-            block_time_stats: compute_latency_stats(&self.block_times),
-        }
-    }
-}
-
-/// Finalized metrics with computed statistics.
-#[derive(Debug)]
-pub(crate) struct FinalMetrics {
-    pub(crate) blocks_submitted: u64,
-    pub(crate) total_txs: u64,
-    pub(crate) total_gas: u128,
-    pub(crate) total_execution_time: Duration,
-    pub(crate) new_payload_stats: LatencyStats,
-    pub(crate) fcu_stats: LatencyStats,
-    pub(crate) block_time_stats: LatencyStats,
-}
-
-impl FinalMetrics {
-    pub(crate) fn blocks_per_second(&self) -> f64 {
-        if self.total_execution_time.as_secs_f64() > 0.0 {
-            self.blocks_submitted as f64 / self.total_execution_time.as_secs_f64()
-        } else {
-            0.0
-        }
-    }
-
-    pub(crate) fn mgas_per_second(&self) -> f64 {
-        if self.total_execution_time.as_secs_f64() > 0.0 {
-            (self.total_gas as f64 / 1_000_000.0) / self.total_execution_time.as_secs_f64()
-        } else {
-            0.0
-        }
-    }
-
-    pub(crate) fn ggas_per_second(&self) -> f64 {
-        if self.total_execution_time.as_secs_f64() > 0.0 {
-            (self.total_gas as f64 / 1_000_000_000.0) / self.total_execution_time.as_secs_f64()
-        } else {
-            0.0
-        }
     }
 }

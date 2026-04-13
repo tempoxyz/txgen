@@ -23,15 +23,14 @@ pub mod timeline;
 pub use clock::RunClock;
 pub use historical::{HistoricalFetcher, HistoricalFetcherConfig, HistoricalTx};
 pub use metrics::{
-    BenchMetrics, BlockStats, LatencySample, LatencyStats, MetricsCollector, ReplayBlockStats,
-    ReplayRunStats, RunStats, ThroughputSample, TimeSeriesMetrics, collect_block_stats,
-    compute_latency_stats,
+    BenchMetrics, BlockStats, LatencySample, LatencyStats, MetricsCollector, RunStats,
+    ThroughputSample, TimeSeriesMetrics, collect_block_stats, compute_latency_stats,
 };
 pub use prometheus::parse_prometheus_text;
 pub use reporter::{
     ClickHouseConfig, ClickHouseReporter, ConsoleReporter, FinalReport, JsonBlockStats,
-    JsonLatency, JsonLatencySample, JsonReplayBlockStats, JsonReport, JsonReporter, JsonRunStats,
-    JsonThroughputSample, JsonTimeSeries, ProgressState, Reporter, parse_reporters,
+    JsonLatency, JsonLatencySample, JsonReport, JsonReporter, JsonRunStats, JsonThroughputSample,
+    JsonTimeSeries, ProgressState, Reporter, parse_reporters,
 };
 pub use reth_api::{
     DEFAULT_PERSISTENCE_THRESHOLD, RethApi, RethForkchoiceUpdated, RethNewPayloadInput,
@@ -41,4 +40,4 @@ pub use sample::{Sample, SampleStore};
 pub use scraper::{ScraperConfig, ScraperHandle, start_scraper};
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource, TxgenSource};
-pub use timeline::{BlockMarker, ReplayBlockMarker};
+pub use timeline::BlockMarker;
