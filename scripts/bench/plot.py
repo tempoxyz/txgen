@@ -1,39 +1,57 @@
 #!/usr/bin/env python3
-"""plot.py — Generate benchmark plots from scraped metrics.
+"""plot.py — Generate benchmark plots from report samples.
 
 Usage:
     uv run --with matplotlib python3 scripts/bench/plot.py [DATADIR]
 
 If DATADIR is omitted, reads from /tmp/txgen-bench-datadir.
 
-Reads $DATADIR/metrics.ndjson (one JSON object per scrape) and produces
-$DATADIR/bench_plots.png with a multi-panel overview.
+Reads $DATADIR/report.json and extracts the unified `samples` array to
+produce $DATADIR/bench_plots.png with a multi-panel overview.
 """
 
 import json
 import os
 import sys
+from collections import defaultdict
 
 
-def load_metrics(path: str) -> list[dict]:
-    """Load NDJSON metrics file and deduplicate by block number."""
-    rows = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
+def load_samples(report_path: str) -> list[dict]:
+    """Load samples from a JSON report file.
 
-    if not rows:
+    Returns a list of dicts, one per scrape timestamp, with metric names
+    as keys (labeled metrics flattened) and values as floats.
+    """
+    with open(report_path) as f:
+        report = json.load(f)
+
+    samples = report.get("samples", [])
+    if not samples:
         return []
 
-    # Deduplicate: keep last sample per block number
-    seen: dict[int, dict] = {}
-    for r in rows:
-        block = int(r.get("reth_blockchain_tree_canonical_chain_height", 0))
-        seen[block] = r
-    return sorted(seen.values(), key=lambda r: r["ts_ms"])
+    # Group samples by offset_ms (each scrape produces multiple samples
+    # at the same offset).
+    by_offset: dict[int, dict] = defaultdict(dict)
+    for s in samples:
+        offset = s["offset_ms"]
+        name = s["name"]
+        labels = s.get("labels", {})
+
+        # Flatten labels into key (same convention as old scrape.py)
+        if labels:
+            if "quantile" in labels:
+                key = f"{name}.q{labels['quantile']}"
+            else:
+                suffix = ".".join(labels.values())
+                key = f"{name}.{suffix}"
+        else:
+            key = name
+
+        by_offset[offset][key] = s["value"]
+        by_offset[offset]["ts_ms"] = s.get("unix_ms", offset)
+
+    # Sort by offset and return as list
+    return [by_offset[k] for k in sorted(by_offset.keys())]
 
 
 def col(rows: list[dict], key: str, conv=float, default=0):
@@ -57,9 +75,9 @@ def main():
         with open("/tmp/txgen-bench-datadir") as f:
             datadir = f.read().strip()
 
-    metrics_path = os.path.join(datadir, "metrics.ndjson")
-    if not os.path.exists(metrics_path):
-        print(f"error: {metrics_path} not found", file=sys.stderr)
+    report_path = os.path.join(datadir, "report.json")
+    if not os.path.exists(report_path):
+        print(f"error: {report_path} not found", file=sys.stderr)
         sys.exit(1)
 
     import matplotlib
@@ -67,10 +85,17 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    rows = load_metrics(metrics_path)
+    rows = load_samples(report_path)
     if not rows:
-        print("error: no data rows", file=sys.stderr)
+        print("error: no sample data in report (was --metrics-url used?)", file=sys.stderr)
         sys.exit(1)
+
+    # Deduplicate: keep last sample per block number
+    seen: dict[int, dict] = {}
+    for r in rows:
+        block = int(r.get("reth_blockchain_tree_canonical_chain_height", 0))
+        seen[block] = r
+    rows = sorted(seen.values(), key=lambda r: r["ts_ms"])
 
     # Print available metric keys for reference
     all_keys = sorted(set().union(*(r.keys() for r in rows)))

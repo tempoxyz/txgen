@@ -1,8 +1,8 @@
 # Bench Scripts
 
 End-to-end benchmarking for a local Tempo dev node. Starts a node, funds
-accounts, generates transactions, sends them with metrics scraping, waits
-for the txpool to drain, and produces a 15-panel matplotlib dashboard.
+accounts, generates transactions, sends them with built-in metrics scraping,
+waits for the txpool to drain, and produces a 15-panel matplotlib dashboard.
 
 ## Setup
 
@@ -45,9 +45,9 @@ cargo build --release -p bench-cli -p txgen-tempo
 
 ### 4. Other dependencies
 
-- Python 3 (for `scrape.py` and `plot.py`)
+- Python 3 (for `plot.py` summary report parsing)
 - [uv](https://github.com/astral-sh/uv) (for running `plot.py` with matplotlib)
-- `curl` (for RPC calls and metrics scraping)
+- `curl` (for RPC calls during pool drain wait)
 
 ## Quick Start
 
@@ -68,6 +68,9 @@ cargo build --release -p bench-cli -p txgen-tempo
 # Skip setup (reuse running node + existing txs)
 ./scripts/bench/all.sh --no-setup --tps 10000
 
+# Custom metrics endpoint
+./scripts/bench/all.sh --metrics-url http://127.0.0.1:9001/metrics
+
 # Run in tmux, plot later
 ./scripts/bench/all.sh --tmux --no-plot
 uv run --with matplotlib python3 scripts/bench/plot.py
@@ -81,9 +84,8 @@ uv run --with matplotlib python3 scripts/bench/plot.py /path/to/datadir
 | Script       | Purpose                                                      |
 |--------------|--------------------------------------------------------------|
 | `setup.sh`   | Kill old node, patch genesis, start Tempo, fund accounts, generate txs |
-| `run.sh`     | Start metrics scraper, run bench, wait for pool drain        |
-| `scrape.py`  | Capture all Prometheus metrics to NDJSON (every 500ms)       |
-| `plot.py`    | 15-panel matplotlib dashboard from scraped metrics           |
+| `run.sh`     | Run bench with built-in metrics scraping, wait for pool drain |
+| `plot.py`    | 15-panel matplotlib dashboard from report samples            |
 | `all.sh`     | Orchestrates setup → run → plot                             |
 
 ## Outputs
@@ -91,11 +93,20 @@ uv run --with matplotlib python3 scripts/bench/plot.py /path/to/datadir
 All outputs go to a temp datadir (path stored in `/tmp/txgen-bench-datadir`):
 
 - `txs.ndjson` — generated transactions
-- `metrics.ndjson` — scraped Prometheus metrics (one JSON object per sample)
-- `report.json` — bench send report (sent/success/failed/latency)
+- `report.json` — bench report with scraped metrics in the `samples` array
 - `bench_plots.png` — matplotlib dashboard
 - `metric_keys.txt` — list of all available metric keys
 - `tempo.log` — node logs
+
+## Metrics
+
+Metrics scraping is handled by the `bench` binary itself via `--metrics-url`.
+The scraper runs in-process alongside the benchmark, fetching the node's
+Prometheus `/metrics` endpoint at the configured interval (default: 500ms).
+All scraped samples are included in the JSON report's `samples` array.
+
+The `plot.py` script reads samples directly from `report.json` — no
+separate metrics file is needed.
 
 ## Notes
 
