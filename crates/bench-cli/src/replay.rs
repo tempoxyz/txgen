@@ -12,9 +12,7 @@ use alloy_primitives::Bytes;
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_engine::JwtSecret;
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
-use bench_core::{
-    ConsoleReporter, FinalReport, ReplayRunStats, Reporter, WaitForPersistence, parse_reporters,
-};
+use bench_core::{ConsoleReporter, FinalReport, Reporter, WaitForPersistence, parse_reporters};
 use eyre::{Context, Result, bail};
 use tokio::sync::mpsc;
 
@@ -74,7 +72,6 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
             rlp_bytes,
             &meta,
             &mut collector,
-            &mut reporters,
             &mut prev_block_hash,
             &mut finalized_hash,
             &persistence_policy,
@@ -84,25 +81,7 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
 
     fetch_handle.await?;
 
-    let metrics = collector.finalize();
-
-    let run_stats = ReplayRunStats {
-        blocks_replayed: metrics.blocks_submitted,
-        total_txs: metrics.total_txs,
-        total_gas: metrics.total_gas,
-        total_duration_ms: metrics.total_execution_time.as_millis() as u64,
-        blocks_per_second: metrics.blocks_per_second(),
-        mgas_per_second: metrics.mgas_per_second(),
-        ggas_per_second: metrics.ggas_per_second(),
-        new_payload_latency: metrics.new_payload_stats.clone(),
-        fcu_latency: metrics.fcu_stats.clone(),
-        block_time: metrics.block_time_stats.clone(),
-    };
-
-    let report = FinalReport {
-        replay_stats: Some(run_stats),
-        ..Default::default()
-    };
+    let report = FinalReport::default();
 
     for reporter in reporters.iter_mut() {
         reporter.finalize(&report)?;

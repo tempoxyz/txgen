@@ -5,11 +5,9 @@
 //! - JSON (machine-readable)
 //! - ClickHouse (for time-series storage)
 
-use crate::metrics::{
-    BenchMetrics, BlockStats, ReplayBlockStats, ReplayRunStats, RunStats, TimeSeriesMetrics,
-};
+use crate::metrics::{BenchMetrics, BlockStats, RunStats, TimeSeriesMetrics};
 use crate::sample::Sample;
-use crate::timeline::{BlockMarker, ReplayBlockMarker};
+use crate::timeline::BlockMarker;
 use eyre::{Context, Result, bail};
 use std::collections::HashMap;
 use std::io::Write;
@@ -29,18 +27,12 @@ pub struct FinalReport {
     pub time_series: Option<TimeSeriesMetrics>,
     /// Block-level run summary (send mode).
     pub run_stats: Option<RunStats>,
-    /// Replay run summary (replay/send-blocks mode).
-    pub replay_stats: Option<ReplayRunStats>,
     /// Unified time-series samples (internal + node).
     pub samples: Vec<Sample>,
-    /// Block observation markers (send mode).
+    /// Block timeline markers (observation or submission).
     pub block_markers: Vec<BlockMarker>,
-    /// Block submission markers (replay/send-blocks mode).
-    pub replay_block_markers: Vec<ReplayBlockMarker>,
     /// Per-block chain stats (send mode).
     pub blocks: Vec<BlockStats>,
-    /// Per-block replay stats (replay/send-blocks mode).
-    pub replay_blocks: Vec<ReplayBlockStats>,
 }
 
 impl FinalReport {
@@ -102,11 +94,6 @@ pub trait Reporter: Send {
 
     /// Called for each block during block stats collection.
     fn on_block(&mut self, _block: &BlockStats) -> Result<()> {
-        Ok(())
-    }
-
-    /// Called for each replayed block during Engine API replay.
-    fn on_replay_block(&mut self, _block: &ReplayBlockStats) -> Result<()> {
         Ok(())
     }
 
@@ -280,102 +267,6 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
             writeln!(self.writer, "═══════════════════════════════════════")?;
         }
 
-        if let Some(stats) = &report.replay_stats {
-            writeln!(self.writer)?;
-            writeln!(
-                self.writer,
-                "═══════════════════════════════════════════════════════"
-            )?;
-            writeln!(self.writer, "                  Block Replay Results")?;
-            writeln!(
-                self.writer,
-                "═══════════════════════════════════════════════════════"
-            )?;
-            writeln!(self.writer)?;
-            writeln!(
-                self.writer,
-                "  Blocks Replayed: {:>10}",
-                stats.blocks_replayed
-            )?;
-            writeln!(self.writer, "  Total Txs:       {:>10}", stats.total_txs)?;
-            writeln!(
-                self.writer,
-                "  Total Gas:       {:>10.2} Ggas",
-                stats.total_gas as f64 / 1_000_000_000.0
-            )?;
-            writeln!(self.writer)?;
-            writeln!(
-                self.writer,
-                "  Duration:        {:>10.2}s",
-                stats.total_duration_ms as f64 / 1000.0
-            )?;
-            writeln!(
-                self.writer,
-                "  Blocks/sec:      {:>10.2}",
-                stats.blocks_per_second
-            )?;
-            writeln!(
-                self.writer,
-                "  Mgas/sec:        {:>10.2}",
-                stats.mgas_per_second
-            )?;
-            writeln!(
-                self.writer,
-                "  Ggas/sec:        {:>10.4}",
-                stats.ggas_per_second
-            )?;
-            writeln!(self.writer)?;
-            writeln!(self.writer, "  newPayload Latency:")?;
-            self.write_latency_stats(&stats.new_payload_latency)?;
-            writeln!(self.writer)?;
-            writeln!(self.writer, "  forkchoiceUpdated Latency:")?;
-            self.write_latency_stats(&stats.fcu_latency)?;
-            writeln!(self.writer)?;
-            writeln!(self.writer, "  Total Block Time:")?;
-            self.write_latency_stats(&stats.block_time)?;
-            writeln!(self.writer)?;
-            writeln!(
-                self.writer,
-                "═══════════════════════════════════════════════════════"
-            )?;
-        }
-
-        Ok(())
-    }
-}
-
-impl<W: Write + Send> ConsoleReporter<W> {
-    fn write_latency_stats(&mut self, stats: &crate::LatencyStats) -> Result<()> {
-        writeln!(
-            self.writer,
-            "    Min:           {:>10.2}ms",
-            stats.min.as_secs_f64() * 1000.0
-        )?;
-        writeln!(
-            self.writer,
-            "    Max:           {:>10.2}ms",
-            stats.max.as_secs_f64() * 1000.0
-        )?;
-        writeln!(
-            self.writer,
-            "    Mean:          {:>10.2}ms",
-            stats.mean.as_secs_f64() * 1000.0
-        )?;
-        writeln!(
-            self.writer,
-            "    P50:           {:>10.2}ms",
-            stats.p50.as_secs_f64() * 1000.0
-        )?;
-        writeln!(
-            self.writer,
-            "    P95:           {:>10.2}ms",
-            stats.p95.as_secs_f64() * 1000.0
-        )?;
-        writeln!(
-            self.writer,
-            "    P99:           {:>10.2}ms",
-            stats.p99.as_secs_f64() * 1000.0
-        )?;
         Ok(())
     }
 }
@@ -442,45 +333,6 @@ impl From<&BlockStats> for JsonBlockStats {
     }
 }
 
-/// Replay block statistics in JSON format.
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-pub struct JsonReplayBlockStats {
-    /// Block number.
-    pub number: u64,
-    /// Block timestamp (unix seconds).
-    pub timestamp: u64,
-    /// Total transactions in the block.
-    pub tx_count: usize,
-    /// Gas used by the block.
-    pub gas_used: u64,
-    /// Gas limit of the block.
-    pub gas_limit: u64,
-    /// newPayload latency in milliseconds.
-    pub new_payload_ms: u64,
-    /// forkchoiceUpdated latency in milliseconds.
-    pub fcu_ms: u64,
-    /// Total execution latency in milliseconds.
-    pub total_latency_ms: u64,
-    /// Payload status from newPayload response.
-    pub payload_status: String,
-}
-
-impl From<&ReplayBlockStats> for JsonReplayBlockStats {
-    fn from(b: &ReplayBlockStats) -> Self {
-        Self {
-            number: b.number,
-            timestamp: b.timestamp,
-            tx_count: b.tx_count,
-            gas_used: b.gas_used,
-            gas_limit: b.gas_limit,
-            new_payload_ms: b.new_payload_ms,
-            fcu_ms: b.fcu_ms,
-            total_latency_ms: b.total_latency_ms,
-            payload_status: b.payload_status.clone(),
-        }
-    }
-}
-
 /// Run summary statistics in JSON format.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct JsonRunStats {
@@ -521,34 +373,6 @@ impl From<&RunStats> for JsonRunStats {
             block_time_p99_ms: r.block_time_p99_ms,
         }
     }
-}
-
-/// JSON output format for replay benchmarks.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct JsonReplayReport {
-    /// Number of blocks replayed.
-    pub blocks_replayed: u64,
-    /// Total transactions across all blocks.
-    pub total_txs: u64,
-    /// Total gas used (in gas units).
-    pub total_gas: u128,
-    /// Total execution time in milliseconds.
-    pub total_duration_ms: u64,
-    /// Blocks replayed per second.
-    pub blocks_per_second: f64,
-    /// Megagas per second.
-    pub mgas_per_second: f64,
-    /// Gigagas per second.
-    pub ggas_per_second: f64,
-    /// newPayload latency statistics.
-    pub new_payload_latency: JsonLatency,
-    /// forkchoiceUpdated latency statistics.
-    pub fcu_latency: JsonLatency,
-    /// Total block time statistics.
-    pub block_time: JsonLatency,
-    /// Per-block replay statistics (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub blocks: Option<Vec<JsonReplayBlockStats>>,
 }
 
 /// Latency statistics in JSON format.
@@ -683,46 +507,6 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
                 blocks,
                 run_stats: report.run_stats.as_ref().map(JsonRunStats::from),
                 metadata,
-            };
-
-            serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
-            writeln!(self.writer)?;
-        }
-
-        if let Some(stats) = &report.replay_stats {
-            let latency_to_json = |l: &crate::LatencyStats| JsonLatency {
-                min_ms: l.min.as_secs_f64() * 1000.0,
-                max_ms: l.max.as_secs_f64() * 1000.0,
-                mean_ms: l.mean.as_secs_f64() * 1000.0,
-                p50_ms: l.p50.as_secs_f64() * 1000.0,
-                p95_ms: l.p95.as_secs_f64() * 1000.0,
-                p99_ms: l.p99.as_secs_f64() * 1000.0,
-            };
-
-            let blocks = if report.replay_blocks.is_empty() {
-                None
-            } else {
-                Some(
-                    report
-                        .replay_blocks
-                        .iter()
-                        .map(JsonReplayBlockStats::from)
-                        .collect(),
-                )
-            };
-
-            let json_report = JsonReplayReport {
-                blocks_replayed: stats.blocks_replayed,
-                total_txs: stats.total_txs,
-                total_gas: stats.total_gas,
-                total_duration_ms: stats.total_duration_ms,
-                blocks_per_second: stats.blocks_per_second,
-                mgas_per_second: stats.mgas_per_second,
-                ggas_per_second: stats.ggas_per_second,
-                new_payload_latency: latency_to_json(&stats.new_payload_latency),
-                fcu_latency: latency_to_json(&stats.fcu_latency),
-                block_time: latency_to_json(&stats.block_time),
-                blocks,
             };
 
             serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
