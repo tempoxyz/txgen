@@ -45,21 +45,14 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     let scraper_handle = if let Some(ref url) = args.metrics_url {
         let scraper_config =
             ScraperConfig::new(url).with_interval(Duration::from_millis(args.scrape_interval_ms));
-        let handle = start_scraper(scraper_config, clock.clone(), store.clone());
 
-        // Spawn internal metric snapshotter on the same interval.
+        // Internal metrics are snapshotted on the same tick as the Prometheus
+        // scrape so all samples share identical timestamps.
         let snap_metrics = metrics.clone();
-        let snap_store = store.clone();
-        let snap_interval = Duration::from_millis(args.scrape_interval_ms);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(snap_interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                let samples = snap_metrics.snapshot_samples();
-                snap_store.push_batch(samples).await;
-            }
-        });
+        let callback: bench_core::SampleCallback =
+            std::sync::Arc::new(move || snap_metrics.snapshot_samples());
+
+        let handle = start_scraper(scraper_config, clock.clone(), store.clone(), Some(callback));
 
         tracing::info!(url, "Started metrics scraper");
         Some(handle)
