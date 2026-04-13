@@ -16,47 +16,57 @@ import sys
 from collections import defaultdict
 
 
-def load_samples(report_path: str) -> list[dict]:
-    """Load samples from a JSON report file.
-
-    Returns a list of dicts, one per scrape timestamp, with metric names
-    as keys (labeled metrics flattened) and values as floats.
-    """
+def load_report(report_path: str) -> dict:
+    """Load the full JSON report."""
     with open(report_path) as f:
-        report = json.load(f)
+        return json.load(f)
 
+
+def load_samples(report: dict) -> list[dict]:
+    """Extract samples grouped by scrape offset.
+
+    Returns a list of dicts keyed by (name, labels_tuple) → value,
+    plus a "ts_ms" entry for the time axis.
+    """
     samples = report.get("samples", [])
     if not samples:
         return []
 
-    # Group samples by offset_ms (each scrape produces multiple samples
-    # at the same offset).
     by_offset: dict[int, dict] = defaultdict(dict)
     for s in samples:
         offset = s["offset_ms"]
         name = s["name"]
         labels = s.get("labels", {})
+        label_key = tuple(sorted(labels.items()))
 
-        # Flatten labels into key (same convention as old scrape.py)
-        if labels:
-            if "quantile" in labels:
-                key = f"{name}.q{labels['quantile']}"
-            else:
-                suffix = ".".join(labels.values())
-                key = f"{name}.{suffix}"
-        else:
-            key = name
-
-        by_offset[offset][key] = s["value"]
+        by_offset[offset][(name, label_key)] = s["value"]
         by_offset[offset]["ts_ms"] = s.get("unix_ms", offset)
 
-    # Sort by offset and return as list
     return [by_offset[k] for k in sorted(by_offset.keys())]
 
 
-def col(rows: list[dict], key: str, conv=float, default=0):
-    """Extract a column from rows, with a default for missing values."""
-    return [conv(r.get(key, default)) for r in rows]
+def col(rows: list[dict], name: str, conv=float, default=0, **labels):
+    """Extract a metric column by name and optional label filters.
+
+    Labels are matched as subsets — a sample with extra labels (e.g.
+    injected metadata) still matches as long as all specified labels
+    are present.
+    """
+    result = []
+    match_items = set(labels.items())
+    for row in rows:
+        val = default
+        for key, v in row.items():
+            if not isinstance(key, tuple):
+                continue
+            n, lk = key
+            if n != name:
+                continue
+            if match_items <= set(lk):
+                val = v
+                break
+        result.append(conv(val))
+    return result
 
 
 def avg(xs: list) -> float:
@@ -85,31 +95,39 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    rows = load_samples(report_path)
+    report = load_report(report_path)
+    rows = load_samples(report)
     if not rows:
         print("error: no sample data in report (was --metrics-url used?)", file=sys.stderr)
         sys.exit(1)
 
     # Deduplicate: keep last sample per block number
+    HEIGHT = "reth_blockchain_tree_canonical_chain_height"
     seen: dict[int, dict] = {}
     for r in rows:
-        block = int(r.get("reth_blockchain_tree_canonical_chain_height", 0))
+        block = int(col([r], HEIGHT, int, 0)[0])
         seen[block] = r
     rows = sorted(seen.values(), key=lambda r: r["ts_ms"])
 
-    # Print available metric keys for reference
-    all_keys = sorted(set().union(*(r.keys() for r in rows)))
+    # Print available metric names for reference
+    all_names = sorted(set(
+        key[0] for row in rows for key in row.keys()
+        if isinstance(key, tuple)
+    ))
     keys_path = os.path.join(datadir, "metric_keys.txt")
     with open(keys_path, "w") as f:
-        for k in all_keys:
+        for k in all_names:
             f.write(k + "\n")
-    print(f"Available metrics ({len(all_keys)} keys) written to {keys_path}")
+    print(f"Available metrics ({len(all_names)} names) written to {keys_path}")
 
     # ── Aliases ──────────────────────────────────────────────────────
     P = "reth_tempo_payload_builder"
 
     t0 = rows[0]["ts_ms"]
     ts = [(r["ts_ms"] - t0) / 1000.0 for r in rows]
+
+    # First sample offset_ms for converting block marker offsets to plot time
+    offset0 = sorted(set(s["offset_ms"] for s in report.get("samples", [])))[0] if report.get("samples") else 0
 
     # ── Extract columns ──────────────────────────────────────────────
     # Throughput
@@ -128,30 +146,30 @@ def main():
     pay_fill = [g / l * 100 if l > 0 else 0 for g, l in zip(pay_gas, pay_limit)]
 
     # Builder timing
-    build_p50 = col(rows, f"{P}_payload_build_duration_seconds.q0.5")
-    build_p99 = col(rows, f"{P}_payload_build_duration_seconds.q0.99")
-    sr_p50 = col(rows, f"{P}_state_root_with_updates_duration_seconds.q0.5")
-    sr_p99 = col(rows, f"{P}_state_root_with_updates_duration_seconds.q0.99")
-    fin_p50 = col(rows, f"{P}_payload_finalization_duration_seconds.q0.5")
-    fin_p99 = col(rows, f"{P}_payload_finalization_duration_seconds.q0.99")
+    build_p50 = col(rows, f"{P}_payload_build_duration_seconds", quantile="0.5")
+    build_p99 = col(rows, f"{P}_payload_build_duration_seconds", quantile="0.99")
+    sr_p50 = col(rows, f"{P}_state_root_with_updates_duration_seconds", quantile="0.5")
+    sr_p99 = col(rows, f"{P}_state_root_with_updates_duration_seconds", quantile="0.99")
+    fin_p50 = col(rows, f"{P}_payload_finalization_duration_seconds", quantile="0.5")
+    fin_p99 = col(rows, f"{P}_payload_finalization_duration_seconds", quantile="0.99")
 
     # Builder anatomy
-    total_tx_exec_p50 = col(rows, f"{P}_total_transaction_execution_duration_seconds.q0.5")
-    state_setup_p50 = col(rows, f"{P}_state_setup_duration_seconds.q0.5")
-    hashed_post_p50 = col(rows, f"{P}_hashed_post_state_duration_seconds.q0.5")
+    total_tx_exec_p50 = col(rows, f"{P}_total_transaction_execution_duration_seconds", quantile="0.5")
+    state_setup_p50 = col(rows, f"{P}_state_setup_duration_seconds", quantile="0.5")
+    hashed_post_p50 = col(rows, f"{P}_hashed_post_state_duration_seconds", quantile="0.5")
     build_count = col(rows, f"{P}_payload_build_duration_seconds_count", int)
 
     # Execution
-    tx_exec_p50 = col(rows, f"{P}_transaction_execution_duration_seconds.q0.5")
-    tx_exec_p99 = col(rows, f"{P}_transaction_execution_duration_seconds.q0.99")
+    tx_exec_p50 = col(rows, f"{P}_transaction_execution_duration_seconds", quantile="0.5")
+    tx_exec_p99 = col(rows, f"{P}_transaction_execution_duration_seconds", quantile="0.99")
 
     # Pool
     pool_pending = col(rows, "reth_transaction_pool_pending_pool_transactions", int)
     pool_basefee = col(rows, "reth_transaction_pool_basefee_pool_transactions", int)
     pool_queued = col(rows, "reth_transaction_pool_queued_pool_transactions", int)
-    fetch_p50 = col(rows, f"{P}_pool_fetch_duration_seconds.q0.5")
-    skip_nonce = col(rows, f"{P}_pool_transactions_skipped_total.nonce_too_low", int)
-    skip_invalid = col(rows, f"{P}_pool_transactions_skipped_total.invalid_tx", int)
+    fetch_p50 = col(rows, f"{P}_pool_fetch_duration_seconds", quantile="0.5")
+    skip_nonce = col(rows, f"{P}_pool_transactions_skipped_total", int, reason="nonce_too_low")
+    skip_invalid = col(rows, f"{P}_pool_transactions_skipped_total", int, reason="invalid_tx")
     skip_nonce_delta = [b - a for a, b in zip([skip_nonce[0]] + skip_nonce, skip_nonce)]
     skip_invalid_delta = [b - a for a, b in zip([skip_invalid[0]] + skip_invalid, skip_invalid)]
 
@@ -178,12 +196,32 @@ def main():
     fig, axes = plt.subplots(5, 3, figsize=(20, 25))
     duration = ts[-1] - ts[0]
     n_blocks = len(rows)
+
+    # ── Block markers ──────────────────────────────────────────────────
+    block_markers = report.get("block_markers", [])
+    marker_ts = [(m["offset_ms"] - offset0) / 1000.0 for m in block_markers]
+
     fig.suptitle(
         f"Tempo Bench: {n_blocks} blocks over {duration:.0f}s "
         f"(avg {avg(tx_last):.0f} tx/block)",
         fontsize=14,
         fontweight="bold",
     )
+
+    # ── Metadata subtitle ────────────────────────────────────────────
+    metadata = report.get("metadata")
+    if metadata:
+        meta_str = "  |  ".join(f"{k}={v}" for k, v in metadata.items())
+        fig.text(0.5, 0.965, meta_str, ha="center", fontsize=10,
+                 color="#555555", fontstyle="italic")
+
+    def add_markers(ax):
+        """Draw a rug plot of block markers along the bottom edge."""
+        if marker_ts:
+            ax.eventplot(marker_ts, orientation="horizontal",
+                         lineoffsets=0, linelengths=0.06,
+                         colors="#E91E63", alpha=0.6, linewidths=0.6,
+                         transform=ax.get_xaxis_transform())
 
     def pl(ax, ys, color, **kw):
         ax.plot(ts, ys, color=color, linewidth=0.8, **kw)
@@ -193,6 +231,7 @@ def main():
         ax.set_ylabel(ylabel)
         ax.set_title(title)
         ax.grid(True, alpha=0.3)
+        add_markers(ax)
 
     ax = axes[0][0]
     pl(ax, tx_last, "#2196F3")
@@ -284,7 +323,9 @@ def main():
     print(f"Saved {out_path}")
 
     # ── Summary ──────────────────────────────────────────────────────
-    print(f"\nBlocks (deduped): {n_blocks}")
+    if marker_ts:
+        print(f"\nBlock markers: {len(marker_ts)}")
+    print(f"Blocks (deduped): {n_blocks}")
     print(f"Time range: {ts[0]:.1f}s – {ts[-1]:.1f}s ({duration:.1f}s)")
     print(f"Avg txs/block: {avg(tx_last):.0f}")
     print(f"Steady Ggas/s: {steady_avg(ts, ggas_s):.2f}")

@@ -42,6 +42,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Split args into setup/run/control
 SETUP_ARGS=()
 RUN_ARGS=()
+BLOCK_TIME="500ms"
 NO_PLOT=false
 NO_SETUP=false
 USE_TMUX=false
@@ -52,11 +53,13 @@ while [[ $# -gt 0 ]]; do
     --no-plot)    NO_PLOT=true; shift ;;
     --no-setup)   NO_SETUP=true; shift ;;
     --tmux)       USE_TMUX=true; shift ;;
+    # Block time → setup + run metadata
+    --block-time) BLOCK_TIME="$2"; SETUP_ARGS+=("$1" "$2"); shift 2 ;;
     # Setup-only flags
-    --spec|--count|--genesis|--tempo-bin|--block-time|--gas-limit|--max-tasks|--txpool-size|--seed|--datadir)
+    --spec|--count|--genesis|--tempo-bin|--gas-limit|--max-tasks|--txpool-size|--seed|--datadir)
       SETUP_ARGS+=("$1" "$2"); shift 2 ;;
     # Run-only flags
-    --tps|--max-concurrent|--rpc-url|--metrics-url|--scrape-interval|--drain-timeout)
+    --tps|--max-concurrent|--rpc-url|--metrics-url|--scrape-interval|--drain-timeout|--metadata)
       RUN_ARGS+=("$1" "$2"); shift 2 ;;
     -h|--help)
       head -32 "$0" | tail -31; exit 0 ;;
@@ -64,6 +67,9 @@ while [[ $# -gt 0 ]]; do
       echo "error: unknown option: $1" >&2; exit 1 ;;
   esac
 done
+
+# Forward block time as metadata to run.sh
+RUN_ARGS+=(--metadata "block_time=$BLOCK_TIME")
 
 # ── Setup ────────────────────────────────────────────────────────────
 if [[ "$NO_SETUP" == false ]]; then
