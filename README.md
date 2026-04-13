@@ -126,6 +126,8 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `--timeout <DUR>` | Request timeout (default: 30s) |
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
 | `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
+| `--metrics-url <URL>` | Prometheus endpoint to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
+| `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
 
 **Required RPC methods:** `eth_sendRawTransaction`, `eth_getBlockByNumber`
 
@@ -144,6 +146,9 @@ bench send-blocks --engine http://localhost:8551 --jwt-secret /path/to/jwt.hex -
 | `-i, --input <PATH>` | Input NDJSON file (default: stdin) |
 | `--wait-for-persistence <POLICY>` | Persistence wait policy: `always`, `never`, or `every:N` (default: `every:2`) |
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
+| `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
+| `--metrics-url <URL>` | Prometheus endpoint to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
+| `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
 
 **Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API)
 
@@ -167,6 +172,9 @@ bench replay \
 | `--from <N>` | Starting block number |
 | `--to <N>` | Ending block number |
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
+| `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
+| `--metrics-url <URL>` | Prometheus endpoint to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
+| `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
 
 **Required RPC methods:**
 - Source RPC: `debug_getRawBlock`
@@ -218,6 +226,27 @@ Report destinations are specified with `--report` and can be repeated:
 | `console` | Print summary to stderr (default if no reporters specified) |
 | `json:<path>` | Write JSON report to file |
 | `clickhouse:<url>` | Push time-series data to ClickHouse |
+
+### Metrics Scraping
+
+All bench commands support built-in Prometheus metrics scraping via `--metrics-url`. When enabled, a background scraper periodically fetches the node's `/metrics` endpoint and includes all samples in the JSON report.
+
+```bash
+# Scrape node metrics alongside the benchmark
+bench send -i txs.ndjson --metrics-url http://127.0.0.1:9001/metrics --report json:report.json
+
+# Custom scrape interval (default: 500ms)
+bench send -i txs.ndjson --metrics-url http://127.0.0.1:9001/metrics --scrape-interval-ms 200
+```
+
+In `send` mode, internal txgen metrics (`txgen_transactions_sent_total`, `txgen_transactions_success_total`, etc.) are also snapshotted on the same interval and included alongside node metrics.
+
+Metadata key=value pairs (`-m key=value`) are applied as labels to all samples, useful for tagging runs with build SHAs, profiles, or experiment IDs.
+
+The JSON report includes:
+- `samples` — unified time-series of all scraped metrics (internal + node)
+- `block_markers` — timestamps when new blocks were observed (send mode)
+- `replay_block_markers` — precise per-block timing windows (replay/send-blocks mode)
 
 ## Output Format
 
