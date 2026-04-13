@@ -152,8 +152,8 @@ def main():
     fetch_p50 = col(rows, f"{P}_pool_fetch_duration_seconds.q0.5")
     skip_nonce = col(rows, f"{P}_pool_transactions_skipped_total.nonce_too_low", int)
     skip_invalid = col(rows, f"{P}_pool_transactions_skipped_total.invalid_tx", int)
-    skip_nonce_delta = [b - a for a, b in zip([0] + skip_nonce, skip_nonce)]
-    skip_invalid_delta = [b - a for a, b in zip([0] + skip_invalid, skip_invalid)]
+    skip_nonce_delta = [b - a for a, b in zip([skip_nonce[0]] + skip_nonce, skip_nonce)]
+    skip_invalid_delta = [b - a for a, b in zip([skip_invalid[0]] + skip_invalid, skip_invalid)]
 
     # ── Derived columns ──────────────────────────────────────────────
     ggas_s = [g / 1e9 for g in gps]
