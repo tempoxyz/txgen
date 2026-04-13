@@ -8,6 +8,7 @@
 //! - [`reth_api`] - reth custom Engine API types (`reth_newPayload`, `reth_forkchoiceUpdated`)
 //! - [`historical`] - Historical transaction fetching from archive RPC
 
+pub mod block_poller;
 pub mod clock;
 pub mod historical;
 pub mod metrics;
@@ -20,6 +21,7 @@ pub mod sender;
 pub mod source;
 pub mod timeline;
 
+pub use block_poller::{BlockPollerHandle, start_block_poller};
 pub use clock::RunClock;
 pub use historical::{HistoricalFetcher, HistoricalFetcherConfig, HistoricalTx};
 pub use metrics::{
