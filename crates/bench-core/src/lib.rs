@@ -39,7 +39,7 @@ pub use reth_api::{
     RethPayloadStatus, WaitForPersistence,
 };
 pub use sample::{Sample, SampleStore};
-pub use scraper::{ScraperConfig, ScraperHandle, start_scraper};
+pub use scraper::{SampleCallback, ScraperConfig, ScraperHandle, start_scraper};
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource, TxgenSource};
 pub use timeline::BlockMarker;

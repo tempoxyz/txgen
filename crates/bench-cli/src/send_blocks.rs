@@ -71,7 +71,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let scraper_handle = if let Some(ref url) = args.metrics_url {
         let scraper_config =
             ScraperConfig::new(url).with_interval(Duration::from_millis(args.scrape_interval_ms));
-        let handle = start_scraper(scraper_config, clock.clone(), store.clone());
+        let handle = start_scraper(scraper_config, clock.clone(), store.clone(), None);
         tracing::info!(url, "Started metrics scraper");
         Some(handle)
     } else {

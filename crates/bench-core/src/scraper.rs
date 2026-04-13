@@ -5,11 +5,17 @@
 
 use crate::clock::RunClock;
 use crate::prometheus::parse_prometheus_text;
-use crate::sample::SampleStore;
+use crate::sample::{Sample, SampleStore};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::watch;
+
+/// Callback that produces additional samples on each scrape tick.
+///
+/// Called at the same offset as the Prometheus scrape so that internal
+/// and node metrics share the same timestamp.
+pub type SampleCallback = Arc<dyn Fn() -> Vec<Sample> + Send + Sync>;
 
 /// Configuration for the background scraper.
 #[derive(Debug, Clone)]
@@ -76,7 +82,16 @@ impl ScraperHandle {
 /// Returns a [`ScraperHandle`] to stop the scraper and query stats.
 /// Scrape failures are logged but never propagated — they do not
 /// affect the benchmark.
-pub fn start_scraper(config: ScraperConfig, clock: RunClock, store: SampleStore) -> ScraperHandle {
+///
+/// An optional `extra_samples` callback is invoked on every tick at the
+/// same offset as the Prometheus scrape, ensuring internal and node
+/// metrics share identical timestamps.
+pub fn start_scraper(
+    config: ScraperConfig,
+    clock: RunClock,
+    store: SampleStore,
+    extra_samples: Option<SampleCallback>,
+) -> ScraperHandle {
     let (stop_tx, stop_rx) = watch::channel(false);
     let scrape_count = Arc::new(AtomicU64::new(0));
     let error_count = Arc::new(AtomicU64::new(0));
@@ -85,6 +100,7 @@ pub fn start_scraper(config: ScraperConfig, clock: RunClock, store: SampleStore)
         config,
         clock,
         store,
+        extra_samples,
         stop_rx,
         scrape_count.clone(),
         error_count.clone(),
@@ -102,6 +118,7 @@ async fn scraper_loop(
     config: ScraperConfig,
     clock: RunClock,
     store: SampleStore,
+    extra_samples: Option<SampleCallback>,
     mut stop_rx: watch::Receiver<bool>,
     scrape_count: Arc<AtomicU64>,
     error_count: Arc<AtomicU64>,
@@ -125,11 +142,21 @@ async fn scraper_loop(
             }
         }
 
+        // Capture timestamps once so all samples from this tick share them.
+        let offset_ms = clock.offset_ms();
+        let unix_ms = clock.unix_ms();
+
+        // Collect extra samples (e.g. internal metrics) at the same offset.
+        if let Some(ref cb) = extra_samples {
+            let extra = cb();
+            if !extra.is_empty() {
+                store.push_batch(extra).await;
+            }
+        }
+
         match client.get(&config.url).send().await {
             Ok(resp) => match resp.text().await {
                 Ok(text) => {
-                    let offset_ms = clock.offset_ms();
-                    let unix_ms = clock.unix_ms();
                     let samples = parse_prometheus_text(&text, offset_ms, unix_ms);
                     if !samples.is_empty() {
                         store.push_batch(samples).await;
