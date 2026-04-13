@@ -12,6 +12,7 @@
 #   --scrape-interval <N>  Metrics scrape interval in ms (default: 500)
 #   --datadir <PATH>       Datadir (default: read from /tmp/txgen-bench-datadir)
 #   --input <PATH>         Tx file (default: $DATADIR/txs.ndjson)
+#   --metadata <K=V>       Extra metadata key=value (repeatable)
 #   --drain-timeout <N>    Seconds to wait for pool drain (default: 300)
 #
 # Outputs:
@@ -26,6 +27,7 @@ METRICS_URL="http://127.0.0.1:9001/metrics"
 SCRAPE_INTERVAL=500
 DATADIR=""
 INPUT=""
+EXTRA_METADATA=()
 DRAIN_TIMEOUT=300
 
 # ── Parse args ───────────────────────────────────────────────────────
@@ -38,6 +40,7 @@ while [[ $# -gt 0 ]]; do
     --scrape-interval)  SCRAPE_INTERVAL="$2"; shift 2 ;;
     --datadir)          DATADIR="$2"; shift 2 ;;
     --input)            INPUT="$2"; shift 2 ;;
+    --metadata)         EXTRA_METADATA+=("$2"); shift 2 ;;
     --drain-timeout)    DRAIN_TIMEOUT="$2"; shift 2 ;;
     -h|--help)          head -18 "$0" | tail -17; exit 0 ;;
     *)                  echo "error: unknown option: $1" >&2; exit 1 ;;
@@ -69,6 +72,16 @@ echo "  Input:       $INPUT"
 echo "  Datadir:     $DATADIR"
 echo ""
 
+# ── Build metadata flags ──────────────────────────────────────────────
+METADATA_FLAGS=(
+  -m "tps=$TPS"
+  -m "max_concurrent=$MAX_CONCURRENT"
+  -m "scrape_interval_ms=$SCRAPE_INTERVAL"
+)
+for kv in "${EXTRA_METADATA[@]}"; do
+  METADATA_FLAGS+=(-m "$kv")
+done
+
 # ── Run bench ────────────────────────────────────────────────────────
 START_TIME=$(date +%s)
 
@@ -79,6 +92,7 @@ START_TIME=$(date +%s)
   --input "$INPUT" \
   --metrics-url "$METRICS_URL" \
   --scrape-interval-ms "$SCRAPE_INTERVAL" \
+  "${METADATA_FLAGS[@]}" \
   --report "json:$DATADIR/report.json" 2>&1
 
 END_TIME=$(date +%s)
