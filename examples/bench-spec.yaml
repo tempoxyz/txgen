@@ -6,7 +6,7 @@ gas:
 
 accounts:
   users:
-    mnemonic: "test test test test test test test test test test test junk"
+    mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
     range: [0, 10000]
 
 artifacts:
