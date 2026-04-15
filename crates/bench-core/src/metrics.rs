@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, mpsc};
 
 /// Metrics collected during a benchmark run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,26 +370,44 @@ struct TimestampedEvent {
 }
 
 /// Atomic counters for concurrent metrics collection.
-#[derive(Debug)]
+///
+/// Events and latencies are sent through lock-free mpsc channels to avoid
+/// write-lock contention on the hot path at high TPS.
 pub struct MetricsCollector {
     sent: AtomicU64,
     success: AtomicU64,
     failed: AtomicU64,
     clock: RunClock,
-    latencies: RwLock<Vec<TimestampedLatency>>,
-    events: RwLock<Vec<TimestampedEvent>>,
+    latency_tx: mpsc::UnboundedSender<TimestampedLatency>,
+    event_tx: mpsc::UnboundedSender<TimestampedEvent>,
+    latency_rx: Mutex<mpsc::UnboundedReceiver<TimestampedLatency>>,
+    event_rx: Mutex<mpsc::UnboundedReceiver<TimestampedEvent>>,
+}
+
+impl std::fmt::Debug for MetricsCollector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetricsCollector")
+            .field("sent", &self.sent)
+            .field("success", &self.success)
+            .field("failed", &self.failed)
+            .finish_non_exhaustive()
+    }
 }
 
 impl MetricsCollector {
     /// Create a new metrics collector with a shared [`RunClock`].
     pub fn new(clock: RunClock) -> Arc<Self> {
+        let (latency_tx, latency_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             sent: AtomicU64::new(0),
             success: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             clock,
-            latencies: RwLock::new(Vec::new()),
-            events: RwLock::new(Vec::new()),
+            latency_tx,
+            event_tx,
+            latency_rx: Mutex::new(latency_rx),
+            event_rx: Mutex::new(event_rx),
         })
     }
 
@@ -409,34 +427,31 @@ impl MetricsCollector {
     }
 
     /// Record a sent transaction.
-    pub async fn record_sent(&self) {
+    pub fn record_sent(&self) {
         self.sent.fetch_add(1, Ordering::Relaxed);
         let offset = self.elapsed();
-        self.events.write().await.push(TimestampedEvent {
+        let _ = self.event_tx.send(TimestampedEvent {
             offset,
             event: TxEvent::Sent,
         });
     }
 
     /// Record a successful transaction with its latency.
-    pub async fn record_success(&self, latency: Duration) {
+    pub fn record_success(&self, latency: Duration) {
         self.success.fetch_add(1, Ordering::Relaxed);
         let offset = self.elapsed();
-        self.latencies
-            .write()
-            .await
-            .push(TimestampedLatency { offset, latency });
-        self.events.write().await.push(TimestampedEvent {
+        let _ = self.latency_tx.send(TimestampedLatency { offset, latency });
+        let _ = self.event_tx.send(TimestampedEvent {
             offset,
             event: TxEvent::Success,
         });
     }
 
     /// Record a failed transaction.
-    pub async fn record_failure(&self) {
+    pub fn record_failure(&self) {
         self.failed.fetch_add(1, Ordering::Relaxed);
         let offset = self.elapsed();
-        self.events.write().await.push(TimestampedEvent {
+        let _ = self.event_tx.send(TimestampedEvent {
             offset,
             event: TxEvent::Failed,
         });
@@ -496,11 +511,32 @@ impl MetricsCollector {
         ]
     }
 
+    /// Drain all pending latency samples from the channel.
+    fn drain_latencies(
+        rx: &mut mpsc::UnboundedReceiver<TimestampedLatency>,
+    ) -> Vec<TimestampedLatency> {
+        let mut latencies = Vec::new();
+        while let Ok(l) = rx.try_recv() {
+            latencies.push(l);
+        }
+        latencies
+    }
+
+    /// Drain all pending events from the channel.
+    fn drain_events(rx: &mut mpsc::UnboundedReceiver<TimestampedEvent>) -> Vec<TimestampedEvent> {
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        events
+    }
+
     /// Compute final metrics.
     pub async fn finalize(&self) -> BenchMetrics {
         let elapsed = self.clock.elapsed();
 
-        let mut latencies = self.latencies.write().await;
+        let mut latency_rx = self.latency_rx.lock().await;
+        let mut latencies = Self::drain_latencies(&mut latency_rx);
         latencies.sort_by_key(|l| l.latency);
         let durations: Vec<Duration> = latencies.iter().map(|l| l.latency).collect();
 
@@ -518,8 +554,10 @@ impl MetricsCollector {
         let total_elapsed = self.clock.elapsed();
         let total_seconds = total_elapsed.as_secs() + 1;
 
-        let events = self.events.read().await;
-        let latencies = self.latencies.read().await;
+        let mut event_rx = self.event_rx.lock().await;
+        let mut latency_rx = self.latency_rx.lock().await;
+        let events = Self::drain_events(&mut event_rx);
+        let latencies = Self::drain_latencies(&mut latency_rx);
 
         let mut throughput = Vec::with_capacity(total_seconds as usize);
         for second in 0..total_seconds {
@@ -601,10 +639,10 @@ mod tests {
     async fn test_metrics_collection() {
         let collector = MetricsCollector::new(RunClock::new());
 
-        collector.record_sent().await;
-        collector.record_sent().await;
-        collector.record_success(Duration::from_millis(10)).await;
-        collector.record_failure().await;
+        collector.record_sent();
+        collector.record_sent();
+        collector.record_success(Duration::from_millis(10));
+        collector.record_failure();
 
         let (sent, success, failed) = collector.counts();
         assert_eq!(sent, 2);
@@ -616,11 +654,11 @@ mod tests {
     async fn test_snapshot_samples() {
         let collector = MetricsCollector::new(RunClock::new());
 
-        collector.record_sent().await;
-        collector.record_sent().await;
-        collector.record_sent().await;
-        collector.record_success(Duration::from_millis(5)).await;
-        collector.record_failure().await;
+        collector.record_sent();
+        collector.record_sent();
+        collector.record_sent();
+        collector.record_success(Duration::from_millis(5));
+        collector.record_failure();
 
         let samples = collector.snapshot_samples();
         assert_eq!(samples.len(), 4);
@@ -742,10 +780,10 @@ mod tests {
     async fn test_time_series_metrics() {
         let collector = MetricsCollector::new(RunClock::new());
 
-        collector.record_sent().await;
-        collector.record_success(Duration::from_millis(50)).await;
-        collector.record_sent().await;
-        collector.record_failure().await;
+        collector.record_sent();
+        collector.record_success(Duration::from_millis(50));
+        collector.record_sent();
+        collector.record_failure();
 
         let ts = collector.time_series().await;
 
