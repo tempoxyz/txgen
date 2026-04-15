@@ -103,7 +103,7 @@ impl Sender {
             key: tx.key,
         };
 
-        self.metrics.record_sent().await;
+        self.metrics.record_sent();
 
         // Get or create the queue for this key.
         let queue = match self.key_queues.entry(pending.key) {
@@ -127,7 +127,7 @@ impl Sender {
 
         if queue.send(pending).await.is_err() {
             tracing::warn!("Failed to enqueue transaction, worker channel closed");
-            self.metrics.record_failure().await;
+            self.metrics.record_failure();
         }
 
         Ok(())
@@ -163,46 +163,53 @@ async fn key_worker(
         let start = Instant::now();
         match provider.send_raw_transaction(&pending.raw).await {
             Ok(_pending_tx) => {
-                metrics.record_success(start.elapsed()).await;
+                metrics.record_success(start.elapsed());
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to send transaction");
-                metrics.record_failure().await;
+                metrics.record_failure();
             }
         }
     }
 }
 
-/// Token bucket rate limiter using scheduled times.
+/// Token-budget rate limiter.
 ///
-/// Tracks the *scheduled* next-token time rather than the last-wake time.
-/// This eliminates throughput loss from sleep overshoot: if a sleep
-/// overshoots by 500µs, subsequent tokens are issued immediately until
-/// the schedule catches up.
+/// Instead of sleeping per-token (which breaks at high TPS due to timer
+/// resolution), this tracks how many tokens *should* have been issued by
+/// now based on elapsed time. Tokens are granted instantly while the
+/// budget allows; the caller only sleeps when it gets ahead of schedule.
 struct RateLimiter {
-    interval: Duration,
-    next_token: tokio::sync::Mutex<Instant>,
+    rate: f64,
+    start: Instant,
+    state: tokio::sync::Mutex<RateLimiterState>,
+}
+
+struct RateLimiterState {
+    issued: u64,
 }
 
 impl RateLimiter {
     fn new(tokens_per_sec: u64) -> Self {
         Self {
-            interval: Duration::from_secs_f64(1.0 / tokens_per_sec as f64),
-            next_token: tokio::sync::Mutex::new(Instant::now()),
+            rate: tokens_per_sec as f64,
+            start: Instant::now(),
+            state: tokio::sync::Mutex::new(RateLimiterState { issued: 0 }),
         }
     }
 
     async fn acquire(&self) {
-        let mut next = self.next_token.lock().await;
-        let now = Instant::now();
+        let mut state = self.state.lock().await;
 
-        if *next > now {
-            tokio::time::sleep(*next - now).await;
+        // The time at which this token *should* be issued.
+        let expected = Duration::from_secs_f64(state.issued as f64 / self.rate);
+        let elapsed = self.start.elapsed();
+
+        if expected > elapsed {
+            tokio::time::sleep(expected - elapsed).await;
         }
 
-        // Advance from the scheduled time, not wall-clock, so we can
-        // burst to catch up after sleep overshoot.
-        *next = (*next).max(now) + self.interval;
+        state.issued += 1;
     }
 }
 
