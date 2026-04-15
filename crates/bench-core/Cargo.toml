@@ -24,7 +24,7 @@ alloy-transport = "1"
 alloy-eips.workspace = true
 
 # async
-tokio = { version = "1", features = ["rt", "sync", "time", "process", "io-util", "io-std"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "process", "io-util", "io-std"] }
 futures = "0.3"
 
 # http
@@ -37,6 +37,7 @@ rand.workspace = true
 eyre.workspace = true
 thiserror.workspace = true
 tracing = "0.1"
+urlencoding = "2"
 uuid.workspace = true
 
 [dev-dependencies]

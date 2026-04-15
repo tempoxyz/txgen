@@ -61,7 +61,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let transport = Http::with_client(hyper_client, args.engine.parse()?);
     let provider = RootProvider::<Ethereum>::new(alloy_rpc_client::RpcClient::new(transport, true));
 
-    let mut reporters = parse_reporters(&args.reports)?;
+    let mut reporters = parse_reporters(&args.reports, "send-blocks", &metadata)?;
     let mut console_reporter: Box<dyn Reporter> = Box::new(ConsoleReporter::stderr(false));
 
     let clock = RunClock::new();
