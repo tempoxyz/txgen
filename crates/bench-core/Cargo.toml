@@ -37,6 +37,7 @@ rand.workspace = true
 eyre.workspace = true
 thiserror.workspace = true
 tracing = "0.1"
+uuid.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
