@@ -55,7 +55,7 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
     let engine_provider =
         RootProvider::<Ethereum>::new(alloy_rpc_client::RpcClient::new(transport, true));
 
-    let mut reporters = parse_reporters(&args.reports)?;
+    let mut reporters = parse_reporters(&args.reports, "replay", &metadata)?;
     let mut console_reporter: Box<dyn Reporter> = Box::new(ConsoleReporter::stderr(false));
 
     let clock = RunClock::new();
