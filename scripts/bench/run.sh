@@ -13,6 +13,7 @@
 #   --datadir <PATH>       Datadir (default: read from /tmp/txgen-bench-datadir)
 #   --input <PATH>         Tx file (default: $DATADIR/txs.ndjson)
 #   --metadata <K=V>       Extra metadata key=value (repeatable)
+#   --report <SPEC>        Additional report destination (repeatable)
 #   --drain-timeout <N>    Seconds to wait for pool drain (default: 300)
 #
 # Outputs:
@@ -28,6 +29,7 @@ SCRAPE_INTERVAL=500
 DATADIR=""
 INPUT=""
 EXTRA_METADATA=()
+EXTRA_REPORTS=()
 DRAIN_TIMEOUT=300
 
 # ── Parse args ───────────────────────────────────────────────────────
@@ -41,6 +43,7 @@ while [[ $# -gt 0 ]]; do
     --datadir)          DATADIR="$2"; shift 2 ;;
     --input)            INPUT="$2"; shift 2 ;;
     --metadata)         EXTRA_METADATA+=("$2"); shift 2 ;;
+    --report)           EXTRA_REPORTS+=("$2"); shift 2 ;;
     --drain-timeout)    DRAIN_TIMEOUT="$2"; shift 2 ;;
     -h|--help)          head -18 "$0" | tail -17; exit 0 ;;
     *)                  echo "error: unknown option: $1" >&2; exit 1 ;;
@@ -82,6 +85,15 @@ for kv in "${EXTRA_METADATA[@]}"; do
   METADATA_FLAGS+=(-m "$kv")
 done
 
+# ── Build report flags ────────────────────────────────────────────────
+REPORT_FLAGS=(
+  --report console
+  --report "json:$DATADIR/report.json"
+)
+for spec in "${EXTRA_REPORTS[@]}"; do
+  REPORT_FLAGS+=(--report "$spec")
+done
+
 # ── Run bench ────────────────────────────────────────────────────────
 START_TIME=$(date +%s)
 
@@ -93,7 +105,7 @@ START_TIME=$(date +%s)
   --metrics-url "$METRICS_URL" \
   --scrape-interval-ms "$SCRAPE_INTERVAL" \
   "${METADATA_FLAGS[@]}" \
-  --report "json:$DATADIR/report.json" 2>&1
+  "${REPORT_FLAGS[@]}" 2>&1
 
 END_TIME=$(date +%s)
 SEND_ELAPSED=$((END_TIME - START_TIME))
