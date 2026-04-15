@@ -10,6 +10,7 @@
 
 pub mod block_poller;
 pub mod clock;
+pub mod correlate;
 pub mod historical;
 pub mod metrics;
 pub mod prometheus;
@@ -23,6 +24,9 @@ pub mod timeline;
 
 pub use block_poller::{BlockPollerHandle, start_block_poller};
 pub use clock::RunClock;
+pub use correlate::{
+    BlockMetricAggregate, CorrelatedBlock, MetricSource, WindowKind, correlate_samples,
+};
 pub use historical::{HistoricalFetcher, HistoricalFetcherConfig, HistoricalTx};
 pub use metrics::{
     BenchMetrics, BlockStats, LatencySample, LatencyStats, MetricsCollector, RunStats,
