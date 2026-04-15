@@ -128,8 +128,9 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
 | `--metrics-url <URL>` | Prometheus endpoint to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
+| `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 300, 0 to disable) |
 
-**Required RPC methods:** `eth_sendRawTransaction`, `eth_getBlockByNumber`
+**Required RPC methods:** `eth_sendRawTransaction`, `eth_getBlockByNumber`, `txpool_status` (for `--drain-timeout`)
 
 #### `bench send-blocks`
 
@@ -456,6 +457,7 @@ Summary of which RPC methods are required by each feature:
 | `debug_getRawBlock` | `txgen extract`, `bench replay` (source RPC) |
 | `reth_newPayload` | `bench send-blocks`, `bench replay` (engine) |
 | `reth_forkchoiceUpdated` | `bench send-blocks`, `bench replay` (engine) |
+| `txpool_status` | `bench send` (pool drain wait) |
 
 > **Note:** `debug_*` methods require a node with the debug namespace enabled (typically archive nodes). `reth_*` methods are custom reth Engine API extensions.
 
