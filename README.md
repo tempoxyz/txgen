@@ -225,7 +225,7 @@ Report destinations are specified with `--report` and can be repeated:
 |--------|-------------|
 | `console` | Print summary to stderr (default if no reporters specified) |
 | `json:<path>` | Write JSON report to file |
-| `clickhouse:<url>` | Push time-series data to ClickHouse |
+| `clickhouse:<url>` | Push per-block benchmark data to ClickHouse |
 
 ### Metrics Scraping
 
@@ -242,6 +242,29 @@ bench send -i txs.ndjson --metrics-url http://127.0.0.1:9001/metrics --scrape-in
 In `send` mode, internal txgen metrics (`txgen_transactions_sent_total`, `txgen_transactions_success_total`, etc.) are also snapshotted on the same interval and included alongside node metrics.
 
 Metadata key=value pairs (`-m key=value`) are applied as labels to all samples, useful for tagging runs with build SHAs, profiles, or experiment IDs.
+
+### ClickHouse Reporting
+
+The ClickHouse reporter pushes per-block benchmark results and correlated Prometheus metrics into three tables (`txgen_runs`, `txgen_blocks`, `txgen_block_metrics`). It requires four metadata keys:
+
+```bash
+bench send -i txs.ndjson \
+  --metrics-url http://127.0.0.1:9001/metrics \
+  --report clickhouse:https://host:8443 \
+  -m scenario=tip20-10k \
+  -m platform=tempo \
+  -m git-sha=abc123 \
+  -m git-ref=main
+```
+
+| Required Metadata | Description |
+|-------------------|-------------|
+| `scenario` | Benchmark scenario name (e.g. `tip20-10k`) |
+| `platform` | Target platform: `ethereum` or `tempo` |
+| `git-sha` | Node commit SHA being benchmarked |
+| `git-ref` | Node git branch/ref |
+
+Authentication is configured via environment variables: `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE`. See [`scripts/clickhouse/README.md`](scripts/clickhouse/README.md) for schema setup and example queries.
 
 The JSON report includes:
 - `samples` — unified time-series of all scraped metrics (internal + node)
