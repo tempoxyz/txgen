@@ -66,7 +66,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     };
     let mut sender = Sender::new(providers.clone(), config.clone(), metrics.clone());
 
-    let mut reporters = parse_reporters(&args.reports)?;
+    let mut reporters = parse_reporters(&args.reports, "send", &metadata)?;
     if reporters.is_empty() {
         reporters.push(Box::new(ConsoleReporter::stderr(true)));
     }

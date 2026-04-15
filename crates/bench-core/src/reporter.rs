@@ -528,22 +528,105 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
 /// ClickHouse reporter configuration.
 #[derive(Debug, Clone)]
 pub struct ClickHouseConfig {
-    /// ClickHouse HTTP endpoint.
+    /// ClickHouse HTTP endpoint (e.g. `https://host:8443`).
     pub url: String,
-    /// Database name.
+    /// Database name (from `CLICKHOUSE_DATABASE`, default: `default`).
     pub database: String,
-    /// Table name.
-    pub table: String,
-    /// Run identifier for grouping results.
-    pub run_id: String,
-    /// Additional tags/labels.
-    pub tags: std::collections::HashMap<String, String>,
+    /// ClickHouse user (from `CLICKHOUSE_USER`).
+    pub user: Option<String>,
+    /// ClickHouse password (from `CLICKHOUSE_PASSWORD`).
+    pub password: Option<String>,
+    /// Run identifier.
+    pub run_id: uuid::Uuid,
+    /// Benchmark start time.
+    pub started_at: std::time::SystemTime,
+    /// Scenario name (from metadata `scenario`).
+    pub scenario_name: String,
+    /// Platform: `ethereum` or `tempo` (from metadata `platform`).
+    pub platform: String,
+    /// Benchmark mode: `send`, `replay`, or `send-blocks`.
+    pub mode: String,
+    /// Node git SHA (from metadata `git-sha`).
+    pub git_sha: String,
+    /// Node git ref (from metadata `git-ref`).
+    pub git_ref: String,
+    /// Config key-value pairs.
+    pub config: HashMap<String, String>,
+    /// Additional metadata key-value pairs.
+    pub metadata: HashMap<String, String>,
 }
 
-/// ClickHouse reporter for time-series storage.
+/// Required metadata keys for the ClickHouse reporter.
+const REQUIRED_METADATA: &[&str] = &["scenario", "platform", "git-sha", "git-ref"];
+
+impl ClickHouseConfig {
+    /// Create a ClickHouse config from the reporter URL and user metadata.
+    ///
+    /// Extracts required fields (`scenario`, `platform`, `git-sha`, `git-ref`)
+    /// from `metadata` and returns an error if any are missing.
+    ///
+    /// `mode` is the bench subcommand (`send`, `replay`, `send-blocks`).
+    pub fn from_metadata(
+        url: &str,
+        mode: &str,
+        metadata: &HashMap<String, String>,
+    ) -> Result<Self> {
+        let missing: Vec<&str> = REQUIRED_METADATA
+            .iter()
+            .filter(|k| !metadata.contains_key(**k))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            bail!(
+                "ClickHouse reporter requires metadata: {}. Use -m key=value for each.",
+                missing.join(", ")
+            );
+        }
+
+        let database =
+            std::env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "default".to_string());
+        let user = std::env::var("CLICKHOUSE_USER").ok();
+        let password = std::env::var("CLICKHOUSE_PASSWORD").ok();
+
+        // Separate config-like keys from remaining metadata.
+        let config_keys = ["tps", "max_concurrent", "chain_id", "scrape_interval_ms"];
+        let mut config = HashMap::new();
+        let mut remaining_metadata = HashMap::new();
+
+        for (k, v) in metadata {
+            if config_keys.contains(&k.as_str()) {
+                config.insert(k.clone(), v.clone());
+            } else if !REQUIRED_METADATA.contains(&k.as_str()) {
+                remaining_metadata.insert(k.clone(), v.clone());
+            }
+        }
+
+        Ok(Self {
+            url: url.to_string(),
+            database,
+            user,
+            password,
+            run_id: uuid::Uuid::new_v4(),
+            started_at: std::time::SystemTime::now(),
+            scenario_name: metadata["scenario"].clone(),
+            platform: metadata["platform"].clone(),
+            mode: mode.to_string(),
+            git_sha: metadata["git-sha"].clone(),
+            git_ref: metadata["git-ref"].clone(),
+            config,
+            metadata: remaining_metadata,
+        })
+    }
+}
+
+/// ClickHouse reporter for benchmark result storage.
+///
+/// Inserts into three tables:
+/// - `txgen_runs` — run metadata
+/// - `txgen_blocks` — per-block facts and timing
+/// - `txgen_block_metrics` — per-block correlated metrics
 pub struct ClickHouseReporter {
     config: ClickHouseConfig,
-    #[allow(dead_code)]
     client: reqwest::Client,
 }
 
@@ -551,80 +634,265 @@ impl ClickHouseReporter {
     /// Create a new ClickHouse reporter.
     pub fn new(config: ClickHouseConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(60))
             .build()
             .context("failed to create HTTP client")?;
 
+        tracing::info!(
+            run_id = %config.run_id,
+            scenario = %config.scenario_name,
+            platform = %config.platform,
+            mode = %config.mode,
+            url = %config.url,
+            database = %config.database,
+            "ClickHouse reporter initialized"
+        );
+
         Ok(Self { config, client })
+    }
+
+    /// Insert rows into a table using `FORMAT JSONEachRow`.
+    fn insert_rows<T: serde::Serialize>(&self, table: &str, rows: &[T]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut body = String::new();
+        for row in rows {
+            // SAFETY: serialization of known structs should not fail
+            body.push_str(&serde_json::to_string(row).unwrap());
+            body.push('\n');
+        }
+
+        let query = format!(
+            "INSERT INTO {}.{} FORMAT JSONEachRow",
+            self.config.database, table
+        );
+        let url = format!("{}/?query={}", self.config.url, urlencoding::encode(&query));
+
+        let rt = tokio::runtime::Handle::current();
+        let mut req = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json");
+        if let Some(ref user) = self.config.user {
+            req = req.header("X-ClickHouse-User", user);
+        }
+        if let Some(ref password) = self.config.password {
+            req = req.header("X-ClickHouse-Key", password);
+        }
+        let resp = tokio::task::block_in_place(|| rt.block_on(req.body(body).send()))
+            .wrap_err_with(|| format!("failed to insert into {table}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = tokio::task::block_in_place(|| rt.block_on(resp.text()))
+                .unwrap_or_else(|_| "<no body>".to_string());
+            bail!("ClickHouse insert into {table} failed (HTTP {status}): {body}");
+        }
+
+        tracing::info!(table, rows = rows.len(), "Inserted rows into ClickHouse");
+        Ok(())
+    }
+
+    /// Build the run row for insertion.
+    fn build_run_row(&self, finished_at: std::time::SystemTime) -> ClickHouseRunRow<'_> {
+        ClickHouseRunRow {
+            run_id: self.config.run_id,
+            started_at: system_time_to_millis(self.config.started_at),
+            finished_at: system_time_to_millis(finished_at),
+            scenario_name: &self.config.scenario_name,
+            platform: &self.config.platform,
+            mode: &self.config.mode,
+            git_sha: &self.config.git_sha,
+            git_ref: &self.config.git_ref,
+            config: &self.config.config,
+            metadata: &self.config.metadata,
+        }
+    }
+
+    /// Build block rows for insertion.
+    fn build_block_rows(
+        &self,
+        report: &FinalReport,
+        correlated: &[crate::correlate::CorrelatedBlock],
+    ) -> Vec<ClickHouseBlockRow> {
+        let blocks_by_number: HashMap<u64, &BlockStats> =
+            report.blocks.iter().map(|b| (b.number, b)).collect();
+
+        correlated
+            .iter()
+            .map(|cb| {
+                let block_stats = blocks_by_number.get(&cb.block_number);
+                let marker = report
+                    .block_markers
+                    .iter()
+                    .find(|m| m.number == cb.block_number);
+
+                ClickHouseBlockRow {
+                    run_id: self.config.run_id,
+                    block_index: cb.block_index,
+                    block_number: cb.block_number,
+                    chain_timestamp: cb.chain_timestamp,
+                    window_kind: cb.window_kind.as_str(),
+                    window_start_offset_ms: cb.window_start_offset_ms,
+                    window_end_offset_ms: cb.window_end_offset_ms,
+                    tx_count: block_stats.map(|b| b.tx_count as u32).unwrap_or(0),
+                    gas_used: block_stats.map(|b| b.gas_used).unwrap_or(0),
+                    gas_limit: block_stats.map(|b| b.gas_limit).unwrap_or(0),
+                    block_time_ms: block_stats.and_then(|b| b.block_time_ms),
+                    new_payload_ms: marker.and_then(|m| m.new_payload_ms()),
+                    fcu_ms: marker.and_then(|m| m.fcu_ms()),
+                    total_latency_ms: marker.and_then(|m| m.execution_ms()),
+                    payload_status: None,
+                    server_latency_us: None,
+                    persistence_wait_us: None,
+                    execution_cache_wait_us: None,
+                    sparse_trie_wait_us: None,
+                }
+            })
+            .collect()
+    }
+
+    /// Build block metric rows for insertion.
+    fn build_metric_rows<'a>(
+        &self,
+        correlated: &'a [crate::correlate::CorrelatedBlock],
+    ) -> Vec<ClickHouseBlockMetricRow<'a>> {
+        correlated
+            .iter()
+            .flat_map(|cb| {
+                cb.metrics.iter().map(move |m| ClickHouseBlockMetricRow {
+                    run_id: self.config.run_id,
+                    block_index: cb.block_index,
+                    block_number: cb.block_number,
+                    metric_name: &m.metric_name,
+                    labels_json: &m.labels_json,
+                    source: m.source.as_str(),
+                    sample_count: m.sample_count,
+                    first_value: m.first_value,
+                    last_value: m.last_value,
+                    min_value: m.min_value,
+                    max_value: m.max_value,
+                    avg_value: m.avg_value,
+                    delta_value: m.delta_value,
+                })
+            })
+            .collect()
     }
 }
 
 impl Reporter for ClickHouseReporter {
-    fn on_block(&mut self, block: &BlockStats) -> Result<()> {
-        tracing::debug!(
-            run_id = %self.config.run_id,
-            block = block.number,
-            tx_count = block.tx_count,
-            gas_used = block.gas_used,
-            "Would insert block to ClickHouse"
-        );
-        Ok(())
-    }
-
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
-        if let Some(metrics) = &report.bench_metrics {
-            // SAFETY: SystemTime::now() is always after UNIX_EPOCH
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+        let finished_at = std::time::SystemTime::now();
+        let precise = report
+            .block_markers
+            .iter()
+            .any(|m| m.fcu_done_offset_ms.is_some());
 
-            let tags_json = serde_json::to_string(&self.config.tags)?;
+        // Correlate samples to blocks.
+        let correlated =
+            crate::correlate::correlate_samples(&report.block_markers, &report.samples, precise);
 
-            let query = format!(
-                "INSERT INTO {}.{} (timestamp, run_id, sent, success, failed, elapsed_secs, tps, success_rate, latency_min_ms, latency_max_ms, latency_mean_ms, latency_p50_ms, latency_p95_ms, latency_p99_ms, tags) VALUES ({}, '{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, '{}')",
-                self.config.database,
-                self.config.table,
-                timestamp,
-                self.config.run_id,
-                metrics.sent,
-                metrics.success,
-                metrics.failed,
-                metrics.elapsed.as_secs_f64(),
-                metrics.tps(),
-                metrics.success_rate(),
-                metrics.latency.min.as_secs_f64() * 1000.0,
-                metrics.latency.max.as_secs_f64() * 1000.0,
-                metrics.latency.mean.as_secs_f64() * 1000.0,
-                metrics.latency.p50.as_secs_f64() * 1000.0,
-                metrics.latency.p95.as_secs_f64() * 1000.0,
-                metrics.latency.p99.as_secs_f64() * 1000.0,
-                tags_json.replace('\'', "\\'"),
-            );
+        tracing::info!(
+            run_id = %self.config.run_id,
+            blocks = correlated.len(),
+            total_metrics = correlated.iter().map(|c| c.metrics.len()).sum::<usize>(),
+            "Inserting benchmark results into ClickHouse"
+        );
 
-            tracing::info!(
-                run_id = %self.config.run_id,
-                sent = metrics.sent,
-                success = metrics.success,
-                tps = metrics.tps(),
-                "Would insert to ClickHouse: {}",
-                query
-            );
+        // Insert run.
+        let run_row = self.build_run_row(finished_at);
+        self.insert_rows("txgen_runs", &[run_row])?;
 
-            if let Some(run) = &report.run_stats {
-                tracing::info!(
-                    run_id = %self.config.run_id,
-                    start_block = run.start_block,
-                    end_block = run.end_block,
-                    avg_tps = run.avg_tps,
-                    avg_gas_per_second = run.avg_gas_per_second,
-                    "Would insert run stats to ClickHouse"
-                );
+        // Insert blocks.
+        let block_rows = self.build_block_rows(report, &correlated);
+        self.insert_rows("txgen_blocks", &block_rows)?;
+
+        // Insert block metrics.
+        let metric_rows = self.build_metric_rows(&correlated);
+        if !metric_rows.is_empty() {
+            // Insert in batches to avoid oversized requests.
+            const BATCH_SIZE: usize = 10_000;
+            for chunk in metric_rows.chunks(BATCH_SIZE) {
+                self.insert_rows("txgen_block_metrics", chunk)?;
             }
         }
 
+        tracing::info!(
+            run_id = %self.config.run_id,
+            scenario = %self.config.scenario_name,
+            platform = %self.config.platform,
+            blocks = block_rows.len(),
+            metrics = metric_rows.len(),
+            "ClickHouse insert complete"
+        );
+
         Ok(())
     }
+}
+
+/// Row for `txgen_runs` table.
+#[derive(serde::Serialize)]
+struct ClickHouseRunRow<'a> {
+    run_id: uuid::Uuid,
+    started_at: u64,
+    finished_at: u64,
+    scenario_name: &'a str,
+    platform: &'a str,
+    mode: &'a str,
+    git_sha: &'a str,
+    git_ref: &'a str,
+    config: &'a HashMap<String, String>,
+    metadata: &'a HashMap<String, String>,
+}
+
+/// Row for `txgen_blocks` table.
+#[derive(serde::Serialize)]
+struct ClickHouseBlockRow {
+    run_id: uuid::Uuid,
+    block_index: u32,
+    block_number: u64,
+    chain_timestamp: Option<u64>,
+    window_kind: &'static str,
+    window_start_offset_ms: u64,
+    window_end_offset_ms: u64,
+    tx_count: u32,
+    gas_used: u64,
+    gas_limit: u64,
+    block_time_ms: Option<u64>,
+    new_payload_ms: Option<u64>,
+    fcu_ms: Option<u64>,
+    total_latency_ms: Option<u64>,
+    payload_status: Option<String>,
+    server_latency_us: Option<u64>,
+    persistence_wait_us: Option<u64>,
+    execution_cache_wait_us: Option<u64>,
+    sparse_trie_wait_us: Option<u64>,
+}
+
+/// Row for `txgen_block_metrics` table.
+#[derive(serde::Serialize)]
+struct ClickHouseBlockMetricRow<'a> {
+    run_id: uuid::Uuid,
+    block_index: u32,
+    block_number: u64,
+    metric_name: &'a str,
+    labels_json: &'a str,
+    source: &'static str,
+    sample_count: u16,
+    first_value: f64,
+    last_value: f64,
+    min_value: f64,
+    max_value: f64,
+    avg_value: f64,
+    delta_value: Option<f64>,
+}
+
+/// Convert a [`SystemTime`](std::time::SystemTime) to Unix milliseconds.
+fn system_time_to_millis(t: std::time::SystemTime) -> u64 {
+    // SAFETY: SystemTime::now() is always after UNIX_EPOCH
+    t.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
 /// Parse reporter specifications into boxed reporters.
@@ -632,8 +900,15 @@ impl Reporter for ClickHouseReporter {
 /// Supported formats:
 /// - `console` - Human-readable output to stderr
 /// - `json:<path>` - JSON output to file
-/// - `clickhouse:<url>` - ClickHouse (not yet implemented)
-pub fn parse_reporters(specs: &[String]) -> Result<Vec<Box<dyn Reporter>>> {
+/// - `clickhouse:<url>` - Push benchmark data to ClickHouse
+///
+/// The ClickHouse reporter requires metadata keys: `scenario`, `platform`,
+/// `git-sha`, `git-ref`. Pass them via `-m key=value`.
+pub fn parse_reporters(
+    specs: &[String],
+    mode: &str,
+    metadata: &HashMap<String, String>,
+) -> Result<Vec<Box<dyn Reporter>>> {
     let mut reporters: Vec<Box<dyn Reporter>> = Vec::new();
 
     if specs.is_empty() {
@@ -648,8 +923,11 @@ pub fn parse_reporters(specs: &[String]) -> Result<Vec<Box<dyn Reporter>>> {
             reporters.push(Box::new(
                 JsonReporter::file(path).wrap_err("failed to create JSON reporter")?,
             ));
-        } else if let Some(_url) = spec.strip_prefix("clickhouse:") {
-            tracing::warn!("ClickHouse reporter not yet fully implemented");
+        } else if let Some(url) = spec.strip_prefix("clickhouse:") {
+            let config = ClickHouseConfig::from_metadata(url, mode, metadata)?;
+            reporters.push(Box::new(
+                ClickHouseReporter::new(config).wrap_err("failed to create ClickHouse reporter")?,
+            ));
         } else {
             bail!("unknown report format: {}", spec);
         }
