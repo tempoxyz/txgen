@@ -24,7 +24,8 @@
 #   --block-time <DUR>    Dev mode block time (default: 500ms)
 #   --gas-limit <N>       Builder gas limit (default: 3000000000)
 #   --max-tasks <N>       Builder max tasks (default: 32)
-#   --txpool-size <N>     Max txpool per sub-pool (default: 500000)
+#   --txpool-count <N>    Max txpool txs per sub-pool (default: 500000)
+#   --txpool-size <N>     Max txpool size in MB per sub-pool (default: 20)
 #   --seed <N>            RNG seed (default: 99)
 #
 # Options (run):
@@ -56,7 +57,7 @@ while [[ $# -gt 0 ]]; do
     # Block time → setup + run metadata
     --block-time) BLOCK_TIME="$2"; SETUP_ARGS+=("$1" "$2"); shift 2 ;;
     # Setup-only flags
-    --spec|--count|--genesis|--tempo-bin|--gas-limit|--max-tasks|--txpool-size|--seed|--datadir)
+    --spec|--count|--genesis|--tempo-bin|--gas-limit|--max-tasks|--txpool-count|--txpool-size|--seed|--datadir)
       SETUP_ARGS+=("$1" "$2"); shift 2 ;;
     # Run-only flags
     --tps|--max-concurrent|--rpc-url|--metrics-url|--scrape-interval|--drain-timeout|--metadata|--report)

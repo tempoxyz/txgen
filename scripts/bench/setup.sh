@@ -12,7 +12,8 @@
 #   --block-time <DUR>    Dev mode block time (default: 500ms)
 #   --gas-limit <N>       Builder gas limit (default: 3000000000)
 #   --max-tasks <N>       Builder max tasks (default: 32)
-#   --txpool-size <N>     Max txpool per sub-pool (default: 500000)
+#   --txpool-count <N>    Max txpool txs per sub-pool (default: 500000)
+#   --txpool-size <N>     Max txpool size in MB per sub-pool (default: 20)
 #   --seed <N>            RNG seed for tx generation (default: 99)
 #   --datadir <PATH>      Explicit datadir (default: mktemp)
 #
@@ -27,7 +28,8 @@ TEMPO_BIN="${TEMPO_BIN:-$HOME/.tempo/bin/tempo}"
 BLOCK_TIME="500ms"
 GAS_LIMIT="3000000000"
 MAX_TASKS="32"
-TXPOOL_SIZE="500000"
+TXPOOL_COUNT="500000"
+TXPOOL_SIZE="20"
 SEED="99"
 DATADIR=""
 FAUCET_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
@@ -44,6 +46,7 @@ while [[ $# -gt 0 ]]; do
     --block-time)   BLOCK_TIME="$2"; shift 2 ;;
     --gas-limit)    GAS_LIMIT="$2"; shift 2 ;;
     --max-tasks)    MAX_TASKS="$2"; shift 2 ;;
+    --txpool-count) TXPOOL_COUNT="$2"; shift 2 ;;
     --txpool-size)  TXPOOL_SIZE="$2"; shift 2 ;;
     --seed)         SEED="$2"; shift 2 ;;
     --datadir)      DATADIR="$2"; shift 2 ;;
@@ -98,7 +101,7 @@ for addr in "${FAUCET_ADDRS[@]}"; do
   FAUCET_FLAGS+=(--faucet.address "$addr")
 done
 
-echo "Starting tempo (block-time=$BLOCK_TIME, gas-limit=$GAS_LIMIT, max-tasks=$MAX_TASKS, txpool=$TXPOOL_SIZE)..."
+echo "Starting tempo (block-time=$BLOCK_TIME, gas-limit=$GAS_LIMIT, max-tasks=$MAX_TASKS, txpool=${TXPOOL_COUNT}x${TXPOOL_SIZE}MB)..."
 "$TEMPO_BIN" node \
   --chain "$GENESIS" \
   --datadir "$DATADIR" \
@@ -110,9 +113,12 @@ echo "Starting tempo (block-time=$BLOCK_TIME, gas-limit=$GAS_LIMIT, max-tasks=$M
   --http.api all \
   --rpc.max-connections 10000 \
   --metrics 127.0.0.1:9001 \
-  --txpool.pending-max-count "$TXPOOL_SIZE" \
-  --txpool.basefee-max-count "$TXPOOL_SIZE" \
-  --txpool.queued-max-count "$TXPOOL_SIZE" \
+  --txpool.pending-max-count "$TXPOOL_COUNT" \
+  --txpool.pending-max-size "$TXPOOL_SIZE" \
+  --txpool.basefee-max-count "$TXPOOL_COUNT" \
+  --txpool.basefee-max-size "$TXPOOL_SIZE" \
+  --txpool.queued-max-count "$TXPOOL_COUNT" \
+  --txpool.queued-max-size "$TXPOOL_SIZE" \
   "${FAUCET_FLAGS[@]}" \
   --log.stdout.filter error \
   >"$DATADIR/tempo.log" 2>&1 &
