@@ -67,6 +67,14 @@ pub struct SendArgs {
     /// Scrape interval in milliseconds for the metrics scraper.
     #[arg(long, default_value = "500")]
     pub scrape_interval_ms: u64,
+
+    /// Wait for the transaction pool to drain after sending.
+    ///
+    /// Polls `txpool_status` and waits until the pending count reaches zero
+    /// (3 consecutive readings) before collecting block stats and finalizing.
+    /// Set to 0 to disable. Keeps the metrics scraper running during the wait.
+    #[arg(long, default_value = "300")]
+    pub drain_timeout: u64,
 }
 
 /// Arguments for the `replay` subcommand.

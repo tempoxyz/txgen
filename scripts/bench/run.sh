@@ -14,7 +14,7 @@
 #   --input <PATH>         Tx file (default: $DATADIR/txs.ndjson)
 #   --metadata <K=V>       Extra metadata key=value (repeatable)
 #   --report <SPEC>        Additional report destination (repeatable)
-#   --drain-timeout <N>    Seconds to wait for pool drain (default: 300)
+#   --drain-timeout <N>    Seconds to wait for pool drain (default: 300, 0 to disable)
 #
 # Outputs:
 #   $DATADIR/report.json   Bench report (includes scraped metrics as samples)
@@ -104,35 +104,16 @@ START_TIME=$(date +%s)
   --input "$INPUT" \
   --metrics-url "$METRICS_URL" \
   --scrape-interval-ms "$SCRAPE_INTERVAL" \
+  --drain-timeout "$DRAIN_TIMEOUT" \
   "${METADATA_FLAGS[@]}" \
   "${REPORT_FLAGS[@]}" 2>&1
 
 END_TIME=$(date +%s)
 SEND_ELAPSED=$((END_TIME - START_TIME))
 echo ""
-echo "=== Send complete in ${SEND_ELAPSED}s ==="
+echo "=== Bench complete in ${SEND_ELAPSED}s ==="
 
-# ── Wait for pool drain ─────────────────────────────────────────────
-echo "Waiting for txpool to drain (timeout=${DRAIN_TIMEOUT}s)..."
-ZERO_COUNT=0
-for i in $(seq 1 "$DRAIN_TIMEOUT"); do
-  pending=$(curl -sf -X POST -H 'Content-Type: application/json' \
-    -d '{"jsonrpc":"2.0","method":"txpool_status","params":[],"id":1}' \
-    "$RPC" 2>/dev/null | python3 -c "import sys,json; print(int(json.load(sys.stdin)['result']['pending'],16))" 2>/dev/null || echo "?")
-  if [[ "$pending" == "0" ]]; then
-    ZERO_COUNT=$((ZERO_COUNT + 1))
-    if [[ $ZERO_COUNT -ge 3 ]]; then
-      echo "Pool drained after ${i}s (3 consecutive zero readings)"
-      break
-    fi
-  else
-    ZERO_COUNT=0
-  fi
-  [[ $((i % 10)) -eq 0 ]] && echo "  pending: $pending"
-  sleep 1
-done
-
-TOTAL_ELAPSED=$(( $(date +%s) - START_TIME ))
+TOTAL_ELAPSED=$SEND_ELAPSED
 
 # ── Kill tempo ───────────────────────────────────────────────────────
 if [[ -f "$DATADIR/tempo.pid" ]]; then
