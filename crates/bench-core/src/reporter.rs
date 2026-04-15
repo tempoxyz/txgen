@@ -813,7 +813,7 @@ impl Reporter for ClickHouseReporter {
         let metric_rows = self.build_metric_rows(&correlated);
         if !metric_rows.is_empty() {
             // Insert in batches to avoid oversized requests.
-            const BATCH_SIZE: usize = 10_000;
+            const BATCH_SIZE: usize = 100_000;
             for chunk in metric_rows.chunks(BATCH_SIZE) {
                 self.insert_rows("txgen_block_metrics", chunk)?;
             }
