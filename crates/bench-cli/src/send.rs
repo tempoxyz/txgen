@@ -83,7 +83,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     let block_poller = start_block_poller(
         query_provider.clone(),
         clock.clone(),
-        Duration::from_secs(1),
+        Duration::from_millis(args.scrape_interval_ms),
         start_block,
     );
 
