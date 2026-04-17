@@ -80,7 +80,6 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
 
     // Process blocks through the send-blocks pipeline
     let mut collector = send_blocks::MetricsCollector::default();
-    let mut replay_markers = Vec::new();
     let mut prev_block_hash = None;
     let mut finalized_hash = None;
     let persistence_policy = WaitForPersistence::Always;
@@ -93,9 +92,7 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
             &engine_provider,
             rlp_bytes,
             &meta,
-            &clock,
             &mut collector,
-            &mut replay_markers,
             &mut prev_block_hash,
             &mut finalized_hash,
             &persistence_policy,
@@ -120,7 +117,6 @@ pub async fn execute(args: ReplayArgs) -> Result<()> {
     let mut report = FinalReport {
         metadata: metadata.clone(),
         samples,
-        block_markers: replay_markers,
         ..Default::default()
     };
 

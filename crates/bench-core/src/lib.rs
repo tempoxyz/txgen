@@ -8,9 +8,7 @@
 //! - [`reth_api`] - reth custom Engine API types (`reth_newPayload`, `reth_forkchoiceUpdated`)
 //! - [`historical`] - Historical transaction fetching from archive RPC
 
-pub mod block_poller;
 pub mod clock;
-pub mod correlate;
 pub mod historical;
 pub mod metrics;
 pub mod prometheus;
@@ -20,13 +18,8 @@ pub mod sample;
 pub mod scraper;
 pub mod sender;
 pub mod source;
-pub mod timeline;
 
-pub use block_poller::{BlockPollerHandle, start_block_poller};
 pub use clock::RunClock;
-pub use correlate::{
-    BlockMetricAggregate, CorrelatedBlock, MetricSource, WindowKind, correlate_samples,
-};
 pub use historical::{HistoricalFetcher, HistoricalFetcherConfig, HistoricalTx};
 pub use metrics::{
     BenchMetrics, BlockStats, LatencySample, LatencyStats, MetricsCollector, RunStats,
@@ -46,4 +39,3 @@ pub use sample::{Sample, SampleStore};
 pub use scraper::{SampleCallback, ScraperConfig, ScraperHandle, start_scraper};
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource, TxgenSource};
-pub use timeline::BlockMarker;

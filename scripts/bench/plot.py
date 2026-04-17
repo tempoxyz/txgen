@@ -8,6 +8,8 @@ If DATADIR is omitted, reads from /tmp/txgen-bench-datadir.
 
 Reads $DATADIR/report.json and extracts the unified `samples` array to
 produce $DATADIR/bench_plots.png with a multi-panel overview.
+
+Samples are point-in-time metric snapshots plotted over time.
 """
 
 import json
@@ -101,14 +103,6 @@ def main():
         print("error: no sample data in report (was --metrics-url used?)", file=sys.stderr)
         sys.exit(1)
 
-    # Deduplicate: keep last sample per block number
-    HEIGHT = "reth_blockchain_tree_canonical_chain_height"
-    seen: dict[int, dict] = {}
-    for r in rows:
-        block = int(col([r], HEIGHT, int, 0)[0])
-        seen[block] = r
-    rows = sorted(seen.values(), key=lambda r: r["ts_ms"])
-
     # Print available metric names for reference
     all_names = sorted(set(
         key[0] for row in rows for key in row.keys()
@@ -125,9 +119,7 @@ def main():
 
     t0 = rows[0]["ts_ms"]
     ts = [(r["ts_ms"] - t0) / 1000.0 for r in rows]
-
-    # First sample offset_ms for converting block marker offsets to plot time
-    offset0 = sorted(set(s["offset_ms"] for s in report.get("samples", [])))[0] if report.get("samples") else 0
+    n_scrapes = len(rows)
 
     # ── Extract columns ──────────────────────────────────────────────
     # Throughput
@@ -189,20 +181,15 @@ def main():
     tx_p99_us = [v * 1e6 for v in tx_exec_p99]
     fetch_p50_ms = [v * 1000 for v in fetch_p50]
 
-    # Builds per block: delta of cumulative build count between deduped samples
-    builds_per_block = [b - a for a, b in zip([build_count[0]] + build_count, build_count)]
+    # Builds per scrape: delta of cumulative build count between samples
+    builds_delta = [b - a for a, b in zip([build_count[0]] + build_count, build_count)]
 
     # ── Plot ─────────────────────────────────────────────────────────
     fig, axes = plt.subplots(5, 3, figsize=(20, 25))
     duration = ts[-1] - ts[0]
-    n_blocks = len(rows)
-
-    # ── Block markers ──────────────────────────────────────────────────
-    block_markers = report.get("block_markers", [])
-    marker_ts = [(m["offset_ms"] - offset0) / 1000.0 for m in block_markers]
 
     fig.suptitle(
-        f"Tempo Bench: {n_blocks} blocks over {duration:.0f}s "
+        f"Tempo Bench: {n_scrapes} scrapes over {duration:.0f}s "
         f"(avg {avg(tx_last):.0f} tx/block)",
         fontsize=14,
         fontweight="bold",
@@ -215,14 +202,6 @@ def main():
         fig.text(0.5, 0.965, meta_str, ha="center", fontsize=10,
                  color="#555555", fontstyle="italic")
 
-    def add_markers(ax):
-        """Draw a rug plot of block markers along the bottom edge."""
-        if marker_ts:
-            ax.eventplot(marker_ts, orientation="horizontal",
-                         lineoffsets=0, linelengths=0.06,
-                         colors="#E91E63", alpha=0.6, linewidths=0.6,
-                         transform=ax.get_xaxis_transform())
-
     def pl(ax, ys, color, **kw):
         ax.plot(ts, ys, color=color, linewidth=0.8, **kw)
 
@@ -231,13 +210,12 @@ def main():
         ax.set_ylabel(ylabel)
         ax.set_title(title)
         ax.grid(True, alpha=0.3)
-        add_markers(ax)
 
     ax = axes[0][0]
     pl(ax, tx_last, "#2196F3")
     a = avg(tx_last)
     ax.axhline(y=a, color="red", linestyle="--", alpha=0.5, label=f"avg={a:.0f}")
-    style(ax, "Txs", "Txs per Block"); ax.legend()
+    style(ax, "Txs", "Txs per Block (latest)"); ax.legend()
 
     ax = axes[0][1]
     pl(ax, ggas_s, "#FF9800")
@@ -267,39 +245,39 @@ def main():
 
     axes[1][2].axis("off")
 
-    # ── Row 3: Block Builder ─────────────────────────────────────────
+    # ── Row 3: Builder Timing (rolling estimates) ────────────────────
     ax = axes[2][0]
     pl(ax, build_p50_ms, "#2196F3", label="p50")
     pl(ax, build_p99_ms, "#F44336", alpha=0.7, label="p99")
-    style(ax, "ms", "Payload Build Duration"); ax.legend()
+    style(ax, "ms", "Payload Build Duration (rolling)"); ax.legend()
 
     ax = axes[2][1]
     pl(ax, sr_p50_ms, "#9C27B0", label="p50")
     pl(ax, sr_p99_ms, "#F44336", alpha=0.7, label="p99")
-    style(ax, "ms", "State Root Duration"); ax.legend()
+    style(ax, "ms", "State Root Duration (rolling)"); ax.legend()
 
     ax = axes[2][2]
     pl(ax, fin_p50_ms, "#607D8B", label="p50")
     pl(ax, fin_p99_ms, "#F44336", alpha=0.7, label="p99")
-    style(ax, "ms", "Payload Finalization Duration"); ax.legend()
+    style(ax, "ms", "Finalization Duration (rolling)"); ax.legend()
 
-    # ── Row 4: Block Anatomy ─────────────────────────────────────────
+    # ── Row 4: Build Anatomy ─────────────────────────────────────────
     ax = axes[3][0]
     pl(ax, total_tx_exec_p50_ms, "#FF5722", label="tx execution")
     pl(ax, state_setup_p50_ms, "#4CAF50", label="state setup")
     pl(ax, hashed_post_p50_ms, "#00BCD4", label="hashed post state")
-    style(ax, "ms", "Build Time Breakdown (p50)"); ax.legend()
+    style(ax, "ms", "Build Time Breakdown (rolling p50)"); ax.legend()
 
     ax = axes[3][1]
-    pl(ax, builds_per_block, "#795548")
-    a = avg(builds_per_block)
+    pl(ax, builds_delta, "#795548")
+    a = avg(builds_delta)
     ax.axhline(y=a, color="red", linestyle="--", alpha=0.5, label=f"avg={a:.1f}")
-    style(ax, "Count", "Builds per Block"); ax.legend()
+    style(ax, "Count", "Builds per Scrape"); ax.legend()
 
     ax = axes[3][2]
     pl(ax, tx_p50_us, "#FF5722", label="p50")
     pl(ax, tx_p99_us, "#F44336", alpha=0.7, label="p99")
-    style(ax, "µs", "Per-Tx Execution Duration"); ax.legend()
+    style(ax, "µs", "Per-Tx Execution Duration (rolling)"); ax.legend()
 
     # ── Row 5: Pool ──────────────────────────────────────────────────
     ax = axes[4][0]
@@ -310,12 +288,12 @@ def main():
 
     ax = axes[4][1]
     pl(ax, fetch_p50_ms, "#009688", label="p50")
-    style(ax, "ms", "Pool Fetch Duration"); ax.legend()
+    style(ax, "ms", "Pool Fetch Duration (rolling)"); ax.legend()
 
     ax = axes[4][2]
     pl(ax, skip_nonce_delta, "#F44336", label="nonce_too_low")
     pl(ax, skip_invalid_delta, "#FF9800", label="invalid_tx")
-    style(ax, "Count", "Skipped Txs per Block"); ax.legend()
+    style(ax, "Count", "Skipped Txs per Scrape"); ax.legend()
 
     plt.tight_layout(rect=[0, 0, 1, 0.97])
     out_path = os.path.join(datadir, "bench_plots.png")
@@ -323,9 +301,7 @@ def main():
     print(f"Saved {out_path}")
 
     # ── Summary ──────────────────────────────────────────────────────
-    if marker_ts:
-        print(f"\nBlock markers: {len(marker_ts)}")
-    print(f"Blocks (deduped): {n_blocks}")
+    print(f"\nScrapes: {n_scrapes}")
     print(f"Time range: {ts[0]:.1f}s – {ts[-1]:.1f}s ({duration:.1f}s)")
     print(f"Avg txs/block: {avg(tx_last):.0f}")
     print(f"Steady Ggas/s: {steady_avg(ts, ggas_s):.2f}")
@@ -339,7 +315,7 @@ def main():
     print(f"State setup   p50={avg(state_setup_p50_ms):.2f}ms")
     print(f"Hashed post   p50={avg(hashed_post_p50_ms):.2f}ms")
     print(f"Pool fetch  p50={avg(fetch_p50_ms):.2f}ms")
-    print(f"Builds/block: {avg(builds_per_block):.1f}")
+    print(f"Builds/scrape: {avg(builds_delta):.1f}")
     print(f"Avg RLP size: {avg(rlp_kb):.0f} KB")
     print(f"Skipped nonce_low: {skip_nonce[-1] if skip_nonce else 0}")
     print(f"Skipped invalid: {skip_invalid[-1] if skip_invalid else 0}")
