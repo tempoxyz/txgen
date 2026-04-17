@@ -2,7 +2,7 @@
 
 use crate::SendArgs;
 use alloy_network::AnyNetwork;
-use alloy_provider::{Provider, ProviderBuilder};
+use alloy_provider::{Provider, ProviderBuilder, ext::TxPoolApi};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
@@ -210,7 +210,7 @@ async fn send_from_source<S: TxSource>(
 ///
 /// Polls `txpool_status` every second. Returns after 3 consecutive zero
 /// readings or when the timeout is reached.
-async fn wait_for_pool_drain<P: Provider<AnyNetwork>>(provider: &P, timeout_secs: u64) {
+async fn wait_for_pool_drain<P: TxPoolApi<AnyNetwork>>(provider: &P, timeout_secs: u64) {
     tracing::info!(timeout_secs, "Waiting for txpool to drain...");
 
     let mut zero_count: u32 = 0;
@@ -224,16 +224,9 @@ async fn wait_for_pool_drain<P: Provider<AnyNetwork>>(provider: &P, timeout_secs
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        match provider
-            .raw_request::<_, serde_json::Value>("txpool_status".into(), ())
-            .await
-        {
+        match provider.txpool_status().await {
             Ok(status) => {
-                let pending = status
-                    .get("pending")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| u64::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16).ok())
-                    .unwrap_or(0);
+                let pending = status.pending;
 
                 if pending == 0 {
                     zero_count += 1;
