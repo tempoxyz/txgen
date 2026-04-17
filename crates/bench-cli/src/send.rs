@@ -1,6 +1,7 @@
 //! `bench send` - Send transactions from file or stdin
 
 use crate::SendArgs;
+use alloy_network::AnyNetwork;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
@@ -33,7 +34,9 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         .map(|url| {
             let url = url.parse().context("failed to parse RPC URL")?;
             let client = RpcClient::builder().layer(retry_layer.clone()).http(url);
-            Ok(ProviderBuilder::new().connect_client(client).erased())
+            Ok(ProviderBuilder::new_with_network::<AnyNetwork>()
+                .connect_client(client)
+                .erased())
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -207,7 +210,7 @@ async fn send_from_source<S: TxSource>(
 ///
 /// Polls `txpool_status` every second. Returns after 3 consecutive zero
 /// readings or when the timeout is reached.
-async fn wait_for_pool_drain<P: Provider>(provider: &P, timeout_secs: u64) {
+async fn wait_for_pool_drain<P: Provider<AnyNetwork>>(provider: &P, timeout_secs: u64) {
     tracing::info!(timeout_secs, "Waiting for txpool to drain...");
 
     let mut zero_count: u32 = 0;
