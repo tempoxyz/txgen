@@ -7,7 +7,7 @@ use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     ConsoleReporter, FileSource, FinalReport, MetricsCollector, ProgressState, Reporter, RunClock,
     RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, StdinSource, TxSource,
-    collect_block_stats, parse_reporters, start_block_poller, start_scraper,
+    collect_block_stats, parse_reporters, start_scraper,
 };
 use eyre::{Context, Result, bail};
 use std::collections::HashMap;
@@ -79,14 +79,6 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         .await
         .wrap_err("failed to get starting block number")?;
 
-    // Start background block head-poller to record BlockMarkers.
-    let block_poller = start_block_poller(
-        query_provider.clone(),
-        clock.clone(),
-        Duration::from_millis(args.scrape_interval_ms),
-        start_block,
-    );
-
     match &args.input {
         Some(path) => {
             let mut source = FileSource::new(path).wrap_err("failed to open input file")?;
@@ -105,9 +97,6 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     if args.drain_timeout > 0 {
         wait_for_pool_drain(query_provider, args.drain_timeout).await;
     }
-
-    // Stop the block poller and collect markers.
-    let block_markers = block_poller.drain().await;
 
     // Stop the scraper before finalizing.
     if let Some(handle) = scraper_handle {
@@ -139,7 +128,6 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         bench_metrics: Some(final_metrics),
         time_series: Some(time_series),
         samples,
-        block_markers,
         ..Default::default()
     };
 

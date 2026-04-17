@@ -226,7 +226,7 @@ Report destinations are specified with `--report` and can be repeated:
 |--------|-------------|
 | `console` | Print summary to stderr (default if no reporters specified) |
 | `json:<path>` | Write JSON report to file |
-| `clickhouse:<url>` | Push per-block benchmark data to ClickHouse |
+| `clickhouse:<url>` | Push benchmark data to ClickHouse |
 
 ### Metrics Scraping
 
@@ -246,7 +246,7 @@ Metadata key=value pairs (`-m key=value`) are applied as labels to all samples, 
 
 ### ClickHouse Reporting
 
-The ClickHouse reporter pushes per-block benchmark results and correlated Prometheus metrics into three tables (`txgen_runs`, `txgen_blocks`, `txgen_block_metrics`). It requires four metadata keys:
+The ClickHouse reporter pushes benchmark results into three tables (`txgen_runs`, `txgen_blocks`, `txgen_metric_samples`). Block data is stored as factual chain data; metrics are stored as point-in-time scrape snapshots with no block attribution. It requires four metadata keys:
 
 ```bash
 bench send -i txs.ndjson \
@@ -268,9 +268,8 @@ bench send -i txs.ndjson \
 Authentication is configured via environment variables: `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE`. See [`scripts/clickhouse/README.md`](scripts/clickhouse/README.md) for schema setup and example queries.
 
 The JSON report includes:
-- `samples` — unified time-series of all scraped metrics (internal + node)
-- `block_markers` — timestamps when new blocks were observed (send mode)
-- `replay_block_markers` — precise per-block timing windows (replay/send-blocks mode)
+- `samples` — point-in-time metric snapshots (internal + node), stored as a time series
+- `blocks` — factual chain data for each block in the run (tx count, gas used, etc.)
 
 ## Output Format
 

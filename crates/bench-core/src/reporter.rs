@@ -7,7 +7,6 @@
 
 use crate::metrics::{BenchMetrics, BlockStats, RunStats, TimeSeriesMetrics};
 use crate::sample::Sample;
-use crate::timeline::BlockMarker;
 use eyre::{Context, Result, bail};
 use std::collections::HashMap;
 use std::io::Write;
@@ -29,8 +28,6 @@ pub struct FinalReport {
     pub run_stats: Option<RunStats>,
     /// Unified time-series samples (internal + node).
     pub samples: Vec<Sample>,
-    /// Block timeline markers (observation or submission).
-    pub block_markers: Vec<BlockMarker>,
     /// Per-block chain stats (send mode).
     pub blocks: Vec<BlockStats>,
 }
@@ -303,9 +300,6 @@ pub struct JsonReport {
     /// Unified time-series samples (internal + node metrics).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub samples: Vec<Sample>,
-    /// Block observation markers.
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub block_markers: Vec<BlockMarker>,
 }
 
 /// Block statistics in JSON format.
@@ -514,7 +508,6 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
                 run_stats: report.run_stats.as_ref().map(JsonRunStats::from),
                 metadata,
                 samples: report.samples.clone(),
-                block_markers: report.block_markers.clone(),
             };
 
             serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
@@ -623,8 +616,8 @@ impl ClickHouseConfig {
 ///
 /// Inserts into three tables:
 /// - `txgen_runs` — run metadata
-/// - `txgen_blocks` — per-block facts and timing
-/// - `txgen_block_metrics` — per-block correlated metrics
+/// - `txgen_blocks` — per-block chain facts
+/// - `txgen_metric_samples` — point-in-time metric snapshots
 pub struct ClickHouseReporter {
     config: ClickHouseConfig,
     client: reqwest::Client,
@@ -712,71 +705,43 @@ impl ClickHouseReporter {
     }
 
     /// Build block rows for insertion.
-    fn build_block_rows(
-        &self,
-        report: &FinalReport,
-        correlated: &[crate::correlate::CorrelatedBlock],
-    ) -> Vec<ClickHouseBlockRow> {
-        let blocks_by_number: HashMap<u64, &BlockStats> =
-            report.blocks.iter().map(|b| (b.number, b)).collect();
-
-        correlated
+    fn build_block_rows(&self, report: &FinalReport) -> Vec<ClickHouseBlockRow> {
+        report
+            .blocks
             .iter()
-            .map(|cb| {
-                let block_stats = blocks_by_number.get(&cb.block_number);
-                let marker = report
-                    .block_markers
-                    .iter()
-                    .find(|m| m.number == cb.block_number);
-
-                ClickHouseBlockRow {
-                    run_id: self.config.run_id,
-                    block_index: cb.block_index,
-                    block_number: cb.block_number,
-                    chain_timestamp: cb.chain_timestamp,
-                    window_kind: cb.window_kind.as_str(),
-                    window_start_offset_ms: cb.window_start_offset_ms,
-                    window_end_offset_ms: cb.window_end_offset_ms,
-                    tx_count: block_stats.map(|b| b.tx_count as u32).unwrap_or(0),
-                    gas_used: block_stats.map(|b| b.gas_used).unwrap_or(0),
-                    gas_limit: block_stats.map(|b| b.gas_limit).unwrap_or(0),
-                    block_time_ms: block_stats.and_then(|b| b.block_time_ms),
-                    new_payload_ms: marker.and_then(|m| m.new_payload_ms()),
-                    fcu_ms: marker.and_then(|m| m.fcu_ms()),
-                    total_latency_ms: marker.and_then(|m| m.execution_ms()),
-                    payload_status: None,
-                    server_latency_us: None,
-                    persistence_wait_us: None,
-                    execution_cache_wait_us: None,
-                    sparse_trie_wait_us: None,
-                }
+            .enumerate()
+            .map(|(idx, block)| ClickHouseBlockRow {
+                run_id: self.config.run_id,
+                block_index: idx as u32,
+                block_number: block.number,
+                chain_timestamp: Some(block.timestamp),
+                tx_count: block.tx_count as u32,
+                gas_used: block.gas_used,
+                gas_limit: block.gas_limit,
+                block_time_ms: block.block_time_ms,
             })
             .collect()
     }
 
-    /// Build block metric rows for insertion.
-    fn build_metric_rows<'a>(
-        &self,
-        correlated: &'a [crate::correlate::CorrelatedBlock],
-    ) -> Vec<ClickHouseBlockMetricRow<'a>> {
-        correlated
+    /// Build metric sample rows for insertion.
+    fn build_sample_rows<'a>(&self, samples: &'a [Sample]) -> Vec<ClickHouseMetricSampleRow<'a>> {
+        samples
             .iter()
-            .flat_map(|cb| {
-                cb.metrics.iter().map(move |m| ClickHouseBlockMetricRow {
+            .map(|s| {
+                let source = if s.name.starts_with("txgen_") {
+                    "txgen"
+                } else {
+                    "prometheus"
+                };
+                ClickHouseMetricSampleRow {
                     run_id: self.config.run_id,
-                    block_index: cb.block_index,
-                    block_number: cb.block_number,
-                    metric_name: &m.metric_name,
-                    labels_json: &m.labels_json,
-                    source: m.source.as_str(),
-                    sample_count: m.sample_count,
-                    first_value: m.first_value,
-                    last_value: m.last_value,
-                    min_value: m.min_value,
-                    max_value: m.max_value,
-                    avg_value: m.avg_value,
-                    delta_value: m.delta_value,
-                })
+                    offset_ms: s.offset_ms,
+                    unix_ms: s.unix_ms,
+                    metric_name: &s.name,
+                    labels_json: serde_json::to_string(&s.labels).unwrap_or_default(),
+                    source,
+                    value: s.value,
+                }
             })
             .collect()
     }
@@ -785,19 +750,11 @@ impl ClickHouseReporter {
 impl Reporter for ClickHouseReporter {
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
         let finished_at = std::time::SystemTime::now();
-        let precise = report
-            .block_markers
-            .iter()
-            .any(|m| m.fcu_done_offset_ms.is_some());
-
-        // Correlate samples to blocks.
-        let correlated =
-            crate::correlate::correlate_samples(&report.block_markers, &report.samples, precise);
 
         tracing::info!(
             run_id = %self.config.run_id,
-            blocks = correlated.len(),
-            total_metrics = correlated.iter().map(|c| c.metrics.len()).sum::<usize>(),
+            blocks = report.blocks.len(),
+            samples = report.samples.len(),
             "Inserting benchmark results into ClickHouse"
         );
 
@@ -806,16 +763,15 @@ impl Reporter for ClickHouseReporter {
         self.insert_rows("txgen_runs", &[run_row])?;
 
         // Insert blocks.
-        let block_rows = self.build_block_rows(report, &correlated);
+        let block_rows = self.build_block_rows(report);
         self.insert_rows("txgen_blocks", &block_rows)?;
 
-        // Insert block metrics.
-        let metric_rows = self.build_metric_rows(&correlated);
-        if !metric_rows.is_empty() {
-            // Insert in batches to avoid oversized requests.
+        // Insert metric samples.
+        let sample_rows = self.build_sample_rows(&report.samples);
+        if !sample_rows.is_empty() {
             const BATCH_SIZE: usize = 100_000;
-            for chunk in metric_rows.chunks(BATCH_SIZE) {
-                self.insert_rows("txgen_block_metrics", chunk)?;
+            for chunk in sample_rows.chunks(BATCH_SIZE) {
+                self.insert_rows("txgen_metric_samples", chunk)?;
             }
         }
 
@@ -824,7 +780,7 @@ impl Reporter for ClickHouseReporter {
             scenario = %self.config.scenario_name,
             platform = %self.config.platform,
             blocks = block_rows.len(),
-            metrics = metric_rows.len(),
+            samples = sample_rows.len(),
             "ClickHouse insert complete"
         );
 
@@ -854,39 +810,22 @@ struct ClickHouseBlockRow {
     block_index: u32,
     block_number: u64,
     chain_timestamp: Option<u64>,
-    window_kind: &'static str,
-    window_start_offset_ms: u64,
-    window_end_offset_ms: u64,
     tx_count: u32,
     gas_used: u64,
     gas_limit: u64,
     block_time_ms: Option<u64>,
-    new_payload_ms: Option<u64>,
-    fcu_ms: Option<u64>,
-    total_latency_ms: Option<u64>,
-    payload_status: Option<String>,
-    server_latency_us: Option<u64>,
-    persistence_wait_us: Option<u64>,
-    execution_cache_wait_us: Option<u64>,
-    sparse_trie_wait_us: Option<u64>,
 }
 
-/// Row for `txgen_block_metrics` table.
+/// Row for `txgen_metric_samples` table.
 #[derive(serde::Serialize)]
-struct ClickHouseBlockMetricRow<'a> {
+struct ClickHouseMetricSampleRow<'a> {
     run_id: uuid::Uuid,
-    block_index: u32,
-    block_number: u64,
+    offset_ms: u64,
+    unix_ms: u64,
     metric_name: &'a str,
-    labels_json: &'a str,
+    labels_json: String,
     source: &'static str,
-    sample_count: u16,
-    first_value: f64,
-    last_value: f64,
-    min_value: f64,
-    max_value: f64,
-    avg_value: f64,
-    delta_value: Option<f64>,
+    value: f64,
 }
 
 /// Convert a [`SystemTime`](std::time::SystemTime) to Unix milliseconds.

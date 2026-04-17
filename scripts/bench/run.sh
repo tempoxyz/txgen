@@ -143,9 +143,9 @@ print(f'  TPS:      {r[\"tps\"]:.0f}')
 print(f'  p50:      {r[\"latency\"][\"p50_ms\"]:.2f}ms')
 print(f'  p99:      {r[\"latency\"][\"p99_ms\"]:.2f}ms')
 samples = len(r.get('samples', []))
-markers = len(r.get('block_markers', []))
+blocks = len(r.get('blocks', []))
 if samples:
     print(f'  Samples:  {samples}')
-if markers:
-    print(f'  Blocks:   {markers}')
+if blocks:
+    print(f'  Blocks:   {blocks}')
 " 2>/dev/null || true
