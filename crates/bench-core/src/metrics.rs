@@ -359,12 +359,13 @@ pub async fn collect_block_stats<N: Network, P: Provider<N>>(
 
 /// Extract a millisecond-precision timestamp from a block response.
 ///
-/// Checks `other_fields` for Tempo's `timestampMillis` field. Falls back
-/// to `timestamp_secs * 1000` for standard Ethereum blocks.
+/// Checks `other_fields` for Tempo's `timestampMillisPart` field and
+/// combines it with the second-precision timestamp. Falls back to
+/// `timestamp_secs * 1000` for standard Ethereum blocks.
 fn extract_timestamp_ms<B: BlockResponse>(block: &B, timestamp_secs: u64) -> u64 {
     if let Some(other) = block.other_fields() {
-        if let Some(Ok(ms)) = other.get_deserialized::<u64>("timestampMillis") {
-            return ms;
+        if let Some(Ok(ms_part)) = other.get_deserialized::<u64>("timestampMillisPart") {
+            return timestamp_secs.saturating_mul(1000).saturating_add(ms_part);
         }
     }
     timestamp_secs.saturating_mul(1000)
