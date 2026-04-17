@@ -5,7 +5,7 @@
 //! - Applying rate limiting
 
 use crate::metrics::MetricsCollector;
-use alloy_network::Ethereum;
+use alloy_network::AnyNetwork;
 use alloy_primitives::Bytes;
 use alloy_provider::{DynProvider, Provider};
 use eyre::Result;
@@ -49,7 +49,7 @@ struct PendingTx {
 
 /// Transaction sender.
 pub struct Sender {
-    providers: Vec<DynProvider<Ethereum>>,
+    providers: Vec<DynProvider<AnyNetwork>>,
     metrics: Arc<MetricsCollector>,
     semaphore: Arc<Semaphore>,
     /// Per-key queues to ensure ordering.
@@ -63,7 +63,7 @@ pub struct Sender {
 impl Sender {
     /// Create a new sender.
     pub fn new(
-        providers: Vec<DynProvider<Ethereum>>,
+        providers: Vec<DynProvider<AnyNetwork>>,
         config: SenderConfig,
         metrics: Arc<MetricsCollector>,
     ) -> Self {
@@ -148,7 +148,7 @@ impl Sender {
 /// Worker that processes transactions for a single scheduling key.
 async fn key_worker(
     mut receiver: mpsc::Receiver<PendingTx>,
-    providers: Vec<DynProvider<Ethereum>>,
+    providers: Vec<DynProvider<AnyNetwork>>,
     metrics: Arc<MetricsCollector>,
     semaphore: Arc<Semaphore>,
 ) {

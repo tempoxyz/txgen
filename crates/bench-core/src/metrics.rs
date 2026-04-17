@@ -7,7 +7,10 @@
 
 use crate::clock::RunClock;
 use crate::sample::Sample;
+use alloy_consensus::BlockHeader;
 use alloy_eips::BlockNumberOrTag;
+use alloy_network::Network;
+use alloy_network::primitives::BlockResponse;
 use alloy_provider::Provider;
 
 use eyre::{Context, Result};
@@ -315,13 +318,18 @@ fn percentile_u64(sorted: &[u64], p: usize) -> u64 {
 }
 
 /// Collect block statistics from the chain.
-pub async fn collect_block_stats<P: Provider>(
+///
+/// Supports millisecond-precision block times when the node returns
+/// Tempo-style `timestampMillis` in the block response's extra fields.
+/// Falls back to second-precision (`timestamp * 1000`) for standard
+/// Ethereum nodes.
+pub async fn collect_block_stats<N: Network, P: Provider<N>>(
     provider: &P,
     start_block: u64,
     end_block: u64,
 ) -> Result<Vec<BlockStats>> {
     let mut stats = Vec::with_capacity((end_block - start_block + 1) as usize);
-    let mut prev_timestamp: Option<u64> = None;
+    let mut prev_timestamp_ms: Option<u64> = None;
 
     for number in start_block..=end_block {
         let block = provider
@@ -330,21 +338,36 @@ pub async fn collect_block_stats<P: Provider>(
             .wrap_err_with(|| format!("failed to fetch block {number}"))?
             .ok_or_else(|| eyre::eyre!("block {number} not found"))?;
 
-        let block_time_ms =
-            prev_timestamp.map(|prev| block.header.timestamp.saturating_sub(prev) * 1000);
-        prev_timestamp = Some(block.header.timestamp);
+        let timestamp_secs = block.header().timestamp();
+        let timestamp_ms = extract_timestamp_ms(&block, timestamp_secs);
+
+        let block_time_ms = prev_timestamp_ms.map(|prev| timestamp_ms.saturating_sub(prev));
+        prev_timestamp_ms = Some(timestamp_ms);
 
         stats.push(BlockStats {
             number,
-            timestamp: block.header.timestamp,
-            tx_count: block.transactions.len(),
-            gas_used: block.header.gas_used,
-            gas_limit: block.header.gas_limit,
+            timestamp: timestamp_secs,
+            tx_count: block.transactions().len(),
+            gas_used: block.header().gas_used(),
+            gas_limit: block.header().gas_limit(),
             block_time_ms,
         });
     }
 
     Ok(stats)
+}
+
+/// Extract a millisecond-precision timestamp from a block response.
+///
+/// Checks `other_fields` for Tempo's `timestampMillis` field. Falls back
+/// to `timestamp_secs * 1000` for standard Ethereum blocks.
+fn extract_timestamp_ms<B: BlockResponse>(block: &B, timestamp_secs: u64) -> u64 {
+    if let Some(other) = block.other_fields() {
+        if let Some(Ok(ms)) = other.get_deserialized::<u64>("timestampMillis") {
+            return ms;
+        }
+    }
+    timestamp_secs.saturating_mul(1000)
 }
 
 /// Internal record for a latency with its timestamp.
