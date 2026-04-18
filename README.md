@@ -15,7 +15,8 @@ txgen generates signed, RLP-encoded transactions from YAML workload specificatio
 ## Installation
 
 ```bash
-cargo install --path crates/txgen-cli
+cargo install --path crates/txgen-ethereum
+cargo install --path crates/txgen-tempo
 cargo install --path crates/bench-cli
 ```
 
@@ -27,32 +28,31 @@ cargo build --release
 
 ## CLI Tools
 
-The workspace provides two binaries: `txgen` for transaction generation and `bench` for benchmarking.
+The workspace provides three binaries: `txgen-ethereum` and `txgen-tempo` for transaction generation, and `bench` for benchmarking. Each txgen binary is a standalone chain-specific generator.
 
-### `txgen`
+### `txgen-ethereum` / `txgen-tempo`
 
-#### `txgen generate`
+#### `generate`
 
 Generate transactions from a workload spec.
 
 ```bash
 # Generate 1000 Ethereum transactions
-txgen generate -s workload.yaml -c ethereum -n 1000
+txgen-ethereum generate -s workload.yaml -n 1000
 
 # Generate Tempo transactions with reproducible seed
-txgen generate -s workload.yaml -c tempo -n 1000 --seed 42
+txgen-tempo generate -s workload.yaml -n 1000 --seed 42
 
 # Fetch nonces from chain before generating
-txgen generate -s workload.yaml -c ethereum -n 1000 --rpc http://localhost:8545
+txgen-ethereum generate -s workload.yaml -n 1000 --rpc http://localhost:8545
 
 # Output to file
-txgen generate -s workload.yaml -c ethereum -n 1000 -o transactions.ndjson
+txgen-ethereum generate -s workload.yaml -n 1000 -o transactions.ndjson
 ```
 
 | Flag | Description |
 |------|-------------|
 | `-s, --spec <PATH>` | Workload specification file (YAML) |
-| `-c, --chain <CHAIN>` | Chain plugin: `ethereum`, `tempo` |
 | `-n, --count <N>` | Number of transactions to generate |
 | `-o, --output <PATH>` | Output file (default: stdout) |
 | `--rpc <URL>` | RPC endpoint for fetching current nonces |
@@ -61,14 +61,14 @@ txgen generate -s workload.yaml -c ethereum -n 1000 -o transactions.ndjson
 
 **Required RPC methods:** `eth_getTransactionCount` (only when `--rpc` is provided)
 
-#### `txgen addresses`
+#### `addresses`
 
 List all addresses from a workload spec (useful for funding).
 
 ```bash
-txgen addresses -s workload.yaml
-txgen addresses -s workload.yaml -f json
-txgen addresses -s workload.yaml -f shell   # space-separated for xargs
+txgen-ethereum addresses -s workload.yaml
+txgen-ethereum addresses -s workload.yaml -f json
+txgen-ethereum addresses -s workload.yaml -f shell   # space-separated for xargs
 ```
 
 | Flag | Description |
@@ -78,12 +78,12 @@ txgen addresses -s workload.yaml -f shell   # space-separated for xargs
 
 **Required RPC methods:** None (offline)
 
-#### `txgen extract`
+#### `extract`
 
 Extract raw RLP-encoded blocks from an archive node as NDJSON.
 
 ```bash
-txgen extract --rpc http://localhost:8545 --from 1000 --to 2000 -o blocks.ndjson
+txgen-ethereum extract --rpc http://localhost:8545 --from 1000 --to 2000 -o blocks.ndjson
 ```
 
 | Flag | Description |
@@ -109,7 +109,7 @@ After sending completes, queries the node for per-block statistics (transaction 
 bench send --input transactions.ndjson --rpc-url http://localhost:8545 --tps 500
 
 # From stdin (pipe from txgen)
-txgen generate -s workload.yaml -c ethereum -n 1000 | bench send --rpc-url http://localhost:8545
+txgen-ethereum generate -s workload.yaml -n 1000 | bench send --rpc-url http://localhost:8545
 
 # With JSON report and metadata
 bench send -i txs.ndjson --rpc-url http://localhost:8545 \
@@ -391,7 +391,7 @@ templates:
 
 ## Supported Chains
 
-### Ethereum (`-c ethereum`)
+### Ethereum (`txgen-ethereum`)
 
 Standard Ethereum transaction types:
 
@@ -401,7 +401,7 @@ Standard Ethereum transaction types:
 | `eip2930` | Access list transactions |
 | `eip1559` | Dynamic fee transactions |
 
-### Tempo (`-c tempo`)
+### Tempo (`txgen-tempo`)
 
 All Ethereum types plus Tempo-native transactions:
 
@@ -450,7 +450,7 @@ Summary of which RPC methods are required by each feature:
 
 | RPC Method | Required By |
 |------------|-------------|
-| `eth_getTransactionCount` | `txgen generate --rpc` |
+| `eth_getTransactionCount` | `txgen-ethereum generate --rpc`, `txgen-tempo generate --rpc` |
 | `eth_sendRawTransaction` | `bench send` |
 | `eth_getBlockByNumber` | `bench send` (per-block stats collection) |
 | `debug_getRawBlock` | `txgen extract`, `bench replay` (source RPC) |
@@ -467,14 +467,15 @@ See the `examples/` directory:
 - `simple.yaml` — Basic Ethereum transfers
 - `tempo.yaml` — Tempo transactions with parallel nonces
 - `tempo-mainnet-spam.yaml` — Tempo mainnet workload
+- `bench-spec.yaml` — Bench workload specification
 - `erc20.abi.json` — ERC-20 ABI artifact
 
 ```bash
 # Run the simple example
-txgen generate -s examples/simple.yaml -c ethereum -n 10 --seed 42
+txgen-ethereum generate -s examples/simple.yaml -n 10 --seed 42
 
 # Run the Tempo example
-txgen generate -s examples/tempo.yaml -c tempo -n 10 --seed 42
+txgen-tempo generate -s examples/tempo.yaml -n 10 --seed 42
 ```
 
 ## Architecture
@@ -483,24 +484,30 @@ txgen generate -s examples/tempo.yaml -c tempo -n 10 --seed 42
 txgen/
 ├── crates/
 │   ├── txgen-core/       # Core library: spec parsing, account management, output
-│   ├── txgen-ethereum/   # Ethereum plugin: legacy, eip2930, eip1559
-│   ├── txgen-tempo/      # Tempo plugin: 0x76 + delegates to ethereum
-│   ├── txgen-cli/        # CLI binary (txgen)
+│   ├── txgen-cli/        # Shared CLI framework and NetworkAdapter trait
+│   ├── txgen-ethereum/   # Ethereum binary: legacy, eip2930, eip1559
+│   ├── txgen-tempo/      # Tempo binary: 0x76 + delegates to ethereum
 │   ├── bench-core/       # Benchmarking: metrics, sender, reporters
 │   └── bench-cli/        # Bench CLI binary (bench)
 └── examples/             # Example workload specs
 ```
 
-### Plugin Trait
+### NetworkAdapter Trait
 
-Chains implement the `ChainPlugin` trait:
+Each chain binary implements the `NetworkAdapter` trait from `txgen-cli`:
 
 ```rust
-pub trait ChainPlugin: Send + Sync {
-    type Template: DeserializeOwned;
-    
-    fn name(&self) -> &'static str;
-    fn build(&self, template: Self::Template, ctx: &mut BuildContext) -> Result<GeneratedTx>;
+pub trait NetworkAdapter: Send + Sync {
+    type Template: DeserializeOwned + Send;
+    type Network: Network;
+
+    fn build_request(
+        &self,
+        template: Self::Template,
+        ctx: &mut BuildContext<'_>,
+    ) -> Result<TxRequest<<Self::Network as Network>::TransactionRequest>>;
+
+    fn prefetch_nonces(/* ... */) -> impl Future<Output = Result<()>> { ... }
 }
 ```
 
