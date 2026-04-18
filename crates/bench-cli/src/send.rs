@@ -8,7 +8,7 @@ use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     ConsoleReporter, FileSource, FinalReport, MetricsCollector, ProgressState, Reporter, RunClock,
     RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, StdinSource, TxSource,
-    collect_block_stats, parse_reporters, start_scraper,
+    collect_block_stats, parse_reporters, start_scraper, trim_trailing_empty_blocks,
 };
 use eyre::{Context, Result, bail};
 use std::collections::HashMap;
@@ -144,7 +144,21 @@ pub async fn execute(args: SendArgs) -> Result<()> {
             "Collecting per-block stats"
         );
 
-        let block_stats = collect_block_stats(query_provider, block_range_start, end_block).await?;
+        let mut block_stats =
+            collect_block_stats(query_provider, block_range_start, end_block).await?;
+
+        // Trim trailing empty blocks (system-only, gas_used == 0) that
+        // accumulated during the txpool drain wait. Also trim metric
+        // samples captured after the last real block.
+        if let Some(cutoff_ms) = trim_trailing_empty_blocks(&mut block_stats) {
+            report.samples.retain(|s| s.unix_ms <= cutoff_ms);
+            if let Some(ts) = report.time_series.as_mut() {
+                ts.latencies
+                    .retain(|l| l.offset_ms <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
+                ts.throughput
+                    .retain(|t| t.second * 1000 <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
+            }
+        }
 
         for block in &block_stats {
             for reporter in reporters.iter_mut() {

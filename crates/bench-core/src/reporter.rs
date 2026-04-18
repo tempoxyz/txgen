@@ -307,8 +307,8 @@ pub struct JsonReport {
 pub struct JsonBlockStats {
     /// Block number.
     pub number: u64,
-    /// Block timestamp (unix seconds).
-    pub timestamp: u64,
+    /// Block timestamp in milliseconds.
+    pub timestamp_ms: u64,
     /// Total transactions in the block.
     pub tx_count: usize,
     /// Gas used by the block.
@@ -324,7 +324,7 @@ impl From<&BlockStats> for JsonBlockStats {
     fn from(b: &BlockStats) -> Self {
         Self {
             number: b.number,
-            timestamp: b.timestamp,
+            timestamp_ms: b.timestamp_ms,
             tx_count: b.tx_count,
             gas_used: b.gas_used,
             gas_limit: b.gas_limit,
@@ -714,7 +714,7 @@ impl ClickHouseReporter {
                 run_id: self.config.run_id,
                 block_index: idx as u32,
                 block_number: block.number,
-                chain_timestamp: Some(block.timestamp),
+                chain_timestamp: Some(block.timestamp_ms / 1000),
                 tx_count: block.tx_count as u32,
                 gas_used: block.gas_used,
                 gas_limit: block.gas_limit,
@@ -941,7 +941,7 @@ mod tests {
             let mut report = sample_report();
             report.blocks = vec![BlockStats {
                 number: 100,
-                timestamp: 1000,
+                timestamp_ms: 1_000_000,
                 tx_count: 10,
                 gas_used: 1_000_000,
                 gas_limit: 30_000_000,
