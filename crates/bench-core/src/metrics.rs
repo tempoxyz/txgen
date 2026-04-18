@@ -161,8 +161,9 @@ pub struct TimeSeriesMetrics {
 pub struct BlockStats {
     /// Block number.
     pub number: u64,
-    /// Block timestamp (unix seconds).
-    pub timestamp: u64,
+    /// Block timestamp in milliseconds. Uses `timestampMillisPart` when
+    /// available, otherwise `header.timestamp * 1000`.
+    pub timestamp_ms: u64,
     /// Total transactions in the block.
     pub tx_count: usize,
     /// Gas used by the block.
@@ -270,19 +271,19 @@ impl RunStats {
         let total_txs: u64 = blocks.iter().map(|b| b.tx_count as u64).sum();
         let total_gas: u64 = blocks.iter().map(|b| b.gas_used).sum();
 
-        let start_ts = blocks.first().map(|b| b.timestamp).unwrap_or(0);
-        let end_ts = blocks.last().map(|b| b.timestamp).unwrap_or(0);
-        let duration_secs = end_ts.saturating_sub(start_ts);
-        let duration_ms = duration_secs * 1000;
+        let start_ms = blocks.first().map(|b| b.timestamp_ms).unwrap_or(0);
+        let end_ms = blocks.last().map(|b| b.timestamp_ms).unwrap_or(0);
+        let duration_ms = end_ms.saturating_sub(start_ms);
+        let duration_secs = duration_ms as f64 / 1000.0;
 
-        let avg_tps = if duration_secs > 0 {
-            total_txs as f64 / duration_secs as f64
+        let avg_tps = if duration_secs > 0.0 {
+            total_txs as f64 / duration_secs
         } else {
             0.0
         };
 
-        let avg_gas_per_second = if duration_secs > 0 {
-            total_gas as f64 / duration_secs as f64
+        let avg_gas_per_second = if duration_secs > 0.0 {
+            total_gas as f64 / duration_secs
         } else {
             0.0
         };
@@ -346,7 +347,7 @@ pub async fn collect_block_stats<N: Network, P: Provider<N>>(
 
         stats.push(BlockStats {
             number,
-            timestamp: timestamp_secs,
+            timestamp_ms,
             tx_count: block.transactions().len(),
             gas_used: block.header().gas_used(),
             gas_limit: block.header().gas_limit(),
@@ -355,6 +356,30 @@ pub async fn collect_block_stats<N: Network, P: Provider<N>>(
     }
 
     Ok(stats)
+}
+
+/// Trim trailing empty blocks from collected block stats.
+///
+/// Removes suffix blocks where `gas_used == 0` (system-only blocks that
+/// contain no user transactions). These typically accumulate while waiting
+/// for the txpool to drain.
+///
+/// Middle gaps (empty blocks between blocks with user transactions) are
+/// preserved since they may indicate real chain stalls.
+///
+/// Returns the millisecond timestamp of the last retained block, or `None`
+/// if no blocks with user transactions were found (in which case the
+/// blocks are left unmodified).
+pub fn trim_trailing_empty_blocks(blocks: &mut Vec<BlockStats>) -> Option<u64> {
+    let last_real_idx = blocks.iter().rposition(|b| b.gas_used > 0)?;
+
+    let trimmed = blocks.len() - (last_real_idx + 1);
+    if trimmed > 0 {
+        tracing::info!(trimmed, "Trimmed trailing empty blocks");
+        blocks.truncate(last_real_idx + 1);
+    }
+
+    blocks.last().map(|b| b.timestamp_ms)
 }
 
 /// Extract a millisecond-precision timestamp from a block response.
@@ -738,7 +763,7 @@ mod tests {
         let blocks = vec![
             BlockStats {
                 number: 100,
-                timestamp: 1000,
+                timestamp_ms: 1_000_000,
                 tx_count: 10,
                 gas_used: 1_000_000,
                 gas_limit: 30_000_000,
@@ -746,7 +771,7 @@ mod tests {
             },
             BlockStats {
                 number: 101,
-                timestamp: 1012,
+                timestamp_ms: 1_012_000,
                 tx_count: 15,
                 gas_used: 1_500_000,
                 gas_limit: 30_000_000,
@@ -754,7 +779,7 @@ mod tests {
             },
             BlockStats {
                 number: 102,
-                timestamp: 1024,
+                timestamp_ms: 1_024_000,
                 tx_count: 20,
                 gas_used: 2_000_000,
                 gas_limit: 30_000_000,
@@ -848,5 +873,77 @@ mod tests {
         assert_eq!(parsed.throughput[0].sent, 100);
         assert_eq!(parsed.latencies.len(), 1);
         assert_eq!(parsed.latencies[0].latency, Duration::from_millis(25));
+    }
+
+    fn make_block(number: u64, gas_used: u64, timestamp_ms: u64) -> BlockStats {
+        BlockStats {
+            number,
+            timestamp_ms,
+            tx_count: if gas_used > 0 { 100 } else { 1 },
+            gas_used,
+            gas_limit: 30_000_000,
+            block_time_ms: Some(500),
+        }
+    }
+
+    #[test]
+    fn trim_trailing_empty_removes_suffix() {
+        let mut blocks = vec![
+            make_block(100, 1_000_000, 1_000_000),
+            make_block(101, 2_000_000, 1_000_500),
+            make_block(102, 0, 1_000_502),
+            make_block(103, 0, 1_000_504),
+        ];
+
+        let cutoff = trim_trailing_empty_blocks(&mut blocks);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks.last().unwrap().number, 101);
+        assert_eq!(cutoff, Some(1_000_500));
+    }
+
+    #[test]
+    fn trim_trailing_empty_preserves_middle_gaps() {
+        let mut blocks = vec![
+            make_block(100, 1_000_000, 1_000_000),
+            make_block(101, 0, 1_000_500), // middle gap
+            make_block(102, 2_000_000, 1_001_000),
+            make_block(103, 0, 1_001_002), // trailing
+        ];
+
+        let cutoff = trim_trailing_empty_blocks(&mut blocks);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[1].gas_used, 0); // middle gap preserved
+        assert_eq!(blocks.last().unwrap().number, 102);
+        assert_eq!(cutoff, Some(1_001_000));
+    }
+
+    #[test]
+    fn trim_trailing_empty_noop_when_no_trailing() {
+        let mut blocks = vec![
+            make_block(100, 1_000_000, 1_000_000),
+            make_block(101, 2_000_000, 1_000_500),
+        ];
+
+        let cutoff = trim_trailing_empty_blocks(&mut blocks);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(cutoff, Some(1_000_500));
+    }
+
+    #[test]
+    fn trim_trailing_empty_all_empty() {
+        let mut blocks = vec![make_block(100, 0, 1_000_000), make_block(101, 0, 1_000_500)];
+
+        let cutoff = trim_trailing_empty_blocks(&mut blocks);
+        // No real blocks found — leave unmodified
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(cutoff, None);
+    }
+
+    #[test]
+    fn trim_trailing_empty_vec() {
+        let mut blocks: Vec<BlockStats> = vec![];
+        let cutoff = trim_trailing_empty_blocks(&mut blocks);
+        assert!(blocks.is_empty());
+        assert_eq!(cutoff, None);
     }
 }

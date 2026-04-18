@@ -24,6 +24,7 @@ pub use historical::{HistoricalFetcher, HistoricalFetcherConfig, HistoricalTx};
 pub use metrics::{
     BenchMetrics, BlockStats, LatencySample, LatencyStats, MetricsCollector, RunStats,
     ThroughputSample, TimeSeriesMetrics, collect_block_stats, compute_latency_stats,
+    trim_trailing_empty_blocks,
 };
 pub use prometheus::parse_prometheus_text;
 pub use reporter::{
