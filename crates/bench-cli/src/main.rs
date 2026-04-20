@@ -3,7 +3,6 @@
 //! Provides subcommands:
 //! - `send` - Send from file/stdin
 //! - `send-blocks` - Submit blocks via reth Engine API
-//! - `replay` - Engine API block replay
 //! - `view` - Print an existing JSON report to console
 
 use clap::{Args, Parser, Subcommand};
@@ -11,7 +10,6 @@ use eyre::Result;
 use std::path::PathBuf;
 use std::time::Duration;
 
-mod replay;
 mod send;
 mod send_blocks;
 mod view;
@@ -77,46 +75,6 @@ pub struct SendArgs {
     pub drain_timeout: u64,
 }
 
-/// Arguments for the `replay` subcommand.
-#[derive(Args)]
-pub struct ReplayArgs {
-    /// Source RPC endpoint (archive node) for fetching block data
-    #[arg(long)]
-    pub rpc_source: String,
-
-    /// Engine API endpoint
-    #[arg(long)]
-    pub engine: String,
-
-    /// Path to JWT secret file
-    #[arg(long)]
-    pub jwt_secret: PathBuf,
-
-    /// Starting block number
-    #[arg(long)]
-    pub from: u64,
-
-    /// Ending block number
-    #[arg(long)]
-    pub to: u64,
-
-    /// Report output destinations
-    #[arg(long = "report", value_name = "FORMAT")]
-    pub reports: Vec<String>,
-
-    /// Metadata key=value pairs to include in the report.
-    #[arg(short = 'm', long = "metadata", value_name = "KEY=VALUE")]
-    pub metadata: Vec<String>,
-
-    /// Prometheus metrics endpoint to scrape during the benchmark.
-    #[arg(long)]
-    pub metrics_url: Option<String>,
-
-    /// Scrape interval in milliseconds for the metrics scraper.
-    #[arg(long, default_value = "500")]
-    pub scrape_interval_ms: u64,
-}
-
 /// Arguments for the `send-blocks` subcommand.
 #[derive(Args)]
 pub struct SendBlocksArgs {
@@ -178,8 +136,6 @@ enum Command {
     Send(SendArgs),
     /// Submit blocks via reth Engine API
     SendBlocks(SendBlocksArgs),
-    /// Replay blocks via Engine API
-    Replay(ReplayArgs),
     /// Print an existing JSON report to the console
     View(ViewArgs),
 }
@@ -223,7 +179,6 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Send(args) => send::execute(args).await,
         Command::SendBlocks(args) => send_blocks::execute(args).await,
-        Command::Replay(args) => replay::execute(args).await,
         Command::View(args) => view::execute(args),
     }
 }
