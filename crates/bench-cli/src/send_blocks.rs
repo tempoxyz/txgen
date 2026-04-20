@@ -271,8 +271,8 @@ pub(crate) async fn process_block(
         gas_limit: meta.gas_limit,
         block_time_ms,
         new_payload_ms: Some(new_payload_latency.as_millis() as u64),
-        fcu_ms: Some(fcu_latency.as_millis() as u64),
-        server_latency_us: Some(payload_status.latency_us),
+        forkchoice_updated_ms: Some(fcu_latency.as_millis() as u64),
+        new_payload_server_latency_us: Some(payload_status.latency_us),
         persistence_wait_us: payload_status.persistence_wait_us,
         execution_cache_wait_us: payload_status.execution_cache_wait_us,
         sparse_trie_wait_us: payload_status.sparse_trie_wait_us,
@@ -285,9 +285,9 @@ pub(crate) async fn process_block(
         txs = meta.tx_count,
         gas = meta.gas_used,
         new_payload_ms = new_payload_latency.as_millis(),
-        fcu_ms = fcu_latency.as_millis(),
+        forkchoice_updated_ms = fcu_latency.as_millis(),
         total_ms = total_latency.as_millis(),
-        server_latency_us = payload_status.latency_us,
+        new_payload_server_latency_us = payload_status.latency_us,
         status = %payload_status_str,
         "Submitted block"
     );

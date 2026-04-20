@@ -36,8 +36,8 @@ One row per block in a run. Contains factual chain data.
 | `gas_limit` | UInt64 | Block gas limit |
 | `block_time_ms` | UInt64? | Inter-block time (ms) |
 | `new_payload_ms` | UInt64? | Client-side `reth_newPayload` latency (ms, send-blocks only) |
-| `fcu_ms` | UInt64? | Client-side `reth_forkchoiceUpdated` latency (ms, send-blocks only) |
-| `server_latency_us` | UInt64? | Server-side execution latency (µs, send-blocks only) |
+| `forkchoice_updated_ms` | UInt64? | Client-side `reth_forkchoiceUpdated` latency (ms, send-blocks only) |
+| `new_payload_server_latency_us` | UInt64? | Server-side execution latency (µs, send-blocks only) |
 | `persistence_wait_us` | UInt64? | Server-side persistence wait (µs, send-blocks only) |
 | `execution_cache_wait_us` | UInt64? | Server-side execution cache wait (µs, send-blocks only) |
 | `sparse_trie_wait_us` | UInt64? | Server-side sparse trie wait (µs, send-blocks only) |
