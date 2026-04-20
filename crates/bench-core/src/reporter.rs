@@ -318,6 +318,24 @@ pub struct JsonBlockStats {
     /// Time since previous block in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_time_ms: Option<u64>,
+    /// Client-side `reth_newPayload` latency in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_payload_ms: Option<u64>,
+    /// Client-side `reth_forkchoiceUpdated` latency in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fcu_ms: Option<u64>,
+    /// Server-side execution latency in microseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_latency_us: Option<u64>,
+    /// Server-side persistence wait in microseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistence_wait_us: Option<u64>,
+    /// Server-side execution cache wait in microseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_cache_wait_us: Option<u64>,
+    /// Server-side sparse trie wait in microseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sparse_trie_wait_us: Option<u64>,
 }
 
 impl From<&BlockStats> for JsonBlockStats {
@@ -329,6 +347,12 @@ impl From<&BlockStats> for JsonBlockStats {
             gas_used: b.gas_used,
             gas_limit: b.gas_limit,
             block_time_ms: b.block_time_ms,
+            new_payload_ms: b.new_payload_ms,
+            fcu_ms: b.fcu_ms,
+            server_latency_us: b.server_latency_us,
+            persistence_wait_us: b.persistence_wait_us,
+            execution_cache_wait_us: b.execution_cache_wait_us,
+            sparse_trie_wait_us: b.sparse_trie_wait_us,
         }
     }
 }
@@ -719,6 +743,12 @@ impl ClickHouseReporter {
                 gas_used: block.gas_used,
                 gas_limit: block.gas_limit,
                 block_time_ms: block.block_time_ms,
+                new_payload_ms: block.new_payload_ms,
+                fcu_ms: block.fcu_ms,
+                server_latency_us: block.server_latency_us,
+                persistence_wait_us: block.persistence_wait_us,
+                execution_cache_wait_us: block.execution_cache_wait_us,
+                sparse_trie_wait_us: block.sparse_trie_wait_us,
             })
             .collect()
     }
@@ -814,6 +844,12 @@ struct ClickHouseBlockRow {
     gas_used: u64,
     gas_limit: u64,
     block_time_ms: Option<u64>,
+    new_payload_ms: Option<u64>,
+    fcu_ms: Option<u64>,
+    server_latency_us: Option<u64>,
+    persistence_wait_us: Option<u64>,
+    execution_cache_wait_us: Option<u64>,
+    sparse_trie_wait_us: Option<u64>,
 }
 
 /// Row for `txgen_metric_samples` table.
@@ -946,6 +982,12 @@ mod tests {
                 gas_used: 1_000_000,
                 gas_limit: 30_000_000,
                 block_time_ms: Some(12000),
+                new_payload_ms: None,
+                fcu_ms: None,
+                server_latency_us: None,
+                persistence_wait_us: None,
+                execution_cache_wait_us: None,
+                sparse_trie_wait_us: None,
             }];
             reporter.finalize(&report).unwrap();
         }

@@ -15,8 +15,8 @@ use alloy_rlp::Decodable;
 use alloy_rpc_types_engine::{ForkchoiceState, JwtSecret};
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    ConsoleReporter, FinalReport, Reporter, RethApi, RethNewPayloadInput, RunClock, SampleStore,
-    ScraperConfig, WaitForPersistence, parse_reporters, start_scraper,
+    BlockStats, ConsoleReporter, FinalReport, Reporter, RethApi, RethNewPayloadInput, RunClock,
+    RunStats, SampleStore, ScraperConfig, WaitForPersistence, parse_reporters, start_scraper,
 };
 use eyre::{Context, Result};
 use std::io::BufRead;
@@ -34,7 +34,9 @@ struct BlockLine {
 pub(crate) struct BlockMeta {
     pub(crate) hash: B256,
     pub(crate) number: u64,
+    pub(crate) timestamp: u64,
     pub(crate) gas_used: u64,
+    pub(crate) gas_limit: u64,
     pub(crate) tx_count: usize,
 }
 
@@ -77,8 +79,6 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     };
 
     let mut collector = MetricsCollector::default();
-    let mut prev_block_hash: Option<B256> = None;
-    let mut finalized_hash: Option<B256> = None;
 
     if let Some(ref path) = args.input {
         let file = std::fs::File::open(path).wrap_err("failed to open input file")?;
@@ -94,8 +94,6 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                 block_bytes,
                 &meta,
                 &mut collector,
-                &mut prev_block_hash,
-                &mut finalized_hash,
                 &persistence_policy,
             )
             .await?;
@@ -123,8 +121,6 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                 block_bytes,
                 &meta,
                 &mut collector,
-                &mut prev_block_hash,
-                &mut finalized_hash,
                 &persistence_policy,
             )
             .await?;
@@ -143,9 +139,14 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
 
     let samples = store.drain().await;
 
+    let blocks = std::mem::take(&mut collector.blocks);
+    let run_stats = RunStats::from_blocks(&blocks);
+
     let mut report = FinalReport {
         metadata: metadata.clone(),
         samples,
+        blocks,
+        run_stats: Some(run_stats),
         ..Default::default()
     };
 
@@ -174,7 +175,9 @@ pub(crate) fn decode_block_meta(rlp_bytes: &[u8]) -> Result<BlockMeta> {
     Ok(BlockMeta {
         hash,
         number: block.header.number,
+        timestamp: block.header.timestamp,
         gas_used: block.header.gas_used,
+        gas_limit: block.header.gas_limit,
         tx_count: block.body.transactions.len(),
     })
 }
@@ -184,8 +187,6 @@ pub(crate) async fn process_block(
     block_bytes: Bytes,
     meta: &BlockMeta,
     collector: &mut MetricsCollector,
-    prev_block_hash: &mut Option<B256>,
-    finalized_hash: &mut Option<B256>,
     persistence_policy: &WaitForPersistence,
 ) -> Result<()> {
     let input = RethNewPayloadInput::BlockRlp(block_bytes);
@@ -206,16 +207,16 @@ pub(crate) async fn process_block(
         );
     }
 
-    let safe_hash = prev_block_hash.unwrap_or(meta.hash);
-    if finalized_hash.is_none() {
-        *finalized_hash = Some(meta.hash);
+    let safe_hash = collector.prev_block_hash.unwrap_or(meta.hash);
+    if collector.finalized_hash.is_none() {
+        collector.finalized_hash = Some(meta.hash);
     }
 
     let forkchoice_state = ForkchoiceState {
         head_block_hash: meta.hash,
         safe_block_hash: safe_hash,
         // SAFETY: finalized_hash is always Some after the check above
-        finalized_block_hash: finalized_hash.unwrap(),
+        finalized_block_hash: collector.finalized_hash.unwrap(),
     };
 
     let fcu_start = Instant::now();
@@ -236,7 +237,28 @@ pub(crate) async fn process_block(
     let total_latency = new_payload_latency + fcu_latency;
     let payload_status_str = payload_status.status.status.to_string();
 
-    collector.record_block();
+    let timestamp_ms = meta.timestamp * 1000;
+    let block_time_ms = collector
+        .prev_timestamp_ms
+        .map(|prev| timestamp_ms.saturating_sub(prev));
+    collector.prev_timestamp_ms = Some(timestamp_ms);
+
+    let block_stats = BlockStats {
+        number: meta.number,
+        timestamp_ms,
+        tx_count: meta.tx_count,
+        gas_used: meta.gas_used,
+        gas_limit: meta.gas_limit,
+        block_time_ms,
+        new_payload_ms: Some(new_payload_latency.as_millis() as u64),
+        fcu_ms: Some(fcu_latency.as_millis() as u64),
+        server_latency_us: Some(payload_status.latency_us),
+        persistence_wait_us: payload_status.persistence_wait_us,
+        execution_cache_wait_us: payload_status.execution_cache_wait_us,
+        sparse_trie_wait_us: payload_status.sparse_trie_wait_us,
+    };
+
+    collector.record_block(block_stats);
 
     tracing::info!(
         block = meta.number,
@@ -250,25 +272,28 @@ pub(crate) async fn process_block(
         "Submitted block"
     );
 
-    *prev_block_hash = Some(meta.hash);
+    collector.prev_block_hash = Some(meta.hash);
 
     if meta.number % 32 == 0 {
-        *finalized_hash = Some(meta.hash);
+        collector.finalized_hash = Some(meta.hash);
     }
 
     Ok(())
 }
 
-/// Aggregated metrics collector.
-///
-/// Tracks `blocks_submitted` for the persistence policy.
+/// Block submission state and metrics collector.
 #[derive(Debug, Default)]
 pub(crate) struct MetricsCollector {
     blocks_submitted: u64,
+    prev_block_hash: Option<B256>,
+    finalized_hash: Option<B256>,
+    prev_timestamp_ms: Option<u64>,
+    blocks: Vec<BlockStats>,
 }
 
 impl MetricsCollector {
-    pub(crate) fn record_block(&mut self) {
+    pub(crate) fn record_block(&mut self, stats: BlockStats) {
         self.blocks_submitted += 1;
+        self.blocks.push(stats);
     }
 }
