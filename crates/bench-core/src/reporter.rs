@@ -20,15 +20,15 @@ use std::path::Path;
 pub struct FinalReport {
     /// User-provided metadata key/value pairs.
     pub metadata: HashMap<String, String>,
-    /// Typed transaction metrics (send mode).
+    /// Typed transaction metrics (send mode only).
     pub bench_metrics: Option<BenchMetrics>,
-    /// Per-second throughput + latency time-series (send mode).
+    /// Per-second throughput + latency time-series (send mode only).
     pub time_series: Option<TimeSeriesMetrics>,
-    /// Block-level run summary (send mode).
+    /// Block-level run summary.
     pub run_stats: Option<RunStats>,
     /// Unified time-series samples (internal + node).
     pub samples: Vec<Sample>,
-    /// Per-block chain stats (send mode).
+    /// Per-block statistics.
     pub blocks: Vec<BlockStats>,
 }
 

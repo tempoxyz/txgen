@@ -1,9 +1,9 @@
 //! `bench send-blocks` - Submit blocks via reth Engine API
 //!
-//! Reads NDJSON `{raw, key}` lines from stdin or file, where `raw` is
+//! Reads NDJSON `{raw}` lines from stdin or file, where `raw` is
 //! RLP-encoded block bytes. Submits each block via `reth_newPayload`
 //! (as `BlockRlp`) and `reth_forkchoiceUpdated`, collecting per-block
-//! metrics from [`RethPayloadStatus`].
+//! timing and engine status from [`RethPayloadStatus`].
 
 use crate::SendBlocksArgs;
 use crate::send::parse_metadata;
@@ -15,9 +15,8 @@ use alloy_rlp::Decodable;
 use alloy_rpc_types_engine::{ForkchoiceState, JwtSecret};
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    BlockStats, ConsoleReporter, FinalReport, RethApi, RethNewPayloadInput, RunClock,
-    RunStats, Sample, SampleStore, ScraperConfig, WaitForPersistence, parse_reporters,
-    start_scraper,
+    BlockStats, ConsoleReporter, FinalReport, RethApi, RethNewPayloadInput, RunClock, RunStats,
+    Sample, SampleStore, ScraperConfig, WaitForPersistence, parse_reporters, start_scraper,
 };
 use eyre::{Context, Result};
 use std::collections::BTreeMap;
