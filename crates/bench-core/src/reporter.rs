@@ -171,11 +171,19 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
     }
 
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
+        let has_send_metrics = report.bench_metrics.is_some();
+        let has_block_data = report.run_stats.is_some();
+
+        if !has_send_metrics && !has_block_data {
+            return Ok(());
+        }
+
+        writeln!(self.writer)?;
+        writeln!(self.writer, "═══════════════════════════════════════")?;
+        writeln!(self.writer, "              Benchmark Results")?;
+        writeln!(self.writer, "═══════════════════════════════════════")?;
+
         if let Some(metrics) = &report.bench_metrics {
-            writeln!(self.writer)?;
-            writeln!(self.writer, "═══════════════════════════════════════")?;
-            writeln!(self.writer, "              Benchmark Results")?;
-            writeln!(self.writer, "═══════════════════════════════════════")?;
             writeln!(self.writer)?;
             writeln!(self.writer, "  Total Sent:      {:>10}", metrics.sent)?;
             writeln!(self.writer, "  Successful:      {:>10}", metrics.success)?;
@@ -228,41 +236,47 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
                 "    P99:           {:>10.2}ms",
                 metrics.latency.p99.as_secs_f64() * 1000.0
             )?;
-
-            if let Some(run) = &report.run_stats {
-                writeln!(self.writer)?;
-                writeln!(self.writer, "  Blocks:")?;
-                writeln!(
-                    self.writer,
-                    "    Range:         {:>10} - {}",
-                    run.start_block, run.end_block
-                )?;
-                writeln!(self.writer, "    Avg TPS:       {:>10.2}", run.avg_tps)?;
-                writeln!(
-                    self.writer,
-                    "    Avg Gas/s:     {:>10.2}",
-                    run.avg_gas_per_second
-                )?;
-                writeln!(
-                    self.writer,
-                    "    Block Time P50:{:>10}ms",
-                    run.block_time_p50_ms
-                )?;
-                writeln!(
-                    self.writer,
-                    "    Block Time P95:{:>10}ms",
-                    run.block_time_p95_ms
-                )?;
-                writeln!(
-                    self.writer,
-                    "    Block Time P99:{:>10}ms",
-                    run.block_time_p99_ms
-                )?;
-            }
-
-            writeln!(self.writer)?;
-            writeln!(self.writer, "═══════════════════════════════════════")?;
         }
+
+        if let Some(run) = &report.run_stats {
+            writeln!(self.writer)?;
+            writeln!(self.writer, "  Blocks:")?;
+            writeln!(
+                self.writer,
+                "    Range:         {:>10} - {}",
+                run.start_block, run.end_block
+            )?;
+            writeln!(
+                self.writer,
+                "    Count:         {:>10}",
+                run.end_block.saturating_sub(run.start_block) + 1
+            )?;
+            writeln!(self.writer, "    Total Txs:     {:>10}", run.total_txs)?;
+            writeln!(self.writer, "    Avg TPS:       {:>10.2}", run.avg_tps)?;
+            writeln!(
+                self.writer,
+                "    Avg Gas/s:     {:>10.2}",
+                run.avg_gas_per_second
+            )?;
+            writeln!(
+                self.writer,
+                "    Block Time P50:{:>10}ms",
+                run.block_time_p50_ms
+            )?;
+            writeln!(
+                self.writer,
+                "    Block Time P95:{:>10}ms",
+                run.block_time_p95_ms
+            )?;
+            writeln!(
+                self.writer,
+                "    Block Time P99:{:>10}ms",
+                run.block_time_p99_ms
+            )?;
+        }
+
+        writeln!(self.writer)?;
+        writeln!(self.writer, "═══════════════════════════════════════")?;
 
         Ok(())
     }
