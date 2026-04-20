@@ -379,7 +379,7 @@ All Ethereum types plus Tempo-native transactions:
 
 | Type | Description |
 |------|-------------|
-| `tempo` | Native 0x76 transactions with parallel nonces |
+| `tempo` | Native 0x76 transactions with protocol, 2D, or expiring nonces |
 
 **Tempo-specific fields:**
 
@@ -396,11 +396,13 @@ templates:
     max_fee_per_gas: 1000000000
     max_priority_fee_per_gas: 1000000000
     
-    # Tempo-specific
-    nonce_key: "42"              # Parallel nonce key (0 = protocol nonce)
+    # Tempo-specific replay protection
+    nonce_key: "42"              # 2D nonce lane (0 = protocol nonce)
+    expiring_nonce: true         # TIP-1009 expiring nonce mode
+    valid_for_secs: 25           # Relative expiry window, resolved at generation time
+    valid_before: 1700100000     # Absolute expiry timestamp (alternative to valid_for_secs)
     fee_token: "0x..."           # Pay gas in stablecoin
     valid_after: 1700000000      # Scheduled: valid after timestamp
-    valid_before: 1700100000     # Scheduled: valid before timestamp
     
     # Batched calls
     calls:
@@ -414,7 +416,22 @@ templates:
         args: ["0x...", 5000]
 ```
 
-**Parallel nonces:** Using different `nonce_key` values allows transactions from the same sender to be sent in parallel without nonce conflicts.
+**2D nonces:** Using different `nonce_key` values allows transactions from the same sender to be sent in parallel without nonce conflicts.
+
+**Expiring nonces:** Set `expiring_nonce: true` to generate TIP-1009 transactions. txgen will set `nonce_key = U256::MAX` and `nonce = 0` automatically. You must provide either:
+
+- `valid_before`: an absolute Unix timestamp in seconds
+- `valid_for_secs`: a relative TTL in seconds, resolved when the transaction is generated
+
+`valid_for_secs` must be `<= 30`, matching Tempo's expiring nonce validity window.
+
+For streamed benchmark pipelines such as `txgen-tempo generate | bench send`, txgen also applies a deterministic per-transaction fee bump before sponsor signing and sender signing. This guarantees that otherwise identical expiring transactions still produce unique signed payloads, avoiding hash-based replay collisions.
+
+Recommended benchmark setting: `valid_for_secs: 25`. This matches `tempo-bench`'s default behavior and stays inside Tempo's 30-second protocol limit while leaving some propagation slack.
+
+**Benchmarking caveat:** Expiring nonce transactions are still time-bounded by `valid_before <= now + 30s`. Streamed generation/send pipelines are practical because txgen builds and signs each transaction immediately before emitting it, but pre-generating a large expiring-tx file and replaying it later is still unsafe because many transactions will expire before submission.
+
+**Prefetch caveat:** `txgen-tempo generate --rpc` only prefetches constant 2D nonce keys that are fixed in the spec. Dynamic/generated `nonce_key` values (`uniform`, `choice`, etc.) are resolved per transaction and are not prefetched automatically.
 
 ## RPC Methods
 
@@ -437,7 +454,7 @@ Summary of which RPC methods are required by each feature:
 See the `examples/` directory:
 
 - `simple.yaml` — Basic Ethereum transfers
-- `tempo.yaml` — Tempo transactions with parallel nonces
+- `tempo.yaml` — Tempo transactions with 2D and expiring nonces
 - `tempo-mainnet-spam.yaml` — Tempo mainnet workload
 - `bench-spec.yaml` — Bench workload specification
 - `erc20.abi.json` — ERC-20 ABI artifact

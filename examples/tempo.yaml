@@ -31,6 +31,22 @@ templates:
     max_priority_fee_per_gas: 1000000000
     nonce_key: "42"  # Use parallel nonce key
 
+  # Tempo expiring nonce (TIP-1009)
+  # txgen sets nonce_key=U256::MAX and nonce=0 automatically.
+  # 25s is the recommended benchmark setting; keep it within Tempo's 30-second max.
+  tempo_expiring:
+    type: tempo
+    from:
+      pool: users
+      select: random
+    to: "0x0000000000000000000000000000000000000001"
+    value: 250
+    gas_limit: 300000
+    max_fee_per_gas: 1000000000
+    max_priority_fee_per_gas: 1000000000
+    expiring_nonce: true
+    valid_for_secs: 25
+
   # EIP-1559 (delegated to ethereum plugin)
   eip1559_transfer:
     type: eip1559
@@ -45,8 +61,10 @@ templates:
 
 mix:
   - template: tempo_transfer
-    weight: 50
+    weight: 40
   - template: tempo_parallel
-    weight: 30
+    weight: 25
+  - template: tempo_expiring
+    weight: 15
   - template: eip1559_transfer
     weight: 20

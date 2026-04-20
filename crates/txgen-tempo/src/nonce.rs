@@ -11,6 +11,7 @@ use eyre::{Result, WrapErr};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
+use tempo_primitives::transaction::TEMPO_EXPIRING_NONCE_KEY;
 use tokio::sync::Mutex;
 use txgen_core::NonceProvider;
 
@@ -23,7 +24,8 @@ pub const NONCE_PRECOMPILE: Address = Address::new([
 /// Tempo nonce provider that fetches nonces from the chain.
 ///
 /// - Protocol nonce (key 0): Uses standard eth_getTransactionCount
-/// - Parallel nonces (key != 0): Queries the nonce precompile storage
+/// - Expiring nonce (key U256::MAX): Always 0
+/// - Parallel nonces (other non-zero keys): Query the nonce precompile storage
 pub struct TempoNonceProvider<P> {
     provider: P,
     rate_limiter: Option<RateLimiter>,
@@ -64,6 +66,9 @@ where
                 .wrap_err("failed to fetch protocol nonce")?;
             eprintln!("fetched lane nonce: {} lane=0 nonce={}", address, nonce);
             Ok(nonce)
+        } else if nonce_key == TEMPO_EXPIRING_NONCE_KEY {
+            eprintln!("fetched lane nonce: {} lane=expiring nonce=0", address);
+            Ok(0)
         } else {
             // Parallel nonce - query nonce precompile storage
             let storage_key = compute_nonce_storage_key(address, nonce_key);
@@ -137,24 +142,9 @@ pub async fn prefetch_parallel_nonces<P: Provider<Ethereum> + Clone + Send + Syn
     spec: &txgen_core::WorkloadSpec,
     nonces: &mut txgen_core::NonceTracker,
 ) -> Result<()> {
-    use crate::TempoTemplate;
-    use crate::compute_scheduling_key;
-    use std::collections::HashSet;
-    use txgen_core::GenValue;
+    use crate::compute_parallel_scheduling_key;
 
-    // Collect unique literal nonce_keys from templates referenced in the mix
-    let mut nonce_keys = HashSet::new();
-    for entry in &spec.mix {
-        if let Some(value) = spec.templates.get(&entry.template) {
-            if let Ok(template) = serde_yaml::from_value::<TempoTemplate>(value.clone()) {
-                if let Some(GenValue::Literal(key)) = &template.nonce_key {
-                    if !key.is_zero() {
-                        nonce_keys.insert(*key);
-                    }
-                }
-            }
-        }
-    }
+    let nonce_keys = collect_prefetchable_parallel_nonce_keys(spec);
 
     if nonce_keys.is_empty() {
         return Ok(());
@@ -180,7 +170,7 @@ pub async fn prefetch_parallel_nonces<P: Provider<Ethereum> + Clone + Send + Syn
                     })?;
 
                 let nonce = storage_value.to::<u64>();
-                let scheduling_key = compute_scheduling_key(address, nonce_key);
+                let scheduling_key = compute_parallel_scheduling_key(address, nonce_key);
                 nonces.reset(scheduling_key, nonce);
 
                 eprintln!(
@@ -192,6 +182,34 @@ pub async fn prefetch_parallel_nonces<P: Provider<Ethereum> + Clone + Send + Syn
     }
 
     Ok(())
+}
+
+/// Collect constant 2D nonce lanes that can be prefetched before generation.
+///
+/// Prefetch only makes sense for nonce keys that are already fixed in the spec.
+/// Generated keys (`uniform`, `choice`, etc.) are resolved per transaction and
+/// cannot be known ahead of time.
+fn collect_prefetchable_parallel_nonce_keys(
+    spec: &txgen_core::WorkloadSpec,
+) -> std::collections::HashSet<U256> {
+    use crate::TempoTemplate;
+    use txgen_core::GenValue;
+
+    let mut nonce_keys = std::collections::HashSet::new();
+
+    for entry in &spec.mix {
+        if let Some(value) = spec.templates.get(&entry.template)
+            && let Ok(template) = serde_yaml::from_value::<TempoTemplate>(value.clone())
+            && !template.expiring_nonce
+            && let Some(GenValue::Literal(key)) = &template.nonce_key
+            && !key.is_zero()
+            && *key != TEMPO_EXPIRING_NONCE_KEY
+        {
+            nonce_keys.insert(*key);
+        }
+    }
+
+    nonce_keys
 }
 
 /// Compute the storage key for a (address, nonce_key) pair in the nonce precompile.
@@ -211,6 +229,7 @@ fn compute_nonce_storage_key(address: Address, nonce_key: U256) -> U256 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use txgen_core::WorkloadSpec;
 
     #[test]
     fn test_nonce_precompile_address() {
@@ -235,5 +254,47 @@ mod tests {
         // Different nonce_key should give different storage key
         let key3 = compute_nonce_storage_key(address, U256::from(43));
         assert_ne!(key, key3);
+    }
+
+    #[test]
+    fn test_collect_prefetchable_parallel_nonce_keys_skips_expiring_nonce_templates() {
+        let spec = WorkloadSpec::parse(
+            r#"
+chain_id: 1
+templates:
+  expiring_flag:
+    type: tempo
+    from: { pool: users, select: random }
+    to: "0x0000000000000000000000000000000000000001"
+    gas_limit: 21000
+    expiring_nonce: true
+    valid_before: 1700000000
+  expiring_reserved_key:
+    type: tempo
+    from: { pool: users, select: random }
+    to: "0x0000000000000000000000000000000000000001"
+    gas_limit: 21000
+    nonce_key: "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+    valid_before: 1700000000
+  parallel_lane:
+    type: tempo
+    from: { pool: users, select: random }
+    to: "0x0000000000000000000000000000000000000001"
+    gas_limit: 21000
+    nonce_key: "42"
+mix:
+  - template: expiring_flag
+    weight: 1
+  - template: expiring_reserved_key
+    weight: 1
+  - template: parallel_lane
+    weight: 1
+"#,
+        )
+        .unwrap();
+
+        let nonce_keys = collect_prefetchable_parallel_nonce_keys(&spec);
+        assert_eq!(nonce_keys.len(), 1);
+        assert!(nonce_keys.contains(&U256::from(42)));
     }
 }
