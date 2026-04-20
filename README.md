@@ -4,7 +4,7 @@ A chain-agnostic transaction generation tool for blockchain load testing and ben
 
 ## Overview
 
-txgen generates signed, RLP-encoded transactions from YAML workload specifications. It outputs transactions as newline-delimited JSON (NDJSON) that can be piped to sending tools or saved for replay.
+txgen generates signed, RLP-encoded transactions from YAML workload specifications. It outputs transactions as newline-delimited JSON (NDJSON) that can be piped to sending tools or saved for later use.
 
 **Key features:**
 - **Chain-agnostic**: Plugin architecture supports multiple chains (Ethereum, Tempo)
@@ -152,34 +152,6 @@ bench send-blocks --engine http://localhost:8551 --jwt-secret /path/to/jwt.hex -
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
 
 **Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API)
-
-#### `bench replay`
-
-Replay blocks from a source archive node via Engine API. Equivalent to `txgen extract ... | bench send-blocks ...` but avoids serialization overhead.
-
-```bash
-bench replay \
-  --rpc-source http://archive:8545 \
-  --engine http://localhost:8551 \
-  --jwt-secret /path/to/jwt.hex \
-  --from 1000 --to 2000
-```
-
-| Flag | Description |
-|------|-------------|
-| `--rpc-source <URL>` | Source RPC endpoint (archive node) |
-| `--engine <URL>` | Engine API endpoint |
-| `--jwt-secret <PATH>` | Path to JWT secret file |
-| `--from <N>` | Starting block number |
-| `--to <N>` | Ending block number |
-| `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
-| `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
-| `--metrics-url <URL>` | Prometheus endpoint to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
-| `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
-
-**Required RPC methods:**
-- Source RPC: `debug_getRawBlock`
-- Engine API: `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API)
 
 #### `bench view`
 
@@ -453,9 +425,9 @@ Summary of which RPC methods are required by each feature:
 | `eth_getTransactionCount` | `txgen-ethereum generate --rpc`, `txgen-tempo generate --rpc` |
 | `eth_sendRawTransaction` | `bench send` |
 | `eth_getBlockByNumber` | `bench send` (per-block stats collection) |
-| `debug_getRawBlock` | `txgen extract`, `bench replay` (source RPC) |
-| `reth_newPayload` | `bench send-blocks`, `bench replay` (engine) |
-| `reth_forkchoiceUpdated` | `bench send-blocks`, `bench replay` (engine) |
+| `debug_getRawBlock` | `txgen extract` |
+| `reth_newPayload` | `bench send-blocks` |
+| `reth_forkchoiceUpdated` | `bench send-blocks` |
 | `txpool_status` | `bench send` (pool drain wait) |
 
 > **Note:** `debug_*` methods require a node with the debug namespace enabled (typically archive nodes). `reth_*` methods are custom reth Engine API extensions.

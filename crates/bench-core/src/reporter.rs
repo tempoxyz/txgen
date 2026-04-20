@@ -537,7 +537,7 @@ pub struct ClickHouseConfig {
     pub scenario_name: String,
     /// Platform: `ethereum` or `tempo` (from metadata `platform`).
     pub platform: String,
-    /// Benchmark mode: `send`, `replay`, or `send-blocks`.
+    /// Benchmark mode: `send` or `send-blocks`.
     pub mode: String,
     /// Node git SHA (from metadata `git-sha`).
     pub git_sha: String,
@@ -558,7 +558,7 @@ impl ClickHouseConfig {
     /// Extracts required fields (`scenario`, `platform`, `git-sha`, `git-ref`)
     /// from `metadata` and returns an error if any are missing.
     ///
-    /// `mode` is the bench subcommand (`send`, `replay`, `send-blocks`).
+    /// `mode` is the bench subcommand (`send`, `send-blocks`).
     pub fn from_metadata(
         url: &str,
         mode: &str,

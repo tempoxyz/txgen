@@ -15,7 +15,7 @@ One row per benchmark execution. Stores run identity, git info, and flexible key
 | `finished_at` | DateTime64(3) | Run end time |
 | `scenario_name` | String | Benchmark scenario (e.g. `tip20-10k`) |
 | `platform` | String | `ethereum` or `tempo` |
-| `mode` | String | `send`, `replay`, or `send-blocks` |
+| `mode` | String | `send` or `send-blocks` |
 | `git_sha` | String | Node commit SHA |
 | `git_ref` | String | Node branch/ref |
 | `config` | Map(String, String) | Run config (tps, max_concurrent, etc.) |
