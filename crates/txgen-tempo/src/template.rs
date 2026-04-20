@@ -58,6 +58,13 @@ pub struct TempoTemplate {
     #[serde(default)]
     pub nonce_key: Option<GenValue<U256>>,
 
+    /// Use Tempo expiring nonce mode (TIP-1009).
+    ///
+    /// When enabled, txgen sets `nonce_key = U256::MAX` and `nonce = 0`
+    /// automatically, and requires either `valid_before` or `valid_for_secs`.
+    #[serde(default)]
+    pub expiring_nonce: bool,
+
     /// Fee token address for paying gas in stablecoins (Tempo 0x76).
     #[serde(default)]
     pub fee_token: Option<Address>,
@@ -73,6 +80,12 @@ pub struct TempoTemplate {
     /// Transaction valid before this timestamp (Tempo 0x76).
     #[serde(default)]
     pub valid_before: Option<u64>,
+
+    /// Relative expiry window in seconds, resolved at generation time.
+    ///
+    /// Only used with `expiring_nonce: true`.
+    #[serde(default)]
+    pub valid_for_secs: Option<u64>,
 
     /// Batched calls (Tempo 0x76).
     #[serde(default)]
