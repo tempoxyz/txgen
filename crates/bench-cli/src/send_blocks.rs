@@ -15,7 +15,7 @@ use alloy_rlp::Decodable;
 use alloy_rpc_types_engine::{ForkchoiceState, JwtSecret};
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    BlockStats, ConsoleReporter, FinalReport, Reporter, RethApi, RethNewPayloadInput, RunClock,
+    BlockStats, ConsoleReporter, FinalReport, RethApi, RethNewPayloadInput, RunClock,
     RunStats, Sample, SampleStore, ScraperConfig, WaitForPersistence, parse_reporters,
     start_scraper,
 };
@@ -66,7 +66,9 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let provider = RootProvider::<Ethereum>::new(alloy_rpc_client::RpcClient::new(transport, true));
 
     let mut reporters = parse_reporters(&args.reports, "send-blocks", &metadata)?;
-    let mut console_reporter: Box<dyn Reporter> = Box::new(ConsoleReporter::stderr(false));
+    if reporters.is_empty() {
+        reporters.push(Box::new(ConsoleReporter::stderr(false)));
+    }
 
     let clock = RunClock::new();
     let store = SampleStore::new();
@@ -157,7 +159,6 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         for reporter in reporters.iter_mut() {
             reporter.on_block(block)?;
         }
-        console_reporter.on_block(block)?;
     }
 
     let mut report = FinalReport {
@@ -173,7 +174,6 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     for reporter in reporters.iter_mut() {
         reporter.finalize(&report)?;
     }
-    console_reporter.finalize(&report)?;
 
     Ok(())
 }
