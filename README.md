@@ -212,7 +212,7 @@ bench send -i txs.ndjson --metrics-url http://127.0.0.1:9001/metrics --report js
 bench send -i txs.ndjson --metrics-url http://127.0.0.1:9001/metrics --scrape-interval-ms 200
 ```
 
-In `send` mode, internal txgen metrics (`txgen_transactions_sent_total`, `txgen_transactions_success_total`, etc.) are also snapshotted on the same interval and included alongside node metrics.
+Internal txgen metrics are snapshotted on the same interval and included alongside node metrics. In `send` mode: `txgen_transactions_sent_total`, `txgen_transactions_success_total`, etc. In `send-blocks` mode: `txgen_blocks_sent_total`, `txgen_blocks_success_total`, `txgen_blocks_failed_total`.
 
 Metadata key=value pairs (`-m key=value`) are applied as labels to all samples, useful for tagging runs with build SHAs, profiles, or experiment IDs.
 

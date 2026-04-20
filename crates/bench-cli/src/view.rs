@@ -1,7 +1,8 @@
 //! `bench view` - Print an existing JSON report with the console reporter.
 
 use bench_core::{
-    BenchMetrics, ConsoleReporter, FinalReport, JsonReport, LatencyStats, Reporter, RunStats,
+    BenchMetrics, BlockStats, ConsoleReporter, FinalReport, JsonReport, LatencyStats, Reporter,
+    RunStats,
 };
 use eyre::{Context, Result};
 use std::fs;
@@ -34,6 +35,13 @@ pub fn execute(args: ViewArgs) -> Result<()> {
         _ => None,
     };
 
+    let blocks: Vec<BlockStats> = report
+        .blocks
+        .unwrap_or_default()
+        .into_iter()
+        .map(BlockStats::from)
+        .collect();
+
     let run_stats = report.run_stats.map(|rs| RunStats {
         start_block: rs.start_block,
         end_block: rs.end_block,
@@ -50,6 +58,7 @@ pub fn execute(args: ViewArgs) -> Result<()> {
     let final_report = FinalReport {
         bench_metrics,
         run_stats,
+        blocks,
         ..Default::default()
     };
 

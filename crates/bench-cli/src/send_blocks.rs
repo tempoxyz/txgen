@@ -16,10 +16,14 @@ use alloy_rpc_types_engine::{ForkchoiceState, JwtSecret};
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
     BlockStats, ConsoleReporter, FinalReport, Reporter, RethApi, RethNewPayloadInput, RunClock,
-    RunStats, SampleStore, ScraperConfig, WaitForPersistence, parse_reporters, start_scraper,
+    RunStats, Sample, SampleStore, ScraperConfig, WaitForPersistence, parse_reporters,
+    start_scraper,
 };
 use eyre::{Context, Result};
+use std::collections::BTreeMap;
 use std::io::BufRead;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -66,19 +70,26 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
 
     let clock = RunClock::new();
     let store = SampleStore::new();
+    let counters = Arc::new(BlockCounters::default());
 
     // Start background scraper if metrics URL is configured.
     let scraper_handle = if let Some(ref url) = args.metrics_url {
         let scraper_config =
             ScraperConfig::new(url).with_interval(Duration::from_millis(args.scrape_interval_ms));
-        let handle = start_scraper(scraper_config, clock.clone(), store.clone(), None);
+
+        let snap_counters = counters.clone();
+        let snap_clock = clock.clone();
+        let callback: bench_core::SampleCallback =
+            Arc::new(move || snap_counters.snapshot_samples(&snap_clock));
+
+        let handle = start_scraper(scraper_config, clock.clone(), store.clone(), Some(callback));
         tracing::info!(url, "Started metrics scraper");
         Some(handle)
     } else {
         None
     };
 
-    let mut collector = MetricsCollector::default();
+    let mut collector = MetricsCollector::new(counters);
 
     if let Some(ref path) = args.input {
         let file = std::fs::File::open(path).wrap_err("failed to open input file")?;
@@ -197,7 +208,7 @@ pub(crate) async fn process_block(
     persistence_policy: &WaitForPersistence,
 ) -> Result<()> {
     let input = RethNewPayloadInput::BlockRlp(block_bytes);
-    let wait = persistence_policy.should_wait(collector.blocks_submitted);
+    let wait = persistence_policy.should_wait(collector.blocks_submitted());
 
     let new_payload_start = Instant::now();
     let payload_status = provider
@@ -265,7 +276,7 @@ pub(crate) async fn process_block(
         sparse_trie_wait_us: payload_status.sparse_trie_wait_us,
     };
 
-    collector.record_block(block_stats);
+    collector.record_success(block_stats);
 
     tracing::info!(
         block = meta.number,
@@ -288,10 +299,52 @@ pub(crate) async fn process_block(
     Ok(())
 }
 
-/// Block submission state and metrics collector.
+/// Shared atomic counters for the scraper snapshot callback.
 #[derive(Debug, Default)]
+struct BlockCounters {
+    submitted: AtomicU64,
+    success: AtomicU64,
+    failed: AtomicU64,
+}
+
+impl BlockCounters {
+    fn snapshot_samples(&self, clock: &RunClock) -> Vec<Sample> {
+        let submitted = self.submitted.load(Ordering::Relaxed);
+        let success = self.success.load(Ordering::Relaxed);
+        let failed = self.failed.load(Ordering::Relaxed);
+        let offset_ms = clock.offset_ms();
+        let unix_ms = clock.unix_ms();
+        let labels = BTreeMap::new();
+
+        vec![
+            Sample {
+                name: "txgen_blocks_sent_total".to_string(),
+                labels: labels.clone(),
+                value: submitted as f64,
+                offset_ms,
+                unix_ms,
+            },
+            Sample {
+                name: "txgen_blocks_success_total".to_string(),
+                labels: labels.clone(),
+                value: success as f64,
+                offset_ms,
+                unix_ms,
+            },
+            Sample {
+                name: "txgen_blocks_failed_total".to_string(),
+                labels,
+                value: failed as f64,
+                offset_ms,
+                unix_ms,
+            },
+        ]
+    }
+}
+
+/// Block submission state and metrics collector.
 pub(crate) struct MetricsCollector {
-    blocks_submitted: u64,
+    counters: Arc<BlockCounters>,
     prev_block_hash: Option<B256>,
     finalized_hash: Option<B256>,
     prev_timestamp_ms: Option<u64>,
@@ -299,8 +352,29 @@ pub(crate) struct MetricsCollector {
 }
 
 impl MetricsCollector {
-    pub(crate) fn record_block(&mut self, stats: BlockStats) {
-        self.blocks_submitted += 1;
+    fn new(counters: Arc<BlockCounters>) -> Self {
+        Self {
+            counters,
+            prev_block_hash: None,
+            finalized_hash: None,
+            prev_timestamp_ms: None,
+            blocks: Vec::new(),
+        }
+    }
+
+    pub(crate) fn record_success(&mut self, stats: BlockStats) {
+        self.counters.submitted.fetch_add(1, Ordering::Relaxed);
+        self.counters.success.fetch_add(1, Ordering::Relaxed);
         self.blocks.push(stats);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_failure(&self) {
+        self.counters.submitted.fetch_add(1, Ordering::Relaxed);
+        self.counters.failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn blocks_submitted(&self) -> u64 {
+        self.counters.submitted.load(Ordering::Relaxed)
     }
 }
