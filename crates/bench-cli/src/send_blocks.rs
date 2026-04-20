@@ -149,6 +149,11 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         handle.stop().await;
     }
 
+    // Push a final snapshot so counter totals are captured even if the
+    // last scraper tick fired before the final block was submitted.
+    let final_samples = collector.final_snapshot(&clock);
+    store.push_batch(final_samples).await;
+
     let samples = store.drain().await;
 
     let blocks = std::mem::take(&mut collector.blocks);
@@ -376,5 +381,9 @@ impl MetricsCollector {
 
     pub(crate) fn blocks_submitted(&self) -> u64 {
         self.counters.submitted.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn final_snapshot(&self, clock: &RunClock) -> Vec<Sample> {
+        self.counters.snapshot_samples(clock)
     }
 }
