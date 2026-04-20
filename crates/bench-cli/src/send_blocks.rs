@@ -34,8 +34,6 @@ struct BlockLine {
 pub(crate) struct BlockMeta {
     pub(crate) hash: B256,
     pub(crate) number: u64,
-    #[allow(dead_code)]
-    pub(crate) timestamp: u64,
     pub(crate) gas_used: u64,
     pub(crate) tx_count: usize,
 }
@@ -176,7 +174,6 @@ pub(crate) fn decode_block_meta(rlp_bytes: &[u8]) -> Result<BlockMeta> {
     Ok(BlockMeta {
         hash,
         number: block.header.number,
-        timestamp: block.header.timestamp,
         gas_used: block.header.gas_used,
         tx_count: block.body.transactions.len(),
     })
