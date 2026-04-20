@@ -30,7 +30,7 @@ One row per block in a run. Contains factual chain data.
 | `run_id` | UUID | Parent run |
 | `block_index` | UInt32 | 0-based position in the run |
 | `block_number` | UInt64 | Chain block number |
-| `chain_timestamp` | UInt64? | Block timestamp (unix seconds) |
+| `chain_timestamp_ms` | UInt64? | Block timestamp (unix milliseconds) |
 | `tx_count` | UInt32 | Transactions in the block |
 | `gas_used` | UInt64 | Gas consumed |
 | `gas_limit` | UInt64 | Block gas limit |
