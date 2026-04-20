@@ -1,9 +1,6 @@
 //! `bench view` - Print an existing JSON report with the console reporter.
 
-use bench_core::{
-    BenchMetrics, BlockStats, ConsoleReporter, FinalReport, JsonReport, LatencyStats, Reporter,
-    RunStats,
-};
+use bench_core::{BenchMetrics, ConsoleReporter, FinalReport, JsonReport, LatencyStats, Reporter};
 use eyre::{Context, Result};
 use std::fs;
 use std::time::Duration;
@@ -35,32 +32,10 @@ pub fn execute(args: ViewArgs) -> Result<()> {
         _ => None,
     };
 
-    let blocks: Vec<BlockStats> = report
-        .blocks
-        .unwrap_or_default()
-        .into_iter()
-        .map(BlockStats::from)
-        .collect();
-
-    let run_stats = report.run_stats.map(|rs| RunStats {
-        start_block: rs.start_block,
-        end_block: rs.end_block,
-        total_blocks: rs.total_blocks,
-        total_txs: rs.total_txs,
-        total_gas: rs.total_gas,
-        duration_ms: rs.duration_ms,
-        avg_blocks_per_second: rs.avg_blocks_per_second,
-        avg_tps: rs.avg_tps,
-        avg_gas_per_second: rs.avg_gas_per_second,
-        block_time_p50_ms: rs.block_time_p50_ms,
-        block_time_p95_ms: rs.block_time_p95_ms,
-        block_time_p99_ms: rs.block_time_p99_ms,
-    });
-
     let final_report = FinalReport {
         bench_metrics,
-        run_stats,
-        blocks,
+        run_stats: report.run_stats,
+        blocks: report.blocks.unwrap_or_default(),
         ..Default::default()
     };
 
