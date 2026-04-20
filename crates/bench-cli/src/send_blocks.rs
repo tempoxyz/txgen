@@ -217,11 +217,12 @@ pub(crate) async fn process_block(
         .wrap_err("reth_newPayload failed")?;
     let new_payload_latency = new_payload_start.elapsed();
 
-    if !payload_status.status.is_valid() && !payload_status.status.is_syncing() {
-        tracing::warn!(
-            block = meta.number,
-            status = ?payload_status.status,
-            "reth_newPayload returned non-VALID status"
+    if !payload_status.status.is_valid() {
+        collector.record_failure();
+        eyre::bail!(
+            "reth_newPayload returned non-VALID status for block {}: {:?}",
+            meta.number,
+            payload_status.status,
         );
     }
 
@@ -244,11 +245,12 @@ pub(crate) async fn process_block(
         .wrap_err("reth_forkchoiceUpdated failed")?;
     let fcu_latency = fcu_start.elapsed();
 
-    if !fcu_result.is_valid() && !fcu_result.is_syncing() {
-        tracing::warn!(
-            block = meta.number,
-            status = ?fcu_result.payload_status,
-            "reth_forkchoiceUpdated returned non-VALID status"
+    if !fcu_result.is_valid() {
+        collector.record_failure();
+        eyre::bail!(
+            "reth_forkchoiceUpdated returned non-VALID status for block {}: {:?}",
+            meta.number,
+            fcu_result.payload_status,
         );
     }
 
@@ -368,7 +370,6 @@ impl MetricsCollector {
         self.blocks.push(stats);
     }
 
-    #[allow(dead_code)]
     pub(crate) fn record_failure(&self) {
         self.counters.submitted.fetch_add(1, Ordering::Relaxed);
         self.counters.failed.fetch_add(1, Ordering::Relaxed);
