@@ -312,138 +312,16 @@ pub struct JsonReport {
     pub time_series: Option<JsonTimeSeries>,
     /// Block-level statistics (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub blocks: Option<Vec<JsonBlockStats>>,
+    pub blocks: Option<Vec<BlockStats>>,
     /// Run summary statistics (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_stats: Option<JsonRunStats>,
+    pub run_stats: Option<RunStats>,
     /// User-provided metadata key/value pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<std::collections::HashMap<String, String>>,
     /// Unified time-series samples (internal + node metrics).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub samples: Vec<Sample>,
-}
-
-/// Block statistics in JSON format.
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-pub struct JsonBlockStats {
-    /// Block number.
-    pub number: u64,
-    /// Block timestamp in milliseconds.
-    pub timestamp_ms: u64,
-    /// Total transactions in the block.
-    pub tx_count: usize,
-    /// Gas used by the block.
-    pub gas_used: u64,
-    /// Gas limit of the block.
-    pub gas_limit: u64,
-    /// Time since previous block in milliseconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub block_time_ms: Option<u64>,
-    /// Client-side `reth_newPayload` latency in milliseconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub new_payload_ms: Option<u64>,
-    /// Client-side `reth_forkchoiceUpdated` latency in milliseconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub forkchoice_updated_ms: Option<u64>,
-    /// Server-side execution latency in microseconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub new_payload_server_latency_us: Option<u64>,
-    /// Server-side persistence wait in microseconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub persistence_wait_us: Option<u64>,
-    /// Server-side execution cache wait in microseconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub execution_cache_wait_us: Option<u64>,
-    /// Server-side sparse trie wait in microseconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sparse_trie_wait_us: Option<u64>,
-}
-
-impl From<&BlockStats> for JsonBlockStats {
-    fn from(b: &BlockStats) -> Self {
-        Self {
-            number: b.number,
-            timestamp_ms: b.timestamp_ms,
-            tx_count: b.tx_count,
-            gas_used: b.gas_used,
-            gas_limit: b.gas_limit,
-            block_time_ms: b.block_time_ms,
-            new_payload_ms: b.new_payload_ms,
-            forkchoice_updated_ms: b.forkchoice_updated_ms,
-            new_payload_server_latency_us: b.new_payload_server_latency_us,
-            persistence_wait_us: b.persistence_wait_us,
-            execution_cache_wait_us: b.execution_cache_wait_us,
-            sparse_trie_wait_us: b.sparse_trie_wait_us,
-        }
-    }
-}
-
-impl From<JsonBlockStats> for BlockStats {
-    fn from(b: JsonBlockStats) -> Self {
-        Self {
-            number: b.number,
-            timestamp_ms: b.timestamp_ms,
-            tx_count: b.tx_count,
-            gas_used: b.gas_used,
-            gas_limit: b.gas_limit,
-            block_time_ms: b.block_time_ms,
-            new_payload_ms: b.new_payload_ms,
-            forkchoice_updated_ms: b.forkchoice_updated_ms,
-            new_payload_server_latency_us: b.new_payload_server_latency_us,
-            persistence_wait_us: b.persistence_wait_us,
-            execution_cache_wait_us: b.execution_cache_wait_us,
-            sparse_trie_wait_us: b.sparse_trie_wait_us,
-        }
-    }
-}
-
-/// Run summary statistics in JSON format.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct JsonRunStats {
-    /// Starting block number.
-    pub start_block: u64,
-    /// Ending block number.
-    pub end_block: u64,
-    /// Total number of blocks.
-    pub total_blocks: u64,
-    /// Total transactions across all blocks.
-    pub total_txs: u64,
-    /// Total gas used across all blocks.
-    pub total_gas: u64,
-    /// Total duration in milliseconds.
-    pub duration_ms: u64,
-    /// Average blocks per second.
-    pub avg_blocks_per_second: f64,
-    /// Average transactions per second.
-    pub avg_tps: f64,
-    /// Average gas per second.
-    pub avg_gas_per_second: f64,
-    /// P50 block time in milliseconds.
-    pub block_time_p50_ms: u64,
-    /// P95 block time in milliseconds.
-    pub block_time_p95_ms: u64,
-    /// P99 block time in milliseconds.
-    pub block_time_p99_ms: u64,
-}
-
-impl From<&RunStats> for JsonRunStats {
-    fn from(r: &RunStats) -> Self {
-        Self {
-            start_block: r.start_block,
-            end_block: r.end_block,
-            total_blocks: r.total_blocks,
-            total_txs: r.total_txs,
-            total_gas: r.total_gas,
-            duration_ms: r.duration_ms,
-            avg_blocks_per_second: r.avg_blocks_per_second,
-            avg_tps: r.avg_tps,
-            avg_gas_per_second: r.avg_gas_per_second,
-            block_time_p50_ms: r.block_time_p50_ms,
-            block_time_p95_ms: r.block_time_p95_ms,
-            block_time_p99_ms: r.block_time_p99_ms,
-        }
-    }
 }
 
 /// Latency statistics in JSON format.
@@ -579,7 +457,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         let blocks = if report.blocks.is_empty() {
             None
         } else {
-            Some(report.blocks.iter().map(JsonBlockStats::from).collect())
+            Some(report.blocks.clone())
         };
 
         let metadata = if report.metadata.is_empty() {
@@ -598,7 +476,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             latency,
             time_series,
             blocks,
-            run_stats: report.run_stats.as_ref().map(JsonRunStats::from),
+            run_stats: report.run_stats.clone(),
             metadata,
             samples: report.samples.clone(),
         };
