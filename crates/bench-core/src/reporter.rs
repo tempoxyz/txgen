@@ -285,20 +285,27 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
 /// JSON output format.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct JsonReport {
-    /// Total transactions sent.
-    pub sent: u64,
-    /// Successful transactions.
-    pub success: u64,
-    /// Failed transactions.
-    pub failed: u64,
-    /// Elapsed time in seconds.
-    pub elapsed_secs: f64,
-    /// Transactions per second.
-    pub tps: f64,
-    /// Success rate percentage.
-    pub success_rate: f64,
-    /// Latency statistics.
-    pub latency: JsonLatency,
+    /// Total transactions sent (send mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sent: Option<u64>,
+    /// Successful transactions (send mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success: Option<u64>,
+    /// Failed transactions (send mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed: Option<u64>,
+    /// Elapsed time in seconds (send mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_secs: Option<f64>,
+    /// Transactions per second (send mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tps: Option<f64>,
+    /// Success rate percentage (send mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success_rate: Option<f64>,
+    /// Latency statistics (send mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency: Option<JsonLatency>,
     /// Time-series data for graphing (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_series: Option<JsonTimeSeries>,
@@ -492,65 +499,86 @@ impl<W: Write + Send> JsonReporter<W> {
 
 impl<W: Write + Send> Reporter for JsonReporter<W> {
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
-        if let Some(metrics) = &report.bench_metrics {
-            let ts = report.time_series.as_ref().map(|ts| JsonTimeSeries {
-                throughput: ts
-                    .throughput
-                    .iter()
-                    .map(|s| JsonThroughputSample {
-                        second: s.second,
-                        sent: s.sent,
-                        success: s.success,
-                        failed: s.failed,
-                    })
-                    .collect(),
-                latencies: ts
-                    .latencies
-                    .iter()
-                    .map(|l| JsonLatencySample {
-                        offset_ms: l.offset_ms,
-                        latency_ms: l.latency.as_secs_f64() * 1000.0,
-                    })
-                    .collect(),
-            });
-
-            let blocks = if report.blocks.is_empty() {
-                None
-            } else {
-                Some(report.blocks.iter().map(JsonBlockStats::from).collect())
-            };
-
-            let metadata = if report.metadata.is_empty() {
-                None
-            } else {
-                Some(report.metadata.clone())
-            };
-
-            let json_report = JsonReport {
-                sent: metrics.sent,
-                success: metrics.success,
-                failed: metrics.failed,
-                elapsed_secs: metrics.elapsed.as_secs_f64(),
-                tps: metrics.tps(),
-                success_rate: metrics.success_rate(),
-                latency: JsonLatency {
-                    min_ms: metrics.latency.min.as_secs_f64() * 1000.0,
-                    max_ms: metrics.latency.max.as_secs_f64() * 1000.0,
-                    mean_ms: metrics.latency.mean.as_secs_f64() * 1000.0,
-                    p50_ms: metrics.latency.p50.as_secs_f64() * 1000.0,
-                    p95_ms: metrics.latency.p95.as_secs_f64() * 1000.0,
-                    p99_ms: metrics.latency.p99.as_secs_f64() * 1000.0,
-                },
-                time_series: ts,
-                blocks,
-                run_stats: report.run_stats.as_ref().map(JsonRunStats::from),
-                metadata,
-                samples: report.samples.clone(),
-            };
-
-            serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
-            writeln!(self.writer)?;
+        let has_data = report.bench_metrics.is_some()
+            || !report.blocks.is_empty()
+            || !report.samples.is_empty();
+        if !has_data {
+            return Ok(());
         }
+
+        let (sent, success, failed, elapsed_secs, tps, success_rate, latency, time_series) =
+            if let Some(metrics) = &report.bench_metrics {
+                let ts = report.time_series.as_ref().map(|ts| JsonTimeSeries {
+                    throughput: ts
+                        .throughput
+                        .iter()
+                        .map(|s| JsonThroughputSample {
+                            second: s.second,
+                            sent: s.sent,
+                            success: s.success,
+                            failed: s.failed,
+                        })
+                        .collect(),
+                    latencies: ts
+                        .latencies
+                        .iter()
+                        .map(|l| JsonLatencySample {
+                            offset_ms: l.offset_ms,
+                            latency_ms: l.latency.as_secs_f64() * 1000.0,
+                        })
+                        .collect(),
+                });
+
+                (
+                    Some(metrics.sent),
+                    Some(metrics.success),
+                    Some(metrics.failed),
+                    Some(metrics.elapsed.as_secs_f64()),
+                    Some(metrics.tps()),
+                    Some(metrics.success_rate()),
+                    Some(JsonLatency {
+                        min_ms: metrics.latency.min.as_secs_f64() * 1000.0,
+                        max_ms: metrics.latency.max.as_secs_f64() * 1000.0,
+                        mean_ms: metrics.latency.mean.as_secs_f64() * 1000.0,
+                        p50_ms: metrics.latency.p50.as_secs_f64() * 1000.0,
+                        p95_ms: metrics.latency.p95.as_secs_f64() * 1000.0,
+                        p99_ms: metrics.latency.p99.as_secs_f64() * 1000.0,
+                    }),
+                    ts,
+                )
+            } else {
+                (None, None, None, None, None, None, None, None)
+            };
+
+        let blocks = if report.blocks.is_empty() {
+            None
+        } else {
+            Some(report.blocks.iter().map(JsonBlockStats::from).collect())
+        };
+
+        let metadata = if report.metadata.is_empty() {
+            None
+        } else {
+            Some(report.metadata.clone())
+        };
+
+        let json_report = JsonReport {
+            sent,
+            success,
+            failed,
+            elapsed_secs,
+            tps,
+            success_rate,
+            latency,
+            time_series,
+            blocks,
+            run_stats: report.run_stats.as_ref().map(JsonRunStats::from),
+            metadata,
+            samples: report.samples.clone(),
+        };
+
+        serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
+        writeln!(self.writer)?;
 
         Ok(())
     }
