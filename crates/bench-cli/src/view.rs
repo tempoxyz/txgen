@@ -16,19 +16,22 @@ pub fn execute(args: ViewArgs) -> Result<()> {
     let report: JsonReport =
         serde_json::from_str(&content).wrap_err("failed to parse JSON report")?;
 
-    let metrics = BenchMetrics {
-        sent: report.sent,
-        success: report.success,
-        failed: report.failed,
-        elapsed: Duration::from_secs_f64(report.elapsed_secs),
-        latency: LatencyStats {
-            min: Duration::from_secs_f64(report.latency.min_ms / 1000.0),
-            max: Duration::from_secs_f64(report.latency.max_ms / 1000.0),
-            mean: Duration::from_secs_f64(report.latency.mean_ms / 1000.0),
-            p50: Duration::from_secs_f64(report.latency.p50_ms / 1000.0),
-            p95: Duration::from_secs_f64(report.latency.p95_ms / 1000.0),
-            p99: Duration::from_secs_f64(report.latency.p99_ms / 1000.0),
-        },
+    let bench_metrics = match (report.sent, report.latency) {
+        (Some(sent), Some(lat)) => Some(BenchMetrics {
+            sent,
+            success: report.success.unwrap_or(0),
+            failed: report.failed.unwrap_or(0),
+            elapsed: Duration::from_secs_f64(report.elapsed_secs.unwrap_or(0.0)),
+            latency: LatencyStats {
+                min: Duration::from_secs_f64(lat.min_ms / 1000.0),
+                max: Duration::from_secs_f64(lat.max_ms / 1000.0),
+                mean: Duration::from_secs_f64(lat.mean_ms / 1000.0),
+                p50: Duration::from_secs_f64(lat.p50_ms / 1000.0),
+                p95: Duration::from_secs_f64(lat.p95_ms / 1000.0),
+                p99: Duration::from_secs_f64(lat.p99_ms / 1000.0),
+            },
+        }),
+        _ => None,
     };
 
     let run_stats = report.run_stats.map(|rs| RunStats {
@@ -45,7 +48,7 @@ pub fn execute(args: ViewArgs) -> Result<()> {
     });
 
     let final_report = FinalReport {
-        bench_metrics: Some(metrics),
+        bench_metrics,
         run_stats,
         ..Default::default()
     };
