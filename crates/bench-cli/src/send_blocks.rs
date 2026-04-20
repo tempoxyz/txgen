@@ -142,6 +142,13 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let blocks = std::mem::take(&mut collector.blocks);
     let run_stats = RunStats::from_blocks(&blocks);
 
+    for block in &blocks {
+        for reporter in reporters.iter_mut() {
+            reporter.on_block(block)?;
+        }
+        console_reporter.on_block(block)?;
+    }
+
     let mut report = FinalReport {
         metadata: metadata.clone(),
         samples,
