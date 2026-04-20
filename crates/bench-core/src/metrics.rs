@@ -172,6 +172,26 @@ pub struct BlockStats {
     pub gas_limit: u64,
     /// Time since previous block in milliseconds.
     pub block_time_ms: Option<u64>,
+
+    // -- Engine API timing (send-blocks mode only) --
+    /// Client-side `reth_newPayload` latency in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_payload_ms: Option<u64>,
+    /// Client-side `reth_forkchoiceUpdated` latency in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fcu_ms: Option<u64>,
+    /// Server-side execution latency in microseconds (from `reth_newPayload` response).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_latency_us: Option<u64>,
+    /// Server-side persistence wait in microseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistence_wait_us: Option<u64>,
+    /// Server-side execution cache wait in microseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_cache_wait_us: Option<u64>,
+    /// Server-side sparse trie wait in microseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sparse_trie_wait_us: Option<u64>,
 }
 
 /// Run summary statistics.
@@ -304,6 +324,12 @@ pub async fn collect_block_stats<N: Network, P: Provider<N>>(
             gas_used: block.header().gas_used(),
             gas_limit: block.header().gas_limit(),
             block_time_ms,
+            new_payload_ms: None,
+            fcu_ms: None,
+            server_latency_us: None,
+            persistence_wait_us: None,
+            execution_cache_wait_us: None,
+            sparse_trie_wait_us: None,
         });
     }
 
@@ -720,6 +746,12 @@ mod tests {
                 gas_used: 1_000_000,
                 gas_limit: 30_000_000,
                 block_time_ms: None,
+                new_payload_ms: None,
+                fcu_ms: None,
+                server_latency_us: None,
+                persistence_wait_us: None,
+                execution_cache_wait_us: None,
+                sparse_trie_wait_us: None,
             },
             BlockStats {
                 number: 101,
@@ -728,6 +760,12 @@ mod tests {
                 gas_used: 1_500_000,
                 gas_limit: 30_000_000,
                 block_time_ms: Some(12000),
+                new_payload_ms: None,
+                fcu_ms: None,
+                server_latency_us: None,
+                persistence_wait_us: None,
+                execution_cache_wait_us: None,
+                sparse_trie_wait_us: None,
             },
             BlockStats {
                 number: 102,
@@ -736,6 +774,12 @@ mod tests {
                 gas_used: 2_000_000,
                 gas_limit: 30_000_000,
                 block_time_ms: Some(12000),
+                new_payload_ms: None,
+                fcu_ms: None,
+                server_latency_us: None,
+                persistence_wait_us: None,
+                execution_cache_wait_us: None,
+                sparse_trie_wait_us: None,
             },
         ];
 
@@ -835,6 +879,12 @@ mod tests {
             gas_used,
             gas_limit: 30_000_000,
             block_time_ms: Some(500),
+            new_payload_ms: None,
+            fcu_ms: None,
+            server_latency_us: None,
+            persistence_wait_us: None,
+            execution_cache_wait_us: None,
+            sparse_trie_wait_us: None,
         }
     }
 
