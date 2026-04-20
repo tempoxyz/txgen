@@ -6,10 +6,8 @@
 //! - [`metrics`] - Collection (sent/success/failed counts, timing)
 //! - [`reporter`] - Output (console, JSON, ClickHouse)
 //! - [`reth_api`] - reth custom Engine API types (`reth_newPayload`, `reth_forkchoiceUpdated`)
-//! - [`historical`] - Historical transaction fetching from archive RPC
 
 pub mod clock;
-pub mod historical;
 pub mod metrics;
 pub mod prometheus;
 pub mod reporter;
@@ -20,7 +18,6 @@ pub mod sender;
 pub mod source;
 
 pub use clock::RunClock;
-pub use historical::{HistoricalFetcher, HistoricalFetcherConfig, HistoricalTx};
 pub use metrics::{
     BenchMetrics, BlockStats, LatencySample, LatencyStats, MetricsCollector, RunStats,
     ThroughputSample, TimeSeriesMetrics, collect_block_stats, compute_latency_stats,

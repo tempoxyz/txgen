@@ -174,54 +174,6 @@ pub struct BlockStats {
     pub block_time_ms: Option<u64>,
 }
 
-/// Statistics for a replayed block via Engine API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReplayBlockStats {
-    /// Block number.
-    pub number: u64,
-    /// Block timestamp (unix seconds).
-    pub timestamp: u64,
-    /// Total transactions in the block.
-    pub tx_count: usize,
-    /// Gas used by the block.
-    pub gas_used: u64,
-    /// Gas limit of the block.
-    pub gas_limit: u64,
-    /// newPayload latency in milliseconds.
-    pub new_payload_ms: u64,
-    /// forkchoiceUpdated latency in milliseconds.
-    pub fcu_ms: u64,
-    /// Total execution latency in milliseconds (newPayload + FCU).
-    pub total_latency_ms: u64,
-    /// Payload status from newPayload response.
-    pub payload_status: String,
-}
-
-/// Summary statistics for a replay run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReplayRunStats {
-    /// Number of blocks replayed.
-    pub blocks_replayed: u64,
-    /// Total transactions across all blocks.
-    pub total_txs: u64,
-    /// Total gas used (in gas units).
-    pub total_gas: u128,
-    /// Total execution time in milliseconds.
-    pub total_duration_ms: u64,
-    /// Blocks replayed per second.
-    pub blocks_per_second: f64,
-    /// Megagas per second.
-    pub mgas_per_second: f64,
-    /// Gigagas per second.
-    pub ggas_per_second: f64,
-    /// newPayload latency statistics.
-    pub new_payload_latency: LatencyStats,
-    /// forkchoiceUpdated latency statistics.
-    pub fcu_latency: LatencyStats,
-    /// Total block time statistics (newPayload + FCU).
-    pub block_time: LatencyStats,
-}
-
 /// Run summary statistics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunStats {
