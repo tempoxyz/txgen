@@ -45,9 +45,11 @@ pub fn execute(args: ViewArgs) -> Result<()> {
     let run_stats = report.run_stats.map(|rs| RunStats {
         start_block: rs.start_block,
         end_block: rs.end_block,
+        total_blocks: rs.total_blocks,
         total_txs: rs.total_txs,
         total_gas: rs.total_gas,
         duration_ms: rs.duration_ms,
+        avg_blocks_per_second: rs.avg_blocks_per_second,
         avg_tps: rs.avg_tps,
         avg_gas_per_second: rs.avg_gas_per_second,
         block_time_p50_ms: rs.block_time_p50_ms,

@@ -201,12 +201,16 @@ pub struct RunStats {
     pub start_block: u64,
     /// Ending block number.
     pub end_block: u64,
+    /// Total blocks in the run.
+    pub total_blocks: u64,
     /// Total transactions across all blocks.
     pub total_txs: u64,
     /// Total gas used across all blocks.
     pub total_gas: u64,
     /// Total duration in milliseconds.
     pub duration_ms: u64,
+    /// Average blocks per second.
+    pub avg_blocks_per_second: f64,
     /// Average transactions per second.
     pub avg_tps: f64,
     /// Average gas per second.
@@ -226,9 +230,11 @@ impl RunStats {
             return Self {
                 start_block: 0,
                 end_block: 0,
+                total_blocks: 0,
                 total_txs: 0,
                 total_gas: 0,
                 duration_ms: 0,
+                avg_blocks_per_second: 0.0,
                 avg_tps: 0.0,
                 avg_gas_per_second: 0.0,
                 block_time_p50_ms: 0,
@@ -239,6 +245,7 @@ impl RunStats {
 
         let start_block = blocks.first().map(|b| b.number).unwrap_or(0);
         let end_block = blocks.last().map(|b| b.number).unwrap_or(0);
+        let total_blocks = blocks.len() as u64;
 
         let total_txs: u64 = blocks.iter().map(|b| b.tx_count as u64).sum();
         let total_gas: u64 = blocks.iter().map(|b| b.gas_used).sum();
@@ -247,6 +254,12 @@ impl RunStats {
         let end_ms = blocks.last().map(|b| b.timestamp_ms).unwrap_or(0);
         let duration_ms = end_ms.saturating_sub(start_ms);
         let duration_secs = duration_ms as f64 / 1000.0;
+
+        let avg_blocks_per_second = if duration_secs > 0.0 {
+            total_blocks as f64 / duration_secs
+        } else {
+            0.0
+        };
 
         let avg_tps = if duration_secs > 0.0 {
             total_txs as f64 / duration_secs
@@ -270,9 +283,11 @@ impl RunStats {
         Self {
             start_block,
             end_block,
+            total_blocks,
             total_txs,
             total_gas,
             duration_ms,
+            avg_blocks_per_second,
             avg_tps,
             avg_gas_per_second,
             block_time_p50_ms,

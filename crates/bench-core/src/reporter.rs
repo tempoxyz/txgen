@@ -246,13 +246,14 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
                 "    Range:         {:>10} - {}",
                 run.start_block, run.end_block
             )?;
-            writeln!(
-                self.writer,
-                "    Count:         {:>10}",
-                run.end_block.saturating_sub(run.start_block) + 1
-            )?;
+            writeln!(self.writer, "    Count:         {:>10}", run.total_blocks)?;
             writeln!(self.writer, "    Total Txs:     {:>10}", run.total_txs)?;
             writeln!(self.writer, "    Avg TPS:       {:>10.2}", run.avg_tps)?;
+            writeln!(
+                self.writer,
+                "    Blocks/s:      {:>10.2}",
+                run.avg_blocks_per_second
+            )?;
             writeln!(
                 self.writer,
                 "    Avg Gas/s:     {:>10.2}",
@@ -404,12 +405,16 @@ pub struct JsonRunStats {
     pub start_block: u64,
     /// Ending block number.
     pub end_block: u64,
+    /// Total number of blocks.
+    pub total_blocks: u64,
     /// Total transactions across all blocks.
     pub total_txs: u64,
     /// Total gas used across all blocks.
     pub total_gas: u64,
     /// Total duration in milliseconds.
     pub duration_ms: u64,
+    /// Average blocks per second.
+    pub avg_blocks_per_second: f64,
     /// Average transactions per second.
     pub avg_tps: f64,
     /// Average gas per second.
@@ -427,9 +432,11 @@ impl From<&RunStats> for JsonRunStats {
         Self {
             start_block: r.start_block,
             end_block: r.end_block,
+            total_blocks: r.total_blocks,
             total_txs: r.total_txs,
             total_gas: r.total_gas,
             duration_ms: r.duration_ms,
+            avg_blocks_per_second: r.avg_blocks_per_second,
             avg_tps: r.avg_tps,
             avg_gas_per_second: r.avg_gas_per_second,
             block_time_p50_ms: r.block_time_p50_ms,
