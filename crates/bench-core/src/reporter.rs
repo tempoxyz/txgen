@@ -378,6 +378,25 @@ impl From<&BlockStats> for JsonBlockStats {
     }
 }
 
+impl From<JsonBlockStats> for BlockStats {
+    fn from(b: JsonBlockStats) -> Self {
+        Self {
+            number: b.number,
+            timestamp_ms: b.timestamp_ms,
+            tx_count: b.tx_count,
+            gas_used: b.gas_used,
+            gas_limit: b.gas_limit,
+            block_time_ms: b.block_time_ms,
+            new_payload_ms: b.new_payload_ms,
+            fcu_ms: b.fcu_ms,
+            server_latency_us: b.server_latency_us,
+            persistence_wait_us: b.persistence_wait_us,
+            execution_cache_wait_us: b.execution_cache_wait_us,
+            sparse_trie_wait_us: b.sparse_trie_wait_us,
+        }
+    }
+}
+
 /// Run summary statistics in JSON format.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct JsonRunStats {
