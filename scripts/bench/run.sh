@@ -184,7 +184,7 @@ else
   METADATA_FLAGS+=(-m "from=$FROM_BLOCK" -m "to=$TO_BLOCK")
 fi
 
-for kv in "${EXTRA_METADATA[@]}"; do
+for kv in "${EXTRA_METADATA[@]+"${EXTRA_METADATA[@]}"}"; do
   METADATA_FLAGS+=(-m "$kv")
 done
 
@@ -192,7 +192,7 @@ REPORT_FLAGS=(
   --report console
   --report "json:$DATADIR/report.json"
 )
-for spec in "${EXTRA_REPORTS[@]}"; do
+for spec in "${EXTRA_REPORTS[@]+"${EXTRA_REPORTS[@]}"}"; do
   REPORT_FLAGS+=(--report "$spec")
 done
 
