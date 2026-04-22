@@ -103,8 +103,6 @@ impl Sender {
             key: tx.key,
         };
 
-        self.metrics.record_sent();
-
         // Get or create the queue for this key.
         let queue = match self.key_queues.entry(pending.key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -155,6 +153,7 @@ async fn key_worker(
     while let Some(pending) = receiver.recv().await {
         // Acquire semaphore permit.
         let _permit = semaphore.acquire().await;
+        metrics.record_sent();
 
         // Pick a random provider for this request.
         // SAFETY: `providers` is guaranteed to be non-empty by construction.
