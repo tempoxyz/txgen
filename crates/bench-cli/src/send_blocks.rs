@@ -13,8 +13,9 @@ use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types_engine::{ForkchoiceState, JwtSecret};
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    BlockStats, ConsoleReporter, FinalReport, RethApi, RethNewPayloadInput, RunClock, RunStats,
-    Sample, SampleStore, ScraperConfig, WaitForPersistence, parse_reporters, start_scraper,
+    BlockStats, ConsoleReporter, FinalReport, ProgressState, Reporter, RethApi,
+    RethNewPayloadInput, RunClock, RunStats, Sample, SampleStore, ScraperConfig,
+    WaitForPersistence, parse_reporters, start_scraper,
 };
 use eyre::{Context, Result};
 use std::collections::BTreeMap;
@@ -91,6 +92,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     };
 
     let mut collector = MetricsCollector::new(counters);
+    let start = Instant::now();
 
     if let Some(ref path) = args.input {
         let file = std::fs::File::open(path).wrap_err("failed to open input file")?;
@@ -101,6 +103,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             let block = parse_block_line(&line)?;
 
             process_block(&provider, &block, &mut collector, &persistence_policy).await?;
+            report_progress(&collector, start, &mut reporters)?;
         }
     } else {
         let stdin = tokio::io::stdin();
@@ -120,6 +123,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             let block = parse_block_line(&line_buf)?;
 
             process_block(&provider, &block, &mut collector, &persistence_policy).await?;
+            report_progress(&collector, start, &mut reporters)?;
         }
     }
 
@@ -168,6 +172,26 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
 
 fn parse_block_line(line: &str) -> Result<BlockLine> {
     serde_json::from_str(line.trim()).wrap_err("failed to parse NDJSON line")
+}
+
+fn report_progress(
+    collector: &MetricsCollector,
+    start: Instant,
+    reporters: &mut [Box<dyn Reporter>],
+) -> Result<()> {
+    let state = ProgressState {
+        sent: collector.blocks_submitted(),
+        success: collector.blocks_success(),
+        failed: collector.blocks_failed(),
+        elapsed: start.elapsed(),
+        max_concurrent: 0,
+        target_tps: None,
+        unit: "block",
+    };
+    for reporter in reporters.iter_mut() {
+        reporter.on_progress(&state)?;
+    }
+    Ok(())
 }
 
 async fn process_block(
@@ -346,6 +370,14 @@ impl MetricsCollector {
 
     fn blocks_submitted(&self) -> u64 {
         self.counters.submitted.load(Ordering::Relaxed)
+    }
+
+    fn blocks_success(&self) -> u64 {
+        self.counters.success.load(Ordering::Relaxed)
+    }
+
+    fn blocks_failed(&self) -> u64 {
+        self.counters.failed.load(Ordering::Relaxed)
     }
 
     fn final_snapshot(&self, clock: &RunClock) -> Vec<Sample> {

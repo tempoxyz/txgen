@@ -51,18 +51,20 @@ impl FinalReport {
 
 /// Snapshot of progress state passed to reporters.
 pub struct ProgressState {
-    /// Total transactions submitted to the sender.
+    /// Total items submitted.
     pub sent: u64,
-    /// Transactions that received an RPC response (success).
+    /// Items that received a successful response.
     pub success: u64,
-    /// Transactions that failed.
+    /// Items that failed.
     pub failed: u64,
     /// Elapsed time since benchmark start.
     pub elapsed: std::time::Duration,
-    /// Configured `--max-concurrent` limit.
+    /// Configured `--max-concurrent` limit (0 = not applicable).
     pub max_concurrent: usize,
-    /// Configured `--tps` target (`None` = unlimited).
+    /// Configured target rate (`None` = unlimited).
     pub target_tps: Option<u64>,
+    /// Display unit for items (e.g. `"tx"`, `"block"`).
+    pub unit: &'static str,
 }
 
 impl ProgressState {
@@ -71,8 +73,8 @@ impl ProgressState {
         self.sent.saturating_sub(self.success + self.failed)
     }
 
-    /// Actual send rate in transactions per second.
-    pub fn actual_tps(&self) -> f64 {
+    /// Actual send rate in items per second.
+    pub fn actual_rate(&self) -> f64 {
         let secs = self.elapsed.as_secs_f64();
         if secs > 0.0 {
             self.sent as f64 / secs
@@ -135,22 +137,30 @@ impl<W: Write + Send> ConsoleReporter<W> {
 impl<W: Write + Send> Reporter for ConsoleReporter<W> {
     fn on_progress(&mut self, state: &ProgressState) -> Result<()> {
         if self.show_progress {
-            let inflight = state.inflight();
-            let actual_tps = state.actual_tps();
+            let rate = state.actual_rate();
 
             write!(
                 self.writer,
-                "\r  Sent: {} | OK: {} | Fail: {} | Inflight: {}/{}",
-                state.sent, state.success, state.failed, inflight, state.max_concurrent
+                "\r  Sent: {} | OK: {} | Fail: {}",
+                state.sent, state.success, state.failed,
             )?;
 
-            write!(self.writer, " | Rate: {:.0}", actual_tps)?;
+            if state.max_concurrent > 0 {
+                let inflight = state.inflight();
+                write!(
+                    self.writer,
+                    " | Inflight: {}/{}",
+                    inflight, state.max_concurrent
+                )?;
+            }
+
+            write!(self.writer, " | Rate: {:.0}", rate)?;
 
             if let Some(target) = state.target_tps {
                 write!(self.writer, "/{}", target)?;
             }
 
-            write!(self.writer, " tps")?;
+            write!(self.writer, " {}/s", state.unit)?;
             self.writer.flush()?;
         }
         Ok(())
@@ -956,6 +966,7 @@ mod tests {
                 elapsed: Duration::from_secs(10),
                 max_concurrent: 200,
                 target_tps: Some(1000),
+                unit: "tx",
             };
             reporter.on_progress(&state).unwrap();
         }
@@ -965,7 +976,7 @@ mod tests {
         assert!(output_str.contains("OK: 90"));
         assert!(output_str.contains("Fail: 10"));
         assert!(output_str.contains("Inflight: 0/200"));
-        assert!(output_str.contains("10/1000 tps"));
+        assert!(output_str.contains("10/1000 tx/s"));
     }
 
     #[test]
@@ -980,13 +991,14 @@ mod tests {
                 elapsed: Duration::from_secs(5),
                 max_concurrent: 100,
                 target_tps: None,
+                unit: "tx",
             };
             reporter.on_progress(&state).unwrap();
         }
 
         let output_str = String::from_utf8(output).unwrap();
         assert!(output_str.contains("Inflight: 150/100"));
-        assert!(output_str.contains("1000 tps"));
+        assert!(output_str.contains("1000 tx/s"));
         assert!(!output_str.contains("1000/"));
     }
 

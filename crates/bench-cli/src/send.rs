@@ -211,6 +211,7 @@ async fn send_from_source<S: TxSource>(
                 elapsed: metrics.elapsed_since_start(),
                 max_concurrent: config.max_concurrent,
                 target_tps: (config.rate_limit > 0).then_some(config.rate_limit),
+                unit: "tx",
             };
             for reporter in reporters.iter_mut() {
                 reporter.on_progress(&state)?;
