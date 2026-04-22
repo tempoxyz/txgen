@@ -1,9 +1,9 @@
-use alloy_consensus::{Block as ConsensusBlock, SignableTransaction, Signed, TxEnvelope};
+use alloy_consensus::{BlockHeader, SignableTransaction, Signed};
 use alloy_eips::{BlockNumberOrTag, eip2718::Encodable2718};
-use alloy_network::{Network, TransactionBuilder, TxSignerSync};
-use alloy_primitives::Bytes;
+use alloy_network::primitives::BlockResponse;
+use alloy_network::{AnyNetwork, Network, TransactionBuilder, TxSignerSync};
+use alloy_primitives::{Bytes, keccak256};
 use alloy_provider::{Provider, ext::DebugApi};
-use alloy_rlp::Decodable;
 use clap::{Args, Parser, Subcommand};
 use eyre::{Result, WrapErr, bail};
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -481,9 +481,8 @@ async fn run_extract(args: ExtractArgs) -> Result<()> {
         bail!("--from must be <= --to");
     }
 
-    let provider =
-        alloy_provider::ProviderBuilder::<_, _, alloy_provider::network::Ethereum>::new()
-            .connect_http(args.rpc.parse().wrap_err("invalid RPC URL")?);
+    let provider = alloy_provider::ProviderBuilder::new_with_network::<AnyNetwork>()
+        .connect_http(args.rpc.parse().wrap_err("invalid RPC URL")?);
 
     let (tx, mut rx) = mpsc::channel::<Result<FetchedBlock>>(args.buffer_size);
 
@@ -517,6 +516,11 @@ async fn run_extract(args: ExtractArgs) -> Result<()> {
 struct BlockOutputLine<'a> {
     raw: &'a str,
     key: &'a str,
+    number: u64,
+    timestamp: u64,
+    gas_used: u64,
+    gas_limit: u64,
+    tx_count: usize,
 }
 
 async fn write_extracted_blocks<W: Write>(
@@ -536,6 +540,11 @@ async fn write_extracted_blocks<W: Write>(
         let line = BlockOutputLine {
             raw: &raw_hex,
             key: &key_hex,
+            number: block.number,
+            timestamp: block.timestamp,
+            gas_used: block.gas_used,
+            gas_limit: block.gas_limit,
+            tx_count: block.tx_count,
         };
         serde_json::to_writer(&mut *writer, &line)?;
         writer.write_all(b"\n")?;
@@ -563,9 +572,14 @@ async fn write_extracted_blocks<W: Write>(
 struct FetchedBlock {
     rlp_bytes: Bytes,
     hash: alloy_primitives::B256,
+    number: u64,
+    timestamp: u64,
+    gas_used: u64,
+    gas_limit: u64,
+    tx_count: usize,
 }
 
-async fn fetch_blocks<P: Provider + DebugApi>(
+async fn fetch_blocks<P: Provider<AnyNetwork> + DebugApi<AnyNetwork>>(
     provider: P,
     from: u64,
     to: u64,
@@ -578,12 +592,24 @@ async fn fetch_blocks<P: Provider + DebugApi>(
                 .await
                 .wrap_err_with(|| format!("failed to fetch raw block {block_num}"))?;
 
-            let mut buf = rlp_bytes.as_ref();
-            let block = ConsensusBlock::<TxEnvelope>::decode(&mut buf)
-                .wrap_err_with(|| format!("failed to RLP-decode block {block_num}"))?;
-            let hash = block.header.hash_slow();
+            let hash = raw_block_hash(&rlp_bytes)
+                .wrap_err_with(|| format!("failed to hash raw block {block_num}"))?;
 
-            Ok(FetchedBlock { rlp_bytes, hash })
+            let block = provider
+                .get_block(BlockNumberOrTag::Number(block_num).into())
+                .await
+                .wrap_err_with(|| format!("failed to fetch block {block_num}"))?
+                .ok_or_else(|| eyre::eyre!("block {block_num} not found"))?;
+
+            Ok(FetchedBlock {
+                rlp_bytes,
+                hash,
+                number: block_num,
+                timestamp: block.header().timestamp(),
+                gas_used: block.header().gas_used(),
+                gas_limit: block.header().gas_limit(),
+                tx_count: block.transactions().len(),
+            })
         }
         .await;
 
@@ -595,4 +621,33 @@ async fn fetch_blocks<P: Provider + DebugApi>(
             break;
         }
     }
+}
+
+/// Compute the block hash from raw RLP-encoded block bytes.
+///
+/// Parses just enough RLP framing to extract the encoded header (the first
+/// item in the top-level list) and returns `keccak256(rlp(header))`. This
+/// works for any block type (Ethereum, Tempo, etc.) without needing to
+/// decode the header's internal fields.
+fn raw_block_hash(raw: &[u8]) -> eyre::Result<alloy_primitives::B256> {
+    let mut buf = raw;
+
+    // Decode the outer block list header.
+    let block_list =
+        alloy_rlp::Header::decode(&mut buf).wrap_err("failed to decode block RLP header")?;
+    eyre::ensure!(block_list.list, "block RLP is not a list");
+
+    // `buf` now points to the start of the list payload.
+    let payload_start = buf;
+
+    // Decode the header item's RLP header (first item in the list).
+    let header_rlp = alloy_rlp::Header::decode(&mut buf).wrap_err("failed to decode header RLP")?;
+    eyre::ensure!(header_rlp.list, "header RLP is not a list");
+
+    // The full encoded header = RLP prefix bytes + payload.
+    let prefix_len = payload_start.len() - buf.len();
+    let total_header_len = prefix_len + header_rlp.payload_length;
+    let header_encoded = &payload_start[..total_header_len];
+
+    Ok(keccak256(header_encoded))
 }

@@ -1,17 +1,15 @@
 //! `bench send-blocks` - Submit blocks via reth Engine API
 //!
-//! Reads NDJSON `{raw}` lines from stdin or file, where `raw` is
-//! RLP-encoded block bytes. Submits each block via `reth_newPayload`
-//! (as `BlockRlp`) and `reth_forkchoiceUpdated`, collecting per-block
-//! timing and engine status from [`RethPayloadStatus`].
+//! Reads NDJSON `{raw, key, number, timestamp, gas_used, gas_limit, tx_count}`
+//! lines from stdin or file (produced by `txgen extract`). Submits each block
+//! via `reth_newPayload` (as `BlockRlp`) and `reth_forkchoiceUpdated`,
+//! collecting per-block timing and engine status from [`RethPayloadStatus`].
 
 use crate::SendBlocksArgs;
 use crate::send::parse_metadata;
-use alloy_consensus::{Block as ConsensusBlock, TxEnvelope};
 use alloy_network::Ethereum;
 use alloy_primitives::{B256, Bytes};
 use alloy_provider::{Provider, RootProvider};
-use alloy_rlp::Decodable;
 use alloy_rpc_types_engine::{ForkchoiceState, JwtSecret};
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
@@ -26,21 +24,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-/// NDJSON line from the block source.
+/// NDJSON line from the block source (`txgen extract` output).
 #[derive(serde::Deserialize)]
 struct BlockLine {
     /// RLP-encoded block bytes (hex with 0x prefix).
     raw: Bytes,
-}
-
-/// Decoded block metadata extracted from RLP.
-pub(crate) struct BlockMeta {
-    pub(crate) hash: B256,
-    pub(crate) number: u64,
-    pub(crate) timestamp: u64,
-    pub(crate) gas_used: u64,
-    pub(crate) gas_limit: u64,
-    pub(crate) tx_count: usize,
+    /// Block hash.
+    key: B256,
+    /// Block number.
+    number: u64,
+    /// Block timestamp in seconds.
+    timestamp: u64,
+    /// Gas used by the block.
+    gas_used: u64,
+    /// Gas limit of the block.
+    gas_limit: u64,
+    /// Number of transactions in the block.
+    tx_count: usize,
 }
 
 pub async fn execute(args: SendBlocksArgs) -> Result<()> {
@@ -98,17 +98,9 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
 
         for line in reader.lines() {
             let line = line.wrap_err("failed to read line")?;
-            let block_bytes = parse_block_line(&line)?;
-            let meta = decode_block_meta(&block_bytes)?;
+            let block = parse_block_line(&line)?;
 
-            process_block(
-                &provider,
-                block_bytes,
-                &meta,
-                &mut collector,
-                &persistence_policy,
-            )
-            .await?;
+            process_block(&provider, &block, &mut collector, &persistence_policy).await?;
         }
     } else {
         let stdin = tokio::io::stdin();
@@ -125,17 +117,9 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                 break;
             }
 
-            let block_bytes = parse_block_line(&line_buf)?;
-            let meta = decode_block_meta(&block_bytes)?;
+            let block = parse_block_line(&line_buf)?;
 
-            process_block(
-                &provider,
-                block_bytes,
-                &meta,
-                &mut collector,
-                &persistence_policy,
-            )
-            .await?;
+            process_block(&provider, &block, &mut collector, &persistence_policy).await?;
         }
     }
 
@@ -182,36 +166,17 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     Ok(())
 }
 
-fn parse_block_line(line: &str) -> Result<Bytes> {
-    let block_line: BlockLine =
-        serde_json::from_str(line.trim()).wrap_err("failed to parse NDJSON line")?;
-    Ok(block_line.raw)
+fn parse_block_line(line: &str) -> Result<BlockLine> {
+    serde_json::from_str(line.trim()).wrap_err("failed to parse NDJSON line")
 }
 
-pub(crate) fn decode_block_meta(rlp_bytes: &[u8]) -> Result<BlockMeta> {
-    let mut buf = rlp_bytes;
-    let block =
-        ConsensusBlock::<TxEnvelope>::decode(&mut buf).wrap_err("failed to RLP-decode block")?;
-    let hash = block.header.hash_slow();
-
-    Ok(BlockMeta {
-        hash,
-        number: block.header.number,
-        timestamp: block.header.timestamp,
-        gas_used: block.header.gas_used,
-        gas_limit: block.header.gas_limit,
-        tx_count: block.body.transactions.len(),
-    })
-}
-
-pub(crate) async fn process_block(
+async fn process_block(
     provider: &(impl Provider + RethApi<Ethereum>),
-    block_bytes: Bytes,
-    meta: &BlockMeta,
+    block: &BlockLine,
     collector: &mut MetricsCollector,
     persistence_policy: &WaitForPersistence,
 ) -> Result<()> {
-    let input = RethNewPayloadInput::BlockRlp(block_bytes);
+    let input = RethNewPayloadInput::BlockRlp(block.raw.clone());
     let wait = persistence_policy.should_wait(collector.blocks_submitted());
 
     let new_payload_start = Instant::now();
@@ -225,18 +190,18 @@ pub(crate) async fn process_block(
         collector.record_failure();
         eyre::bail!(
             "reth_newPayload returned non-VALID status for block {}: {:?}",
-            meta.number,
+            block.number,
             payload_status.status,
         );
     }
 
-    let safe_hash = collector.prev_block_hash.unwrap_or(meta.hash);
+    let safe_hash = collector.prev_block_hash.unwrap_or(block.key);
     if collector.finalized_hash.is_none() {
-        collector.finalized_hash = Some(meta.hash);
+        collector.finalized_hash = Some(block.key);
     }
 
     let forkchoice_state = ForkchoiceState {
-        head_block_hash: meta.hash,
+        head_block_hash: block.key,
         safe_block_hash: safe_hash,
         // SAFETY: finalized_hash is always Some after the check above
         finalized_block_hash: collector.finalized_hash.unwrap(),
@@ -253,7 +218,7 @@ pub(crate) async fn process_block(
         collector.record_failure();
         eyre::bail!(
             "reth_forkchoiceUpdated returned non-VALID status for block {}: {:?}",
-            meta.number,
+            block.number,
             fcu_result.payload_status,
         );
     }
@@ -261,18 +226,18 @@ pub(crate) async fn process_block(
     let total_latency = new_payload_latency + fcu_latency;
     let payload_status_str = payload_status.status.status.to_string();
 
-    let timestamp_ms = meta.timestamp * 1000;
+    let timestamp_ms = block.timestamp * 1000;
     let block_time_ms = collector
         .prev_timestamp_ms
         .map(|prev| timestamp_ms.saturating_sub(prev));
     collector.prev_timestamp_ms = Some(timestamp_ms);
 
     let block_stats = BlockStats {
-        number: meta.number,
+        number: block.number,
         timestamp_ms,
-        tx_count: meta.tx_count,
-        gas_used: meta.gas_used,
-        gas_limit: meta.gas_limit,
+        tx_count: block.tx_count,
+        gas_used: block.gas_used,
+        gas_limit: block.gas_limit,
         block_time_ms,
         new_payload_ms: Some(new_payload_latency.as_millis() as u64),
         forkchoice_updated_ms: Some(fcu_latency.as_millis() as u64),
@@ -285,9 +250,9 @@ pub(crate) async fn process_block(
     collector.record_success(block_stats);
 
     tracing::info!(
-        block = meta.number,
-        txs = meta.tx_count,
-        gas = meta.gas_used,
+        block = block.number,
+        txs = block.tx_count,
+        gas = block.gas_used,
         new_payload_ms = new_payload_latency.as_millis(),
         forkchoice_updated_ms = fcu_latency.as_millis(),
         total_ms = total_latency.as_millis(),
@@ -296,10 +261,10 @@ pub(crate) async fn process_block(
         "Submitted block"
     );
 
-    collector.prev_block_hash = Some(meta.hash);
+    collector.prev_block_hash = Some(block.key);
 
-    if meta.number % 32 == 0 {
-        collector.finalized_hash = Some(meta.hash);
+    if block.number % 32 == 0 {
+        collector.finalized_hash = Some(block.key);
     }
 
     Ok(())
@@ -349,7 +314,7 @@ impl BlockCounters {
 }
 
 /// Block submission state and metrics collector.
-pub(crate) struct MetricsCollector {
+struct MetricsCollector {
     counters: Arc<BlockCounters>,
     prev_block_hash: Option<B256>,
     finalized_hash: Option<B256>,
@@ -368,22 +333,22 @@ impl MetricsCollector {
         }
     }
 
-    pub(crate) fn record_success(&mut self, stats: BlockStats) {
+    fn record_success(&mut self, stats: BlockStats) {
         self.counters.submitted.fetch_add(1, Ordering::Relaxed);
         self.counters.success.fetch_add(1, Ordering::Relaxed);
         self.blocks.push(stats);
     }
 
-    pub(crate) fn record_failure(&self) {
+    fn record_failure(&self) {
         self.counters.submitted.fetch_add(1, Ordering::Relaxed);
         self.counters.failed.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn blocks_submitted(&self) -> u64 {
+    fn blocks_submitted(&self) -> u64 {
         self.counters.submitted.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn final_snapshot(&self, clock: &RunClock) -> Vec<Sample> {
+    fn final_snapshot(&self, clock: &RunClock) -> Vec<Sample> {
         self.counters.snapshot_samples(clock)
     }
 }

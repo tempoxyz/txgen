@@ -22,9 +22,7 @@ serde_json.workspace = true
 
 # alloy
 alloy-primitives.workspace = true
-alloy-consensus.workspace = true
 alloy-network.workspace = true
-alloy-rlp.workspace = true
 alloy-provider = { version = "1", features = ["hyper", "txpool-api"] }
 alloy-rpc-client = "1"
 alloy-rpc-types-engine = { version = "1", features = ["jwt"] }
