@@ -334,7 +334,6 @@ def plot_replay(plt, report, rows, metadata, datadir):
     V = "reth_sync_block_validation"
     X = "reth_sync_execution"
     S = "reth_tree_root_sparse_trie"
-    P = "reth_consensus_engine_persistence"
 
     t0 = rows[0]["ts_ms"]
     ts = [(r["ts_ms"] - t0) / 1000.0 for r in rows]
@@ -350,7 +349,7 @@ def plot_replay(plt, report, rows, metadata, datadir):
     gas_per_sec = col(rows, f"{E}_new_payload_gas_per_second_last")
     ggas_s = [g / 1e9 for g in gas_per_sec]
 
-    total_gas = col(rows, f"{E}_new_payload_total_gas_last", int)
+    gas_processed = col(rows, f"{X}_gas_processed_total", int)
 
     # ── Engine latency ───────────────────────────────────────────────
     np_latency_p50 = col(rows, f"{E}_new_payload_latency", quantile="0.5")
@@ -370,19 +369,21 @@ def plot_replay(plt, report, rows, metadata, datadir):
     exec_gps = col(rows, f"{X}_gas_per_second")
 
     # ── Persistence ──────────────────────────────────────────────────
-    persist_p50 = col(rows, f"{P}_save_blocks_duration_seconds", quantile="0.5")
-    persist_p99 = col(rows, f"{P}_save_blocks_duration_seconds", quantile="0.99")
+    persist_p50 = col(rows, f"{E}_persistence_duration", quantile="0.5")
+    persist_p99 = col(rows, f"{E}_persistence_duration", quantile="0.99")
 
     # ── Sparse trie ──────────────────────────────────────────────────
     sparse_p50 = col(rows, f"{S}_total_duration_histogram", quantile="0.5")
     sparse_p99 = col(rows, f"{S}_total_duration_histogram", quantile="0.99")
     sparse_mem = col(rows, f"{S}_retained_memory_bytes", int)
 
-    # ── Caching ──────────────────────────────────────────────────────
-    cache_acct_hits = col(rows, "reth_sync_caching_account_cache_hits", int)
-    cache_acct_miss = col(rows, "reth_sync_caching_account_cache_misses", int)
-    cache_stor_hits = col(rows, "reth_sync_caching_storage_cache_hits", int)
-    cache_stor_miss = col(rows, "reth_sync_caching_storage_cache_misses", int)
+    # ── Engine status ────────────────────────────────────────────────
+    np_valid = col(rows, f"{E}_new_payload_valid", int)
+    np_invalid = col(rows, f"{E}_new_payload_invalid", int)
+    np_error = col(rows, f"{E}_new_payload_error", int)
+    fcu_valid = col(rows, f"{E}_forkchoice_updated_valid", int)
+    fcu_invalid = col(rows, f"{E}_forkchoice_updated_invalid", int)
+    fcu_error = col(rows, f"{E}_forkchoice_updated_error", int)
 
     # ── Memory ───────────────────────────────────────────────────────
     jemalloc_resident = col(rows, "reth_jemalloc_resident", int)
@@ -404,13 +405,13 @@ def plot_replay(plt, report, rows, metadata, datadir):
     persist_p99_ms = [v * 1000 for v in persist_p99]
     sparse_p50_ms = [v * 1000 for v in sparse_p50]
     sparse_p99_ms = [v * 1000 for v in sparse_p99]
-    sparse_mem_mb = [v / (1024 * 1024) for v in sparse_mem]
+    sparse_mem_kb = [v / 1024 for v in sparse_mem]
     resident_mb = [v / (1024 * 1024) for v in jemalloc_resident]
     allocated_mb = [v / (1024 * 1024) for v in jemalloc_allocated]
-    cache_acct_hits_d = delta(cache_acct_hits)
-    cache_acct_miss_d = delta(cache_acct_miss)
-    cache_stor_hits_d = delta(cache_stor_hits)
-    cache_stor_miss_d = delta(cache_stor_miss)
+    gas_processed_rebase = [g - gas_processed[0] for g in gas_processed]
+    np_valid_d = delta(np_valid)
+    np_invalid_d = delta(np_invalid)
+    np_error_d = delta(np_error)
 
     # ── Plot ─────────────────────────────────────────────────────────
     fig, axes = plt.subplots(5, 3, figsize=(20, 25))
@@ -455,8 +456,8 @@ def plot_replay(plt, report, rows, metadata, datadir):
     style(ax, "Ggas/s", "Engine Gas Throughput"); ax.legend()
 
     ax = axes[0][2]
-    pl(ax, total_gas, "#4CAF50")
-    style(ax, "Gas", "Cumulative Gas (newPayload)")
+    pl(ax, gas_processed_rebase, "#4CAF50")
+    style(ax, "Gas", "Cumulative Gas Processed")
 
     # ── Row 2: Engine Latency ────────────────────────────────────────
     ax = axes[1][0]
@@ -503,16 +504,15 @@ def plot_replay(plt, report, rows, metadata, datadir):
     style(ax, "ms", "Sparse Trie Duration (rolling)"); ax.legend()
 
     ax = axes[3][2]
-    pl(ax, sparse_mem_mb, "#3F51B5")
-    style(ax, "MB", "Sparse Trie Retained Memory")
+    pl(ax, sparse_mem_kb, "#3F51B5")
+    style(ax, "KB", "Sparse Trie Retained Memory")
 
-    # ── Row 5: Caching & Memory ──────────────────────────────────────
+    # ── Row 5: Engine Status & Memory ────────────────────────────────
     ax = axes[4][0]
-    pl(ax, cache_acct_hits_d, "#4CAF50", label="account hits")
-    pl(ax, cache_acct_miss_d, "#F44336", label="account misses")
-    pl(ax, cache_stor_hits_d, "#2196F3", alpha=0.7, label="storage hits")
-    pl(ax, cache_stor_miss_d, "#FF9800", alpha=0.7, label="storage misses")
-    style(ax, "Count", "Execution Cache Hits/Misses per Scrape"); ax.legend()
+    pl(ax, np_valid_d, "#4CAF50", label="valid")
+    pl(ax, np_invalid_d, "#F44336", label="invalid")
+    pl(ax, np_error_d, "#FF9800", label="error")
+    style(ax, "Count", "newPayload Status per Scrape"); ax.legend()
 
     ax = axes[4][1]
     pl(ax, resident_mb, "#E91E63", label="resident")
@@ -543,9 +543,11 @@ def plot_replay(plt, report, rows, metadata, datadir):
     print(f"State root  p50={avg(sr_p50_ms):.2f}ms  p99={avg(sr_p99_ms):.2f}ms")
     print(f"Persistence p50={avg(persist_p50_ms):.2f}ms  p99={avg(persist_p99_ms):.2f}ms")
     print(f"Sparse trie p50={avg(sparse_p50_ms):.2f}ms  p99={avg(sparse_p99_ms):.2f}ms")
-    print(f"Sparse trie mem: {avg(sparse_mem_mb):.1f} MB")
+    print(f"Sparse trie mem: {avg(sparse_mem_kb):.1f} KB")
     print(f"Memory resident: {avg(resident_mb):.0f} MB")
     print(f"Failed blocks: {blocks_fail[-1] if blocks_fail else 0}")
+    print(f"Invalid payloads: {np_invalid[-1] if np_invalid else 0}")
+    print(f"Payload errors: {np_error[-1] if np_error else 0}")
 
 
 if __name__ == "__main__":
