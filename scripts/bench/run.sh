@@ -33,6 +33,7 @@
 #   --jwt-secret <PATH>    Path to JWT secret file (required)
 #   --from <N>             Starting block number (required)
 #   --to <N>               Ending block number (required)
+#   --wait-for-persistence <POLICY>  always, never, or every:N (default: every:2)
 #
 # Node options (used with setup):
 #   --genesis <PATH>       Genesis JSON (default: /tmp/txgen-localnet/genesis.json)
@@ -75,6 +76,7 @@ ENGINE="http://localhost:8551"
 JWT_SECRET=""
 FROM_BLOCK=""
 TO_BLOCK=""
+WAIT_FOR_PERSISTENCE="every:2"
 
 # Node
 GENESIS="/tmp/txgen-localnet/genesis.json"
@@ -111,6 +113,7 @@ while [[ $# -gt 0 ]]; do
     --jwt-secret)       JWT_SECRET="$2"; shift 2 ;;
     --from)             FROM_BLOCK="$2"; shift 2 ;;
     --to)               TO_BLOCK="$2"; shift 2 ;;
+    --wait-for-persistence) WAIT_FOR_PERSISTENCE="$2"; shift 2 ;;
     # Node
     --genesis)          GENESIS="$2"; shift 2 ;;
     --tempo-bin)        TEMPO_BIN="$2"; shift 2 ;;
@@ -181,7 +184,7 @@ if [[ "$MODE" == "send" ]]; then
   METADATA_FLAGS+=(-m "tps=$TPS" -m "max_concurrent=$MAX_CONCURRENT")
   METADATA_FLAGS+=(-m "scrape_interval_ms=$SCRAPE_INTERVAL")
 else
-  METADATA_FLAGS+=(-m "from=$FROM_BLOCK" -m "to=$TO_BLOCK")
+  METADATA_FLAGS+=(-m "from=$FROM_BLOCK" -m "to=$TO_BLOCK" -m "wait_for_persistence=$WAIT_FOR_PERSISTENCE")
 fi
 
 for kv in "${EXTRA_METADATA[@]+"${EXTRA_METADATA[@]}"}"; do
@@ -232,6 +235,7 @@ else
   echo "  Source RPC:  $RPC_SOURCE"
   echo "  Engine:      $ENGINE"
   echo "  Range:       $FROM_BLOCK - $TO_BLOCK"
+  echo "  Persistence: $WAIT_FOR_PERSISTENCE"
   echo "  Metrics:     $METRICS_URL (interval=${SCRAPE_INTERVAL}ms)"
   echo ""
 
@@ -242,6 +246,7 @@ else
   | "$BENCH_BIN" send-blocks \
       --engine "$ENGINE" \
       --jwt-secret "$JWT_SECRET" \
+      --wait-for-persistence "$WAIT_FOR_PERSISTENCE" \
       --metrics-url "$METRICS_URL" \
       --scrape-interval-ms "$SCRAPE_INTERVAL" \
       "${METADATA_FLAGS[@]}" \
