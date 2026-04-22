@@ -48,6 +48,14 @@ impl NetworkAdapter for TempoAdapter {
         let selected = ctx.select_signer(&template.from)?;
         let is_tempo = template.tx_type == TempoTxType::Tempo;
         let nonce_mode = resolve_nonce_mode(&template, is_tempo, ctx)?;
+        if !matches!(nonce_mode, TempoNonceMode::Expiring)
+            && let Some(valid_for_secs) = template.valid_for_secs
+        {
+            bail!(
+                "`valid_for_secs` is only supported for expiring Tempo transactions (got {valid_for_secs}s on {:?})",
+                template.tx_type
+            );
+        }
         let scheduling_key = compute_scheduling_key(selected.address, nonce_mode, ctx);
         let nonce = match nonce_mode {
             TempoNonceMode::Expiring => 0,
@@ -76,35 +84,29 @@ impl NetworkAdapter for TempoAdapter {
 
                 req.calls = calls;
 
-                match nonce_mode {
-                    TempoNonceMode::Protocol => {}
-                    TempoNonceMode::Parallel(nonce_key) => req.set_nonce_key(nonce_key),
-                    TempoNonceMode::Expiring => {
-                        req.set_nonce(0);
-                        req.set_nonce_key(TEMPO_EXPIRING_NONCE_KEY);
-                        req.set_valid_before(resolve_expiring_valid_before(&template)?);
+                let is_expiring = matches!(nonce_mode, TempoNonceMode::Expiring);
+                let valid_before = match nonce_mode {
+                    TempoNonceMode::Protocol => template.valid_before,
+                    TempoNonceMode::Parallel(nonce_key) => {
+                        req.set_nonce_key(nonce_key);
+                        template.valid_before
                     }
-                }
+                    TempoNonceMode::Expiring => {
+                        req.set_nonce_key(TEMPO_EXPIRING_NONCE_KEY);
+                        Some(resolve_expiring_valid_before(&template)?)
+                    }
+                };
+
                 if let Some(fee_token) = template.fee_token {
                     req.set_fee_token(fee_token);
-                }
-                if !matches!(nonce_mode, TempoNonceMode::Expiring) {
-                    if let Some(valid_before) = template.valid_before {
-                        req.set_valid_before(valid_before);
-                    }
-                }
-                if !matches!(nonce_mode, TempoNonceMode::Expiring)
-                    && let Some(valid_for_secs) = template.valid_for_secs
-                {
-                    bail!(
-                        "`valid_for_secs` is only supported for expiring Tempo transactions (got {valid_for_secs}s on {:?})",
-                        template.tx_type
-                    );
                 }
                 if let Some(valid_after) = template.valid_after {
                     req.set_valid_after(valid_after);
                 }
-                if matches!(nonce_mode, TempoNonceMode::Expiring) {
+                if let Some(valid_before) = valid_before {
+                    req.set_valid_before(valid_before);
+                }
+                if is_expiring {
                     apply_expiring_uniqueness_bump(&mut req, ctx)?;
                 }
 
@@ -124,15 +126,6 @@ impl NetworkAdapter for TempoAdapter {
                 }
             }
             TempoTxType::Legacy => {
-                if template.expiring_nonce {
-                    bail!("expiring nonce mode is only supported for Tempo transactions");
-                }
-                if let Some(valid_for_secs) = template.valid_for_secs {
-                    bail!(
-                        "`valid_for_secs` is only supported for expiring Tempo transactions (got {valid_for_secs}s on {:?})",
-                        template.tx_type
-                    );
-                }
                 req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
                 if let TxKind::Call(addr) = to {
                     req.set_to(addr);
@@ -143,15 +136,6 @@ impl NetworkAdapter for TempoAdapter {
                 }
             }
             TempoTxType::Eip2930 => {
-                if template.expiring_nonce {
-                    bail!("expiring nonce mode is only supported for Tempo transactions");
-                }
-                if let Some(valid_for_secs) = template.valid_for_secs {
-                    bail!(
-                        "`valid_for_secs` is only supported for expiring Tempo transactions (got {valid_for_secs}s on {:?})",
-                        template.tx_type
-                    );
-                }
                 req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
                 req.set_access_list(Default::default());
                 if let TxKind::Call(addr) = to {
@@ -163,15 +147,6 @@ impl NetworkAdapter for TempoAdapter {
                 }
             }
             TempoTxType::Eip1559 => {
-                if template.expiring_nonce {
-                    bail!("expiring nonce mode is only supported for Tempo transactions");
-                }
-                if let Some(valid_for_secs) = template.valid_for_secs {
-                    bail!(
-                        "`valid_for_secs` is only supported for expiring Tempo transactions (got {valid_for_secs}s on {:?})",
-                        template.tx_type
-                    );
-                }
                 req.set_max_fee_per_gas(
                     template.max_fee_per_gas.unwrap_or(ctx.gas.max_fee_per_gas),
                 );
