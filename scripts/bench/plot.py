@@ -80,6 +80,11 @@ def steady_avg(ts: list, xs: list, warmup: float = 15) -> float:
     return avg(vals)
 
 
+def delta(xs: list) -> list:
+    """Compute per-sample deltas from a cumulative series."""
+    return [b - a for a, b in zip([xs[0]] + xs, xs)]
+
+
 def main():
     if len(sys.argv) > 1:
         datadir = sys.argv[1]
@@ -114,7 +119,17 @@ def main():
             f.write(k + "\n")
     print(f"Available metrics ({len(all_names)} names) written to {keys_path}")
 
-    # ── Aliases ──────────────────────────────────────────────────────
+    metadata = report.get("metadata", {})
+    mode = metadata.get("mode", "send")
+
+    if mode == "replay":
+        plot_replay(plt, report, rows, metadata, datadir)
+    else:
+        plot_send(plt, report, rows, metadata, datadir)
+
+
+def plot_send(plt, report, rows, metadata, datadir):
+    """Plot layout for send mode (payload builder metrics)."""
     P = "reth_tempo_payload_builder"
 
     t0 = rows[0]["ts_ms"]
@@ -162,8 +177,8 @@ def main():
     fetch_p50 = col(rows, f"{P}_pool_fetch_duration_seconds", quantile="0.5")
     skip_nonce = col(rows, f"{P}_pool_transactions_skipped_total", int, reason="nonce_too_low")
     skip_invalid = col(rows, f"{P}_pool_transactions_skipped_total", int, reason="invalid_tx")
-    skip_nonce_delta = [b - a for a, b in zip([skip_nonce[0]] + skip_nonce, skip_nonce)]
-    skip_invalid_delta = [b - a for a, b in zip([skip_invalid[0]] + skip_invalid, skip_invalid)]
+    skip_nonce_delta = delta(skip_nonce)
+    skip_invalid_delta = delta(skip_invalid)
 
     # ── Derived columns ──────────────────────────────────────────────
     ggas_s = [g / 1e9 for g in gps]
@@ -180,9 +195,7 @@ def main():
     tx_p50_us = [v * 1e6 for v in tx_exec_p50]
     tx_p99_us = [v * 1e6 for v in tx_exec_p99]
     fetch_p50_ms = [v * 1000 for v in fetch_p50]
-
-    # Builds per scrape: delta of cumulative build count between samples
-    builds_delta = [b - a for a, b in zip([build_count[0]] + build_count, build_count)]
+    builds_delta = delta(build_count)
 
     # ── Plot ─────────────────────────────────────────────────────────
     fig, axes = plt.subplots(5, 3, figsize=(20, 25))
@@ -195,8 +208,6 @@ def main():
         fontweight="bold",
     )
 
-    # ── Metadata subtitle ────────────────────────────────────────────
-    metadata = report.get("metadata")
     if metadata:
         meta_str = "  |  ".join(f"{k}={v}" for k, v in metadata.items())
         fig.text(0.5, 0.965, meta_str, ha="center", fontsize=10,
@@ -229,7 +240,6 @@ def main():
     ax.axhline(y=a, color="red", linestyle="--", alpha=0.5, label=f"avg={a:.0f} KB")
     style(ax, "KB", "RLP Block Size"); ax.legend()
 
-    # ── Row 2: Block Gas ─────────────────────────────────────────────
     ax = axes[1][0]
     pl(ax, gas_pct, "#E91E63")
     a = steady_avg(ts, gas_pct)
@@ -245,7 +255,6 @@ def main():
 
     axes[1][2].axis("off")
 
-    # ── Row 3: Builder Timing (rolling estimates) ────────────────────
     ax = axes[2][0]
     pl(ax, build_p50_ms, "#2196F3", label="p50")
     pl(ax, build_p99_ms, "#F44336", alpha=0.7, label="p99")
@@ -261,7 +270,6 @@ def main():
     pl(ax, fin_p99_ms, "#F44336", alpha=0.7, label="p99")
     style(ax, "ms", "Finalization Duration (rolling)"); ax.legend()
 
-    # ── Row 4: Build Anatomy ─────────────────────────────────────────
     ax = axes[3][0]
     pl(ax, total_tx_exec_p50_ms, "#FF5722", label="tx execution")
     pl(ax, state_setup_p50_ms, "#4CAF50", label="state setup")
@@ -279,7 +287,6 @@ def main():
     pl(ax, tx_p99_us, "#F44336", alpha=0.7, label="p99")
     style(ax, "µs", "Per-Tx Execution Duration (rolling)"); ax.legend()
 
-    # ── Row 5: Pool ──────────────────────────────────────────────────
     ax = axes[4][0]
     pl(ax, pool_pending, "#2196F3", label="pending")
     pl(ax, pool_basefee, "#FF9800", label="basefee")
@@ -319,6 +326,226 @@ def main():
     print(f"Avg RLP size: {avg(rlp_kb):.0f} KB")
     print(f"Skipped nonce_low: {skip_nonce[-1] if skip_nonce else 0}")
     print(f"Skipped invalid: {skip_invalid[-1] if skip_invalid else 0}")
+
+
+def plot_replay(plt, report, rows, metadata, datadir):
+    """Plot layout for replay mode (engine API / block validation metrics)."""
+    E = "reth_consensus_engine_beacon"
+    V = "reth_sync_block_validation"
+    X = "reth_sync_execution"
+    S = "reth_tree_root_sparse_trie"
+    P = "reth_consensus_engine_persistence"
+
+    t0 = rows[0]["ts_ms"]
+    ts = [(r["ts_ms"] - t0) / 1000.0 for r in rows]
+    n_scrapes = len(rows)
+
+    # ── Engine throughput ────────────────────────────────────────────
+    blocks_sent = col(rows, "txgen_blocks_sent_total", int)
+    blocks_ok = col(rows, "txgen_blocks_success_total", int)
+    blocks_fail = col(rows, "txgen_blocks_failed_total", int)
+    blocks_sent_delta = delta(blocks_sent)
+    blocks_ok_delta = delta(blocks_ok)
+
+    gas_per_sec = col(rows, f"{E}_new_payload_gas_per_second_last")
+    ggas_s = [g / 1e9 for g in gas_per_sec]
+
+    total_gas = col(rows, f"{E}_new_payload_total_gas_last", int)
+
+    # ── Engine latency ───────────────────────────────────────────────
+    np_latency_p50 = col(rows, f"{E}_new_payload_latency", quantile="0.5")
+    np_latency_p99 = col(rows, f"{E}_new_payload_latency", quantile="0.99")
+    fcu_latency_p50 = col(rows, f"{E}_forkchoice_updated_latency", quantile="0.5")
+    fcu_latency_p99 = col(rows, f"{E}_forkchoice_updated_latency", quantile="0.99")
+
+    # ── Block validation ─────────────────────────────────────────────
+    validation_p50 = col(rows, f"{V}_payload_validation_histogram", quantile="0.5")
+    validation_p99 = col(rows, f"{V}_payload_validation_histogram", quantile="0.99")
+    state_root_p50 = col(rows, f"{V}_state_root_histogram", quantile="0.5")
+    state_root_p99 = col(rows, f"{V}_state_root_histogram", quantile="0.99")
+
+    # ── Execution ────────────────────────────────────────────────────
+    exec_p50 = col(rows, f"{X}_execution_histogram", quantile="0.5")
+    exec_p99 = col(rows, f"{X}_execution_histogram", quantile="0.99")
+    exec_gps = col(rows, f"{X}_gas_per_second")
+
+    # ── Persistence ──────────────────────────────────────────────────
+    persist_p50 = col(rows, f"{P}_save_blocks_duration_seconds", quantile="0.5")
+    persist_p99 = col(rows, f"{P}_save_blocks_duration_seconds", quantile="0.99")
+
+    # ── Sparse trie ──────────────────────────────────────────────────
+    sparse_p50 = col(rows, f"{S}_total_duration_histogram", quantile="0.5")
+    sparse_p99 = col(rows, f"{S}_total_duration_histogram", quantile="0.99")
+    sparse_mem = col(rows, f"{S}_retained_memory_bytes", int)
+
+    # ── Caching ──────────────────────────────────────────────────────
+    cache_acct_hits = col(rows, "reth_sync_caching_account_cache_hits", int)
+    cache_acct_miss = col(rows, "reth_sync_caching_account_cache_misses", int)
+    cache_stor_hits = col(rows, "reth_sync_caching_storage_cache_hits", int)
+    cache_stor_miss = col(rows, "reth_sync_caching_storage_cache_misses", int)
+
+    # ── Memory ───────────────────────────────────────────────────────
+    jemalloc_resident = col(rows, "reth_jemalloc_resident", int)
+    jemalloc_allocated = col(rows, "reth_jemalloc_allocated", int)
+
+    # ── Derived columns ──────────────────────────────────────────────
+    np_p50_ms = [v * 1000 for v in np_latency_p50]
+    np_p99_ms = [v * 1000 for v in np_latency_p99]
+    fcu_p50_ms = [v * 1000 for v in fcu_latency_p50]
+    fcu_p99_ms = [v * 1000 for v in fcu_latency_p99]
+    val_p50_ms = [v * 1000 for v in validation_p50]
+    val_p99_ms = [v * 1000 for v in validation_p99]
+    sr_p50_ms = [v * 1000 for v in state_root_p50]
+    sr_p99_ms = [v * 1000 for v in state_root_p99]
+    exec_p50_ms = [v * 1000 for v in exec_p50]
+    exec_p99_ms = [v * 1000 for v in exec_p99]
+    exec_ggas_s = [g / 1e9 for g in exec_gps]
+    persist_p50_ms = [v * 1000 for v in persist_p50]
+    persist_p99_ms = [v * 1000 for v in persist_p99]
+    sparse_p50_ms = [v * 1000 for v in sparse_p50]
+    sparse_p99_ms = [v * 1000 for v in sparse_p99]
+    sparse_mem_mb = [v / (1024 * 1024) for v in sparse_mem]
+    resident_mb = [v / (1024 * 1024) for v in jemalloc_resident]
+    allocated_mb = [v / (1024 * 1024) for v in jemalloc_allocated]
+    cache_acct_hits_d = delta(cache_acct_hits)
+    cache_acct_miss_d = delta(cache_acct_miss)
+    cache_stor_hits_d = delta(cache_stor_hits)
+    cache_stor_miss_d = delta(cache_stor_miss)
+
+    # ── Plot ─────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(5, 3, figsize=(20, 25))
+    duration = ts[-1] - ts[0]
+
+    total_blocks = blocks_ok[-1] if blocks_ok else 0
+    bps = total_blocks / duration if duration > 0 else 0
+
+    fig.suptitle(
+        f"Replay Bench: {total_blocks} blocks over {duration:.0f}s "
+        f"({bps:.1f} blocks/s)",
+        fontsize=14,
+        fontweight="bold",
+    )
+
+    if metadata:
+        meta_str = "  |  ".join(f"{k}={v}" for k, v in metadata.items())
+        fig.text(0.5, 0.965, meta_str, ha="center", fontsize=10,
+                 color="#555555", fontstyle="italic")
+
+    def pl(ax, ys, color, **kw):
+        ax.plot(ts, ys, color=color, linewidth=0.8, **kw)
+
+    def style(ax, ylabel="", title=""):
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+
+    # ── Row 1: Throughput ────────────────────────────────────────────
+    ax = axes[0][0]
+    pl(ax, blocks_ok_delta, "#2196F3", label="success")
+    pl(ax, blocks_sent_delta, "#FF9800", alpha=0.5, label="sent")
+    a = avg(blocks_ok_delta)
+    ax.axhline(y=a, color="red", linestyle="--", alpha=0.5, label=f"avg={a:.1f}")
+    style(ax, "Blocks", "Blocks per Scrape"); ax.legend()
+
+    ax = axes[0][1]
+    pl(ax, ggas_s, "#FF9800")
+    a = steady_avg(ts, ggas_s)
+    ax.axhline(y=a, color="red", linestyle="--", alpha=0.5, label=f"steady={a:.2f}")
+    style(ax, "Ggas/s", "Engine Gas Throughput"); ax.legend()
+
+    ax = axes[0][2]
+    pl(ax, total_gas, "#4CAF50")
+    style(ax, "Gas", "Cumulative Gas (newPayload)")
+
+    # ── Row 2: Engine Latency ────────────────────────────────────────
+    ax = axes[1][0]
+    pl(ax, np_p50_ms, "#2196F3", label="p50")
+    pl(ax, np_p99_ms, "#F44336", alpha=0.7, label="p99")
+    style(ax, "ms", "newPayload Latency (rolling)"); ax.legend()
+
+    ax = axes[1][1]
+    pl(ax, fcu_p50_ms, "#9C27B0", label="p50")
+    pl(ax, fcu_p99_ms, "#F44336", alpha=0.7, label="p99")
+    style(ax, "ms", "forkchoiceUpdated Latency (rolling)"); ax.legend()
+
+    ax = axes[1][2]
+    pl(ax, val_p50_ms, "#607D8B", label="p50")
+    pl(ax, val_p99_ms, "#F44336", alpha=0.7, label="p99")
+    style(ax, "ms", "Payload Validation Duration (rolling)"); ax.legend()
+
+    # ── Row 3: Execution & State Root ────────────────────────────────
+    ax = axes[2][0]
+    pl(ax, exec_p50_ms, "#FF5722", label="p50")
+    pl(ax, exec_p99_ms, "#F44336", alpha=0.7, label="p99")
+    style(ax, "ms", "Block Execution Duration (rolling)"); ax.legend()
+
+    ax = axes[2][1]
+    pl(ax, sr_p50_ms, "#9C27B0", label="p50")
+    pl(ax, sr_p99_ms, "#F44336", alpha=0.7, label="p99")
+    style(ax, "ms", "State Root Duration (rolling)"); ax.legend()
+
+    ax = axes[2][2]
+    pl(ax, exec_ggas_s, "#4CAF50")
+    a = steady_avg(ts, exec_ggas_s)
+    ax.axhline(y=a, color="red", linestyle="--", alpha=0.5, label=f"steady={a:.2f}")
+    style(ax, "Ggas/s", "Execution Gas Throughput"); ax.legend()
+
+    # ── Row 4: Persistence & Sparse Trie ─────────────────────────────
+    ax = axes[3][0]
+    pl(ax, persist_p50_ms, "#795548", label="p50")
+    pl(ax, persist_p99_ms, "#F44336", alpha=0.7, label="p99")
+    style(ax, "ms", "Persistence Duration (rolling)"); ax.legend()
+
+    ax = axes[3][1]
+    pl(ax, sparse_p50_ms, "#00BCD4", label="p50")
+    pl(ax, sparse_p99_ms, "#F44336", alpha=0.7, label="p99")
+    style(ax, "ms", "Sparse Trie Duration (rolling)"); ax.legend()
+
+    ax = axes[3][2]
+    pl(ax, sparse_mem_mb, "#3F51B5")
+    style(ax, "MB", "Sparse Trie Retained Memory")
+
+    # ── Row 5: Caching & Memory ──────────────────────────────────────
+    ax = axes[4][0]
+    pl(ax, cache_acct_hits_d, "#4CAF50", label="account hits")
+    pl(ax, cache_acct_miss_d, "#F44336", label="account misses")
+    pl(ax, cache_stor_hits_d, "#2196F3", alpha=0.7, label="storage hits")
+    pl(ax, cache_stor_miss_d, "#FF9800", alpha=0.7, label="storage misses")
+    style(ax, "Count", "Execution Cache Hits/Misses per Scrape"); ax.legend()
+
+    ax = axes[4][1]
+    pl(ax, resident_mb, "#E91E63", label="resident")
+    pl(ax, allocated_mb, "#9C27B0", alpha=0.7, label="allocated")
+    style(ax, "MB", "Memory (jemalloc)"); ax.legend()
+
+    ax = axes[4][2]
+    pl(ax, blocks_ok, "#4CAF50", label="success")
+    pl(ax, blocks_fail, "#F44336", label="failed")
+    style(ax, "Blocks", "Cumulative Blocks"); ax.legend()
+
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    out_path = os.path.join(datadir, "bench_plots.png")
+    plt.savefig(out_path, dpi=150)
+    print(f"Saved {out_path}")
+
+    # ── Summary ──────────────────────────────────────────────────────
+    print(f"\nScrapes: {n_scrapes}")
+    print(f"Time range: {ts[0]:.1f}s – {ts[-1]:.1f}s ({duration:.1f}s)")
+    print(f"Total blocks: {total_blocks}")
+    print(f"Blocks/s: {bps:.1f}")
+    print(f"Steady Ggas/s (engine): {steady_avg(ts, ggas_s):.2f}")
+    print(f"Steady Ggas/s (exec):   {steady_avg(ts, exec_ggas_s):.2f}")
+    print(f"newPayload  p50={avg(np_p50_ms):.2f}ms  p99={avg(np_p99_ms):.2f}ms")
+    print(f"FCU         p50={avg(fcu_p50_ms):.2f}ms  p99={avg(fcu_p99_ms):.2f}ms")
+    print(f"Validation  p50={avg(val_p50_ms):.2f}ms  p99={avg(val_p99_ms):.2f}ms")
+    print(f"Execution   p50={avg(exec_p50_ms):.2f}ms  p99={avg(exec_p99_ms):.2f}ms")
+    print(f"State root  p50={avg(sr_p50_ms):.2f}ms  p99={avg(sr_p99_ms):.2f}ms")
+    print(f"Persistence p50={avg(persist_p50_ms):.2f}ms  p99={avg(persist_p99_ms):.2f}ms")
+    print(f"Sparse trie p50={avg(sparse_p50_ms):.2f}ms  p99={avg(sparse_p99_ms):.2f}ms")
+    print(f"Sparse trie mem: {avg(sparse_mem_mb):.1f} MB")
+    print(f"Memory resident: {avg(resident_mb):.0f} MB")
+    print(f"Failed blocks: {blocks_fail[-1] if blocks_fail else 0}")
 
 
 if __name__ == "__main__":
