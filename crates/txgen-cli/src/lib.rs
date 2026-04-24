@@ -1,9 +1,9 @@
-use alloy_consensus::{BlockHeader, SignableTransaction, Signed};
+use alloy_consensus::{BlockHeader, Sealed, SignableTransaction, Signed};
 use alloy_eips::{BlockNumberOrTag, eip2718::Encodable2718};
-use alloy_network::primitives::BlockResponse;
-use alloy_network::{AnyNetwork, Network, TransactionBuilder, TxSignerSync};
-use alloy_primitives::{Bytes, keccak256};
+use alloy_network::{Network, TransactionBuilder, TxSignerSync};
+use alloy_primitives::Bytes;
 use alloy_provider::{Provider, ext::DebugApi};
+use alloy_rlp::Decodable;
 use clap::{Args, Parser, Subcommand};
 use eyre::{Result, WrapErr, bail};
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -215,13 +215,14 @@ pub async fn run<A: NetworkAdapter>(adapter: A) -> Result<()>
 where
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
-        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718 + Decodable,
+    <A::Network as Network>::Header: Decodable,
 {
     let cli = Cli::parse();
     match cli.command {
         Command::Generate(args) => run_generate(adapter, args).await,
         Command::Addresses(args) => run_addresses(args),
-        Command::Extract(args) => run_extract(args).await,
+        Command::Extract(args) => run_extract::<A::Network>(args).await,
     }
 }
 
@@ -476,19 +477,25 @@ fn run_addresses(args: AddressesArgs) -> Result<()> {
 // Private — extract subcommand
 // ---------------------------------------------------------------------------
 
-async fn run_extract(args: ExtractArgs) -> Result<()> {
+async fn run_extract<N>(args: ExtractArgs) -> Result<()>
+where
+    N: Network,
+    N::TxEnvelope: Decodable,
+    N::Header: Decodable,
+{
     if args.from > args.to {
         bail!("--from must be <= --to");
     }
 
-    let provider = alloy_provider::ProviderBuilder::new_with_network::<AnyNetwork>()
-        .connect_http(args.rpc.parse().wrap_err("invalid RPC URL")?);
+    let provider =
+        alloy_provider::RootProvider::<N>::new_http(args.rpc.parse().wrap_err("invalid RPC URL")?);
 
     let (tx, mut rx) = mpsc::channel::<Result<FetchedBlock>>(args.buffer_size);
 
     let from = args.from;
     let to = args.to;
-    let fetch_handle = tokio::spawn(async move { fetch_blocks(provider, from, to, tx).await });
+    let fetch_handle =
+        tokio::spawn(async move { fetch_blocks::<N, _>(provider, from, to, tx).await });
 
     let total = to - from + 1;
     let write_result = match args.output {
@@ -579,12 +586,13 @@ struct FetchedBlock {
     tx_count: usize,
 }
 
-async fn fetch_blocks<P: Provider<AnyNetwork> + DebugApi<AnyNetwork>>(
-    provider: P,
-    from: u64,
-    to: u64,
-    tx: mpsc::Sender<Result<FetchedBlock>>,
-) {
+async fn fetch_blocks<N, P>(provider: P, from: u64, to: u64, tx: mpsc::Sender<Result<FetchedBlock>>)
+where
+    N: Network,
+    N::TxEnvelope: Decodable,
+    N::Header: Decodable,
+    P: Provider<N> + DebugApi<N>,
+{
     for block_num in from..=to {
         let result = async {
             let rlp_bytes: Bytes = provider
@@ -592,23 +600,21 @@ async fn fetch_blocks<P: Provider<AnyNetwork> + DebugApi<AnyNetwork>>(
                 .await
                 .wrap_err_with(|| format!("failed to fetch raw block {block_num}"))?;
 
-            let hash = raw_block_hash(&rlp_bytes)
-                .wrap_err_with(|| format!("failed to hash raw block {block_num}"))?;
+            let sealed: Sealed<alloy_consensus::Block<N::TxEnvelope, N::Header>> =
+                alloy_consensus::Block::decode_sealed(&mut rlp_bytes.as_ref())
+                    .map_err(|e| eyre::eyre!("failed to decode block {block_num}: {e}"))?;
 
-            let block = provider
-                .get_block(BlockNumberOrTag::Number(block_num).into())
-                .await
-                .wrap_err_with(|| format!("failed to fetch block {block_num}"))?
-                .ok_or_else(|| eyre::eyre!("block {block_num} not found"))?;
+            let hash = sealed.hash();
+            let block = sealed.inner();
 
             Ok(FetchedBlock {
                 rlp_bytes,
                 hash,
-                number: block_num,
-                timestamp: block.header().timestamp(),
-                gas_used: block.header().gas_used(),
-                gas_limit: block.header().gas_limit(),
-                tx_count: block.transactions().len(),
+                number: block.header.number(),
+                timestamp: block.header.timestamp(),
+                gas_used: block.header.gas_used(),
+                gas_limit: block.header.gas_limit(),
+                tx_count: block.body.transactions.len(),
             })
         }
         .await;
@@ -621,33 +627,4 @@ async fn fetch_blocks<P: Provider<AnyNetwork> + DebugApi<AnyNetwork>>(
             break;
         }
     }
-}
-
-/// Compute the block hash from raw RLP-encoded block bytes.
-///
-/// Parses just enough RLP framing to extract the encoded header (the first
-/// item in the top-level list) and returns `keccak256(rlp(header))`. This
-/// works for any block type (Ethereum, Tempo, etc.) without needing to
-/// decode the header's internal fields.
-fn raw_block_hash(raw: &[u8]) -> eyre::Result<alloy_primitives::B256> {
-    let mut buf = raw;
-
-    // Decode the outer block list header.
-    let block_list =
-        alloy_rlp::Header::decode(&mut buf).wrap_err("failed to decode block RLP header")?;
-    eyre::ensure!(block_list.list, "block RLP is not a list");
-
-    // `buf` now points to the start of the list payload.
-    let payload_start = buf;
-
-    // Decode the header item's RLP header (first item in the list).
-    let header_rlp = alloy_rlp::Header::decode(&mut buf).wrap_err("failed to decode header RLP")?;
-    eyre::ensure!(header_rlp.list, "header RLP is not a list");
-
-    // The full encoded header = RLP prefix bytes + payload.
-    let prefix_len = payload_start.len() - buf.len();
-    let total_header_len = prefix_len + header_rlp.payload_length;
-    let header_encoded = &payload_start[..total_header_len];
-
-    Ok(keccak256(header_encoded))
 }
