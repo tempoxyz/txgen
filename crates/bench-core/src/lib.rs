@@ -19,21 +19,21 @@ pub mod source;
 
 pub use clock::RunClock;
 pub use metrics::{
-    BenchMetrics, BlockStats, LatencySample, LatencyStats, MetricsCollector, RunStats,
-    ThroughputSample, TimeSeriesMetrics, collect_block_stats, compute_latency_stats,
-    trim_trailing_empty_blocks,
+    collect_block_stats, compute_latency_stats, trim_trailing_empty_blocks, BenchMetrics,
+    BlockStats, LatencySample, LatencyStats, MetricsCollector, RunStats, ThroughputSample,
+    TimeSeriesMetrics,
 };
 pub use prometheus::parse_prometheus_text;
 pub use reporter::{
-    ClickHouseConfig, ClickHouseReporter, ConsoleReporter, FinalReport, JsonLatency,
-    JsonLatencySample, JsonReport, JsonReporter, JsonThroughputSample, JsonTimeSeries,
-    ProgressState, Reporter, parse_reporters,
+    parse_reporters, ClickHouseConfig, ClickHouseReporter, ConsoleReporter, FinalReport,
+    JsonLatency, JsonLatencySample, JsonReport, JsonReporter, JsonThroughputSample, JsonTimeSeries,
+    ProgressState, Reporter,
 };
 pub use reth_api::{
-    DEFAULT_PERSISTENCE_THRESHOLD, RethApi, RethForkchoiceUpdated, RethNewPayloadInput,
-    RethPayloadStatus, WaitForPersistence,
+    RethApi, RethForkchoiceUpdated, RethNewPayloadInput, RethPayloadStatus, WaitForPersistence,
+    DEFAULT_PERSISTENCE_THRESHOLD,
 };
 pub use sample::{Sample, SampleStore};
-pub use scraper::{SampleCallback, ScraperConfig, ScraperHandle, start_scraper};
+pub use scraper::{start_scraper, SampleCallback, ScraperConfig, ScraperHandle};
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource, TxgenSource};

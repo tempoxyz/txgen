@@ -32,12 +32,7 @@ pub struct NdjsonWriter<W: Write> {
 impl<W: Write> NdjsonWriter<W> {
     /// Create a new NDJSON writer.
     pub fn new(writer: W) -> Self {
-        Self {
-            writer,
-            count: 0,
-            raw_hex: String::new(),
-            key_hex: String::new(),
-        }
+        Self { writer, count: 0, raw_hex: String::new(), key_hex: String::new() }
     }
 
     /// Write a generated transaction.
@@ -57,10 +52,7 @@ impl<W: Write> NdjsonWriter<W> {
             write!(self.key_hex, "{:02x}", byte)?;
         }
 
-        let out = OutputTx {
-            raw: &self.raw_hex,
-            key: &self.key_hex,
-        };
+        let out = OutputTx { raw: &self.raw_hex, key: &self.key_hex };
 
         serde_json::to_writer(&mut self.writer, &out)?;
         self.writer.write_all(b"\n")?;
@@ -109,10 +101,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut writer = NdjsonWriter::new(&mut buf);
 
-        let tx = GeneratedTx {
-            raw: Bytes::from(vec![0x02, 0xf8, 0x70]),
-            key: [0xab; 20],
-        };
+        let tx = GeneratedTx { raw: Bytes::from(vec![0x02, 0xf8, 0x70]), key: [0xab; 20] };
 
         writer.write(&tx).unwrap();
         writer.flush().unwrap();
@@ -128,10 +117,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut writer = NdjsonWriter::new(&mut buf);
 
-        let tx = GeneratedTx {
-            raw: Bytes::from(vec![0x00]),
-            key: [0x00; 20],
-        };
+        let tx = GeneratedTx { raw: Bytes::from(vec![0x00]), key: [0x00; 20] };
 
         assert_eq!(writer.count(), 0);
         writer.write(&tx).unwrap();

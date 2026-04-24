@@ -138,21 +138,14 @@ where
         input: RethNewPayloadInput,
         wait_for_persistence: Option<bool>,
     ) -> TransportResult<RethPayloadStatus> {
-        self.client()
-            .request(
-                "reth_newPayload",
-                (input, wait_for_persistence, None::<bool>),
-            )
-            .await
+        self.client().request("reth_newPayload", (input, wait_for_persistence, None::<bool>)).await
     }
 
     async fn reth_forkchoice_updated(
         &self,
         forkchoice_state: ForkchoiceState,
     ) -> TransportResult<RethForkchoiceUpdated> {
-        self.client()
-            .request("reth_forkchoiceUpdated", (forkchoice_state,))
-            .await
+        self.client().request("reth_forkchoiceUpdated", (forkchoice_state,)).await
     }
 }
 

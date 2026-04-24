@@ -24,7 +24,7 @@ impl NetworkAdapter for EthereumAdapter {
         ctx: &mut BuildContext<'_>,
     ) -> Result<TxRequest<TransactionRequest>> {
         let selected = ctx.select_signer(&template.from)?;
-        let key: [u8; 20] = selected.address.0.0;
+        let key: [u8; 20] = selected.address.0 .0;
         let nonce = ctx.next_nonce(key);
 
         let (to, value, input) = resolve_call_data(&template, ctx)?;
@@ -55,9 +55,7 @@ impl NetworkAdapter for EthereumAdapter {
                     template.max_fee_per_gas.unwrap_or(ctx.gas.max_fee_per_gas),
                 );
                 req.set_max_priority_fee_per_gas(
-                    template
-                        .max_priority_fee_per_gas
-                        .unwrap_or(ctx.gas.max_priority_fee_per_gas),
+                    template.max_priority_fee_per_gas.unwrap_or(ctx.gas.max_priority_fee_per_gas),
                 );
             }
         }
@@ -103,8 +101,7 @@ mod tests {
     use alloy_consensus::SignableTransaction;
     use alloy_eips::eip2718::Encodable2718;
     use alloy_network::TxSignerSync;
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
+    use rand::{rngs::StdRng, SeedableRng};
     use std::collections::HashMap;
     use txgen_core::{
         AccountManager, AccountPoolDef, AccountRef, ArtifactManager, GasConfig, GenValue,
@@ -134,10 +131,7 @@ mod tests {
 
         let template = EthereumTemplate {
             tx_type: EthTxType::Eip1559,
-            from: AccountRef {
-                pool: "users".to_string(),
-                select: SelectMode::Index(0),
-            },
+            from: AccountRef { pool: "users".to_string(), select: SelectMode::Index(0) },
             gas_limit: 21000,
             value: GenValue::Literal(U256::from(1000)),
             to: Some(GenValue::Literal(alloy_primitives::Address::ZERO)),
@@ -151,10 +145,7 @@ mod tests {
         let tx_req = adapter.build_request(template, &mut ctx).unwrap();
 
         let mut unsigned = tx_req.request.build_unsigned().unwrap();
-        let signer = ctx
-            .accounts
-            .get_by_index(&tx_req.signer_pool, tx_req.signer_index)
-            .unwrap();
+        let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index).unwrap();
         let sig = signer.sign_transaction_sync(&mut unsigned).unwrap();
         let signed = unsigned.into_signed(sig);
         let envelope =

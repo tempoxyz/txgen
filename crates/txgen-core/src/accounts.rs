@@ -1,7 +1,7 @@
 use alloy_primitives::Address;
 use alloy_signer::Signer;
-use alloy_signer_local::{LocalSigner, MnemonicBuilder, coins_bip39::English};
-use eyre::{Result, WrapErr, bail};
+use alloy_signer_local::{coins_bip39::English, LocalSigner, MnemonicBuilder};
+use eyre::{bail, Result, WrapErr};
 use k256::ecdsa::SigningKey;
 use rand::Rng;
 use serde::Deserialize;
@@ -19,9 +19,7 @@ pub struct AccountManager {
 impl AccountManager {
     /// Create an empty account manager (for testing).
     pub fn empty() -> Self {
-        Self {
-            pools: HashMap::new(),
-        }
+        Self { pools: HashMap::new() }
     }
 
     /// Create an account manager from spec definitions.
@@ -149,11 +147,8 @@ mod tests {
 
     #[test]
     fn test_derive_single_signer() {
-        let def = AccountPoolDef {
-            mnemonic: TEST_MNEMONIC.to_string(),
-            index: Some(0),
-            range: None,
-        };
+        let def =
+            AccountPoolDef { mnemonic: TEST_MNEMONIC.to_string(), index: Some(0), range: None };
         let signers = def.derive_signers().unwrap();
         assert_eq!(signers.len(), 1);
     }

@@ -1,7 +1,7 @@
 use alloy_dyn_abi::DynSolValue;
 use alloy_json_abi::JsonAbi;
 use alloy_primitives::{Address, Bytes, U256};
-use eyre::{Result, WrapErr, bail};
+use eyre::{bail, Result, WrapErr};
 use serde::Deserialize;
 use std::{collections::HashMap, path::PathBuf};
 
@@ -19,11 +19,7 @@ impl ArtifactManager {
         let mut abis = HashMap::new();
 
         for (name, path) in artifacts {
-            let full_path = if path.is_absolute() {
-                path.clone()
-            } else {
-                base_path.join(path)
-            };
+            let full_path = if path.is_absolute() { path.clone() } else { base_path.join(path) };
 
             let content = std::fs::read_to_string(&full_path)
                 .wrap_err_with(|| format!("failed to read artifact: {}", full_path.display()))?;
@@ -44,9 +40,7 @@ impl ArtifactManager {
 
     /// Get an ABI by name.
     pub fn get(&self, name: &str) -> Result<&JsonAbi> {
-        self.abis
-            .get(name)
-            .ok_or_else(|| eyre::eyre!("artifact '{}' not found", name))
+        self.abis.get(name).ok_or_else(|| eyre::eyre!("artifact '{}' not found", name))
     }
 }
 
@@ -160,11 +154,11 @@ fn yaml_to_sol_value(
     // Handle generator expressions
     if value.is_mapping() {
         // Check if it's a generator
-        if value.get("uniform").is_some()
-            || value.get("choice").is_some()
-            || value.get("pool").is_some()
-            || value.get("random_bytes").is_some()
-            || value.get("const").is_some()
+        if value.get("uniform").is_some() ||
+            value.get("choice").is_some() ||
+            value.get("pool").is_some() ||
+            value.get("random_bytes").is_some() ||
+            value.get("const").is_some()
         {
             return resolve_generator_to_sol(value, sol_type, resolver);
         }
@@ -202,10 +196,7 @@ fn yaml_to_sol_value(
         t if t.starts_with("int") => {
             let val: i64 = serde_yaml::from_value(value.clone())?;
             let bits = parse_int_bits(t)?;
-            Ok(DynSolValue::Int(
-                alloy_primitives::I256::try_from(val)?,
-                bits,
-            ))
+            Ok(DynSolValue::Int(alloy_primitives::I256::try_from(val)?, bits))
         }
         t if t.starts_with("bytes") && t.len() > 5 => {
             // Fixed bytes (bytes1, bytes32, etc.)
@@ -215,19 +206,14 @@ fn yaml_to_sol_value(
             let mut fixed = vec![0u8; size];
             let len = bytes.len().min(size);
             fixed[..len].copy_from_slice(&bytes[..len]);
-            Ok(DynSolValue::FixedBytes(
-                alloy_primitives::FixedBytes::from_slice(&fixed),
-                size,
-            ))
+            Ok(DynSolValue::FixedBytes(alloy_primitives::FixedBytes::from_slice(&fixed), size))
         }
         t if t.ends_with("[]") => {
             // Dynamic array
             let inner_type = &t[..t.len() - 2];
             let arr: Vec<serde_yaml::Value> = serde_yaml::from_value(value.clone())?;
-            let values: Result<Vec<_>> = arr
-                .iter()
-                .map(|v| yaml_to_sol_value(v, inner_type, resolver))
-                .collect();
+            let values: Result<Vec<_>> =
+                arr.iter().map(|v| yaml_to_sol_value(v, inner_type, resolver)).collect();
             Ok(DynSolValue::Array(values?))
         }
         _ => bail!("unsupported Solidity type: {}", sol_type),

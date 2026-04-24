@@ -1,8 +1,6 @@
 use alloy_primitives::Address;
 use eyre::Result;
-use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
+use std::{collections::HashMap, future::Future, pin::Pin};
 
 /// Trait for fetching nonces from the chain.
 ///

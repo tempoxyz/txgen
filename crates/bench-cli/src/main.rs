@@ -7,8 +7,7 @@
 
 use clap::{Args, Parser, Subcommand};
 use eyre::Result;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 mod send;
 mod send_blocks;
@@ -159,9 +158,7 @@ fn parse_wait_for_persistence(s: &str) -> Result<bench_core::WaitForPersistence,
             }
             Ok(bench_core::WaitForPersistence::EveryN(n))
         }
-        _ => Err(format!(
-            "invalid value '{s}': expected 'always', 'never', or 'every:N'"
-        )),
+        _ => Err(format!("invalid value '{s}': expected 'always', 'never', or 'every:N'")),
     }
 }
 

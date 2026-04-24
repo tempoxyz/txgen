@@ -1,8 +1,7 @@
 use alloy_primitives::{Address, Bytes, U256};
-use eyre::{Result, bail};
+use eyre::{bail, Result};
 use rand::Rng;
-use serde::Deserialize;
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize};
 
 use crate::{AccountManager, SelectMode};
 
@@ -199,17 +198,13 @@ impl FromGenerator for String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
+    use rand::{rngs::StdRng, SeedableRng};
 
     #[test]
     fn test_uniform_u64() {
         let accounts = AccountManager::empty();
         let mut rng = StdRng::seed_from_u64(42);
-        let mut resolver = ValueResolver {
-            accounts: &accounts,
-            rng: &mut rng,
-        };
+        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
 
         let generator = Generator::Uniform([1, 100]);
         let val: u64 = u64::from_generator(&generator, &mut resolver).unwrap();
@@ -220,10 +215,7 @@ mod tests {
     fn test_const_address() {
         let accounts = AccountManager::empty();
         let mut rng = StdRng::seed_from_u64(42);
-        let mut resolver = ValueResolver {
-            accounts: &accounts,
-            rng: &mut rng,
-        };
+        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
 
         let generator = Generator::Const(serde_yaml::Value::String(
             "0x0000000000000000000000000000000000000001".to_string(),

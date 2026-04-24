@@ -4,8 +4,7 @@
 //! are stored as [`Sample`]s in a shared [`SampleStore`].
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::RwLock;
 
 /// A single metric data point.
@@ -39,9 +38,7 @@ pub struct SampleStore {
 impl SampleStore {
     /// Create a new empty store.
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(Vec::new())),
-        }
+        Self { inner: Arc::new(RwLock::new(Vec::new())) }
     }
 
     /// Append a batch of samples.
@@ -95,9 +92,7 @@ mod tests {
         let store = SampleStore::new();
         assert!(store.is_empty().await);
 
-        store
-            .push_batch(vec![make_sample("a", 1.0, 0), make_sample("b", 2.0, 100)])
-            .await;
+        store.push_batch(vec![make_sample("a", 1.0, 0), make_sample("b", 2.0, 100)]).await;
 
         assert_eq!(store.len().await, 2);
 
