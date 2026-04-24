@@ -6,7 +6,7 @@
 //! - ClickHouse (for time-series storage)
 
 use crate::{
-    metrics::{BenchMetrics, BlockStats, RunStats, TimeSeriesMetrics},
+    metrics::{BenchMetrics, BlockStats, RunStats, ThroughputSample, TimeSeriesMetrics},
     sample::Sample,
 };
 use eyre::{bail, Context, Result};
@@ -310,22 +310,9 @@ pub struct JsonLatency {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct JsonTimeSeries {
     /// Per-second throughput samples.
-    pub throughput: Vec<JsonThroughputSample>,
+    pub throughput: Vec<ThroughputSample>,
     /// Individual latency samples.
     pub latencies: Vec<JsonLatencySample>,
-}
-
-/// Per-second throughput sample.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct JsonThroughputSample {
-    /// Second offset from start.
-    pub second: u64,
-    /// Transactions sent.
-    pub sent: u64,
-    /// Successful transactions.
-    pub success: u64,
-    /// Failed transactions.
-    pub failed: u64,
 }
 
 /// Individual latency sample.
@@ -377,12 +364,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
                     throughput: ts
                         .throughput
                         .iter()
-                        .map(|s| JsonThroughputSample {
-                            second: s.second,
-                            sent: s.sent,
-                            success: s.success,
-                            failed: s.failed,
-                        })
+                        .cloned()
                         .collect(),
                     latencies: ts
                         .latencies
