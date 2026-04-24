@@ -45,14 +45,7 @@ impl<'a> BuildContext<'a> {
         nonces: &'a mut NonceTracker,
         rng: &'a mut StdRng,
     ) -> Self {
-        Self {
-            chain_id,
-            gas,
-            accounts,
-            artifacts,
-            nonces,
-            rng,
-        }
+        Self { chain_id, gas, accounts, artifacts, nonces, rng }
     }
 
     /// Get the next nonce for a scheduling key.
@@ -62,10 +55,7 @@ impl<'a> BuildContext<'a> {
 
     /// Create a value resolver for this context.
     pub fn resolver(&mut self) -> crate::ValueResolver<'_> {
-        crate::ValueResolver {
-            accounts: self.accounts,
-            rng: self.rng,
-        }
+        crate::ValueResolver { accounts: self.accounts, rng: self.rng }
     }
 
     /// Select a signer from a pool based on the account reference.
@@ -77,11 +67,7 @@ impl<'a> BuildContext<'a> {
                 let pool = self.accounts.get_pool(&from.pool)?;
                 // SAFETY: the signer came from this pool, so it must be present
                 let idx = pool.iter().position(|s| s.address() == addr).unwrap_or(0);
-                Ok(SelectedSigner {
-                    address: addr,
-                    pool: from.pool.clone(),
-                    index: idx,
-                })
+                Ok(SelectedSigner { address: addr, pool: from.pool.clone(), index: idx })
             }
             SelectMode::Index(idx) => {
                 let signer = self.accounts.get_by_index(&from.pool, idx)?;
@@ -146,10 +132,7 @@ mod tests {
 
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
 
-        let account_ref = AccountRef {
-            pool: "default".into(),
-            select: SelectMode::Index(1),
-        };
+        let account_ref = AccountRef { pool: "default".into(), select: SelectMode::Index(1) };
         let selected = ctx.select_signer(&account_ref).unwrap();
         assert_eq!(selected.index, 1);
         assert_eq!(selected.pool, "default");
@@ -174,10 +157,7 @@ mod tests {
 
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
 
-        let account_ref = AccountRef {
-            pool: "default".into(),
-            select: SelectMode::Random,
-        };
+        let account_ref = AccountRef { pool: "default".into(), select: SelectMode::Random };
         let selected = ctx.select_signer(&account_ref).unwrap();
         assert_eq!(selected.pool, "default");
         assert!(selected.index < 3);

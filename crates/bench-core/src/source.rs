@@ -7,11 +7,11 @@
 
 use alloy_primitives::Bytes;
 use eyre::{Context, Result};
-use std::io::BufRead;
-use std::path::Path;
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use std::{io::BufRead, path::Path, process::Stdio};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::{Child, Command},
+};
 use txgen_core::GeneratedTx;
 
 /// A transaction read from a source.
@@ -65,9 +65,7 @@ impl FileSource {
     pub fn new(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path).context("failed to open file")?;
         let reader = std::io::BufReader::new(file);
-        Ok(Self {
-            lines: reader.lines(),
-        })
+        Ok(Self { lines: reader.lines() })
     }
 }
 
@@ -94,10 +92,7 @@ pub struct StdinSource {
 impl StdinSource {
     /// Create a new stdin source.
     pub fn new() -> Self {
-        Self {
-            reader: BufReader::new(tokio::io::stdin()),
-            line_buf: String::new(),
-        }
+        Self { reader: BufReader::new(tokio::io::stdin()), line_buf: String::new() }
     }
 }
 
@@ -143,18 +138,11 @@ impl TxgenSource {
             .spawn()
             .context("failed to spawn txgen")?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| eyre::eyre!("txgen stdout not captured"))?;
+        let stdout = child.stdout.take().ok_or_else(|| eyre::eyre!("txgen stdout not captured"))?;
 
         let reader = BufReader::new(stdout);
 
-        Ok(Self {
-            child,
-            reader,
-            line_buf: String::new(),
-        })
+        Ok(Self { child, reader, line_buf: String::new() })
     }
 
     /// Wait for the txgen process to exit.

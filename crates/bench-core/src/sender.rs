@@ -10,11 +10,15 @@ use alloy_primitives::Bytes;
 use alloy_provider::{DynProvider, Provider};
 use eyre::Result;
 use rand::seq::IndexedRandom;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::{Semaphore, mpsc};
-use tokio::task::JoinHandle;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::{
+    sync::{mpsc, Semaphore},
+    task::JoinHandle,
+};
 use txgen_core::GeneratedTx;
 
 /// Configuration for the sender.
@@ -34,10 +38,7 @@ pub struct SenderConfig {
 
 impl Default for SenderConfig {
     fn default() -> Self {
-        Self {
-            rate_limit: 0,
-            max_concurrent: 100,
-        }
+        Self { rate_limit: 0, max_concurrent: 100 }
     }
 }
 
@@ -98,10 +99,7 @@ impl Sender {
             limiter.acquire().await;
         }
 
-        let pending = PendingTx {
-            raw: tx.raw,
-            key: tx.key,
-        };
+        let pending = PendingTx { raw: tx.raw, key: tx.key };
 
         // Get or create the queue for this key.
         let queue = match self.key_queues.entry(pending.key) {

@@ -5,12 +5,14 @@
 //!
 //! For protocol nonce (key 0), the nonce is stored in the account state directly.
 
-use alloy_primitives::{Address, B256, U256, keccak256};
-use alloy_provider::{Provider, network::Ethereum};
+use alloy_primitives::{keccak256, Address, B256, U256};
+use alloy_provider::{network::Ethereum, Provider};
 use eyre::{Result, WrapErr};
-use std::future::Future;
-use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    pin::Pin,
+    time::{Duration, Instant},
+};
 use tempo_primitives::transaction::TEMPO_EXPIRING_NONCE_KEY;
 use tokio::sync::Mutex;
 use txgen_core::NonceProvider;
@@ -37,18 +39,12 @@ where
 {
     /// Create a new Tempo nonce provider (unbounded).
     pub fn new(provider: P) -> Self {
-        Self {
-            provider,
-            rate_limiter: None,
-        }
+        Self { provider, rate_limiter: None }
     }
 
     /// Create a new Tempo nonce provider with rate limiting.
     pub fn with_rate_limit(provider: P, requests_per_sec: u64) -> Self {
-        Self {
-            provider,
-            rate_limiter: Some(RateLimiter::new(requests_per_sec)),
-        }
+        Self { provider, rate_limiter: Some(RateLimiter::new(requests_per_sec)) }
     }
 
     /// Fetch the nonce for a given address and nonce_key.
@@ -80,10 +76,7 @@ where
 
             // Storage value is uint64, stored as U256
             let nonce = storage_value.to::<u64>();
-            eprintln!(
-                "fetched lane nonce: {} lane={} nonce={}",
-                address, nonce_key, nonce
-            );
+            eprintln!("fetched lane nonce: {} lane={} nonce={}", address, nonce_key, nonce);
             Ok(nonce)
         }
     }
@@ -150,10 +143,7 @@ pub async fn prefetch_parallel_nonces<P: Provider<Ethereum> + Clone + Send + Syn
         return Ok(());
     }
 
-    eprintln!(
-        "prefetching nonces for {} parallel lane(s)...",
-        nonce_keys.len()
-    );
+    eprintln!("prefetching nonces for {} parallel lane(s)...", nonce_keys.len());
 
     for (pool_name, addresses) in accounts.all_addresses() {
         for address in addresses {
@@ -173,10 +163,7 @@ pub async fn prefetch_parallel_nonces<P: Provider<Ethereum> + Clone + Send + Syn
                 let scheduling_key = compute_parallel_scheduling_key(address, nonce_key);
                 nonces.reset(scheduling_key, nonce);
 
-                eprintln!(
-                    "fetched lane nonce: {} lane={} nonce={}",
-                    address, nonce_key, nonce
-                );
+                eprintln!("fetched lane nonce: {} lane={} nonce={}", address, nonce_key, nonce);
             }
         }
     }
@@ -198,12 +185,12 @@ fn collect_prefetchable_parallel_nonce_keys(
     let mut nonce_keys = std::collections::HashSet::new();
 
     for entry in &spec.mix {
-        if let Some(value) = spec.templates.get(&entry.template)
-            && let Ok(template) = serde_yaml::from_value::<TempoTemplate>(value.clone())
-            && !template.expiring_nonce
-            && let Some(GenValue::Literal(key)) = &template.nonce_key
-            && !key.is_zero()
-            && *key != TEMPO_EXPIRING_NONCE_KEY
+        if let Some(value) = spec.templates.get(&entry.template) &&
+            let Ok(template) = serde_yaml::from_value::<TempoTemplate>(value.clone()) &&
+            !template.expiring_nonce &&
+            let Some(GenValue::Literal(key)) = &template.nonce_key &&
+            !key.is_zero() &&
+            *key != TEMPO_EXPIRING_NONCE_KEY
         {
             nonce_keys.insert(*key);
         }

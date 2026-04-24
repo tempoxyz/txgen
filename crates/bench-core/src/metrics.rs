@@ -5,21 +5,23 @@
 //! - Timing (latencies, throughput)
 //! - Block-level statistics (post-run)
 
-use crate::clock::RunClock;
-use crate::sample::Sample;
+use crate::{clock::RunClock, sample::Sample};
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockNumberOrTag;
-use alloy_network::Network;
-use alloy_network::primitives::BlockResponse;
+use alloy_network::{primitives::BlockResponse, Network};
 use alloy_provider::Provider;
 
 use eyre::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tokio::sync::{mpsc, Mutex};
 
 /// Metrics collected during a benchmark run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,23 +257,13 @@ impl RunStats {
         let duration_ms = end_ms.saturating_sub(start_ms);
         let duration_secs = duration_ms as f64 / 1000.0;
 
-        let avg_blocks_per_second = if duration_secs > 0.0 {
-            total_blocks as f64 / duration_secs
-        } else {
-            0.0
-        };
+        let avg_blocks_per_second =
+            if duration_secs > 0.0 { total_blocks as f64 / duration_secs } else { 0.0 };
 
-        let avg_tps = if duration_secs > 0.0 {
-            total_txs as f64 / duration_secs
-        } else {
-            0.0
-        };
+        let avg_tps = if duration_secs > 0.0 { total_txs as f64 / duration_secs } else { 0.0 };
 
-        let avg_gas_per_second = if duration_secs > 0.0 {
-            total_gas as f64 / duration_secs
-        } else {
-            0.0
-        };
+        let avg_gas_per_second =
+            if duration_secs > 0.0 { total_gas as f64 / duration_secs } else { 0.0 };
 
         let mut block_times: Vec<u64> = blocks.iter().filter_map(|b| b.block_time_ms).collect();
         block_times.sort();
@@ -385,9 +377,7 @@ fn extract_timestamp_ms<B: BlockResponse>(block: &B, timestamp_secs: u64) -> u64
         if let Some(Ok(ms_part)) =
             other.get_deserialized::<alloy_primitives::U64>("timestampMillisPart")
         {
-            return timestamp_secs
-                .saturating_mul(1000)
-                .saturating_add(ms_part.to());
+            return timestamp_secs.saturating_mul(1000).saturating_add(ms_part.to());
         }
     }
     timestamp_secs.saturating_mul(1000)
@@ -476,10 +466,7 @@ impl MetricsCollector {
     pub fn record_sent(&self) {
         self.sent.fetch_add(1, Ordering::Relaxed);
         let offset = self.elapsed();
-        let _ = self.event_tx.send(TimestampedEvent {
-            offset,
-            event: TxEvent::Sent,
-        });
+        let _ = self.event_tx.send(TimestampedEvent { offset, event: TxEvent::Sent });
     }
 
     /// Record a successful transaction with its latency.
@@ -487,20 +474,14 @@ impl MetricsCollector {
         self.success.fetch_add(1, Ordering::Relaxed);
         let offset = self.elapsed();
         let _ = self.latency_tx.send(TimestampedLatency { offset, latency });
-        let _ = self.event_tx.send(TimestampedEvent {
-            offset,
-            event: TxEvent::Success,
-        });
+        let _ = self.event_tx.send(TimestampedEvent { offset, event: TxEvent::Success });
     }
 
     /// Record a failed transaction.
     pub fn record_failure(&self) {
         self.failed.fetch_add(1, Ordering::Relaxed);
         let offset = self.elapsed();
-        let _ = self.event_tx.send(TimestampedEvent {
-            offset,
-            event: TxEvent::Failed,
-        });
+        let _ = self.event_tx.send(TimestampedEvent { offset, event: TxEvent::Failed });
     }
 
     /// Get the current counts (sent, success, failed).
@@ -624,26 +605,15 @@ impl MetricsCollector {
                 }
             }
 
-            throughput.push(ThroughputSample {
-                second,
-                sent,
-                success,
-                failed,
-            });
+            throughput.push(ThroughputSample { second, sent, success, failed });
         }
 
         let latency_samples: Vec<LatencySample> = latencies
             .iter()
-            .map(|l| LatencySample {
-                offset_ms: l.offset.as_millis() as u64,
-                latency: l.latency,
-            })
+            .map(|l| LatencySample { offset_ms: l.offset.as_millis() as u64, latency: l.latency })
             .collect();
 
-        TimeSeriesMetrics {
-            throughput,
-            latencies: latency_samples,
-        }
+        TimeSeriesMetrics { throughput, latencies: latency_samples }
     }
 }
 
@@ -661,11 +631,8 @@ mod duration_serde {
     where
         S: Serializer,
     {
-        DurationRepr {
-            secs: duration.as_secs(),
-            nanos: duration.subsec_nanos(),
-        }
-        .serialize(serializer)
+        DurationRepr { secs: duration.as_secs(), nanos: duration.subsec_nanos() }
+            .serialize(serializer)
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
@@ -865,16 +832,8 @@ mod tests {
     #[test]
     fn test_time_series_serde() {
         let ts = TimeSeriesMetrics {
-            throughput: vec![ThroughputSample {
-                second: 0,
-                sent: 100,
-                success: 90,
-                failed: 10,
-            }],
-            latencies: vec![LatencySample {
-                offset_ms: 500,
-                latency: Duration::from_millis(25),
-            }],
+            throughput: vec![ThroughputSample { second: 0, sent: 100, success: 90, failed: 10 }],
+            latencies: vec![LatencySample { offset_ms: 500, latency: Duration::from_millis(25) }],
         };
 
         let json = serde_json::to_string(&ts).unwrap();
@@ -936,10 +895,8 @@ mod tests {
 
     #[test]
     fn trim_trailing_empty_noop_when_no_trailing() {
-        let mut blocks = vec![
-            make_block(100, 1_000_000, 1_000_000),
-            make_block(101, 2_000_000, 1_000_500),
-        ];
+        let mut blocks =
+            vec![make_block(100, 1_000_000, 1_000_000), make_block(101, 2_000_000, 1_000_500)];
 
         let cutoff = trim_trailing_empty_blocks(&mut blocks);
         assert_eq!(blocks.len(), 2);

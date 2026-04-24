@@ -2,17 +2,16 @@
 
 use crate::SendArgs;
 use alloy_network::AnyNetwork;
-use alloy_provider::{Provider, ProviderBuilder, ext::TxPoolApi};
+use alloy_provider::{ext::TxPoolApi, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
+    collect_block_stats, parse_reporters, start_scraper, trim_trailing_empty_blocks,
     ConsoleReporter, FileSource, FinalReport, MetricsCollector, ProgressState, Reporter, RunClock,
     RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, StdinSource, TxSource,
-    collect_block_stats, parse_reporters, start_scraper, trim_trailing_empty_blocks,
 };
-use eyre::{Context, Result, bail};
-use std::collections::HashMap;
-use std::time::Duration;
+use eyre::{bail, Context, Result};
+use std::{collections::HashMap, time::Duration};
 
 pub async fn execute(args: SendArgs) -> Result<()> {
     tracing::info!(
@@ -34,9 +33,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         .map(|url| {
             let url = url.parse().context("failed to parse RPC URL")?;
             let client = RpcClient::builder().layer(retry_layer.clone()).http(url);
-            Ok(ProviderBuilder::new_with_network::<AnyNetwork>()
-                .connect_client(client)
-                .erased())
+            Ok(ProviderBuilder::new_with_network::<AnyNetwork>().connect_client(client).erased())
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -63,10 +60,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         None
     };
 
-    let config = SenderConfig {
-        rate_limit: args.tps,
-        max_concurrent: args.max_concurrent,
-    };
+    let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
     let mut sender = Sender::new(providers.clone(), config.clone(), metrics.clone());
 
     let mut reporters = parse_reporters(&args.reports, "send", &metadata)?;
@@ -77,10 +71,8 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     // Record the block number before sending so we can collect per-block stats
     // afterwards. Use the first provider for block queries.
     let query_provider = &providers[0];
-    let start_block = query_provider
-        .get_block_number()
-        .await
-        .wrap_err("failed to get starting block number")?;
+    let start_block =
+        query_provider.get_block_number().await.wrap_err("failed to get starting block number")?;
 
     match &args.input {
         Some(path) => {
@@ -121,10 +113,8 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     // the block that was current before sending (start_block is the last
     // existing block at that point, so start_block+1 is the first block that
     // could contain our transactions) and ends at the current latest block.
-    let end_block = query_provider
-        .get_block_number()
-        .await
-        .wrap_err("failed to get ending block number")?;
+    let end_block =
+        query_provider.get_block_number().await.wrap_err("failed to get ending block number")?;
 
     let mut report = FinalReport {
         metadata: metadata.clone(),
@@ -138,11 +128,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
 
     if end_block > start_block {
         let block_range_start = start_block + 1;
-        tracing::info!(
-            start = block_range_start,
-            end = end_block,
-            "Collecting per-block stats"
-        );
+        tracing::info!(start = block_range_start, end = end_block, "Collecting per-block stats");
 
         let mut block_stats =
             collect_block_stats(query_provider, block_range_start, end_block).await?;
@@ -181,9 +167,8 @@ pub async fn execute(args: SendArgs) -> Result<()> {
 pub(crate) fn parse_metadata(args: &[String]) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
     for arg in args {
-        let (key, value) = arg
-            .split_once('=')
-            .ok_or_else(|| eyre::eyre!("invalid metadata format: {arg}"))?;
+        let (key, value) =
+            arg.split_once('=').ok_or_else(|| eyre::eyre!("invalid metadata format: {arg}"))?;
         if key.is_empty() {
             bail!("metadata key cannot be empty: {arg}");
         }

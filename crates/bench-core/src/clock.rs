@@ -4,8 +4,10 @@
 //! - **offset** (monotonic) — for correlating metrics within a run.
 //! - **unix** (wall-clock) — for TSDB export and debugging.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
 
 /// Inner state for [`RunClock`].
 #[derive(Debug)]
@@ -30,17 +32,10 @@ impl RunClock {
     /// Create a new clock, capturing the current time as the start.
     pub fn new() -> Self {
         // SAFETY: `SystemTime::now()` is always after `UNIX_EPOCH`.
-        let start_unix_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let start_unix_ms =
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64;
 
-        Self {
-            inner: Arc::new(Inner {
-                start_instant: Instant::now(),
-                start_unix_ms,
-            }),
-        }
+        Self { inner: Arc::new(Inner { start_instant: Instant::now(), start_unix_ms }) }
     }
 
     /// Monotonic offset in milliseconds since benchmark start.

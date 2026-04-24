@@ -3,12 +3,18 @@
 //! Periodically fetches metrics from a node's `/metrics` endpoint,
 //! parses them, and writes [`Sample`]s into a shared [`SampleStore`].
 
-use crate::clock::RunClock;
-use crate::prometheus::parse_prometheus_text;
-use crate::sample::{Sample, SampleStore};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use crate::{
+    clock::RunClock,
+    prometheus::parse_prometheus_text,
+    sample::{Sample, SampleStore},
+};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::sync::watch;
 
 /// Callback that produces additional samples on each scrape tick.
@@ -106,12 +112,7 @@ pub fn start_scraper(
         error_count.clone(),
     ));
 
-    ScraperHandle {
-        stop_tx,
-        handle,
-        scrape_count,
-        error_count,
-    }
+    ScraperHandle { stop_tx, handle, scrape_count, error_count }
 }
 
 async fn scraper_loop(
@@ -123,10 +124,7 @@ async fn scraper_loop(
     scrape_count: Arc<AtomicU64>,
     error_count: Arc<AtomicU64>,
 ) {
-    let client = reqwest::Client::builder()
-        .timeout(config.timeout)
-        .build()
-        .unwrap_or_default();
+    let client = reqwest::Client::builder().timeout(config.timeout).build().unwrap_or_default();
 
     let mut interval = tokio::time::interval(config.interval);
     // Don't try to catch up if a scrape takes longer than the interval.

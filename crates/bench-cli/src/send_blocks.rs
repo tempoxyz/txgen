@@ -5,24 +5,27 @@
 //! via `reth_newPayload` (as `BlockRlp`) and `reth_forkchoiceUpdated`,
 //! collecting per-block timing and engine status from [`RethPayloadStatus`].
 
-use crate::SendBlocksArgs;
-use crate::send::parse_metadata;
+use crate::{send::parse_metadata, SendBlocksArgs};
 use alloy_network::Ethereum;
-use alloy_primitives::{B256, Bytes};
+use alloy_primitives::{Bytes, B256};
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types_engine::{ForkchoiceState, JwtSecret};
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    BlockStats, ConsoleReporter, FinalReport, ProgressState, Reporter, RethApi,
-    RethNewPayloadInput, RunClock, RunStats, Sample, SampleStore, ScraperConfig,
-    WaitForPersistence, parse_reporters, start_scraper,
+    parse_reporters, start_scraper, BlockStats, ConsoleReporter, FinalReport, ProgressState,
+    Reporter, RethApi, RethNewPayloadInput, RunClock, RunStats, Sample, SampleStore, ScraperConfig,
+    WaitForPersistence,
 };
 use eyre::{Context, Result};
-use std::collections::BTreeMap;
-use std::io::BufRead;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    io::BufRead,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// NDJSON line from the block source (`txgen extract` output).
@@ -45,9 +48,8 @@ struct BlockLine {
 }
 
 pub async fn execute(args: SendBlocksArgs) -> Result<()> {
-    let jwt_secret_hex = tokio::fs::read_to_string(&args.jwt_secret)
-        .await
-        .wrap_err("failed to read JWT secret")?;
+    let jwt_secret_hex =
+        tokio::fs::read_to_string(&args.jwt_secret).await.wrap_err("failed to read JWT secret")?;
     let jwt_secret =
         JwtSecret::from_hex(jwt_secret_hex.trim()).wrap_err("invalid JWT secret hex")?;
 
@@ -112,10 +114,8 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
 
         loop {
             line_buf.clear();
-            let bytes_read = reader
-                .read_line(&mut line_buf)
-                .await
-                .wrap_err("failed to read from stdin")?;
+            let bytes_read =
+                reader.read_line(&mut line_buf).await.wrap_err("failed to read from stdin")?;
             if bytes_read == 0 {
                 break;
             }
@@ -204,10 +204,8 @@ async fn process_block(
     let wait = persistence_policy.should_wait(collector.blocks_submitted());
 
     let new_payload_start = Instant::now();
-    let payload_status = provider
-        .reth_new_payload(input, wait)
-        .await
-        .wrap_err("reth_newPayload failed")?;
+    let payload_status =
+        provider.reth_new_payload(input, wait).await.wrap_err("reth_newPayload failed")?;
     let new_payload_latency = new_payload_start.elapsed();
 
     if !payload_status.status.is_valid() {
@@ -251,9 +249,7 @@ async fn process_block(
     let payload_status_str = payload_status.status.status.to_string();
 
     let timestamp_ms = block.timestamp * 1000;
-    let block_time_ms = collector
-        .prev_timestamp_ms
-        .map(|prev| timestamp_ms.saturating_sub(prev));
+    let block_time_ms = collector.prev_timestamp_ms.map(|prev| timestamp_ms.saturating_sub(prev));
     collector.prev_timestamp_ms = Some(timestamp_ms);
 
     let block_stats = BlockStats {

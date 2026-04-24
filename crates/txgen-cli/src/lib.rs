@@ -1,14 +1,13 @@
 use alloy_consensus::{BlockHeader, Sealed, SignableTransaction, Signed};
-use alloy_eips::{BlockNumberOrTag, eip2718::Encodable2718};
+use alloy_eips::{eip2718::Encodable2718, BlockNumberOrTag};
 use alloy_network::{Network, TransactionBuilder, TxSignerSync};
 use alloy_primitives::Bytes;
-use alloy_provider::{Provider, ext::DebugApi};
+use alloy_provider::{ext::DebugApi, Provider};
 use alloy_rlp::Decodable;
 use clap::{Args, Parser, Subcommand};
-use eyre::{Result, WrapErr, bail};
-use rand::{Rng, SeedableRng, rngs::StdRng};
-use std::io::Write;
-use std::path::PathBuf;
+use eyre::{bail, Result, WrapErr};
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use std::{io::Write, path::PathBuf};
 use tokio::sync::mpsc;
 use txgen_core::{
     AccountManager, ArtifactManager, BuildContext, GeneratedTx, NdjsonWriter, NonceTracker,
@@ -96,10 +95,7 @@ impl GenerateContext {
     pub fn from_args(args: &GenerateArgs) -> Result<Self> {
         let spec = WorkloadSpec::load(&args.spec)
             .wrap_err_with(|| format!("failed to load spec: {}", args.spec.display()))?;
-        let base_path = args
-            .spec
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
+        let base_path = args.spec.parent().unwrap_or_else(|| std::path::Path::new("."));
         let accounts = AccountManager::from_spec(&spec.accounts)?;
         let artifacts = ArtifactManager::load(&spec.artifacts, base_path)?;
         let nonces = NonceTracker::new();
@@ -107,13 +103,7 @@ impl GenerateContext {
             Some(seed) => StdRng::seed_from_u64(seed),
             None => StdRng::from_os_rng(),
         };
-        Ok(Self {
-            spec,
-            accounts,
-            artifacts,
-            nonces,
-            rng,
-        })
+        Ok(Self { spec, accounts, artifacts, nonces, rng })
     }
 
     pub fn spec(&self) -> &WorkloadSpec {
@@ -255,10 +245,8 @@ pub fn load_template<T: serde::de::DeserializeOwned>(
     total_weight: u64,
 ) -> Result<(String, T)> {
     let name = pick_template(spec, rng, total_weight)?;
-    let value = spec
-        .templates
-        .get(&name)
-        .ok_or_else(|| eyre::eyre!("template '{}' not found", name))?;
+    let value =
+        spec.templates.get(&name).ok_or_else(|| eyre::eyre!("template '{}' not found", name))?;
     let template: T = serde_yaml::from_value(value.clone())
         .wrap_err_with(|| format!("failed to parse template '{}'", name))?;
     Ok((name, template))
@@ -281,13 +269,7 @@ pub async fn fetch_protocol_nonces(
     for (pool_name, addresses) in accounts.all_addresses() {
         let total = addresses.len();
         for (idx, address) in addresses.iter().enumerate() {
-            eprintln!(
-                "fetching nonce for {}[{}/{}] ({})...",
-                pool_name,
-                idx + 1,
-                total,
-                address
-            );
+            eprintln!("fetching nonce for {}[{}/{}] ({})...", pool_name, idx + 1, total, address);
 
             let nonce = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
@@ -296,13 +278,10 @@ pub async fn fetch_protocol_nonces(
             .await
             .wrap_err_with(|| format!("timeout fetching nonce for {}[{}]", pool_name, idx))?
             .wrap_err_with(|| {
-                format!(
-                    "failed to fetch nonce for {}[{}] ({})",
-                    pool_name, idx, address
-                )
+                format!("failed to fetch nonce for {}[{}] ({})", pool_name, idx, address)
             })?;
 
-            let scheduling_key = address.0.0;
+            let scheduling_key = address.0 .0;
             nonces.reset(scheduling_key, nonce);
 
             eprintln!(
@@ -351,26 +330,12 @@ where
     match output {
         Some(path) => {
             let mut writer = txgen_core::output::file_writer(&path)?;
-            generate_txs(
-                adapter,
-                &ctx.spec,
-                count,
-                total_weight,
-                &mut build_ctx,
-                &mut writer,
-            )?;
+            generate_txs(adapter, &ctx.spec, count, total_weight, &mut build_ctx, &mut writer)?;
             eprintln!("wrote {} transactions to {}", count, path.display());
         }
         None => {
             let mut writer = txgen_core::output::stdout_writer();
-            generate_txs(
-                adapter,
-                &ctx.spec,
-                count,
-                total_weight,
-                &mut build_ctx,
-                &mut writer,
-            )?;
+            generate_txs(adapter, &ctx.spec, count, total_weight, &mut build_ctx, &mut writer)?;
         }
     }
 
@@ -387,10 +352,7 @@ fn pick_template(spec: &WorkloadSpec, rng: &mut StdRng, total_weight: u64) -> Re
         }
     }
     // SAFETY: Should not reach here if total_weight > 0 and mix is non-empty
-    unreachable!(
-        "template selection failed with roll={} total_weight={}",
-        roll, total_weight
-    )
+    unreachable!("template selection failed with roll={} total_weight={}", roll, total_weight)
 }
 
 fn generate_txs<A: NetworkAdapter, W: Write>(
@@ -418,9 +380,7 @@ where
             .build_unsigned()
             .map_err(|e| eyre::eyre!("failed to build unsigned tx from template '{name}': {e}"))?;
 
-        let signer = ctx
-            .accounts
-            .get_by_index(&tx_req.signer_pool, tx_req.signer_index)?;
+        let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?;
         let sig = signer
             .sign_transaction_sync(&mut unsigned)
             .map_err(|e| eyre::eyre!("failed to sign tx from template '{name}': {e}"))?;
@@ -429,10 +389,7 @@ where
         let envelope = <A::Network as Network>::TxEnvelope::from(signed);
         let raw = Bytes::from(envelope.encoded_2718());
 
-        writer.write(&GeneratedTx {
-            raw,
-            key: tx_req.key,
-        })?;
+        writer.write(&GeneratedTx { raw, key: tx_req.key })?;
     }
     writer.flush()?;
     Ok(())
@@ -448,10 +405,7 @@ fn run_addresses(args: AddressesArgs) -> Result<()> {
 
     let accounts = AccountManager::from_spec(&spec.accounts)?;
 
-    let all_addresses: Vec<_> = accounts
-        .all_addresses()
-        .flat_map(|(_, addrs)| addrs)
-        .collect();
+    let all_addresses: Vec<_> = accounts.all_addresses().flat_map(|(_, addrs)| addrs).collect();
 
     match args.format.as_str() {
         "plain" => {

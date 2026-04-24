@@ -5,12 +5,12 @@
 //! - JSON (machine-readable)
 //! - ClickHouse (for time-series storage)
 
-use crate::metrics::{BenchMetrics, BlockStats, RunStats, TimeSeriesMetrics};
-use crate::sample::Sample;
-use eyre::{Context, Result, bail};
-use std::collections::HashMap;
-use std::io::Write;
-use std::path::Path;
+use crate::{
+    metrics::{BenchMetrics, BlockStats, RunStats, TimeSeriesMetrics},
+    sample::Sample,
+};
+use eyre::{bail, Context, Result};
+use std::{collections::HashMap, io::Write, path::Path};
 
 /// Unified final report passed to reporters at finalization.
 ///
@@ -109,28 +109,19 @@ pub struct ConsoleReporter<W: Write + Send = Box<dyn Write + Send>> {
 impl ConsoleReporter {
     /// Create a new console reporter writing to stdout.
     pub fn stdout(show_progress: bool) -> Self {
-        Self {
-            writer: Box::new(std::io::stdout()),
-            show_progress,
-        }
+        Self { writer: Box::new(std::io::stdout()), show_progress }
     }
 
     /// Create a new console reporter writing to stderr.
     pub fn stderr(show_progress: bool) -> Self {
-        Self {
-            writer: Box::new(std::io::stderr()),
-            show_progress,
-        }
+        Self { writer: Box::new(std::io::stderr()), show_progress }
     }
 }
 
 impl<W: Write + Send> ConsoleReporter<W> {
     /// Create a new console reporter with a custom writer.
     pub fn new(writer: W, show_progress: bool) -> Self {
-        Self {
-            writer,
-            show_progress,
-        }
+        Self { writer, show_progress }
     }
 }
 
@@ -147,11 +138,7 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
 
             if state.max_concurrent > 0 {
                 let inflight = state.inflight();
-                write!(
-                    self.writer,
-                    " | Inflight: {}/{}",
-                    inflight, state.max_concurrent
-                )?;
+                write!(self.writer, " | Inflight: {}/{}", inflight, state.max_concurrent)?;
             }
 
             write!(self.writer, " | Rate: {:.0}", rate)?;
@@ -199,21 +186,9 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
             writeln!(self.writer, "  Successful:      {:>10}", metrics.success)?;
             writeln!(self.writer, "  Failed:          {:>10}", metrics.failed)?;
             writeln!(self.writer)?;
-            writeln!(
-                self.writer,
-                "  Duration:        {:>10.2}s",
-                metrics.elapsed.as_secs_f64()
-            )?;
-            writeln!(
-                self.writer,
-                "  Throughput:      {:>10.2} tx/s",
-                metrics.tps()
-            )?;
-            writeln!(
-                self.writer,
-                "  Success Rate:    {:>10.1}%",
-                metrics.success_rate()
-            )?;
+            writeln!(self.writer, "  Duration:        {:>10.2}s", metrics.elapsed.as_secs_f64())?;
+            writeln!(self.writer, "  Throughput:      {:>10.2} tx/s", metrics.tps())?;
+            writeln!(self.writer, "  Success Rate:    {:>10.1}%", metrics.success_rate())?;
             writeln!(self.writer)?;
             writeln!(self.writer, "  Latency:")?;
             writeln!(
@@ -259,31 +234,11 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
             writeln!(self.writer, "    Count:         {:>10}", run.total_blocks)?;
             writeln!(self.writer, "    Total Txs:     {:>10}", run.total_txs)?;
             writeln!(self.writer, "    Avg TPS:       {:>10.2}", run.avg_tps)?;
-            writeln!(
-                self.writer,
-                "    Blocks/s:      {:>10.2}",
-                run.avg_blocks_per_second
-            )?;
-            writeln!(
-                self.writer,
-                "    Avg Gas/s:     {:>10.2}",
-                run.avg_gas_per_second
-            )?;
-            writeln!(
-                self.writer,
-                "    Block Time P50:{:>10}ms",
-                run.block_time_p50_ms
-            )?;
-            writeln!(
-                self.writer,
-                "    Block Time P95:{:>10}ms",
-                run.block_time_p95_ms
-            )?;
-            writeln!(
-                self.writer,
-                "    Block Time P99:{:>10}ms",
-                run.block_time_p99_ms
-            )?;
+            writeln!(self.writer, "    Blocks/s:      {:>10.2}", run.avg_blocks_per_second)?;
+            writeln!(self.writer, "    Avg Gas/s:     {:>10.2}", run.avg_gas_per_second)?;
+            writeln!(self.writer, "    Block Time P50:{:>10}ms", run.block_time_p50_ms)?;
+            writeln!(self.writer, "    Block Time P95:{:>10}ms", run.block_time_p95_ms)?;
+            writeln!(self.writer, "    Block Time P99:{:>10}ms", run.block_time_p99_ms)?;
         }
 
         writeln!(self.writer)?;
@@ -390,17 +345,13 @@ pub struct JsonReporter<W: Write + Send = Box<dyn Write + Send>> {
 impl JsonReporter {
     /// Create a JSON reporter writing to stdout.
     pub fn stdout() -> Self {
-        Self {
-            writer: Box::new(std::io::stdout()),
-        }
+        Self { writer: Box::new(std::io::stdout()) }
     }
 
     /// Create a JSON reporter writing to a file.
     pub fn file(path: &Path) -> Result<JsonReporter<std::io::BufWriter<std::fs::File>>> {
         let file = std::fs::File::create(path).context("failed to create output file")?;
-        Ok(JsonReporter {
-            writer: std::io::BufWriter::new(file),
-        })
+        Ok(JsonReporter { writer: std::io::BufWriter::new(file) })
     }
 }
 
@@ -413,9 +364,9 @@ impl<W: Write + Send> JsonReporter<W> {
 
 impl<W: Write + Send> Reporter for JsonReporter<W> {
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
-        let has_data = report.bench_metrics.is_some()
-            || !report.blocks.is_empty()
-            || !report.samples.is_empty();
+        let has_data = report.bench_metrics.is_some() ||
+            !report.blocks.is_empty() ||
+            !report.samples.is_empty();
         if !has_data {
             return Ok(());
         }
@@ -464,17 +415,10 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
                 (None, None, None, None, None, None, None, None)
             };
 
-        let blocks = if report.blocks.is_empty() {
-            None
-        } else {
-            Some(report.blocks.clone())
-        };
+        let blocks = if report.blocks.is_empty() { None } else { Some(report.blocks.clone()) };
 
-        let metadata = if report.metadata.is_empty() {
-            None
-        } else {
-            Some(report.metadata.clone())
-        };
+        let metadata =
+            if report.metadata.is_empty() { None } else { Some(report.metadata.clone()) };
 
         let json_report = JsonReport {
             sent,
@@ -544,11 +488,8 @@ impl ClickHouseConfig {
         mode: &str,
         metadata: &HashMap<String, String>,
     ) -> Result<Self> {
-        let missing: Vec<&str> = REQUIRED_METADATA
-            .iter()
-            .filter(|k| !metadata.contains_key(**k))
-            .copied()
-            .collect();
+        let missing: Vec<&str> =
+            REQUIRED_METADATA.iter().filter(|k| !metadata.contains_key(**k)).copied().collect();
         if !missing.is_empty() {
             bail!(
                 "ClickHouse reporter requires metadata: {}. Use -m key=value for each.",
@@ -637,17 +578,11 @@ impl ClickHouseReporter {
             body.push('\n');
         }
 
-        let query = format!(
-            "INSERT INTO {}.{} FORMAT JSONEachRow",
-            self.config.database, table
-        );
+        let query = format!("INSERT INTO {}.{} FORMAT JSONEachRow", self.config.database, table);
         let url = format!("{}/?query={}", self.config.url, urlencoding::encode(&query));
 
         let rt = tokio::runtime::Handle::current();
-        let mut req = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/json");
+        let mut req = self.client.post(&url).header("Content-Type", "application/json");
         if let Some(ref user) = self.config.user {
             req = req.header("X-ClickHouse-User", user);
         }
@@ -714,11 +649,7 @@ impl ClickHouseReporter {
         samples
             .iter()
             .map(|s| {
-                let source = if s.name.starts_with("txgen_") {
-                    "txgen"
-                } else {
-                    "prometheus"
-                };
+                let source = if s.name.starts_with("txgen_") { "txgen" } else { "prometheus" };
                 ClickHouseMetricSampleRow {
                     run_id: self.config.run_id,
                     offset_ms: s.offset_ms,
@@ -891,10 +822,7 @@ mod tests {
     }
 
     fn sample_report() -> FinalReport {
-        FinalReport {
-            bench_metrics: Some(sample_metrics()),
-            ..Default::default()
-        }
+        FinalReport { bench_metrics: Some(sample_metrics()), ..Default::default() }
     }
 
     #[test]

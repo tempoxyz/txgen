@@ -55,13 +55,7 @@ fn parse_line(line: &str, offset_ms: u64, unix_ms: u64) -> Option<Sample> {
     let value_str = rest.split_whitespace().next()?;
     let value = parse_value(value_str)?;
 
-    Some(Sample {
-        name: name.to_string(),
-        labels,
-        value,
-        offset_ms,
-        unix_ms,
-    })
+    Some(Sample { name: name.to_string(), labels, value, offset_ms, unix_ms })
 }
 
 /// Parse the label portion inside `{...}`.

@@ -2,8 +2,7 @@
 
 use bench_core::{BenchMetrics, ConsoleReporter, FinalReport, JsonReport, LatencyStats, Reporter};
 use eyre::{Context, Result};
-use std::fs;
-use std::time::Duration;
+use std::{fs, time::Duration};
 
 use crate::ViewArgs;
 
