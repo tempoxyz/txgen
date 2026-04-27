@@ -1,25 +1,31 @@
-# Tempo mainnet spam workload
-# Uses test mnemonic - addresses should be funded with tempo_fundAddress
+# Tempo mainnet spam workload.
 #
-# Tempo mainnet does NOT support native value transfers.
-# All transfers must be TIP20 token transfers.
+# Uses the standard test mnemonic. Make sure derived addresses are funded first,
+# for example with tempo_fundAddress.
+#
+# Tempo mainnet does NOT support native value transfers. All transfers in this
+# file are TIP20 token transfers.
 
 chain_id: 4217
 
+# Mainnet gas price settings (10 gwei).
 gas:
-  max_fee_per_gas: 10000000000       # 10 gwei
+  max_fee_per_gas: 10000000000
   max_priority_fee_per_gas: 10000000000
 
 accounts:
+  # Use a high derivation range so these addresses do not overlap with the
+  # smaller local examples.
   spammers:
     mnemonic: "test test test test test test test test test test test junk"
     range: [300, 400]
 
 artifacts:
+  # ERC-20 ABI used by the TIP20 transfer calls below.
   ERC20: erc20.abi.json
 
 templates:
-  # TIP20 token transfer (USDC on Tempo)
+  # TIP20 token transfer (USDC on Tempo).
   tip20_transfer:
     type: tempo
     from:
@@ -29,15 +35,14 @@ templates:
     max_fee_per_gas: 10000000000
     max_priority_fee_per_gas: 10000000000
     call:
-      to: "0x20c000000000000000000000033abb6ac7d235e5"  # USDC on Tempo
+      to: "0x20c000000000000000000000033abb6ac7d235e5"  # USDC on Tempo.
       abi: ERC20
       function: transfer
       args:
-        - "0x000000000000000000000000000000000000dEaD"  # burn address
-        - 1  # 1 wei of USDC
+        - "0x000000000000000000000000000000000000dEaD"  # Burn address.
+        - 1  # 1 wei of USDC.
 
-  # Parallel nonce for higher throughput
-  # Using high nonce_key range to get fresh lanes
+  # Parallel nonce for higher throughput.
   tip20_parallel:
     type: tempo
     from:
@@ -47,16 +52,17 @@ templates:
     max_fee_per_gas: 10000000000
     max_priority_fee_per_gas: 10000000000
     nonce_key:
-      uniform: [0, 100]  # 100 lanes per account, reused across txs
+      uniform: [0, 100]  # 100 nonce lanes per account, reused across txs.
     call:
-      to: "0x20c000000000000000000000033abb6ac7d235e5"  # USDC on Tempo
+      to: "0x20c000000000000000000000033abb6ac7d235e5"  # USDC on Tempo.
       abi: ERC20
       function: transfer
       args:
-        - "0x000000000000000000000000000000000000dEaD"  # burn address
-        - 1  # 1 wei of USDC
+        - "0x000000000000000000000000000000000000dEaD"  # Burn address.
+        - 1  # 1 wei of USDC.
 
 mix:
+  # Bias the mix toward parallel-lane transactions for higher throughput.
   - template: tip20_transfer
     weight: 30
   - template: tip20_parallel

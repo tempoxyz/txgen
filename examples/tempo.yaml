@@ -1,12 +1,18 @@
+# Tempo feature showcase workload.
+#
+# Demonstrates native Tempo transactions, 2D nonce lanes, expiring nonces, and a
+# regular EIP-1559 transaction in one weighted mix.
+
 chain_id: 1
 
 accounts:
+  # Deterministic senders for every template in this file.
   users:
     mnemonic: "test test test test test test test test test test test junk"
     range: [0, 10]
 
 templates:
-  # Tempo native transaction (0x76)
+  # Tempo native transaction (0x76).
   tempo_transfer:
     type: tempo
     from:
@@ -18,7 +24,7 @@ templates:
     max_fee_per_gas: 1000000000
     max_priority_fee_per_gas: 1000000000
 
-  # Tempo with parallel nonce (for higher throughput)
+  # Tempo with parallel nonce (for higher throughput).
   tempo_parallel:
     type: tempo
     from:
@@ -29,9 +35,9 @@ templates:
     gas_limit: 300000
     max_fee_per_gas: 1000000000
     max_priority_fee_per_gas: 1000000000
-    nonce_key: "42"  # Use parallel nonce key
+    nonce_key: "42"  # Use a non-zero 2D nonce lane.
 
-  # Tempo expiring nonce (TIP-1009)
+  # Tempo expiring nonce (TIP-1009).
   # txgen sets nonce_key=U256::MAX and nonce=0 automatically.
   # 25s is the recommended benchmark setting; keep it within Tempo's 30-second max.
   tempo_expiring:
@@ -47,7 +53,7 @@ templates:
     expiring_nonce: true
     valid_for_secs: 25
 
-  # EIP-1559 (delegated to ethereum plugin)
+  # EIP-1559 transaction delegated to the Ethereum plugin.
   eip1559_transfer:
     type: eip1559
     from:
@@ -60,6 +66,7 @@ templates:
     max_priority_fee_per_gas: 1000000000
 
 mix:
+  # Weighted workload mix. Higher weights are selected more often.
   - template: tempo_transfer
     weight: 40
   - template: tempo_parallel

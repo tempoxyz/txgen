@@ -1,21 +1,29 @@
+# Minimal sequence workload.
+#
+# A sequence emits multiple ordered transactions from one workload item. Bindings
+# are resolved once per sequence instance, then reused by every step.
+
 chain_id: 1
 
 accounts:
+  # Sender and recipient accounts are selected from this deterministic pool.
   users:
     mnemonic: "test test test test test test test test test test test junk"
     range: [0, 10]
 
 templates:
+  # Template with fields bound at sequence-generation time.
   bound_transfer:
     type: eip1559
-    from: { var: sender.ref }
-    to: { var: recipient.address }
-    value: { var: amount }
+    from: { var: sender.ref }        # Account reference selected by the sequence.
+    to: { var: recipient.address }   # Address selected by the sequence.
+    value: { var: amount }           # Random amount selected by the sequence.
     gas_limit: 21000
     max_fee_per_gas: 1000000000
     max_priority_fee_per_gas: 1000000000
 
 sequences:
+  # Emits two transfers that share the same sender, recipient, and amount.
   two_transfers:
     bindings:
       sender:
@@ -30,11 +38,13 @@ sequences:
         u256:
           uniform: [1, 100]
     steps:
+      # Both steps use the bound_transfer template and the bindings above.
       - name: first
         template: bound_transfer
       - name: second
         template: bound_transfer
 
 mix:
+  # Generate only the two-transfer sequence.
   - sequence: two_transfers
     weight: 100

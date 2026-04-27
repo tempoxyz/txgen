@@ -1,16 +1,24 @@
+# Minimal Ethereum EIP-1559 workload.
+#
+# Generates simple native-value transfers from deterministic test accounts to a
+# fixed recipient address. Use this as the smallest complete txgen spec.
+
+# Ethereum mainnet chain ID. Change this to match your target network.
 chain_id: 1
 
 accounts:
+  # Deterministic sender pool derived from the standard test mnemonic.
   users:
     mnemonic: "test test test test test test test test test test test junk"
-    range: [0, 10]
+    range: [0, 10]  # Derive accounts m/44'/60'/0'/0/0 through /9.
 
 templates:
+  # A basic EIP-1559 native transfer.
   transfer:
     type: eip1559
     from:
       pool: users
-      select: random
+      select: random  # Pick a sender from the users pool for each transaction.
     to: "0x0000000000000000000000000000000000000001"
     value: 1000
     gas_limit: 21000
@@ -18,5 +26,6 @@ templates:
     max_priority_fee_per_gas: 1000000000
 
 mix:
+  # The workload contains only the transfer template.
   - template: transfer
     weight: 100

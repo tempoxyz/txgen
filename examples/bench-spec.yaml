@@ -1,18 +1,28 @@
+# Bench TIP20 token-transfer workload.
+#
+# This spec is intended for high-volume benchmark runs. It creates a large pool
+# of deterministic senders and repeatedly calls ERC20.transfer on Tempo's TIP20
+# predeploy address.
+
 chain_id: 1337
 
+# Default gas settings used by templates unless they override them.
 gas:
   max_fee_per_gas: 100000000000
   max_priority_fee_per_gas: 100000000000
 
 accounts:
+  # Large account pool for benchmark fan-out.
   users:
     mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
     range: [0, 10000]
 
 artifacts:
+  # ABI names can be referenced by contract calls below.
   ERC20: erc20.abi.json
 
 templates:
+  # Tempo transaction that calls ERC20.transfer(address,uint256).
   tip20_transfer:
     type: tempo
     from:
@@ -22,13 +32,14 @@ templates:
     max_fee_per_gas: 100000000000
     max_priority_fee_per_gas: 100000000000
     call:
-      to: "0x20c0000000000000000000000000000000000000"
+      to: "0x20c0000000000000000000000000000000000000"  # TIP20 predeploy.
       abi: ERC20
       function: transfer
       args:
-        - "0x000000000000000000000000000000000000dEaD"
+        - "0x000000000000000000000000000000000000dEaD"  # Recipient/burn address.
         - 1
 
 mix:
+  # The benchmark emits only TIP20 transfers.
   - template: tip20_transfer
     weight: 100

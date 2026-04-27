@@ -19,22 +19,27 @@
 
 chain_id: 1337
 
+# Default gas settings for this local Tempo/TIP20 workload.
 gas:
   max_fee_per_gas: 100000000000
   max_priority_fee_per_gas: 100000000000
 
 accounts:
+  # Owners hold tokens and approve spenders.
   owners:
     mnemonic: "test test test test test test test test test test test junk"
     range: [0, 10]
+  # Spenders submit transferFrom after approval.
   spenders:
     mnemonic: "test test test test test test test test test test test junk"
     range: [10, 20]
 
 artifacts:
+  # ERC-20 ABI used by transfer, approve, and transferFrom calls.
   ERC20: erc20.abi.json
 
 templates:
+  # Standalone TIP20 transfer used directly by the mix.
   tip20_transfer:
     type: tempo
     from:
@@ -44,36 +49,39 @@ templates:
     max_fee_per_gas: 100000000000
     max_priority_fee_per_gas: 100000000000
     call:
-      to: "0x20c0000000000000000000000000000000000000"
+      to: "0x20c0000000000000000000000000000000000000"  # TIP20 predeploy.
       abi: ERC20
       function: transfer
       args:
         - "0x000000000000000000000000000000000000dEaD"
         - 1
 
+  # Approval template. The sequence step fills in from/spender/amount.
   tip20_approve:
     type: tempo
     gas_limit: 1000000
     max_fee_per_gas: 100000000000
     max_priority_fee_per_gas: 100000000000
     call:
-      to: "0x20c0000000000000000000000000000000000000"
+      to: "0x20c0000000000000000000000000000000000000"  # TIP20 predeploy.
       abi: ERC20
       function: approve
       args: []
 
+  # transferFrom template. The sequence step fills in from/owner/recipient/amount.
   tip20_transfer_from:
     type: tempo
     gas_limit: 1000000
     max_fee_per_gas: 100000000000
     max_priority_fee_per_gas: 100000000000
     call:
-      to: "0x20c0000000000000000000000000000000000000"
+      to: "0x20c0000000000000000000000000000000000000"  # TIP20 predeploy.
       abi: ERC20
       function: transferFrom
       args: []
 
 sequences:
+  # Approve once, then spend the approved allowance in the next step.
   approve_then_transfer_from:
     bindings:
       owner:
@@ -111,6 +119,7 @@ sequences:
               - { var: transfer_amount }
 
 mix:
+  # Half of workload items are standalone transfers; half are two-step sequences.
   - template: tip20_transfer
     weight: 50
   - sequence: approve_then_transfer_from
