@@ -4,7 +4,7 @@ use alloy_signer_local::{coins_bip39::English, LocalSigner, MnemonicBuilder};
 use eyre::{bail, Result, WrapErr};
 use k256::ecdsa::SigningKey;
 use rand::Rng;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 
 /// Type alias for our signer type.
@@ -119,13 +119,34 @@ pub struct AccountRef {
 }
 
 /// How to select an account from a pool.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone)]
 pub enum SelectMode {
     /// Select randomly.
     Random,
     /// Select by specific index.
     Index(usize),
+}
+
+impl<'de> Deserialize<'de> for SelectMode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum SelectModeDef {
+            Name(String),
+            Index { index: usize },
+        }
+
+        match SelectModeDef::deserialize(deserializer)? {
+            SelectModeDef::Name(name) if name == "random" => Ok(SelectMode::Random),
+            SelectModeDef::Name(other) => {
+                Err(serde::de::Error::unknown_variant(&other, &["random", "index"]))
+            }
+            SelectModeDef::Index { index } => Ok(SelectMode::Index(index)),
+        }
+    }
 }
 
 /// Extension trait for LocalSigner to get the address.

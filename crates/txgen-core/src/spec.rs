@@ -1,4 +1,5 @@
-use crate::AccountPoolDef;
+use crate::{AccountPoolDef, AccountRef, GenValue};
+use alloy_primitives::{Address, U256};
 use eyre::{Result, WrapErr};
 use serde::Deserialize;
 use std::{collections::HashMap, env, path::PathBuf};
@@ -25,7 +26,11 @@ pub struct WorkloadSpec {
     #[serde(default)]
     pub templates: HashMap<String, serde_yaml::Value>,
 
-    /// Weighted mix of templates for generation.
+    /// Transaction sequences keyed by name.
+    #[serde(default)]
+    pub sequences: HashMap<String, SequenceDef>,
+
+    /// Weighted mix of templates and sequences for generation.
     #[serde(default)]
     pub mix: Vec<MixEntry>,
 }
@@ -56,13 +61,77 @@ fn default_priority_fee() -> u128 {
     1_000_000_000 // 1 gwei
 }
 
-/// Entry in the weighted template mix.
+/// Entry in the weighted workload mix.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MixEntry {
-    /// Template name (must exist in templates).
-    pub template: String,
+    /// Template name (must exist in templates). Mutually exclusive with `sequence`.
+    #[serde(default)]
+    pub template: Option<String>,
+    /// Sequence name (must exist in sequences). Mutually exclusive with `template`.
+    #[serde(default)]
+    pub sequence: Option<String>,
     /// Relative weight for random selection.
     pub weight: u64,
+}
+
+/// A multi-transaction workload unit.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SequenceDef {
+    /// Values resolved once per sequence instance and reused by steps.
+    #[serde(default)]
+    pub bindings: HashMap<String, SequenceBinding>,
+    /// Ordered transaction steps.
+    pub steps: Vec<SequenceStep>,
+}
+
+/// A transaction step in a sequence.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SequenceStep {
+    /// Optional human-readable step name for diagnostics.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Template name to instantiate for this step.
+    pub template: String,
+    /// Per-step YAML overlay applied over the referenced template.
+    #[serde(default, rename = "with")]
+    pub with_value: serde_yaml::Value,
+}
+
+/// A sequence binding definition.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SequenceBinding {
+    /// Select an account once. Exposes `<name>.ref` and `<name>.address`.
+    #[serde(default)]
+    pub account: Option<AccountRef>,
+    /// Resolve an address once.
+    #[serde(default)]
+    pub address: Option<GenValue<Address>>,
+    /// Resolve a U256 once.
+    #[serde(default)]
+    pub u256: Option<GenValue<U256>>,
+    /// Resolve a u64 once.
+    #[serde(default)]
+    pub u64: Option<GenValue<u64>>,
+    /// Resolve a string once.
+    #[serde(default)]
+    pub string: Option<GenValue<String>>,
+    /// Resolve a Tempo nonce key once.
+    #[serde(default)]
+    pub nonce_key: Option<NonceKeyBinding>,
+}
+
+/// Sequence-scoped Tempo nonce-key binding.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NonceKeyBinding {
+    /// Generate a deterministic unique key per sequence instance.
+    #[serde(default)]
+    pub unique: bool,
+    /// Base added to generated unique keys.
+    #[serde(default)]
+    pub base: Option<U256>,
+    /// Explicit/generated value when `unique` is false.
+    #[serde(default)]
+    pub value: Option<GenValue<U256>>,
 }
 
 impl WorkloadSpec {

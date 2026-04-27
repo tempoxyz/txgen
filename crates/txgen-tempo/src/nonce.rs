@@ -179,24 +179,66 @@ pub async fn prefetch_parallel_nonces<P: Provider<Ethereum> + Clone + Send + Syn
 fn collect_prefetchable_parallel_nonce_keys(
     spec: &txgen_core::WorkloadSpec,
 ) -> std::collections::HashSet<U256> {
-    use crate::TempoTemplate;
-    use txgen_core::GenValue;
-
     let mut nonce_keys = std::collections::HashSet::new();
 
     for entry in &spec.mix {
-        if let Some(value) = spec.templates.get(&entry.template)
-            && let Ok(template) = serde_yaml::from_value::<TempoTemplate>(value.clone())
-            && !template.expiring_nonce
-            && let Some(GenValue::Literal(key)) = &template.nonce_key
-            && !key.is_zero()
-            && *key != TEMPO_EXPIRING_NONCE_KEY
+        if let Some(template_name) = &entry.template {
+            if let Some(value) = spec.templates.get(template_name) {
+                collect_nonce_key_from_template_value(value.clone(), &mut nonce_keys);
+            }
+        } else if let Some(sequence_name) = &entry.sequence
+            && let Some(sequence) = spec.sequences.get(sequence_name)
         {
-            nonce_keys.insert(*key);
+            for step in &sequence.steps {
+                if let Some(base) = spec.templates.get(&step.template) {
+                    let mut value = base.clone();
+                    merge_yaml(&mut value, step.with_value.clone());
+                    collect_nonce_key_from_template_value(value, &mut nonce_keys);
+                }
+            }
         }
     }
 
     nonce_keys
+}
+
+fn collect_nonce_key_from_template_value(
+    value: serde_yaml::Value,
+    nonce_keys: &mut std::collections::HashSet<U256>,
+) {
+    use crate::TempoTemplate;
+    use txgen_core::GenValue;
+
+    if let Ok(template) = serde_yaml::from_value::<TempoTemplate>(value)
+        && !template.expiring_nonce
+        && let Some(GenValue::Literal(key)) = &template.nonce_key
+        && !key.is_zero()
+        && *key != TEMPO_EXPIRING_NONCE_KEY
+    {
+        nonce_keys.insert(*key);
+    }
+}
+
+fn merge_yaml(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
+    if matches!(overlay, serde_yaml::Value::Null) {
+        return;
+    }
+
+    match (base, overlay) {
+        (serde_yaml::Value::Mapping(base_map), serde_yaml::Value::Mapping(overlay_map)) => {
+            for (key, value) in overlay_map {
+                match base_map.get_mut(&key) {
+                    Some(base_value) => merge_yaml(base_value, value),
+                    None => {
+                        base_map.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base_value, overlay_value) => {
+            *base_value = overlay_value;
+        }
+    }
 }
 
 /// Compute the storage key for a (address, nonce_key) pair in the nonce precompile.

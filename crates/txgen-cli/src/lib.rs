@@ -1,7 +1,7 @@
 use alloy_consensus::{BlockHeader, Sealed, SignableTransaction, Signed};
 use alloy_eips::{eip2718::Encodable2718, BlockNumberOrTag};
 use alloy_network::{Network, TransactionBuilder, TxSignerSync};
-use alloy_primitives::Bytes;
+use alloy_primitives::{keccak256, Address, Bytes, U256};
 use alloy_provider::{ext::DebugApi, Provider};
 use alloy_rlp::Decodable;
 use clap::{Args, Parser, Subcommand};
@@ -10,8 +10,8 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{io::Write, path::PathBuf};
 use tokio::sync::mpsc;
 use txgen_core::{
-    AccountManager, ArtifactManager, BuildContext, GeneratedTx, NdjsonWriter, NonceTracker,
-    WorkloadSpec,
+    AccountManager, ArtifactManager, BuildContext, GeneratedTx, NdjsonWriter, NonceKeyBinding,
+    NonceTracker, SequenceBinding, WorkloadSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -238,18 +238,12 @@ where
 // Public helpers — used by per-network generate implementations
 // ---------------------------------------------------------------------------
 
-/// Pick a random template and deserialize it from the spec.
-pub fn load_template<T: serde::de::DeserializeOwned>(
-    spec: &WorkloadSpec,
-    rng: &mut StdRng,
-    total_weight: u64,
-) -> Result<(String, T)> {
-    let name = pick_template(spec, rng, total_weight)?;
+/// Deserialize a named template from the spec.
+pub fn load_template<T: serde::de::DeserializeOwned>(spec: &WorkloadSpec, name: &str) -> Result<T> {
     let value =
-        spec.templates.get(&name).ok_or_else(|| eyre::eyre!("template '{}' not found", name))?;
-    let template: T = serde_yaml::from_value(value.clone())
-        .wrap_err_with(|| format!("failed to parse template '{}'", name))?;
-    Ok((name, template))
+        spec.templates.get(name).ok_or_else(|| eyre::eyre!("template '{}' not found", name))?;
+    serde_yaml::from_value(value.clone())
+        .wrap_err_with(|| format!("failed to parse template '{}'", name))
 }
 
 /// Fetch protocol nonces (nonce_key=0) for all accounts from an EVM RPC.
@@ -313,9 +307,8 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    let total_weight = ctx.spec.total_weight();
-    if total_weight == 0 {
-        bail!("no templates in mix (total weight is 0)");
+    if ctx.spec.total_weight() == 0 {
+        bail!("no workload entries in mix (total weight is 0)");
     }
 
     let mut build_ctx = BuildContext::new(
@@ -330,36 +323,176 @@ where
     match output {
         Some(path) => {
             let mut writer = txgen_core::output::file_writer(&path)?;
-            generate_txs(adapter, &ctx.spec, count, total_weight, &mut build_ctx, &mut writer)?;
-            eprintln!("wrote {} transactions to {}", count, path.display());
+            let written = generate_txs(adapter, &ctx.spec, count, &mut build_ctx, &mut writer)?;
+            eprintln!("wrote {} transactions to {}", written, path.display());
         }
         None => {
             let mut writer = txgen_core::output::stdout_writer();
-            generate_txs(adapter, &ctx.spec, count, total_weight, &mut build_ctx, &mut writer)?;
+            generate_txs(adapter, &ctx.spec, count, &mut build_ctx, &mut writer)?;
         }
     }
 
     Ok(())
 }
 
-fn pick_template(spec: &WorkloadSpec, rng: &mut StdRng, total_weight: u64) -> Result<String> {
-    let roll = rng.random_range(0..total_weight);
-    let mut cumulative = 0;
+#[derive(Debug, Clone)]
+enum WorkloadItem {
+    Template(String),
+    Sequence(String),
+}
+
+#[derive(Debug, Clone)]
+enum ResolvedBinding {
+    Account { pool: String, index: usize, address: Address },
+    Address(Address),
+    U256(U256),
+    U64(u64),
+    String(String),
+}
+
+const SEQUENCE_COUNTER_KEY: [u8; 20] = *b"txgen-sequence-key!!";
+
+fn pick_workload_item(
+    spec: &WorkloadSpec,
+    rng: &mut StdRng,
+    remaining_txs: u64,
+) -> Result<Option<WorkloadItem>> {
+    let mut total_weight = 0u64;
+    let mut candidates = Vec::new();
+
     for entry in &spec.mix {
-        cumulative += entry.weight;
-        if roll < cumulative {
-            return Ok(entry.template.clone());
+        let item = match (&entry.template, &entry.sequence) {
+            (Some(template), None) => WorkloadItem::Template(template.clone()),
+            (None, Some(sequence)) => WorkloadItem::Sequence(sequence.clone()),
+            (Some(_), Some(_)) => {
+                bail!("mix entries must set either `template` or `sequence`, not both")
+            }
+            (None, None) => bail!("mix entries must set either `template` or `sequence`"),
+        };
+
+        let tx_count = workload_item_tx_count(spec, &item)?;
+        if tx_count > 0 && tx_count <= remaining_txs && entry.weight > 0 {
+            total_weight = total_weight
+                .checked_add(entry.weight)
+                .ok_or_else(|| eyre::eyre!("mix weights overflowed u64"))?;
+            candidates.push((item, entry.weight));
         }
     }
-    // SAFETY: Should not reach here if total_weight > 0 and mix is non-empty
-    unreachable!("template selection failed with roll={} total_weight={}", roll, total_weight)
+
+    if total_weight == 0 {
+        return Ok(None);
+    }
+
+    let roll = rng.random_range(0..total_weight);
+    let mut cumulative = 0;
+    for (item, weight) in candidates {
+        cumulative += weight;
+        if roll < cumulative {
+            return Ok(Some(item));
+        }
+    }
+
+    unreachable!("workload selection failed with roll={roll} total_weight={total_weight}")
+}
+
+fn workload_item_tx_count(spec: &WorkloadSpec, item: &WorkloadItem) -> Result<u64> {
+    match item {
+        WorkloadItem::Template(name) => {
+            if !spec.templates.contains_key(name) {
+                bail!("template '{}' not found", name);
+            }
+            Ok(1)
+        }
+        WorkloadItem::Sequence(name) => {
+            let sequence = spec
+                .sequences
+                .get(name)
+                .ok_or_else(|| eyre::eyre!("sequence '{}' not found", name))?;
+            if sequence.steps.is_empty() {
+                bail!("sequence '{}' has no steps", name);
+            }
+            Ok(sequence.steps.len() as u64)
+        }
+    }
 }
 
 fn generate_txs<A: NetworkAdapter, W: Write>(
     adapter: &A,
     spec: &WorkloadSpec,
     count: u64,
-    total_weight: u64,
+    ctx: &mut BuildContext<'_>,
+    writer: &mut NdjsonWriter<W>,
+) -> Result<u64>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let mut written = 0u64;
+
+    while written < count {
+        let remaining = count - written;
+        let Some(item) = pick_workload_item(spec, ctx.rng, remaining)? else {
+            break;
+        };
+
+        match item {
+            WorkloadItem::Template(name) => {
+                let value = spec
+                    .templates
+                    .get(&name)
+                    .ok_or_else(|| eyre::eyre!("template '{}' not found", name))?
+                    .clone();
+                emit_template_value(adapter, &name, value, &[], ctx, writer)?;
+                written += 1;
+            }
+            WorkloadItem::Sequence(name) => {
+                let sequence = spec
+                    .sequences
+                    .get(&name)
+                    .ok_or_else(|| eyre::eyre!("sequence '{}' not found", name))?;
+                let sequence_instance = ctx.next_nonce(SEQUENCE_COUNTER_KEY);
+                let sequence_key = compute_sequence_key(&name, sequence_instance);
+                let bindings =
+                    resolve_sequence_bindings(&sequence.bindings, sequence_instance, ctx)
+                        .wrap_err_with(|| {
+                            format!("failed to resolve bindings for sequence '{name}'")
+                        })?;
+
+                for (idx, step) in sequence.steps.iter().enumerate() {
+                    let label = step.name.as_deref().unwrap_or(&step.template);
+                    let base = spec
+                        .templates
+                        .get(&step.template)
+                        .ok_or_else(|| eyre::eyre!("template '{}' not found", step.template))?
+                        .clone();
+                    let merged = merge_template_overlay(base, step.with_value.clone());
+                    let materialized = substitute_vars(merged, &bindings).wrap_err_with(|| {
+                        format!("failed to materialize sequence '{name}' step {idx} ('{label}')")
+                    })?;
+                    emit_template_value(
+                        adapter,
+                        &format!("{name}.{label}"),
+                        materialized,
+                        &[sequence_key],
+                        ctx,
+                        writer,
+                    )?;
+                    written += 1;
+                }
+            }
+        }
+    }
+
+    writer.flush()?;
+    Ok(written)
+}
+
+fn emit_template_value<A: NetworkAdapter, W: Write>(
+    adapter: &A,
+    name: &str,
+    value: serde_yaml::Value,
+    extra_scheduling_keys: &[[u8; 20]],
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
 ) -> Result<()>
@@ -368,31 +501,231 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    for _ in 0..count {
-        let (name, template) = load_template::<A::Template>(spec, ctx.rng, total_weight)?;
+    let template: A::Template = serde_yaml::from_value(value)
+        .wrap_err_with(|| format!("failed to parse template '{name}'"))?;
 
-        let tx_req = adapter
-            .build_request(template, ctx)
-            .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
+    let tx_req = adapter
+        .build_request(template, ctx)
+        .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
 
-        let mut unsigned = tx_req
-            .request
-            .build_unsigned()
-            .map_err(|e| eyre::eyre!("failed to build unsigned tx from template '{name}': {e}"))?;
+    let mut unsigned = tx_req
+        .request
+        .build_unsigned()
+        .map_err(|e| eyre::eyre!("failed to build unsigned tx from template '{name}': {e}"))?;
 
-        let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?;
-        let sig = signer
-            .sign_transaction_sync(&mut unsigned)
-            .map_err(|e| eyre::eyre!("failed to sign tx from template '{name}': {e}"))?;
+    let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?;
+    let sig = signer
+        .sign_transaction_sync(&mut unsigned)
+        .map_err(|e| eyre::eyre!("failed to sign tx from template '{name}': {e}"))?;
 
-        let signed = unsigned.into_signed(sig);
-        let envelope = <A::Network as Network>::TxEnvelope::from(signed);
-        let raw = Bytes::from(envelope.encoded_2718());
+    let signed = unsigned.into_signed(sig);
+    let envelope = <A::Network as Network>::TxEnvelope::from(signed);
+    let raw = Bytes::from(envelope.encoded_2718());
 
-        writer.write(&GeneratedTx { raw, scheduling_keys: vec![tx_req.key] })?;
+    let mut scheduling_keys = Vec::with_capacity(1 + extra_scheduling_keys.len());
+    scheduling_keys.push(tx_req.key);
+    for key in extra_scheduling_keys {
+        if !scheduling_keys.contains(key) {
+            scheduling_keys.push(*key);
+        }
     }
-    writer.flush()?;
+
+    writer.write(&GeneratedTx { raw, scheduling_keys })?;
     Ok(())
+}
+
+fn resolve_sequence_bindings(
+    bindings: &std::collections::HashMap<String, SequenceBinding>,
+    sequence_instance: u64,
+    ctx: &mut BuildContext<'_>,
+) -> Result<std::collections::HashMap<String, ResolvedBinding>> {
+    let mut resolved = std::collections::HashMap::new();
+
+    for (name, binding) in bindings {
+        let fields_set = [
+            binding.account.is_some(),
+            binding.address.is_some(),
+            binding.u256.is_some(),
+            binding.u64.is_some(),
+            binding.string.is_some(),
+            binding.nonce_key.is_some(),
+        ]
+        .into_iter()
+        .filter(|set| *set)
+        .count();
+
+        if fields_set != 1 {
+            bail!("binding '{name}' must set exactly one binding type");
+        }
+
+        let value = if let Some(account) = &binding.account {
+            let selected = ctx.select_signer(account)?;
+            ResolvedBinding::Account {
+                pool: selected.pool,
+                index: selected.index,
+                address: selected.address,
+            }
+        } else if let Some(address) = &binding.address {
+            ResolvedBinding::Address(ctx.resolve_value(address)?)
+        } else if let Some(u256) = &binding.u256 {
+            ResolvedBinding::U256(ctx.resolve_value(u256)?)
+        } else if let Some(u64_value) = &binding.u64 {
+            ResolvedBinding::U64(ctx.resolve_value(u64_value)?)
+        } else if let Some(string) = &binding.string {
+            ResolvedBinding::String(ctx.resolve_value(string)?)
+        } else if let Some(nonce_key) = &binding.nonce_key {
+            ResolvedBinding::U256(resolve_nonce_key_binding(nonce_key, sequence_instance, ctx)?)
+        } else {
+            unreachable!("fields_set verified exactly one binding type")
+        };
+
+        resolved.insert(name.clone(), value);
+    }
+
+    Ok(resolved)
+}
+
+fn resolve_nonce_key_binding(
+    binding: &NonceKeyBinding,
+    sequence_instance: u64,
+    ctx: &mut BuildContext<'_>,
+) -> Result<U256> {
+    if binding.unique {
+        if binding.value.is_some() {
+            bail!("unique nonce_key bindings must not also set `value`");
+        }
+        return binding
+            .base
+            .unwrap_or(U256::ZERO)
+            .checked_add(U256::from(sequence_instance))
+            .ok_or_else(|| eyre::eyre!("unique nonce_key binding overflowed U256"));
+    }
+
+    let value = binding.value.as_ref().ok_or_else(|| {
+        eyre::eyre!("nonce_key bindings require either `unique: true` or `value`")
+    })?;
+    ctx.resolve_value(value)
+}
+
+fn compute_sequence_key(sequence_name: &str, sequence_instance: u64) -> [u8; 20] {
+    let mut data = Vec::with_capacity(16 + sequence_name.len() + 8);
+    data.extend_from_slice(b"txgen:sequence:");
+    data.extend_from_slice(sequence_name.as_bytes());
+    data.extend_from_slice(&sequence_instance.to_be_bytes());
+
+    let hash = keccak256(data);
+    let mut key = [0u8; 20];
+    key.copy_from_slice(&hash[..20]);
+    key
+}
+
+fn merge_template_overlay(
+    mut base: serde_yaml::Value,
+    overlay: serde_yaml::Value,
+) -> serde_yaml::Value {
+    if matches!(overlay, serde_yaml::Value::Null) {
+        return base;
+    }
+    merge_yaml(&mut base, overlay);
+    base
+}
+
+fn merge_yaml(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
+    match (base, overlay) {
+        (serde_yaml::Value::Mapping(base_map), serde_yaml::Value::Mapping(overlay_map)) => {
+            for (key, value) in overlay_map {
+                match base_map.get_mut(&key) {
+                    Some(base_value) => merge_yaml(base_value, value),
+                    None => {
+                        base_map.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base_value, overlay_value) => {
+            *base_value = overlay_value;
+        }
+    }
+}
+
+fn substitute_vars(
+    value: serde_yaml::Value,
+    bindings: &std::collections::HashMap<String, ResolvedBinding>,
+) -> Result<serde_yaml::Value> {
+    match value {
+        serde_yaml::Value::Mapping(mapping) if mapping.len() == 1 => {
+            let var_key = serde_yaml::Value::String("var".to_string());
+            if let Some(serde_yaml::Value::String(path)) = mapping.get(&var_key) {
+                return binding_to_value(path, bindings);
+            }
+            let substituted = mapping
+                .into_iter()
+                .map(|(key, value)| Ok((key, substitute_vars(value, bindings)?)))
+                .collect::<Result<serde_yaml::Mapping>>()?;
+            Ok(serde_yaml::Value::Mapping(substituted))
+        }
+        serde_yaml::Value::Mapping(mapping) => {
+            let substituted = mapping
+                .into_iter()
+                .map(|(key, value)| Ok((key, substitute_vars(value, bindings)?)))
+                .collect::<Result<serde_yaml::Mapping>>()?;
+            Ok(serde_yaml::Value::Mapping(substituted))
+        }
+        serde_yaml::Value::Sequence(values) => {
+            let substituted = values
+                .into_iter()
+                .map(|value| substitute_vars(value, bindings))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(serde_yaml::Value::Sequence(substituted))
+        }
+        other => Ok(other),
+    }
+}
+
+fn binding_to_value(
+    path: &str,
+    bindings: &std::collections::HashMap<String, ResolvedBinding>,
+) -> Result<serde_yaml::Value> {
+    let (name, field) =
+        path.split_once('.').map_or((path, None), |(name, field)| (name, Some(field)));
+    let binding =
+        bindings.get(name).ok_or_else(|| eyre::eyre!("unknown sequence binding '{name}'"))?;
+
+    match (binding, field) {
+        (ResolvedBinding::Account { pool, index, .. }, Some("ref")) => {
+            account_ref_value(pool, *index)
+        }
+        (ResolvedBinding::Account { address, .. }, Some("address")) => {
+            Ok(serde_yaml::Value::String(address.to_string()))
+        }
+        (ResolvedBinding::Account { .. }, None) => {
+            bail!("account binding '{name}' requires `.ref` or `.address`")
+        }
+        (ResolvedBinding::Address(address), None) => {
+            Ok(serde_yaml::Value::String(address.to_string()))
+        }
+        (ResolvedBinding::U256(value), None) => Ok(serde_yaml::Value::String(value.to_string())),
+        (ResolvedBinding::U64(value), None) => Ok(serde_yaml::to_value(value)?),
+        (ResolvedBinding::String(value), None) => Ok(serde_yaml::Value::String(value.clone())),
+        (_, Some(field)) => bail!("binding '{name}' has no field '{field}'"),
+    }
+}
+
+fn account_ref_value(pool: &str, index: usize) -> Result<serde_yaml::Value> {
+    let mut select = serde_yaml::Mapping::new();
+    select.insert(serde_yaml::Value::String("index".to_string()), serde_yaml::to_value(index)?);
+
+    let mut account = serde_yaml::Mapping::new();
+    account.insert(
+        serde_yaml::Value::String("pool".to_string()),
+        serde_yaml::Value::String(pool.to_string()),
+    );
+    account.insert(
+        serde_yaml::Value::String("select".to_string()),
+        serde_yaml::Value::Mapping(select),
+    );
+
+    Ok(serde_yaml::Value::Mapping(account))
 }
 
 // ---------------------------------------------------------------------------
