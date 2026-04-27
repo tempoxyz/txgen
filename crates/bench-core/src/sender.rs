@@ -46,7 +46,7 @@ type SchedulingKeys = Vec<SchedulingKey>;
 
 type KeySets = (SchedulingKeys, SchedulingKeys);
 
-const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A transaction to be sent.
