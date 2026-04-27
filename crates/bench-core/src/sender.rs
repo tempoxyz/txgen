@@ -243,7 +243,7 @@ async fn submit_tx(
         keys
     };
 
-    let Ok(_permit) = semaphore.acquire().await else {
+    let Ok(permit) = semaphore.acquire().await else {
         tracing::warn!("Failed to acquire concurrency permit");
         metrics.record_failure();
         release_keys(&completion_tx, release_all_keys());
@@ -269,6 +269,8 @@ async fn submit_tx(
             return;
         }
     };
+
+    drop(permit);
 
     release_keys(&completion_tx, pending.submission_keys);
 
