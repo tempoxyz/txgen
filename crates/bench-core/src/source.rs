@@ -12,7 +12,7 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
 };
-use txgen_core::GeneratedTx;
+use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey};
 
 /// A transaction read from a source.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -20,11 +20,11 @@ pub struct SourceTx {
     /// Raw transaction bytes (hex-encoded with 0x prefix).
     pub raw: String,
     /// Scheduling keys released once RPC submission succeeds (hex-encoded with 0x prefix).
-    pub submission_keys: Vec<String>,
+    pub submission_keys: Vec<SchedulingKey>,
     /// Scheduling keys released once a transaction receipt is observed (hex-encoded with 0x
     /// prefix).
     #[serde(default)]
-    pub inclusion_keys: Vec<String>,
+    pub inclusion_keys: Vec<SchedulingKey>,
 }
 
 impl SourceTx {
@@ -37,8 +37,8 @@ impl SourceTx {
             .parse::<Bytes>()
             .context("invalid raw tx hex")?;
 
-        let submission_keys = parse_keys(self.submission_keys)?;
-        let inclusion_keys = parse_keys(self.inclusion_keys)?;
+        let submission_keys = dedup_scheduling_keys(self.submission_keys);
+        let inclusion_keys = dedup_scheduling_keys(self.inclusion_keys);
 
         if submission_keys.is_empty() && inclusion_keys.is_empty() {
             eyre::bail!("transactions must have at least one submission or inclusion key");
@@ -46,25 +46,6 @@ impl SourceTx {
 
         Ok(GeneratedTx { raw, submission_keys, inclusion_keys })
     }
-}
-
-fn parse_keys(keys: Vec<String>) -> Result<Vec<[u8; 20]>> {
-    let mut parsed_keys = Vec::with_capacity(keys.len());
-    for key in keys {
-        let key_bytes =
-            hex::decode(key.strip_prefix("0x").unwrap_or(&key)).context("invalid key hex")?;
-
-        if key_bytes.len() != 20 {
-            eyre::bail!("scheduling key must be 20 bytes, got {}", key_bytes.len());
-        }
-
-        let mut parsed = [0u8; 20];
-        parsed.copy_from_slice(&key_bytes);
-        if !parsed_keys.contains(&parsed) {
-            parsed_keys.push(parsed);
-        }
-    }
-    Ok(parsed_keys)
 }
 
 /// Transaction source trait.
@@ -211,7 +192,7 @@ mod tests {
         .unwrap();
 
         let generated = source_tx.into_generated_tx().unwrap();
-        assert_eq!(generated.submission_keys, vec![[0x11; 20]]);
-        assert_eq!(generated.inclusion_keys, vec![[0x22; 20]]);
+        assert_eq!(generated.submission_keys, vec![SchedulingKey::from([0x11; 20])]);
+        assert_eq!(generated.inclusion_keys, vec![SchedulingKey::from([0x22; 20])]);
     }
 }

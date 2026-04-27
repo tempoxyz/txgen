@@ -19,7 +19,7 @@ use tokio::{
     sync::{mpsc, Semaphore},
     task::JoinHandle,
 };
-use txgen_core::GeneratedTx;
+use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey};
 
 /// Configuration for the sender.
 #[derive(Debug, Clone)]
@@ -42,7 +42,7 @@ impl Default for SenderConfig {
     }
 }
 
-type SchedulingKeys = Vec<[u8; 20]>;
+type SchedulingKeys = Vec<SchedulingKey>;
 
 type KeySets = (SchedulingKeys, SchedulingKeys);
 
@@ -57,7 +57,7 @@ struct PendingTx {
 }
 
 impl PendingTx {
-    fn scheduling_keys(&self) -> impl Iterator<Item = &[u8; 20]> {
+    fn scheduling_keys(&self) -> impl Iterator<Item = &SchedulingKey> {
         self.submission_keys.iter().chain(self.inclusion_keys.iter())
     }
 }
@@ -70,7 +70,7 @@ pub struct Sender {
     /// Transactions waiting for all of their scheduling keys to become free.
     pending: VecDeque<PendingTx>,
     /// Scheduling keys currently held by dispatched transactions.
-    active_keys: HashSet<[u8; 20]>,
+    active_keys: HashSet<SchedulingKey>,
     completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
     completion_rx: mpsc::UnboundedReceiver<SchedulingKeys>,
     /// Worker task handles for awaiting completion.
@@ -160,7 +160,7 @@ impl Sender {
         }
     }
 
-    fn release_keys(&mut self, keys: &[[u8; 20]]) {
+    fn release_keys(&mut self, keys: &[SchedulingKey]) {
         for key in keys {
             self.active_keys.remove(key);
         }
@@ -207,8 +207,8 @@ fn normalize_key_sets(
     submission_keys: SchedulingKeys,
     inclusion_keys: SchedulingKeys,
 ) -> Result<KeySets> {
-    let inclusion_keys = dedup_keys(inclusion_keys);
-    let mut submission_keys = dedup_keys(submission_keys);
+    let inclusion_keys = dedup_scheduling_keys(inclusion_keys);
+    let mut submission_keys = dedup_scheduling_keys(submission_keys);
 
     // If a key appears in both sets, keep the stricter release policy.
     submission_keys.retain(|key| !inclusion_keys.contains(key));
@@ -218,16 +218,6 @@ fn normalize_key_sets(
     }
 
     Ok((submission_keys, inclusion_keys))
-}
-
-fn dedup_keys(keys: SchedulingKeys) -> SchedulingKeys {
-    let mut normalized = Vec::with_capacity(keys.len());
-    for key in keys {
-        if !normalized.contains(&key) {
-            normalized.push(key);
-        }
-    }
-    normalized
 }
 
 async fn submit_tx(

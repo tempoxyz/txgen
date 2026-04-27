@@ -3,6 +3,7 @@ mod accounts;
 mod nonce;
 pub mod output;
 mod plugin;
+mod scheduling_key;
 mod spec;
 mod value;
 mod yaml;
@@ -14,6 +15,7 @@ pub use accounts::{
 pub use nonce::{NonceProvider, NonceTracker};
 pub use output::{GeneratedTx, NdjsonWriter};
 pub use plugin::{BuildContext, SelectedSigner};
+pub use scheduling_key::{dedup_scheduling_keys, SchedulingKey};
 pub use spec::{
     GasConfig, MixEntry, MixItem, SequenceBinding, SequenceDef, SequenceStep, WorkloadSpec,
 };
