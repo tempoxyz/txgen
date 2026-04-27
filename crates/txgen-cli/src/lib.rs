@@ -350,8 +350,6 @@ enum ResolvedBinding {
     String(String),
 }
 
-const SEQUENCE_COUNTER_KEY: [u8; 20] = *b"txgen-sequence-key!!";
-
 fn pick_workload_item(
     spec: &WorkloadSpec,
     rng: &mut StdRng,
@@ -429,6 +427,7 @@ where
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
     let mut written = 0u64;
+    let mut sequence_instances = 0u64;
 
     while written < count {
         let remaining = count - written;
@@ -451,7 +450,10 @@ where
                     .sequences
                     .get(&name)
                     .ok_or_else(|| eyre::eyre!("sequence '{}' not found", name))?;
-                let sequence_instance = ctx.next_nonce(SEQUENCE_COUNTER_KEY);
+                let sequence_instance = sequence_instances;
+                sequence_instances = sequence_instances
+                    .checked_add(1)
+                    .ok_or_else(|| eyre::eyre!("sequence instance counter overflowed u64"))?;
                 let sequence_key = compute_sequence_key(&name, sequence_instance);
                 let bindings =
                     resolve_sequence_bindings(&sequence.bindings, sequence_instance, ctx)
