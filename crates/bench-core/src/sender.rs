@@ -42,14 +42,18 @@ impl Default for SenderConfig {
     }
 }
 
+type SchedulingKeys = Vec<[u8; 20]>;
+
+type KeySets = (SchedulingKeys, SchedulingKeys);
+
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A transaction to be sent.
 struct PendingTx {
     raw: Bytes,
-    submission_keys: Vec<[u8; 20]>,
-    inclusion_keys: Vec<[u8; 20]>,
+    submission_keys: SchedulingKeys,
+    inclusion_keys: SchedulingKeys,
 }
 
 impl PendingTx {
@@ -67,8 +71,8 @@ pub struct Sender {
     pending: VecDeque<PendingTx>,
     /// Scheduling keys currently held by dispatched transactions.
     active_keys: HashSet<[u8; 20]>,
-    completion_tx: mpsc::UnboundedSender<Vec<[u8; 20]>>,
-    completion_rx: mpsc::UnboundedReceiver<Vec<[u8; 20]>>,
+    completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
+    completion_rx: mpsc::UnboundedReceiver<SchedulingKeys>,
     /// Worker task handles for awaiting completion.
     worker_handles: Vec<JoinHandle<()>>,
     /// Rate limiter tokens.
@@ -200,9 +204,9 @@ impl Sender {
 }
 
 fn normalize_key_sets(
-    submission_keys: Vec<[u8; 20]>,
-    inclusion_keys: Vec<[u8; 20]>,
-) -> Result<(Vec<[u8; 20]>, Vec<[u8; 20]>)> {
+    submission_keys: SchedulingKeys,
+    inclusion_keys: SchedulingKeys,
+) -> Result<KeySets> {
     let inclusion_keys = dedup_keys(inclusion_keys);
     let mut submission_keys = dedup_keys(submission_keys);
 
@@ -216,7 +220,7 @@ fn normalize_key_sets(
     Ok((submission_keys, inclusion_keys))
 }
 
-fn dedup_keys(keys: Vec<[u8; 20]>) -> Vec<[u8; 20]> {
+fn dedup_keys(keys: SchedulingKeys) -> SchedulingKeys {
     let mut normalized = Vec::with_capacity(keys.len());
     for key in keys {
         if !normalized.contains(&key) {
@@ -231,7 +235,7 @@ async fn submit_tx(
     providers: Vec<DynProvider<AnyNetwork>>,
     metrics: Arc<MetricsCollector>,
     semaphore: Arc<Semaphore>,
-    completion_tx: mpsc::UnboundedSender<Vec<[u8; 20]>>,
+    completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
 ) {
     let release_all_keys = || {
         let mut keys = pending.submission_keys.clone();
@@ -272,7 +276,7 @@ async fn submit_tx(
         return;
     }
 
-    if let Err(e) = wait_for_receipt(&provider, tx_hash).await {
+    if let Err(e) = wait_for_receipt(provider, tx_hash).await {
         tracing::warn!(error = %e, %tx_hash, "Failed waiting for transaction receipt");
         metrics.record_failure();
     }
@@ -280,7 +284,7 @@ async fn submit_tx(
     release_keys(&completion_tx, pending.inclusion_keys);
 }
 
-fn release_keys(completion_tx: &mpsc::UnboundedSender<Vec<[u8; 20]>>, keys: Vec<[u8; 20]>) {
+fn release_keys(completion_tx: &mpsc::UnboundedSender<SchedulingKeys>, keys: SchedulingKeys) {
     if !keys.is_empty() {
         let _ = completion_tx.send(keys);
     }

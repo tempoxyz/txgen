@@ -154,11 +154,11 @@ fn yaml_to_sol_value(
     // Handle generator expressions
     if value.is_mapping() {
         // Check if it's a generator
-        if value.get("uniform").is_some()
-            || value.get("choice").is_some()
-            || value.get("pool").is_some()
-            || value.get("random_bytes").is_some()
-            || value.get("const").is_some()
+        if value.get("uniform").is_some() ||
+            value.get("choice").is_some() ||
+            value.get("pool").is_some() ||
+            value.get("random_bytes").is_some() ||
+            value.get("const").is_some()
         {
             return resolve_generator_to_sol(value, sol_type, resolver);
         }
