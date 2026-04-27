@@ -477,27 +477,8 @@ Supported binding references:
 | `u256` | `<name>` |
 | `u64` | `<name>` |
 | `string` | `<name>` |
-| `nonce_key` | `<name>` |
 
 Each emitted sequence step gets both its natural nonce-lane scheduling key and a synthetic sequence-instance scheduling key. Bench treats all scheduling keys the same: sharing any key serializes submission.
-
-Tempo sequence-scoped nonce lanes can be generated with `nonce_key` bindings:
-
-```yaml
-bindings:
-  lane:
-    nonce_key:
-      unique: true
-      base: 1000000000
-
-steps:
-  - template: tempo_step_a
-    with:
-      nonce_key: { var: lane }
-  - template: tempo_step_b
-    with:
-      nonce_key: { var: lane }
-```
 
 `txgen generate -n` counts emitted transactions, not sequence instances. txgen never emits a partial sequence; if no remaining mix entry fits the remaining transaction budget, generation stops early.
 
