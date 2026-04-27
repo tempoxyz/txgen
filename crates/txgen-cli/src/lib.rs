@@ -389,7 +389,7 @@ where
         let envelope = <A::Network as Network>::TxEnvelope::from(signed);
         let raw = Bytes::from(envelope.encoded_2718());
 
-        writer.write(&GeneratedTx { raw, key: tx_req.key })?;
+        writer.write(&GeneratedTx { raw, scheduling_keys: vec![tx_req.key] })?;
     }
     writer.flush()?;
     Ok(())

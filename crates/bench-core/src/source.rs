@@ -19,8 +19,8 @@ use txgen_core::GeneratedTx;
 pub struct SourceTx {
     /// Raw transaction bytes (hex-encoded with 0x prefix).
     pub raw: String,
-    /// Scheduling key (hex-encoded with 0x prefix).
-    pub key: String,
+    /// Scheduling keys (hex-encoded with 0x prefix).
+    pub scheduling_keys: Vec<String>,
 }
 
 impl SourceTx {
@@ -33,17 +33,27 @@ impl SourceTx {
             .parse::<Bytes>()
             .context("invalid raw tx hex")?;
 
-        let key_bytes = hex::decode(self.key.strip_prefix("0x").unwrap_or(&self.key))
-            .context("invalid key hex")?;
-
-        if key_bytes.len() != 20 {
-            eyre::bail!("key must be 20 bytes, got {}", key_bytes.len());
+        if self.scheduling_keys.is_empty() {
+            eyre::bail!("scheduling_keys must not be empty");
         }
 
-        let mut key = [0u8; 20];
-        key.copy_from_slice(&key_bytes);
+        let mut scheduling_keys = Vec::with_capacity(self.scheduling_keys.len());
+        for key in self.scheduling_keys {
+            let key_bytes =
+                hex::decode(key.strip_prefix("0x").unwrap_or(&key)).context("invalid key hex")?;
 
-        Ok(GeneratedTx { raw, key })
+            if key_bytes.len() != 20 {
+                eyre::bail!("scheduling key must be 20 bytes, got {}", key_bytes.len());
+            }
+
+            let mut parsed = [0u8; 20];
+            parsed.copy_from_slice(&key_bytes);
+            if !scheduling_keys.contains(&parsed) {
+                scheduling_keys.push(parsed);
+            }
+        }
+
+        Ok(GeneratedTx { raw, scheduling_keys })
     }
 }
 

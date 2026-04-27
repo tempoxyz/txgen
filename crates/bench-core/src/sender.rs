@@ -11,7 +11,7 @@ use alloy_provider::{DynProvider, Provider};
 use eyre::Result;
 use rand::seq::IndexedRandom;
 use std::{
-    collections::HashMap,
+    collections::{HashSet, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -45,7 +45,7 @@ impl Default for SenderConfig {
 /// A transaction to be sent.
 struct PendingTx {
     raw: Bytes,
-    key: [u8; 20],
+    scheduling_keys: Vec<[u8; 20]>,
 }
 
 /// Transaction sender.
@@ -53,8 +53,12 @@ pub struct Sender {
     providers: Vec<DynProvider<AnyNetwork>>,
     metrics: Arc<MetricsCollector>,
     semaphore: Arc<Semaphore>,
-    /// Per-key queues to ensure ordering.
-    key_queues: HashMap<[u8; 20], mpsc::Sender<PendingTx>>,
+    /// Transactions waiting for all of their scheduling keys to become free.
+    pending: VecDeque<PendingTx>,
+    /// Scheduling keys currently held by dispatched transactions.
+    active_keys: HashSet<[u8; 20]>,
+    completion_tx: mpsc::UnboundedSender<Vec<[u8; 20]>>,
+    completion_rx: mpsc::UnboundedReceiver<Vec<[u8; 20]>>,
     /// Worker task handles for awaiting completion.
     worker_handles: Vec<JoinHandle<()>>,
     /// Rate limiter tokens.
@@ -76,11 +80,16 @@ impl Sender {
             None
         };
 
+        let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+
         Self {
             providers,
             metrics,
             semaphore,
-            key_queues: HashMap::new(),
+            pending: VecDeque::new(),
+            active_keys: HashSet::new(),
+            completion_tx,
+            completion_rx,
             worker_handles: Vec::new(),
             rate_limiter,
         }
@@ -88,8 +97,8 @@ impl Sender {
 
     /// Send a transaction.
     ///
-    /// This respects scheduling key ordering: transactions with the same key
-    /// are sent sequentially, while transactions with different keys can be
+    /// This respects scheduling key ordering: transactions that share any key
+    /// are sent sequentially, while transactions with disjoint key sets can be
     /// sent in parallel.
     pub async fn send(&mut self, tx: GeneratedTx) -> Result<()> {
         // Apply rate limiting before enqueueing to provide backpressure
@@ -99,75 +108,134 @@ impl Sender {
             limiter.acquire().await;
         }
 
-        let pending = PendingTx { raw: tx.raw, key: tx.key };
+        self.drain_completions();
 
-        // Get or create the queue for this key.
-        let queue = match self.key_queues.entry(pending.key) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let (sender, receiver) = mpsc::channel(1024);
-
-                // Spawn a worker for this key.
-                let providers = self.providers.clone();
-                let metrics = self.metrics.clone();
-                let semaphore = self.semaphore.clone();
-
-                let handle = tokio::spawn(async move {
-                    key_worker(receiver, providers, metrics, semaphore).await;
-                });
-                self.worker_handles.push(handle);
-
-                e.insert(sender)
-            }
-        };
-
-        if queue.send(pending).await.is_err() {
-            tracing::warn!("Failed to enqueue transaction, worker channel closed");
-            self.metrics.record_failure();
-        }
+        let scheduling_keys = normalize_keys(tx.scheduling_keys)?;
+        self.pending.push_back(PendingTx { raw: tx.raw, scheduling_keys });
+        self.schedule_ready();
 
         Ok(())
     }
 
     /// Wait for all pending transactions to complete.
     pub async fn flush(&mut self) {
-        // Drop all senders to signal workers to stop.
-        self.key_queues.clear();
+        self.drain_completions();
+        self.schedule_ready();
 
-        // Wait for all workers to finish processing.
+        while !self.pending.is_empty() || !self.active_keys.is_empty() {
+            match self.completion_rx.recv().await {
+                Some(keys) => {
+                    self.release_keys(&keys);
+                    self.drain_completions();
+                    self.schedule_ready();
+                }
+                None => break,
+            }
+        }
+
         for handle in self.worker_handles.drain(..) {
             let _ = handle.await;
         }
     }
-}
 
-/// Worker that processes transactions for a single scheduling key.
-async fn key_worker(
-    mut receiver: mpsc::Receiver<PendingTx>,
-    providers: Vec<DynProvider<AnyNetwork>>,
-    metrics: Arc<MetricsCollector>,
-    semaphore: Arc<Semaphore>,
-) {
-    while let Some(pending) = receiver.recv().await {
-        // Acquire semaphore permit.
-        let _permit = semaphore.acquire().await;
-        metrics.record_sent();
+    fn drain_completions(&mut self) {
+        while let Ok(keys) = self.completion_rx.try_recv() {
+            self.release_keys(&keys);
+        }
+    }
 
-        // Pick a random provider for this request.
-        // SAFETY: `providers` is guaranteed to be non-empty by construction.
-        let provider = providers.choose(&mut rand::rng()).unwrap();
+    fn release_keys(&mut self, keys: &[[u8; 20]]) {
+        for key in keys {
+            self.active_keys.remove(key);
+        }
+    }
 
-        let start = Instant::now();
-        match provider.send_raw_transaction(&pending.raw).await {
-            Ok(_pending_tx) => {
-                metrics.record_success(start.elapsed());
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to send transaction");
-                metrics.record_failure();
+    fn schedule_ready(&mut self) {
+        let mut blocked_keys = self.active_keys.clone();
+        let mut index = 0;
+
+        while index < self.pending.len() {
+            let is_ready =
+                self.pending[index].scheduling_keys.iter().all(|key| !blocked_keys.contains(key));
+
+            if is_ready {
+                let pending = self.pending.remove(index).expect("pending index exists");
+                for key in &pending.scheduling_keys {
+                    self.active_keys.insert(*key);
+                    blocked_keys.insert(*key);
+                }
+                self.dispatch(pending);
+            } else {
+                for key in &self.pending[index].scheduling_keys {
+                    blocked_keys.insert(*key);
+                }
+                index += 1;
             }
         }
     }
+
+    fn dispatch(&mut self, pending: PendingTx) {
+        let providers = self.providers.clone();
+        let metrics = self.metrics.clone();
+        let semaphore = self.semaphore.clone();
+        let completion_tx = self.completion_tx.clone();
+
+        let handle = tokio::spawn(async move {
+            submit_tx(pending, providers, metrics, semaphore, completion_tx).await;
+        });
+        self.worker_handles.push(handle);
+    }
+}
+
+fn normalize_keys(keys: Vec<[u8; 20]>) -> Result<Vec<[u8; 20]>> {
+    if keys.is_empty() {
+        eyre::bail!("scheduling_keys must not be empty");
+    }
+
+    let mut normalized = Vec::with_capacity(keys.len());
+    for key in keys {
+        if !normalized.contains(&key) {
+            normalized.push(key);
+        }
+    }
+    Ok(normalized)
+}
+
+async fn submit_tx(
+    pending: PendingTx,
+    providers: Vec<DynProvider<AnyNetwork>>,
+    metrics: Arc<MetricsCollector>,
+    semaphore: Arc<Semaphore>,
+    completion_tx: mpsc::UnboundedSender<Vec<[u8; 20]>>,
+) {
+    let completion_keys = pending.scheduling_keys.clone();
+
+    match semaphore.acquire().await {
+        Ok(_permit) => {
+            metrics.record_sent();
+
+            // Pick a random provider for this request.
+            // SAFETY: `providers` is guaranteed to be non-empty by construction.
+            let provider = providers.choose(&mut rand::rng()).unwrap();
+
+            let start = Instant::now();
+            match provider.send_raw_transaction(&pending.raw).await {
+                Ok(_pending_tx) => {
+                    metrics.record_success(start.elapsed());
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to send transaction");
+                    metrics.record_failure();
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to acquire concurrency permit");
+            metrics.record_failure();
+        }
+    }
+
+    let _ = completion_tx.send(completion_keys);
 }
 
 /// Token-budget rate limiter.
