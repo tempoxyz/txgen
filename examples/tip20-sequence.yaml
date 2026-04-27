@@ -1,0 +1,117 @@
+# TIP20 workload with dependent transaction sequences.
+#
+# This mixes standalone TIP20 transfers with a two-step sequence:
+#   1. owner approves spender
+#   2. spender calls transferFrom(owner, recipient, amount)
+#
+# The second step depends on the first step's allowance state, so both steps
+# share a sequence inclusion key and bench waits for the approve receipt before
+# submitting transferFrom.
+#
+# With the weights below, workload item selection is 50/50. Because a sequence
+# emits two transactions, `txgen generate -n 100` will produce roughly:
+#   - 1/3 standalone transfer txs
+#   - 2/3 sequence txs, i.e. approve + transferFrom pairs
+#
+# If you want a 50/50 split by emitted transaction count instead, use weights:
+#   - template: 2
+#   - sequence: 1
+
+chain_id: 1337
+
+gas:
+  max_fee_per_gas: 100000000000
+  max_priority_fee_per_gas: 100000000000
+
+accounts:
+  owners:
+    mnemonic: "test test test test test test test test test test test junk"
+    range: [0, 10]
+  spenders:
+    mnemonic: "test test test test test test test test test test test junk"
+    range: [10, 20]
+
+artifacts:
+  ERC20: erc20.abi.json
+
+templates:
+  tip20_transfer:
+    type: tempo
+    from:
+      pool: owners
+      select: random
+    gas_limit: 1000000
+    max_fee_per_gas: 100000000000
+    max_priority_fee_per_gas: 100000000000
+    call:
+      to: "0x20c0000000000000000000000000000000000000"
+      abi: ERC20
+      function: transfer
+      args:
+        - "0x000000000000000000000000000000000000dEaD"
+        - 1
+
+  tip20_approve:
+    type: tempo
+    gas_limit: 1000000
+    max_fee_per_gas: 100000000000
+    max_priority_fee_per_gas: 100000000000
+    call:
+      to: "0x20c0000000000000000000000000000000000000"
+      abi: ERC20
+      function: approve
+      args: []
+
+  tip20_transfer_from:
+    type: tempo
+    gas_limit: 1000000
+    max_fee_per_gas: 100000000000
+    max_priority_fee_per_gas: 100000000000
+    call:
+      to: "0x20c0000000000000000000000000000000000000"
+      abi: ERC20
+      function: transferFrom
+      args: []
+
+sequences:
+  approve_then_transfer_from:
+    bindings:
+      owner:
+        account:
+          pool: owners
+          select: random
+      spender:
+        account:
+          pool: spenders
+          select: random
+      recipient:
+        address:
+          const: "0x000000000000000000000000000000000000dEaD"
+      approval_amount:
+        u256: 1000000
+      transfer_amount:
+        u256: 1
+    steps:
+      - name: approve
+        template: tip20_approve
+        with:
+          from: { var: owner.ref }
+          call:
+            args:
+              - { var: spender.address }
+              - { var: approval_amount }
+      - name: transfer_from
+        template: tip20_transfer_from
+        with:
+          from: { var: spender.ref }
+          call:
+            args:
+              - { var: owner.address }
+              - { var: recipient }
+              - { var: transfer_amount }
+
+mix:
+  - template: tip20_transfer
+    weight: 50
+  - sequence: approve_then_transfer_from
+    weight: 50

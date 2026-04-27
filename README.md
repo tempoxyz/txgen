@@ -484,6 +484,8 @@ Each emitted sequence step gets its natural nonce-lane key as a `submission_key`
 
 `txgen generate -n` counts emitted transactions, not sequence instances. txgen never emits a partial sequence; if no remaining mix entry fits the remaining transaction budget, generation stops early.
 
+See `examples/sequence.yaml` for a small syntax example and `examples/tip20-sequence.yaml` for a Tempo TIP20 `approve -> transferFrom` sequence whose second transaction depends on the first.
+
 ## Supported Chains
 
 ### Ethereum (`txgen-ethereum`)
