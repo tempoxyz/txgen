@@ -10,8 +10,8 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{io::Write, path::PathBuf};
 use tokio::sync::mpsc;
 use txgen_core::{
-    AccountManager, ArtifactManager, BuildContext, GeneratedTx, NdjsonWriter, NonceKeyBinding,
-    NonceTracker, SequenceBinding, WorkloadSpec,
+    AccountManager, ArtifactManager, BuildContext, GeneratedTx, NdjsonWriter, NonceTracker,
+    SequenceBinding, WorkloadSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -456,10 +456,9 @@ where
                     .ok_or_else(|| eyre::eyre!("sequence instance counter overflowed u64"))?;
                 let sequence_key = compute_sequence_key(&name, sequence_instance);
                 let bindings =
-                    resolve_sequence_bindings(&sequence.bindings, sequence_instance, ctx)
-                        .wrap_err_with(|| {
-                            format!("failed to resolve bindings for sequence '{name}'")
-                        })?;
+                    resolve_sequence_bindings(&sequence.bindings, ctx).wrap_err_with(|| {
+                        format!("failed to resolve bindings for sequence '{name}'")
+                    })?;
 
                 for (idx, step) in sequence.steps.iter().enumerate() {
                     let label = step.name.as_deref().unwrap_or(&step.template);
@@ -538,7 +537,6 @@ where
 
 fn resolve_sequence_bindings(
     bindings: &std::collections::HashMap<String, SequenceBinding>,
-    sequence_instance: u64,
     ctx: &mut BuildContext<'_>,
 ) -> Result<std::collections::HashMap<String, ResolvedBinding>> {
     let mut resolved = std::collections::HashMap::new();
@@ -550,7 +548,6 @@ fn resolve_sequence_bindings(
             binding.u256.is_some(),
             binding.u64.is_some(),
             binding.string.is_some(),
-            binding.nonce_key.is_some(),
         ]
         .into_iter()
         .filter(|set| *set)
@@ -575,8 +572,6 @@ fn resolve_sequence_bindings(
             ResolvedBinding::U64(ctx.resolve_value(u64_value)?)
         } else if let Some(string) = &binding.string {
             ResolvedBinding::String(ctx.resolve_value(string)?)
-        } else if let Some(nonce_key) = &binding.nonce_key {
-            ResolvedBinding::U256(resolve_nonce_key_binding(nonce_key, sequence_instance, ctx)?)
         } else {
             unreachable!("fields_set verified exactly one binding type")
         };
@@ -585,28 +580,6 @@ fn resolve_sequence_bindings(
     }
 
     Ok(resolved)
-}
-
-fn resolve_nonce_key_binding(
-    binding: &NonceKeyBinding,
-    sequence_instance: u64,
-    ctx: &mut BuildContext<'_>,
-) -> Result<U256> {
-    if binding.unique {
-        if binding.value.is_some() {
-            bail!("unique nonce_key bindings must not also set `value`");
-        }
-        return binding
-            .base
-            .unwrap_or(U256::ZERO)
-            .checked_add(U256::from(sequence_instance))
-            .ok_or_else(|| eyre::eyre!("unique nonce_key binding overflowed U256"));
-    }
-
-    let value = binding.value.as_ref().ok_or_else(|| {
-        eyre::eyre!("nonce_key bindings require either `unique: true` or `value`")
-    })?;
-    ctx.resolve_value(value)
 }
 
 fn compute_sequence_key(sequence_name: &str, sequence_instance: u64) -> [u8; 20] {

@@ -115,23 +115,6 @@ pub struct SequenceBinding {
     /// Resolve a string once.
     #[serde(default)]
     pub string: Option<GenValue<String>>,
-    /// Resolve a Tempo nonce key once.
-    #[serde(default)]
-    pub nonce_key: Option<NonceKeyBinding>,
-}
-
-/// Sequence-scoped Tempo nonce-key binding.
-#[derive(Debug, Clone, Deserialize)]
-pub struct NonceKeyBinding {
-    /// Generate a deterministic unique key per sequence instance.
-    #[serde(default)]
-    pub unique: bool,
-    /// Base added to generated unique keys.
-    #[serde(default)]
-    pub base: Option<U256>,
-    /// Explicit/generated value when `unique` is false.
-    #[serde(default)]
-    pub value: Option<GenValue<U256>>,
 }
 
 impl WorkloadSpec {
@@ -253,10 +236,6 @@ sequences:
         account: { pool: users, select: { index: 1 } }
       amount:
         u256: { uniform: [1, 10] }
-      lane:
-        nonce_key:
-          unique: true
-          base: 1000
     steps:
       - name: first
         template: transfer
@@ -271,7 +250,7 @@ mix:
         let spec = WorkloadSpec::parse(yaml).unwrap();
         let sequence = &spec.sequences["pair"];
         assert_eq!(sequence.steps.len(), 2);
-        assert!(sequence.bindings["lane"].nonce_key.as_ref().unwrap().unique);
+        assert!(sequence.bindings["amount"].u256.is_some());
         assert_eq!(spec.mix[0].sequence.as_deref(), Some("pair"));
     }
 }
