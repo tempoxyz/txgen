@@ -10,8 +10,8 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{io::Write, path::PathBuf};
 use tokio::sync::mpsc;
 use txgen_core::{
-    AccountManager, ArtifactManager, BuildContext, GeneratedTx, NdjsonWriter, NonceTracker,
-    SequenceBinding, WorkloadSpec,
+    AccountManager, ArtifactManager, BuildContext, GeneratedTx, MixItem, NdjsonWriter,
+    NonceTracker, SequenceBinding, WorkloadSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -359,13 +359,9 @@ fn pick_workload_item(
     let mut candidates = Vec::new();
 
     for entry in &spec.mix {
-        let item = match (&entry.template, &entry.sequence) {
-            (Some(template), None) => WorkloadItem::Template(template.clone()),
-            (None, Some(sequence)) => WorkloadItem::Sequence(sequence.clone()),
-            (Some(_), Some(_)) => {
-                bail!("mix entries must set either `template` or `sequence`, not both")
-            }
-            (None, None) => bail!("mix entries must set either `template` or `sequence`"),
+        let item = match &entry.item {
+            MixItem::Template(template) => WorkloadItem::Template(template.clone()),
+            MixItem::Sequence(sequence) => WorkloadItem::Sequence(sequence.clone()),
         };
 
         let tx_count = workload_item_tx_count(spec, &item)?;
@@ -542,38 +538,21 @@ fn resolve_sequence_bindings(
     let mut resolved = std::collections::HashMap::new();
 
     for (name, binding) in bindings {
-        let fields_set = [
-            binding.account.is_some(),
-            binding.address.is_some(),
-            binding.u256.is_some(),
-            binding.u64.is_some(),
-            binding.string.is_some(),
-        ]
-        .into_iter()
-        .filter(|set| *set)
-        .count();
-
-        if fields_set != 1 {
-            bail!("binding '{name}' must set exactly one binding type");
-        }
-
-        let value = if let Some(account) = &binding.account {
-            let selected = ctx.select_signer(account)?;
-            ResolvedBinding::Account {
-                pool: selected.pool,
-                index: selected.index,
-                address: selected.address,
+        let value = match binding {
+            SequenceBinding::Account(account) => {
+                let selected = ctx.select_signer(account)?;
+                ResolvedBinding::Account {
+                    pool: selected.pool,
+                    index: selected.index,
+                    address: selected.address,
+                }
             }
-        } else if let Some(address) = &binding.address {
-            ResolvedBinding::Address(ctx.resolve_value(address)?)
-        } else if let Some(u256) = &binding.u256 {
-            ResolvedBinding::U256(ctx.resolve_value(u256)?)
-        } else if let Some(u64_value) = &binding.u64 {
-            ResolvedBinding::U64(ctx.resolve_value(u64_value)?)
-        } else if let Some(string) = &binding.string {
-            ResolvedBinding::String(ctx.resolve_value(string)?)
-        } else {
-            unreachable!("fields_set verified exactly one binding type")
+            SequenceBinding::Address(address) => {
+                ResolvedBinding::Address(ctx.resolve_value(address)?)
+            }
+            SequenceBinding::U256(u256) => ResolvedBinding::U256(ctx.resolve_value(u256)?),
+            SequenceBinding::U64(u64_value) => ResolvedBinding::U64(ctx.resolve_value(u64_value)?),
+            SequenceBinding::String(string) => ResolvedBinding::String(ctx.resolve_value(string)?),
         };
 
         resolved.insert(name.clone(), value);

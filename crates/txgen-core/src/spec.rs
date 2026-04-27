@@ -1,7 +1,7 @@
 use crate::{AccountPoolDef, AccountRef, GenValue};
 use alloy_primitives::{Address, U256};
 use eyre::{Result, WrapErr};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::{collections::HashMap, env, path::PathBuf};
 
 /// Workload specification parsed from YAML.
@@ -62,16 +62,53 @@ fn default_priority_fee() -> u128 {
 }
 
 /// Entry in the weighted workload mix.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct MixEntry {
-    /// Template name (must exist in templates). Mutually exclusive with `sequence`.
-    #[serde(default)]
-    pub template: Option<String>,
-    /// Sequence name (must exist in sequences). Mutually exclusive with `template`.
-    #[serde(default)]
-    pub sequence: Option<String>,
+    /// Workload item to generate.
+    pub item: MixItem,
     /// Relative weight for random selection.
     pub weight: u64,
+}
+
+/// A named workload item referenced by the mix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MixItem {
+    /// Template name (must exist in templates).
+    Template(String),
+    /// Sequence name (must exist in sequences).
+    Sequence(String),
+}
+
+impl<'de> Deserialize<'de> for MixEntry {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct MixEntryDef {
+            template: Option<String>,
+            sequence: Option<String>,
+            weight: u64,
+        }
+
+        let def = MixEntryDef::deserialize(deserializer)?;
+        let item = match (def.template, def.sequence) {
+            (Some(template), None) => MixItem::Template(template),
+            (None, Some(sequence)) => MixItem::Sequence(sequence),
+            (Some(_), Some(_)) => {
+                return Err(serde::de::Error::custom(
+                    "mix entries must set either `template` or `sequence`, not both",
+                ))
+            }
+            (None, None) => {
+                return Err(serde::de::Error::custom(
+                    "mix entries must set either `template` or `sequence`",
+                ))
+            }
+        };
+
+        Ok(Self { item, weight: def.weight })
+    }
 }
 
 /// A multi-transaction workload unit.
@@ -98,23 +135,62 @@ pub struct SequenceStep {
 }
 
 /// A sequence binding definition.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SequenceBinding {
+#[derive(Debug, Clone)]
+pub enum SequenceBinding {
     /// Select an account once. Exposes `<name>.ref` and `<name>.address`.
-    #[serde(default)]
-    pub account: Option<AccountRef>,
+    Account(AccountRef),
     /// Resolve an address once.
-    #[serde(default)]
-    pub address: Option<GenValue<Address>>,
+    Address(GenValue<Address>),
     /// Resolve a U256 once.
-    #[serde(default)]
-    pub u256: Option<GenValue<U256>>,
+    U256(GenValue<U256>),
     /// Resolve a u64 once.
-    #[serde(default)]
-    pub u64: Option<GenValue<u64>>,
+    U64(GenValue<u64>),
     /// Resolve a string once.
-    #[serde(default)]
-    pub string: Option<GenValue<String>>,
+    String(GenValue<String>),
+}
+
+impl<'de> Deserialize<'de> for SequenceBinding {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SequenceBindingDef {
+            account: Option<AccountRef>,
+            address: Option<GenValue<Address>>,
+            u256: Option<GenValue<U256>>,
+            u64: Option<GenValue<u64>>,
+            string: Option<GenValue<String>>,
+        }
+
+        let def = SequenceBindingDef::deserialize(deserializer)?;
+        let mut fields_set = 0;
+        fields_set += usize::from(def.account.is_some());
+        fields_set += usize::from(def.address.is_some());
+        fields_set += usize::from(def.u256.is_some());
+        fields_set += usize::from(def.u64.is_some());
+        fields_set += usize::from(def.string.is_some());
+
+        if fields_set != 1 {
+            return Err(serde::de::Error::custom(
+                "sequence bindings must set exactly one binding type",
+            ));
+        }
+
+        if let Some(account) = def.account {
+            Ok(Self::Account(account))
+        } else if let Some(address) = def.address {
+            Ok(Self::Address(address))
+        } else if let Some(u256) = def.u256 {
+            Ok(Self::U256(u256))
+        } else if let Some(u64_value) = def.u64 {
+            Ok(Self::U64(u64_value))
+        } else if let Some(string) = def.string {
+            Ok(Self::String(string))
+        } else {
+            unreachable!("fields_set verified exactly one binding type")
+        }
+    }
 }
 
 impl WorkloadSpec {
@@ -250,7 +326,7 @@ mix:
         let spec = WorkloadSpec::parse(yaml).unwrap();
         let sequence = &spec.sequences["pair"];
         assert_eq!(sequence.steps.len(), 2);
-        assert!(sequence.bindings["amount"].u256.is_some());
-        assert_eq!(spec.mix[0].sequence.as_deref(), Some("pair"));
+        assert!(matches!(sequence.bindings["amount"], SequenceBinding::U256(_)));
+        assert_eq!(spec.mix[0].item, MixItem::Sequence("pair".to_string()));
     }
 }

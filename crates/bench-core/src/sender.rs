@@ -155,21 +155,21 @@ impl Sender {
         let mut index = 0;
 
         while index < self.pending.len() {
-            let is_ready =
-                self.pending[index].scheduling_keys.iter().all(|key| !blocked_keys.contains(key));
+            let is_blocked =
+                self.pending[index].scheduling_keys.iter().any(|key| blocked_keys.contains(key));
 
-            if is_ready {
+            if is_blocked {
+                for key in &self.pending[index].scheduling_keys {
+                    blocked_keys.insert(*key);
+                }
+                index += 1;
+            } else {
                 let pending = self.pending.remove(index).expect("pending index exists");
                 for key in &pending.scheduling_keys {
                     self.active_keys.insert(*key);
                     blocked_keys.insert(*key);
                 }
                 self.dispatch(pending);
-            } else {
-                for key in &self.pending[index].scheduling_keys {
-                    blocked_keys.insert(*key);
-                }
-                index += 1;
             }
         }
     }
@@ -210,27 +210,26 @@ async fn submit_tx(
 ) {
     let completion_keys = pending.scheduling_keys.clone();
 
-    match semaphore.acquire().await {
-        Ok(_permit) => {
-            metrics.record_sent();
+    let Ok(_permit) = semaphore.acquire().await else {
+        tracing::warn!("Failed to acquire concurrency permit");
+        metrics.record_failure();
+        let _ = completion_tx.send(completion_keys);
+        return;
+    };
 
-            // Pick a random provider for this request.
-            // SAFETY: `providers` is guaranteed to be non-empty by construction.
-            let provider = providers.choose(&mut rand::rng()).unwrap();
+    metrics.record_sent();
 
-            let start = Instant::now();
-            match provider.send_raw_transaction(&pending.raw).await {
-                Ok(_pending_tx) => {
-                    metrics.record_success(start.elapsed());
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to send transaction");
-                    metrics.record_failure();
-                }
-            }
+    // Pick a random provider for this request.
+    // SAFETY: `providers` is guaranteed to be non-empty by construction.
+    let provider = providers.choose(&mut rand::rng()).unwrap();
+
+    let start = Instant::now();
+    match provider.send_raw_transaction(&pending.raw).await {
+        Ok(_pending_tx) => {
+            metrics.record_success(start.elapsed());
         }
         Err(e) => {
-            tracing::warn!(error = %e, "Failed to acquire concurrency permit");
+            tracing::warn!(error = %e, "Failed to send transaction");
             metrics.record_failure();
         }
     }

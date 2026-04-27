@@ -182,18 +182,21 @@ fn collect_prefetchable_parallel_nonce_keys(
     let mut nonce_keys = std::collections::HashSet::new();
 
     for entry in &spec.mix {
-        if let Some(template_name) = &entry.template {
-            if let Some(value) = spec.templates.get(template_name) {
-                collect_nonce_key_from_template_value(value.clone(), &mut nonce_keys);
+        match &entry.item {
+            txgen_core::MixItem::Template(template_name) => {
+                if let Some(value) = spec.templates.get(template_name) {
+                    collect_nonce_key_from_template_value(value.clone(), &mut nonce_keys);
+                }
             }
-        } else if let Some(sequence_name) = &entry.sequence
-            && let Some(sequence) = spec.sequences.get(sequence_name)
-        {
-            for step in &sequence.steps {
-                if let Some(base) = spec.templates.get(&step.template) {
-                    let mut value = base.clone();
-                    merge_yaml(&mut value, step.with_value.clone());
-                    collect_nonce_key_from_template_value(value, &mut nonce_keys);
+            txgen_core::MixItem::Sequence(sequence_name) => {
+                if let Some(sequence) = spec.sequences.get(sequence_name) {
+                    for step in &sequence.steps {
+                        if let Some(base) = spec.templates.get(&step.template) {
+                            let mut value = base.clone();
+                            merge_yaml(&mut value, step.with_value.clone());
+                            collect_nonce_key_from_template_value(value, &mut nonce_keys);
+                        }
+                    }
                 }
             }
         }
