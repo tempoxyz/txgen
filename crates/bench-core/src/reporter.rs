@@ -361,7 +361,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         let (sent, success, failed, elapsed_secs, tps, success_rate, latency, time_series) =
             if let Some(metrics) = &report.bench_metrics {
                 let ts = report.time_series.as_ref().map(|ts| JsonTimeSeries {
-                    throughput: ts.throughput.iter().cloned().collect(),
+                    throughput: ts.throughput.to_vec(),
                     latencies: ts
                         .latencies
                         .iter()
