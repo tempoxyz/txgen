@@ -47,8 +47,8 @@ impl NetworkAdapter for TempoAdapter {
         let selected = ctx.select_signer(&template.from)?;
         let is_tempo = template.tx_type == TempoTxType::Tempo;
         let nonce_mode = resolve_nonce_mode(&template, is_tempo, ctx)?;
-        if !matches!(nonce_mode, TempoNonceMode::Expiring) &&
-            let Some(valid_for_secs) = template.valid_for_secs
+        if !matches!(nonce_mode, TempoNonceMode::Expiring)
+            && let Some(valid_for_secs) = template.valid_for_secs
         {
             bail!(
                 "`valid_for_secs` is only supported for expiring Tempo transactions (got {valid_for_secs}s on {:?})",

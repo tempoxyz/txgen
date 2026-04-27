@@ -193,7 +193,7 @@ fn collect_prefetchable_parallel_nonce_keys(
                     for step in &sequence.steps {
                         if let Some(base) = spec.templates.get(&step.template) {
                             let mut value = base.clone();
-                            merge_yaml(&mut value, step.with_value.clone());
+                            txgen_core::merge_yaml(&mut value, step.with_value.clone());
                             collect_nonce_key_from_template_value(value, &mut nonce_keys);
                         }
                     }
@@ -212,35 +212,13 @@ fn collect_nonce_key_from_template_value(
     use crate::TempoTemplate;
     use txgen_core::GenValue;
 
-    if let Ok(template) = serde_yaml::from_value::<TempoTemplate>(value) &&
-        !template.expiring_nonce &&
-        let Some(GenValue::Literal(key)) = &template.nonce_key &&
-        !key.is_zero() &&
-        *key != TEMPO_EXPIRING_NONCE_KEY
+    if let Ok(template) = serde_yaml::from_value::<TempoTemplate>(value)
+        && !template.expiring_nonce
+        && let Some(GenValue::Literal(key)) = &template.nonce_key
+        && !key.is_zero()
+        && *key != TEMPO_EXPIRING_NONCE_KEY
     {
         nonce_keys.insert(*key);
-    }
-}
-
-fn merge_yaml(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
-    if matches!(overlay, serde_yaml::Value::Null) {
-        return;
-    }
-
-    match (base, overlay) {
-        (serde_yaml::Value::Mapping(base_map), serde_yaml::Value::Mapping(overlay_map)) => {
-            for (key, value) in overlay_map {
-                match base_map.get_mut(&key) {
-                    Some(base_value) => merge_yaml(base_value, value),
-                    None => {
-                        base_map.insert(key, value);
-                    }
-                }
-            }
-        }
-        (base_value, overlay_value) => {
-            *base_value = overlay_value;
-        }
     }
 }
 
