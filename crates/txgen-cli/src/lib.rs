@@ -10,8 +10,8 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{io::Write, path::PathBuf};
 use tokio::sync::mpsc;
 use txgen_core::{
-    merge_yaml, AccountManager, ArtifactManager, BuildContext, GeneratedTx, MixItem, NdjsonWriter,
-    NonceTracker, SequenceBinding, WorkloadSpec,
+    dedup_scheduling_keys, merge_yaml, AccountManager, ArtifactManager, BuildContext, GeneratedTx,
+    MixItem, NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, WorkloadSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -471,7 +471,7 @@ fn emit_template_value<A: NetworkAdapter, W: Write>(
     adapter: &A,
     name: &str,
     value: serde_yaml::Value,
-    inclusion_keys: &[[u8; 20]],
+    inclusion_keys: &[SchedulingKey],
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
 ) -> Result<()>
@@ -503,20 +503,10 @@ where
 
     writer.write(&GeneratedTx {
         raw,
-        submission_keys: vec![tx_req.key],
-        inclusion_keys: dedup_keys(inclusion_keys),
+        submission_keys: vec![SchedulingKey::from(tx_req.key)],
+        inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),
     })?;
     Ok(())
-}
-
-fn dedup_keys(keys: &[[u8; 20]]) -> Vec<[u8; 20]> {
-    let mut deduped = Vec::with_capacity(keys.len());
-    for key in keys {
-        if !deduped.contains(key) {
-            deduped.push(*key);
-        }
-    }
-    deduped
 }
 
 fn resolve_sequence_bindings(
@@ -549,7 +539,7 @@ fn resolve_sequence_bindings(
     Ok(resolved)
 }
 
-fn compute_sequence_key(sequence_name: &str, sequence_instance: u64) -> [u8; 20] {
+fn compute_sequence_key(sequence_name: &str, sequence_instance: u64) -> SchedulingKey {
     let mut data = Vec::with_capacity(16 + sequence_name.len() + 8);
     data.extend_from_slice(b"txgen:sequence:");
     data.extend_from_slice(sequence_name.as_bytes());
@@ -558,7 +548,7 @@ fn compute_sequence_key(sequence_name: &str, sequence_instance: u64) -> [u8; 20]
     let hash = keccak256(data);
     let mut key = [0u8; 20];
     key.copy_from_slice(&hash[..20]);
-    key
+    SchedulingKey::from(key)
 }
 
 fn merge_template_overlay(
