@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, Bytes, B256, U256};
 use eyre::{bail, Result};
 use rand::Rng;
 use serde::{de::DeserializeOwned, Deserialize};
@@ -178,6 +178,31 @@ impl FromGenerator for Bytes {
                 Ok(s.parse()?)
             }
             _ => bail!("cannot generate Bytes from {:?}", generator),
+        }
+    }
+}
+
+impl FromGenerator for B256 {
+    fn from_generator(generator: &Generator, resolver: &mut ValueResolver<'_>) -> Result<Self> {
+        match generator {
+            Generator::RandomBytes(len) => {
+                if *len != 32 {
+                    bail!("bytes32 random_bytes must be 32 bytes, got {len}");
+                }
+                let mut bytes = [0u8; 32];
+                resolver.rng.fill(&mut bytes[..]);
+                Ok(B256::from(bytes))
+            }
+            Generator::Const(v) => {
+                let s: String = serde_yaml::from_value(v.clone())?;
+                Ok(s.parse()?)
+            }
+            Generator::Choice(choices) => {
+                let idx = resolver.rng.random_range(0..choices.len());
+                let s: String = serde_yaml::from_value(choices[idx].clone())?;
+                Ok(s.parse()?)
+            }
+            _ => bail!("cannot generate B256 from {:?}", generator),
         }
     }
 }

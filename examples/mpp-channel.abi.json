@@ -1,0 +1,26 @@
+[
+  {
+    "name": "open",
+    "type": "function",
+    "inputs": [
+      {"name": "payee", "type": "address"},
+      {"name": "token", "type": "address"},
+      {"name": "deposit", "type": "uint128"},
+      {"name": "salt", "type": "bytes32"},
+      {"name": "authorizedSigner", "type": "address"}
+    ],
+    "outputs": [
+      {"name": "channelId", "type": "bytes32"}
+    ]
+  },
+  {
+    "name": "close",
+    "type": "function",
+    "inputs": [
+      {"name": "channelId", "type": "bytes32"},
+      {"name": "cumulativeAmount", "type": "uint128"},
+      {"name": "signature", "type": "bytes"}
+    ],
+    "outputs": []
+  }
+]

@@ -476,15 +476,40 @@ Supported binding references:
 |---------|------------|
 | `account` | `<name>.ref`, `<name>.address` |
 | `address` | `<name>` |
+| `bytes32` | `<name>` |
+| `abi_hash` | `<name>` |
 | `u256` | `<name>` |
 | `u64` | `<name>` |
 | `string` | `<name>` |
+
+Sequences also expose `{ var: chain_id }` as the top-level workload `chain_id` unless a binding named `chain_id` is defined.
+
+Hash bindings can reference other sequence bindings and are resolved once per sequence instance. For deterministic IDs that contracts compute with `keccak256(abi.encode(...))` (such as Tempo MPP channel IDs), use `abi_hash`:
+
+```yaml
+bindings:
+  payer:
+    account: { pool: users, select: random }
+  salt:
+    bytes32: { random_bytes: 32 }
+  channel_id:
+    abi_hash:
+      types: [address, address, address, bytes32, address, address, uint256]
+      values:
+        - { var: payer.address } # payer
+        - { var: payer.address } # payee
+        - "0x20c0000000000000000000000000000000000000" # token
+        - { var: salt }
+        - "0x0000000000000000000000000000000000000000" # authorizedSigner
+        - "0x0000000000000000000000000000000000000000" # channel contract
+        - { var: chain_id }
+```
 
 Each emitted sequence step gets its natural nonce-lane key as a `submission_key` and a synthetic sequence-instance key as an `inclusion_key`. This lets bench pipeline nonce-ordered transactions while waiting for sequence dependencies to be included before submitting later steps.
 
 `txgen generate -n` counts emitted transactions, not sequence instances. txgen never emits a partial sequence; if no remaining mix entry fits the remaining transaction budget, generation stops early.
 
-See `examples/sequence.yaml` for a small syntax example and `examples/tip20-sequence.yaml` for a Tempo TIP20 `approve -> transferFrom` sequence whose second transaction depends on the first.
+See `examples/sequence.yaml` for a small syntax example, `examples/tip20-sequence.yaml` for a Tempo TIP20 `approve -> transferFrom` sequence whose second transaction depends on the first, and `examples/tip20-mpp.yaml` for TIP20 transfers mixed with deterministic MPP channel `open -> close` sequences.
 
 ## Supported Chains
 

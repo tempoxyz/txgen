@@ -1,17 +1,18 @@
 use alloy_consensus::{BlockHeader, Sealed, SignableTransaction, Signed};
+use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_eips::{eip2718::Encodable2718, BlockNumberOrTag};
 use alloy_network::{Network, TransactionBuilder, TxSignerSync};
-use alloy_primitives::{keccak256, Address, Bytes, U256};
+use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_provider::{ext::DebugApi, Provider};
 use alloy_rlp::Decodable;
 use clap::{Args, Parser, Subcommand};
 use eyre::{bail, Result, WrapErr};
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use std::{io::Write, path::PathBuf};
+use std::{collections::HashSet, io::Write, path::PathBuf};
 use tokio::sync::mpsc;
 use txgen_core::{
-    dedup_scheduling_keys, merge_yaml, AccountManager, ArtifactManager, BuildContext, GeneratedTx,
-    MixItem, NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, WorkloadSpec,
+    dedup_scheduling_keys, merge_yaml, AbiHashDef, AccountManager, ArtifactManager, BuildContext,
+    GeneratedTx, MixItem, NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, WorkloadSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -331,6 +332,7 @@ where
 enum ResolvedBinding {
     Account { pool: String, index: usize, address: Address },
     Address(Address),
+    Bytes32(B256),
     U256(U256),
     U64(u64),
     String(String),
@@ -514,29 +516,143 @@ fn resolve_sequence_bindings(
     ctx: &mut BuildContext<'_>,
 ) -> Result<std::collections::HashMap<String, ResolvedBinding>> {
     let mut resolved = std::collections::HashMap::new();
+    if !bindings.contains_key("chain_id") {
+        resolved.insert("chain_id".to_string(), ResolvedBinding::U64(ctx.chain_id));
+    }
 
-    for (name, binding) in bindings {
-        let value = match binding {
-            SequenceBinding::Account(account) => {
-                let selected = ctx.select_signer(account)?;
-                ResolvedBinding::Account {
-                    pool: selected.pool,
-                    index: selected.index,
-                    address: selected.address,
-                }
-            }
-            SequenceBinding::Address(address) => {
-                ResolvedBinding::Address(ctx.resolve_value(address)?)
-            }
-            SequenceBinding::U256(u256) => ResolvedBinding::U256(ctx.resolve_value(u256)?),
-            SequenceBinding::U64(u64_value) => ResolvedBinding::U64(ctx.resolve_value(u64_value)?),
-            SequenceBinding::String(string) => ResolvedBinding::String(ctx.resolve_value(string)?),
-        };
-
-        resolved.insert(name.clone(), value);
+    let mut resolving = HashSet::new();
+    for name in bindings.keys() {
+        resolve_sequence_binding(name, bindings, &mut resolved, &mut resolving, ctx)?;
     }
 
     Ok(resolved)
+}
+
+fn resolve_sequence_binding(
+    name: &str,
+    bindings: &std::collections::HashMap<String, SequenceBinding>,
+    resolved: &mut std::collections::HashMap<String, ResolvedBinding>,
+    resolving: &mut HashSet<String>,
+    ctx: &mut BuildContext<'_>,
+) -> Result<()> {
+    if resolved.contains_key(name) {
+        return Ok(());
+    }
+
+    let binding =
+        bindings.get(name).ok_or_else(|| eyre::eyre!("unknown sequence binding '{name}'"))?;
+    if !resolving.insert(name.to_string()) {
+        bail!("circular sequence binding dependency involving '{name}'");
+    }
+
+    resolve_binding_dependencies(binding, bindings, resolved, resolving, ctx)?;
+
+    let value = match binding {
+        SequenceBinding::Account(account) => {
+            let selected = ctx.select_signer(account)?;
+            ResolvedBinding::Account {
+                pool: selected.pool,
+                index: selected.index,
+                address: selected.address,
+            }
+        }
+        SequenceBinding::Address(address) => ResolvedBinding::Address(ctx.resolve_value(address)?),
+        SequenceBinding::Bytes32(bytes32) => ResolvedBinding::Bytes32(ctx.resolve_value(bytes32)?),
+        SequenceBinding::AbiHash(abi_hash) => {
+            ResolvedBinding::Bytes32(resolve_abi_hash(abi_hash, resolved)?)
+        }
+        SequenceBinding::U256(u256) => ResolvedBinding::U256(ctx.resolve_value(u256)?),
+        SequenceBinding::U64(u64_value) => ResolvedBinding::U64(ctx.resolve_value(u64_value)?),
+        SequenceBinding::String(string) => ResolvedBinding::String(ctx.resolve_value(string)?),
+    };
+
+    resolving.remove(name);
+    resolved.insert(name.to_string(), value);
+    Ok(())
+}
+
+fn resolve_binding_dependencies(
+    binding: &SequenceBinding,
+    bindings: &std::collections::HashMap<String, SequenceBinding>,
+    resolved: &mut std::collections::HashMap<String, ResolvedBinding>,
+    resolving: &mut HashSet<String>,
+    ctx: &mut BuildContext<'_>,
+) -> Result<()> {
+    for dep in binding_dependency_names(binding) {
+        if resolved.contains_key(&dep) {
+            continue;
+        }
+        resolve_sequence_binding(&dep, bindings, resolved, resolving, ctx)?;
+    }
+    Ok(())
+}
+
+fn binding_dependency_names(binding: &SequenceBinding) -> HashSet<String> {
+    let mut deps = HashSet::new();
+    if let SequenceBinding::AbiHash(abi_hash) = binding {
+        for value in &abi_hash.values {
+            collect_var_names(value, &mut deps);
+        }
+    }
+    deps
+}
+
+fn resolve_abi_hash(
+    def: &AbiHashDef,
+    bindings: &std::collections::HashMap<String, ResolvedBinding>,
+) -> Result<B256> {
+    if def.types.len() != def.values.len() {
+        bail!(
+            "abi_hash expects the same number of types and values, got {} types and {} values",
+            def.types.len(),
+            def.values.len()
+        );
+    }
+
+    let mut values = Vec::with_capacity(def.values.len());
+    for (idx, (sol_type, value)) in def.types.iter().zip(&def.values).enumerate() {
+        let substituted = substitute_vars(value.clone(), bindings)?;
+        let json = yaml_to_json(substituted)?;
+        let ty = DynSolType::parse(sol_type)
+            .wrap_err_with(|| format!("failed to parse abi_hash type {idx} ('{sol_type}')"))?;
+        let value = ty
+            .coerce_json(&json)
+            .wrap_err_with(|| format!("failed to coerce abi_hash value {idx} as '{sol_type}'"))?;
+        values.push(value);
+    }
+
+    Ok(keccak256(DynSolValue::Tuple(values).abi_encode_params()))
+}
+
+fn yaml_to_json(value: serde_yaml::Value) -> Result<serde_json::Value> {
+    Ok(serde_json::to_value(value)?)
+}
+
+fn collect_var_names(value: &serde_yaml::Value, names: &mut HashSet<String>) {
+    match value {
+        serde_yaml::Value::Mapping(mapping) if mapping.len() == 1 => {
+            let var_key = serde_yaml::Value::String("var".to_string());
+            if let Some(serde_yaml::Value::String(path)) = mapping.get(&var_key) {
+                let name = path.split_once('.').map_or(path.as_str(), |(name, _)| name);
+                names.insert(name.to_string());
+                return;
+            }
+            for value in mapping.values() {
+                collect_var_names(value, names);
+            }
+        }
+        serde_yaml::Value::Mapping(mapping) => {
+            for value in mapping.values() {
+                collect_var_names(value, names);
+            }
+        }
+        serde_yaml::Value::Sequence(values) => {
+            for value in values {
+                collect_var_names(value, names);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn compute_sequence_key(sequence_name: &str, sequence_instance: u64) -> SchedulingKey {
@@ -615,6 +731,7 @@ fn binding_to_value(
         (ResolvedBinding::Address(address), None) => {
             Ok(serde_yaml::Value::String(address.to_string()))
         }
+        (ResolvedBinding::Bytes32(value), None) => Ok(serde_yaml::Value::String(value.to_string())),
         (ResolvedBinding::U256(value), None) => Ok(serde_yaml::Value::String(value.to_string())),
         (ResolvedBinding::U64(value), None) => Ok(serde_yaml::to_value(value)?),
         (ResolvedBinding::String(value), None) => Ok(serde_yaml::Value::String(value.clone())),

@@ -1,5 +1,5 @@
 use crate::{AccountPoolDef, AccountRef, GenValue};
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Deserializer};
 use std::{collections::HashMap, env, path::PathBuf};
@@ -141,12 +141,26 @@ pub enum SequenceBinding {
     Account(AccountRef),
     /// Resolve an address once.
     Address(GenValue<Address>),
+    /// Resolve a bytes32 value once.
+    Bytes32(GenValue<B256>),
+    /// Resolve a Keccak-256 hash over ABI-encoded values once.
+    AbiHash(AbiHashDef),
     /// Resolve a U256 once.
     U256(GenValue<U256>),
     /// Resolve a u64 once.
     U64(GenValue<u64>),
     /// Resolve a string once.
     String(GenValue<String>),
+}
+
+/// Values to ABI-encode and hash with Keccak-256.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AbiHashDef {
+    /// Solidity ABI types, one per value.
+    pub types: Vec<String>,
+    /// Values to encode using the corresponding type.
+    #[serde(alias = "args")]
+    pub values: Vec<serde_yaml::Value>,
 }
 
 impl<'de> Deserialize<'de> for SequenceBinding {
@@ -158,6 +172,8 @@ impl<'de> Deserialize<'de> for SequenceBinding {
         struct SequenceBindingDef {
             account: Option<AccountRef>,
             address: Option<GenValue<Address>>,
+            bytes32: Option<GenValue<B256>>,
+            abi_hash: Option<AbiHashDef>,
             u256: Option<GenValue<U256>>,
             u64: Option<GenValue<u64>>,
             string: Option<GenValue<String>>,
@@ -167,6 +183,8 @@ impl<'de> Deserialize<'de> for SequenceBinding {
         let mut fields_set = 0;
         fields_set += usize::from(def.account.is_some());
         fields_set += usize::from(def.address.is_some());
+        fields_set += usize::from(def.bytes32.is_some());
+        fields_set += usize::from(def.abi_hash.is_some());
         fields_set += usize::from(def.u256.is_some());
         fields_set += usize::from(def.u64.is_some());
         fields_set += usize::from(def.string.is_some());
@@ -181,6 +199,10 @@ impl<'de> Deserialize<'de> for SequenceBinding {
             Ok(Self::Account(account))
         } else if let Some(address) = def.address {
             Ok(Self::Address(address))
+        } else if let Some(bytes32) = def.bytes32 {
+            Ok(Self::Bytes32(bytes32))
+        } else if let Some(abi_hash) = def.abi_hash {
+            Ok(Self::AbiHash(abi_hash))
         } else if let Some(u256) = def.u256 {
             Ok(Self::U256(u256))
         } else if let Some(u64_value) = def.u64 {
@@ -312,6 +334,15 @@ sequences:
         account: { pool: users, select: { index: 1 } }
       amount:
         u256: { uniform: [1, 10] }
+      salt:
+        bytes32: { random_bytes: 32 }
+      channel_id:
+        abi_hash:
+          types: [address, bytes32, uint256]
+          values:
+            - { var: sender.address }
+            - { var: salt }
+            - { var: chain_id }
     steps:
       - name: first
         template: transfer
@@ -327,6 +358,8 @@ mix:
         let sequence = &spec.sequences["pair"];
         assert_eq!(sequence.steps.len(), 2);
         assert!(matches!(sequence.bindings["amount"], SequenceBinding::U256(_)));
+        assert!(matches!(sequence.bindings["salt"], SequenceBinding::Bytes32(_)));
+        assert!(matches!(sequence.bindings["channel_id"], SequenceBinding::AbiHash(_)));
         assert_eq!(spec.mix[0].item, MixItem::Sequence("pair".to_string()));
     }
 }
