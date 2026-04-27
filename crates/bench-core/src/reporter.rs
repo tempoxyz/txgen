@@ -351,9 +351,9 @@ impl<W: Write + Send> JsonReporter<W> {
 
 impl<W: Write + Send> Reporter for JsonReporter<W> {
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
-        let has_data = report.bench_metrics.is_some() ||
-            !report.blocks.is_empty() ||
-            !report.samples.is_empty();
+        let has_data = report.bench_metrics.is_some()
+            || !report.blocks.is_empty()
+            || !report.samples.is_empty();
         if !has_data {
             return Ok(());
         }

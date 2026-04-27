@@ -8,17 +8,20 @@ use std::io::Write;
 pub struct GeneratedTx {
     /// RLP-encoded signed transaction (EIP-2718 envelope).
     pub raw: Bytes,
-    /// Scheduling key (20 bytes).
-    /// - Same key = must be sent sequentially
-    /// - Different key = can be sent in parallel
-    pub key: [u8; 20],
+    /// Scheduling keys (20 bytes each).
+    ///
+    /// A transaction may carry multiple independent ordering constraints. Bench
+    /// must only submit it when none of its keys are active. Transactions that
+    /// share any key must be sent sequentially; transactions with disjoint key
+    /// sets may be sent in parallel.
+    pub scheduling_keys: Vec<[u8; 20]>,
 }
 
 /// JSON output format for NDJSON stream.
 #[derive(Serialize)]
 struct OutputTx<'a> {
     raw: &'a str,
-    key: &'a str,
+    scheduling_keys: &'a [String],
 }
 
 /// Writes generated transactions as newline-delimited JSON.
@@ -26,13 +29,13 @@ pub struct NdjsonWriter<W: Write> {
     writer: W,
     count: u64,
     raw_hex: String,
-    key_hex: String,
+    key_hex: Vec<String>,
 }
 
 impl<W: Write> NdjsonWriter<W> {
     /// Create a new NDJSON writer.
     pub fn new(writer: W) -> Self {
-        Self { writer, count: 0, raw_hex: String::new(), key_hex: String::new() }
+        Self { writer, count: 0, raw_hex: String::new(), key_hex: Vec::new() }
     }
 
     /// Write a generated transaction.
@@ -46,13 +49,18 @@ impl<W: Write> NdjsonWriter<W> {
         }
 
         self.key_hex.clear();
-        self.key_hex.push_str("0x");
-        for byte in tx.key.iter() {
-            use std::fmt::Write;
-            write!(self.key_hex, "{:02x}", byte)?;
+        self.key_hex.reserve(tx.scheduling_keys.len());
+        for key in &tx.scheduling_keys {
+            let mut key_hex = String::with_capacity(42);
+            key_hex.push_str("0x");
+            for byte in key.iter() {
+                use std::fmt::Write;
+                write!(key_hex, "{:02x}", byte)?;
+            }
+            self.key_hex.push(key_hex);
         }
 
-        let out = OutputTx { raw: &self.raw_hex, key: &self.key_hex };
+        let out = OutputTx { raw: &self.raw_hex, scheduling_keys: &self.key_hex };
 
         serde_json::to_writer(&mut self.writer, &out)?;
         self.writer.write_all(b"\n")?;
@@ -101,14 +109,19 @@ mod tests {
         let mut buf = Vec::new();
         let mut writer = NdjsonWriter::new(&mut buf);
 
-        let tx = GeneratedTx { raw: Bytes::from(vec![0x02, 0xf8, 0x70]), key: [0xab; 20] };
+        let tx = GeneratedTx {
+            raw: Bytes::from(vec![0x02, 0xf8, 0x70]),
+            scheduling_keys: vec![[0xab; 20]],
+        };
 
         writer.write(&tx).unwrap();
         writer.flush().unwrap();
 
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("\"raw\":\"0x02f870\""));
-        assert!(output.contains("\"key\":\"0xabababababababababababababababababababab\""));
+        assert!(
+            output.contains("\"scheduling_keys\":[\"0xabababababababababababababababababababab\"]")
+        );
         assert!(output.ends_with('\n'));
     }
 
@@ -117,7 +130,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut writer = NdjsonWriter::new(&mut buf);
 
-        let tx = GeneratedTx { raw: Bytes::from(vec![0x00]), key: [0x00; 20] };
+        let tx = GeneratedTx { raw: Bytes::from(vec![0x00]), scheduling_keys: vec![[0x00; 20]] };
 
         assert_eq!(writer.count(), 0);
         writer.write(&tx).unwrap();

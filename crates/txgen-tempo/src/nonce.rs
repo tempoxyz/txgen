@@ -185,12 +185,12 @@ fn collect_prefetchable_parallel_nonce_keys(
     let mut nonce_keys = std::collections::HashSet::new();
 
     for entry in &spec.mix {
-        if let Some(value) = spec.templates.get(&entry.template) &&
-            let Ok(template) = serde_yaml::from_value::<TempoTemplate>(value.clone()) &&
-            !template.expiring_nonce &&
-            let Some(GenValue::Literal(key)) = &template.nonce_key &&
-            !key.is_zero() &&
-            *key != TEMPO_EXPIRING_NONCE_KEY
+        if let Some(value) = spec.templates.get(&entry.template)
+            && let Ok(template) = serde_yaml::from_value::<TempoTemplate>(value.clone())
+            && !template.expiring_nonce
+            && let Some(GenValue::Literal(key)) = &template.nonce_key
+            && !key.is_zero()
+            && *key != TEMPO_EXPIRING_NONCE_KEY
         {
             nonce_keys.insert(*key);
         }
