@@ -361,11 +361,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         let (sent, success, failed, elapsed_secs, tps, success_rate, latency, time_series) =
             if let Some(metrics) = &report.bench_metrics {
                 let ts = report.time_series.as_ref().map(|ts| JsonTimeSeries {
-                    throughput: ts
-                        .throughput
-                        .iter()
-                        .cloned()
-                        .collect(),
+                    throughput: ts.throughput.iter().cloned().collect(),
                     latencies: ts
                         .latencies
                         .iter()
@@ -745,10 +741,9 @@ fn system_time_to_millis(t: std::time::SystemTime) -> u64 {
 /// - `console` - Human-readable output to stderr
 /// - `json:<path>` - JSON output to file
 /// - `clickhouse:<url>` - Push benchmark data to ClickHouse
-/// - `victoriametrics:<url>` - Push samples to VictoriaMetrics via
-///   `/api/v1/import/prometheus`. Auth and other knobs are read from
-///   environment variables (`VM_BEARER_TOKEN`, `VM_USER`, `VM_PASSWORD`,
-///   `VM_TENANT_ID`, `VM_BATCH_SIZE`, `VM_TIMEOUT_SECS`).
+/// - `victoriametrics:<url>` - Push samples to VictoriaMetrics via `/api/v1/import/prometheus`.
+///   Auth and other knobs are read from environment variables (`VM_BEARER_TOKEN`, `VM_USER`,
+///   `VM_PASSWORD`, `VM_TENANT_ID`, `VM_BATCH_SIZE`, `VM_TIMEOUT_SECS`).
 ///
 /// The ClickHouse reporter requires metadata keys: `scenario`, `platform`,
 /// `git-sha`, `git-ref`. Pass them via `-m key=value`.
@@ -777,9 +772,8 @@ pub fn parse_reporters(
                 ClickHouseReporter::new(config).wrap_err("failed to create ClickHouse reporter")?,
             ));
         } else if let Some(url) = spec.strip_prefix("victoriametrics:") {
-            let config = crate::victoriametrics::VictoriaMetricsConfig::from_metadata(
-                url, metadata,
-            )?;
+            let config =
+                crate::victoriametrics::VictoriaMetricsConfig::from_metadata(url, metadata)?;
             reporters.push(Box::new(
                 crate::victoriametrics::VictoriaMetricsReporter::new(config)
                     .wrap_err("failed to create VictoriaMetrics reporter")?,
