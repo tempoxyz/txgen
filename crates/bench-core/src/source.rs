@@ -21,7 +21,8 @@ pub struct SourceTx {
     pub raw: String,
     /// Scheduling keys released once RPC submission succeeds (hex-encoded with 0x prefix).
     pub submission_keys: Vec<String>,
-    /// Scheduling keys released once a transaction receipt is observed (hex-encoded with 0x prefix).
+    /// Scheduling keys released once a transaction receipt is observed (hex-encoded with 0x
+    /// prefix).
     #[serde(default)]
     pub inclusion_keys: Vec<String>,
 }
