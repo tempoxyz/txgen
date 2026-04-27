@@ -285,19 +285,24 @@ bench send -i txs.ndjson \
 Transactions are output as NDJSON with two fields:
 
 ```json
-{"raw":"0x02f86c01...","key":"0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc"}
+{
+  "raw": "0x02f86c01...",
+  "scheduling_keys": [
+    "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc"
+  ]
+}
 ```
 
 | Field | Description |
 |-------|-------------|
 | `raw` | RLP-encoded signed transaction (EIP-2718 envelope) |
-| `key` | Scheduling key (20 bytes) for ordering |
+| `scheduling_keys` | One or more 20-byte ordering constraints |
 
-**Scheduling rule:** Transactions with the same `key` must be sent sequentially (they share a nonce sequence). Different keys can be sent in parallel.
+**Scheduling rule:** Transactions that share any scheduling key must be sent sequentially. Transactions with disjoint scheduling-key sets can be sent in parallel. Normal transactions carry their natural nonce-lane key; sequence steps also carry a sequence-instance key.
 
 ## Workload Specification
 
-Workload specs are YAML files that define accounts, templates, and mix ratios.
+Workload specs are YAML files that define accounts, transaction templates, optional transaction sequences, and mix ratios.
 
 ### Structure
 
@@ -335,10 +340,39 @@ templates:
     value: 1000
     gas_limit: 21000
 
+# Optional multi-transaction sequences
+sequences:
+  two_transfers:
+    bindings:
+      sender:
+        account:
+          pool: users
+          select: random
+      recipient:
+        account:
+          pool: users
+          select: random
+      amount:
+        u256:
+          uniform: [1, 100]
+    steps:
+      - template: transfer
+        with:
+          from: { var: sender.ref }
+          to: { var: recipient.address }
+          value: { var: amount }
+      - template: transfer
+        with:
+          from: { var: sender.ref }
+          to: { var: recipient.address }
+          value: { var: amount }
+
 # Weighted mix for generation
 mix:
   - template: transfer
-    weight: 100
+    weight: 90
+  - sequence: two_transfers
+    weight: 10
 ```
 
 ### Account Selection
@@ -397,6 +431,75 @@ templates:
         - 1000000           # amount
       value: 0
 ```
+
+### Transaction Sequences
+
+Use `sequences` when one generated workload item should emit multiple ordered transactions. Bindings are resolved once per sequence instance and can be referenced from any step with `{ var: ... }`.
+
+```yaml
+sequences:
+  approve_then_transfer_from:
+    bindings:
+      owner:
+        account: { pool: users, select: random }
+      spender:
+        account: { pool: users, select: random }
+      recipient:
+        account: { pool: users, select: random }
+      amount:
+        u256: { uniform: [1, 1000] }
+
+    steps:
+      - template: erc20_approve
+        with:
+          from: { var: owner.ref }
+          call:
+            args:
+              - { var: spender.address }
+              - { var: amount }
+
+      - template: erc20_transfer_from
+        with:
+          from: { var: spender.ref }
+          call:
+            args:
+              - { var: owner.address }
+              - { var: recipient.address }
+              - { var: amount }
+```
+
+Supported binding references:
+
+| Binding | References |
+|---------|------------|
+| `account` | `<name>.ref`, `<name>.address` |
+| `address` | `<name>` |
+| `u256` | `<name>` |
+| `u64` | `<name>` |
+| `string` | `<name>` |
+| `nonce_key` | `<name>` |
+
+Each emitted sequence step gets both its natural nonce-lane scheduling key and a synthetic sequence-instance scheduling key. Bench treats all scheduling keys the same: sharing any key serializes submission.
+
+Tempo sequence-scoped nonce lanes can be generated with `nonce_key` bindings:
+
+```yaml
+bindings:
+  lane:
+    nonce_key:
+      unique: true
+      base: 1000000000
+
+steps:
+  - template: tempo_step_a
+    with:
+      nonce_key: { var: lane }
+  - template: tempo_step_b
+    with:
+      nonce_key: { var: lane }
+```
+
+`txgen generate -n` counts emitted transactions, not sequence instances. txgen never emits a partial sequence; if no remaining mix entry fits the remaining transaction budget, generation stops early.
 
 ## Supported Chains
 

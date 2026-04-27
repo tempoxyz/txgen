@@ -234,4 +234,44 @@ mix:
         let spec = WorkloadSpec::parse(yaml).unwrap();
         assert_eq!(spec.total_weight(), 100);
     }
+
+    #[test]
+    fn test_parse_sequence_spec() {
+        let yaml = r#"
+chain_id: 1
+templates:
+  transfer:
+    from: { var: sender.ref }
+    to: { var: recipient.address }
+    value: { var: amount }
+sequences:
+  pair:
+    bindings:
+      sender:
+        account: { pool: users, select: random }
+      recipient:
+        account: { pool: users, select: { index: 1 } }
+      amount:
+        u256: { uniform: [1, 10] }
+      lane:
+        nonce_key:
+          unique: true
+          base: 1000
+    steps:
+      - name: first
+        template: transfer
+      - name: second
+        template: transfer
+        with:
+          value: 11
+mix:
+  - sequence: pair
+    weight: 100
+"#;
+        let spec = WorkloadSpec::parse(yaml).unwrap();
+        let sequence = &spec.sequences["pair"];
+        assert_eq!(sequence.steps.len(), 2);
+        assert!(sequence.bindings["lane"].nonce_key.as_ref().unwrap().unique);
+        assert_eq!(spec.mix[0].sequence.as_deref(), Some("pair"));
+    }
 }

@@ -179,3 +179,28 @@ impl TxSource for TxgenSource {
         Ok(Some(source_tx.into_generated_tx()?))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_multiple_scheduling_keys() {
+        let source_tx: SourceTx = serde_json::from_str(
+            r#"{
+                "raw": "0x02f870",
+                "scheduling_keys": [
+                    "0x1111111111111111111111111111111111111111",
+                    "0x2222222222222222222222222222222222222222",
+                    "0x1111111111111111111111111111111111111111"
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let generated = source_tx.into_generated_tx().unwrap();
+        assert_eq!(generated.scheduling_keys.len(), 2);
+        assert_eq!(generated.scheduling_keys[0], [0x11; 20]);
+        assert_eq!(generated.scheduling_keys[1], [0x22; 20]);
+    }
+}
