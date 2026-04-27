@@ -1,0 +1,40 @@
+chain_id: 1
+
+accounts:
+  users:
+    mnemonic: "test test test test test test test test test test test junk"
+    range: [0, 10]
+
+templates:
+  bound_transfer:
+    type: eip1559
+    from: { var: sender.ref }
+    to: { var: recipient.address }
+    value: { var: amount }
+    gas_limit: 21000
+    max_fee_per_gas: 1000000000
+    max_priority_fee_per_gas: 1000000000
+
+sequences:
+  two_transfers:
+    bindings:
+      sender:
+        account:
+          pool: users
+          select: random
+      recipient:
+        account:
+          pool: users
+          select: random
+      amount:
+        u256:
+          uniform: [1, 100]
+    steps:
+      - name: first
+        template: bound_transfer
+      - name: second
+        template: bound_transfer
+
+mix:
+  - sequence: two_transfers
+    weight: 100

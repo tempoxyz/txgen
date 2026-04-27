@@ -1,7 +1,7 @@
 //! Transaction sender with scheduling key ordering and rate limiting.
 //!
 //! Handles sending transactions to an RPC endpoint while:
-//! - Respecting scheduling key ordering (same key = sequential, different key = parallel)
+//! - Respecting scheduling key ordering (shared key = sequential, disjoint keys = parallel)
 //! - Applying rate limiting
 
 use crate::metrics::MetricsCollector;
