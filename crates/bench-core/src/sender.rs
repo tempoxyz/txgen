@@ -42,10 +42,20 @@ impl Default for SenderConfig {
     }
 }
 
+const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// A transaction to be sent.
 struct PendingTx {
     raw: Bytes,
-    scheduling_keys: Vec<[u8; 20]>,
+    submission_keys: Vec<[u8; 20]>,
+    inclusion_keys: Vec<[u8; 20]>,
+}
+
+impl PendingTx {
+    fn scheduling_keys(&self) -> impl Iterator<Item = &[u8; 20]> {
+        self.submission_keys.iter().chain(self.inclusion_keys.iter())
+    }
 }
 
 /// Transaction sender.
@@ -110,8 +120,10 @@ impl Sender {
 
         self.drain_completions();
 
-        let scheduling_keys = normalize_keys(tx.scheduling_keys)?;
-        self.pending.push_back(PendingTx { raw: tx.raw, scheduling_keys });
+        let GeneratedTx { raw, submission_keys, inclusion_keys } = tx;
+        let (submission_keys, inclusion_keys) =
+            normalize_key_sets(submission_keys, inclusion_keys)?;
+        self.pending.push_back(PendingTx { raw, submission_keys, inclusion_keys });
         self.schedule_ready();
 
         Ok(())
@@ -156,16 +168,16 @@ impl Sender {
 
         while index < self.pending.len() {
             let is_blocked =
-                self.pending[index].scheduling_keys.iter().any(|key| blocked_keys.contains(key));
+                self.pending[index].scheduling_keys().any(|key| blocked_keys.contains(key));
 
             if is_blocked {
-                for key in &self.pending[index].scheduling_keys {
+                for key in self.pending[index].scheduling_keys() {
                     blocked_keys.insert(*key);
                 }
                 index += 1;
             } else {
                 let pending = self.pending.remove(index).expect("pending index exists");
-                for key in &pending.scheduling_keys {
+                for key in pending.scheduling_keys() {
                     self.active_keys.insert(*key);
                     blocked_keys.insert(*key);
                 }
@@ -187,18 +199,31 @@ impl Sender {
     }
 }
 
-fn normalize_keys(keys: Vec<[u8; 20]>) -> Result<Vec<[u8; 20]>> {
-    if keys.is_empty() {
-        eyre::bail!("scheduling_keys must not be empty");
+fn normalize_key_sets(
+    submission_keys: Vec<[u8; 20]>,
+    inclusion_keys: Vec<[u8; 20]>,
+) -> Result<(Vec<[u8; 20]>, Vec<[u8; 20]>)> {
+    let inclusion_keys = dedup_keys(inclusion_keys);
+    let mut submission_keys = dedup_keys(submission_keys);
+
+    // If a key appears in both sets, keep the stricter release policy.
+    submission_keys.retain(|key| !inclusion_keys.contains(key));
+
+    if submission_keys.is_empty() && inclusion_keys.is_empty() {
+        eyre::bail!("transactions must have at least one submission or inclusion key");
     }
 
+    Ok((submission_keys, inclusion_keys))
+}
+
+fn dedup_keys(keys: Vec<[u8; 20]>) -> Vec<[u8; 20]> {
     let mut normalized = Vec::with_capacity(keys.len());
     for key in keys {
         if !normalized.contains(&key) {
             normalized.push(key);
         }
     }
-    Ok(normalized)
+    normalized
 }
 
 async fn submit_tx(
@@ -208,12 +233,16 @@ async fn submit_tx(
     semaphore: Arc<Semaphore>,
     completion_tx: mpsc::UnboundedSender<Vec<[u8; 20]>>,
 ) {
-    let completion_keys = pending.scheduling_keys.clone();
+    let release_all_keys = || {
+        let mut keys = pending.submission_keys.clone();
+        keys.extend_from_slice(&pending.inclusion_keys);
+        keys
+    };
 
     let Ok(_permit) = semaphore.acquire().await else {
         tracing::warn!("Failed to acquire concurrency permit");
         metrics.record_failure();
-        let _ = completion_tx.send(completion_keys);
+        release_keys(&completion_tx, release_all_keys());
         return;
     };
 
@@ -224,17 +253,56 @@ async fn submit_tx(
     let provider = providers.choose(&mut rand::rng()).unwrap();
 
     let start = Instant::now();
-    match provider.send_raw_transaction(&pending.raw).await {
-        Ok(_pending_tx) => {
+    let tx_hash = match provider.send_raw_transaction(&pending.raw).await {
+        Ok(pending_tx) => {
             metrics.record_success(start.elapsed());
+            *pending_tx.tx_hash()
         }
         Err(e) => {
             tracing::warn!(error = %e, "Failed to send transaction");
             metrics.record_failure();
+            release_keys(&completion_tx, release_all_keys());
+            return;
         }
+    };
+
+    release_keys(&completion_tx, pending.submission_keys);
+
+    if pending.inclusion_keys.is_empty() {
+        return;
     }
 
-    let _ = completion_tx.send(completion_keys);
+    if let Err(e) = wait_for_receipt(&provider, tx_hash).await {
+        tracing::warn!(error = %e, %tx_hash, "Failed waiting for transaction receipt");
+        metrics.record_failure();
+    }
+
+    release_keys(&completion_tx, pending.inclusion_keys);
+}
+
+fn release_keys(completion_tx: &mpsc::UnboundedSender<Vec<[u8; 20]>>, keys: Vec<[u8; 20]>) {
+    if !keys.is_empty() {
+        let _ = completion_tx.send(keys);
+    }
+}
+
+async fn wait_for_receipt(
+    provider: &DynProvider<AnyNetwork>,
+    tx_hash: alloy_primitives::TxHash,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + RECEIPT_TIMEOUT;
+
+    loop {
+        if provider.get_transaction_receipt(tx_hash).await?.is_some() {
+            return Ok(());
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            eyre::bail!("timed out waiting for transaction receipt");
+        }
+
+        tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
+    }
 }
 
 /// Token-budget rate limiter.

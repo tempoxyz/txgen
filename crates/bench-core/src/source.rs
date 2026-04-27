@@ -19,8 +19,11 @@ use txgen_core::GeneratedTx;
 pub struct SourceTx {
     /// Raw transaction bytes (hex-encoded with 0x prefix).
     pub raw: String,
-    /// Scheduling keys (hex-encoded with 0x prefix).
-    pub scheduling_keys: Vec<String>,
+    /// Scheduling keys released once RPC submission succeeds (hex-encoded with 0x prefix).
+    pub submission_keys: Vec<String>,
+    /// Scheduling keys released once a transaction receipt is observed (hex-encoded with 0x prefix).
+    #[serde(default)]
+    pub inclusion_keys: Vec<String>,
 }
 
 impl SourceTx {
@@ -33,28 +36,34 @@ impl SourceTx {
             .parse::<Bytes>()
             .context("invalid raw tx hex")?;
 
-        if self.scheduling_keys.is_empty() {
-            eyre::bail!("scheduling_keys must not be empty");
+        let submission_keys = parse_keys(self.submission_keys)?;
+        let inclusion_keys = parse_keys(self.inclusion_keys)?;
+
+        if submission_keys.is_empty() && inclusion_keys.is_empty() {
+            eyre::bail!("transactions must have at least one submission or inclusion key");
         }
 
-        let mut scheduling_keys = Vec::with_capacity(self.scheduling_keys.len());
-        for key in self.scheduling_keys {
-            let key_bytes =
-                hex::decode(key.strip_prefix("0x").unwrap_or(&key)).context("invalid key hex")?;
-
-            if key_bytes.len() != 20 {
-                eyre::bail!("scheduling key must be 20 bytes, got {}", key_bytes.len());
-            }
-
-            let mut parsed = [0u8; 20];
-            parsed.copy_from_slice(&key_bytes);
-            if !scheduling_keys.contains(&parsed) {
-                scheduling_keys.push(parsed);
-            }
-        }
-
-        Ok(GeneratedTx { raw, scheduling_keys })
+        Ok(GeneratedTx { raw, submission_keys, inclusion_keys })
     }
+}
+
+fn parse_keys(keys: Vec<String>) -> Result<Vec<[u8; 20]>> {
+    let mut parsed_keys = Vec::with_capacity(keys.len());
+    for key in keys {
+        let key_bytes =
+            hex::decode(key.strip_prefix("0x").unwrap_or(&key)).context("invalid key hex")?;
+
+        if key_bytes.len() != 20 {
+            eyre::bail!("scheduling key must be 20 bytes, got {}", key_bytes.len());
+        }
+
+        let mut parsed = [0u8; 20];
+        parsed.copy_from_slice(&key_bytes);
+        if !parsed_keys.contains(&parsed) {
+            parsed_keys.push(parsed);
+        }
+    }
+    Ok(parsed_keys)
 }
 
 /// Transaction source trait.
@@ -185,22 +194,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_multiple_scheduling_keys() {
+    fn parses_submission_and_inclusion_keys() {
         let source_tx: SourceTx = serde_json::from_str(
             r#"{
                 "raw": "0x02f870",
-                "scheduling_keys": [
+                "submission_keys": [
                     "0x1111111111111111111111111111111111111111",
-                    "0x2222222222222222222222222222222222222222",
                     "0x1111111111111111111111111111111111111111"
+                ],
+                "inclusion_keys": [
+                    "0x2222222222222222222222222222222222222222"
                 ]
             }"#,
         )
         .unwrap();
 
         let generated = source_tx.into_generated_tx().unwrap();
-        assert_eq!(generated.scheduling_keys.len(), 2);
-        assert_eq!(generated.scheduling_keys[0], [0x11; 20]);
-        assert_eq!(generated.scheduling_keys[1], [0x22; 20]);
+        assert_eq!(generated.submission_keys, vec![[0x11; 20]]);
+        assert_eq!(generated.inclusion_keys, vec![[0x22; 20]]);
     }
 }

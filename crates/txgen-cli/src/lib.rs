@@ -489,7 +489,7 @@ fn emit_template_value<A: NetworkAdapter, W: Write>(
     adapter: &A,
     name: &str,
     value: serde_yaml::Value,
-    extra_scheduling_keys: &[[u8; 20]],
+    inclusion_keys: &[[u8; 20]],
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
 ) -> Result<()>
@@ -519,16 +519,22 @@ where
     let envelope = <A::Network as Network>::TxEnvelope::from(signed);
     let raw = Bytes::from(envelope.encoded_2718());
 
-    let mut scheduling_keys = Vec::with_capacity(1 + extra_scheduling_keys.len());
-    scheduling_keys.push(tx_req.key);
-    for key in extra_scheduling_keys {
-        if !scheduling_keys.contains(key) {
-            scheduling_keys.push(*key);
+    writer.write(&GeneratedTx {
+        raw,
+        submission_keys: vec![tx_req.key],
+        inclusion_keys: dedup_keys(inclusion_keys),
+    })?;
+    Ok(())
+}
+
+fn dedup_keys(keys: &[[u8; 20]]) -> Vec<[u8; 20]> {
+    let mut deduped = Vec::with_capacity(keys.len());
+    for key in keys {
+        if !deduped.contains(key) {
+            deduped.push(*key);
         }
     }
-
-    writer.write(&GeneratedTx { raw, scheduling_keys })?;
-    Ok(())
+    deduped
 }
 
 fn resolve_sequence_bindings(

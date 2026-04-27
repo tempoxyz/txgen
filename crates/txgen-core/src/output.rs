@@ -8,20 +8,25 @@ use std::io::Write;
 pub struct GeneratedTx {
     /// RLP-encoded signed transaction (EIP-2718 envelope).
     pub raw: Bytes,
-    /// Scheduling keys (20 bytes each).
+    /// Scheduling keys released once the transaction is accepted by the RPC endpoint.
     ///
-    /// A transaction may carry multiple independent ordering constraints. Bench
-    /// must only submit it when none of its keys are active. Transactions that
-    /// share any key must be sent sequentially; transactions with disjoint key
-    /// sets may be sent in parallel.
-    pub scheduling_keys: Vec<[u8; 20]>,
+    /// Use these for constraints that the chain enforces after submission, such as
+    /// sender nonce lanes.
+    pub submission_keys: Vec<[u8; 20]>,
+
+    /// Scheduling keys released once the transaction is included in a block.
+    ///
+    /// Use these for cross-lane dependencies where submission order alone does not
+    /// guarantee execution order, such as transaction sequences.
+    pub inclusion_keys: Vec<[u8; 20]>,
 }
 
 /// JSON output format for NDJSON stream.
 #[derive(Serialize)]
 struct OutputTx<'a> {
     raw: &'a str,
-    scheduling_keys: &'a [String],
+    submission_keys: &'a [String],
+    inclusion_keys: &'a [String],
 }
 
 /// Writes generated transactions as newline-delimited JSON.
@@ -29,13 +34,20 @@ pub struct NdjsonWriter<W: Write> {
     writer: W,
     count: u64,
     raw_hex: String,
-    key_hex: Vec<String>,
+    submission_key_hex: Vec<String>,
+    inclusion_key_hex: Vec<String>,
 }
 
 impl<W: Write> NdjsonWriter<W> {
     /// Create a new NDJSON writer.
     pub fn new(writer: W) -> Self {
-        Self { writer, count: 0, raw_hex: String::new(), key_hex: Vec::new() }
+        Self {
+            writer,
+            count: 0,
+            raw_hex: String::new(),
+            submission_key_hex: Vec::new(),
+            inclusion_key_hex: Vec::new(),
+        }
     }
 
     /// Write a generated transaction.
@@ -48,19 +60,14 @@ impl<W: Write> NdjsonWriter<W> {
             write!(self.raw_hex, "{:02x}", byte)?;
         }
 
-        self.key_hex.clear();
-        self.key_hex.reserve(tx.scheduling_keys.len());
-        for key in &tx.scheduling_keys {
-            let mut key_hex = String::with_capacity(42);
-            key_hex.push_str("0x");
-            for byte in key.iter() {
-                use std::fmt::Write;
-                write!(key_hex, "{:02x}", byte)?;
-            }
-            self.key_hex.push(key_hex);
-        }
+        encode_keys(&mut self.submission_key_hex, &tx.submission_keys)?;
+        encode_keys(&mut self.inclusion_key_hex, &tx.inclusion_keys)?;
 
-        let out = OutputTx { raw: &self.raw_hex, scheduling_keys: &self.key_hex };
+        let out = OutputTx {
+            raw: &self.raw_hex,
+            submission_keys: &self.submission_key_hex,
+            inclusion_keys: &self.inclusion_key_hex,
+        };
 
         serde_json::to_writer(&mut self.writer, &out)?;
         self.writer.write_all(b"\n")?;
@@ -84,6 +91,23 @@ impl<W: Write> NdjsonWriter<W> {
     pub fn into_inner(self) -> W {
         self.writer
     }
+}
+
+fn encode_keys(buffer: &mut Vec<String>, keys: &[[u8; 20]]) -> Result<()> {
+    buffer.clear();
+    buffer.reserve(keys.len());
+
+    for key in keys {
+        let mut key_hex = String::with_capacity(42);
+        key_hex.push_str("0x");
+        for byte in key.iter() {
+            use std::fmt::Write;
+            write!(key_hex, "{:02x}", byte)?;
+        }
+        buffer.push(key_hex);
+    }
+
+    Ok(())
 }
 
 /// Create a writer for stdout.
@@ -111,7 +135,8 @@ mod tests {
 
         let tx = GeneratedTx {
             raw: Bytes::from(vec![0x02, 0xf8, 0x70]),
-            scheduling_keys: vec![[0xab; 20]],
+            submission_keys: vec![[0xab; 20]],
+            inclusion_keys: vec![[0xcd; 20]],
         };
 
         writer.write(&tx).unwrap();
@@ -120,7 +145,10 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("\"raw\":\"0x02f870\""));
         assert!(
-            output.contains("\"scheduling_keys\":[\"0xabababababababababababababababababababab\"]")
+            output.contains("\"submission_keys\":[\"0xabababababababababababababababababababab\"]")
+        );
+        assert!(
+            output.contains("\"inclusion_keys\":[\"0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\"]")
         );
         assert!(output.ends_with('\n'));
     }
@@ -130,7 +158,11 @@ mod tests {
         let mut buf = Vec::new();
         let mut writer = NdjsonWriter::new(&mut buf);
 
-        let tx = GeneratedTx { raw: Bytes::from(vec![0x00]), scheduling_keys: vec![[0x00; 20]] };
+        let tx = GeneratedTx {
+            raw: Bytes::from(vec![0x00]),
+            submission_keys: vec![[0x00; 20]],
+            inclusion_keys: Vec::new(),
+        };
 
         assert_eq!(writer.count(), 0);
         writer.write(&tx).unwrap();
