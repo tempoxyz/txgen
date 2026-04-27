@@ -4,7 +4,7 @@
 //! - [`source`] - Transaction sources (txgen subprocess, file, stdin)
 //! - [`sender`] - Sending with scheduling key ordering + rate limiting
 //! - [`metrics`] - Collection (sent/success/failed counts, timing)
-//! - [`reporter`] - Output (console, JSON, ClickHouse)
+//! - [`reporter`] - Output (console, JSON, ClickHouse, VictoriaMetrics)
 //! - [`reth_api`] - reth custom Engine API types (`reth_newPayload`, `reth_forkchoiceUpdated`)
 
 pub mod clock;
@@ -16,6 +16,7 @@ pub mod sample;
 pub mod scraper;
 pub mod sender;
 pub mod source;
+pub mod victoriametrics;
 
 pub use clock::RunClock;
 pub use metrics::{
@@ -37,3 +38,4 @@ pub use sample::{Sample, SampleStore};
 pub use scraper::{start_scraper, SampleCallback, ScraperConfig, ScraperHandle};
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource, TxgenSource};
+pub use victoriametrics::{VictoriaMetricsConfig, VictoriaMetricsReporter};

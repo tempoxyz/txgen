@@ -199,6 +199,7 @@ Report destinations are specified with `--report` and can be repeated:
 | `console` | Print summary to stderr (default if no reporters specified) |
 | `json:<path>` | Write JSON report to file |
 | `clickhouse:<url>` | Push benchmark data to ClickHouse |
+| `victoriametrics:<url>` | Push samples to VictoriaMetrics (`/api/v1/import/prometheus`) |
 
 ### Metrics Scraping
 
@@ -242,6 +243,42 @@ Authentication is configured via environment variables: `CLICKHOUSE_USER`, `CLIC
 The JSON report includes:
 - `samples` — point-in-time metric snapshots (internal + node), stored as a time series
 - `blocks` — factual chain data for each block in the run (tx count, gas used, etc.)
+
+### VictoriaMetrics Reporting
+
+The VictoriaMetrics reporter forwards every sample in the unified time series (internal `txgen_*` counters plus scraped node Prometheus metrics) to a VictoriaMetrics instance via the `/api/v1/import/prometheus` endpoint. Samples are sent as Prometheus text exposition with their original `unix_ms` timestamps, so backfilling at the end of the run does not lose fidelity.
+
+```bash
+bench send -i txs.ndjson \
+  --metrics-url http://127.0.0.1:9001/metrics \
+  --report victoriametrics:http://vm:8428 \
+  -m scenario=tip20-10k \
+  -m platform=tempo \
+  -m git-sha=abc123 \
+  -m git-ref=main
+```
+
+Each `-m key=value` pair from `--metadata` is forwarded as a server-side `extra_label=key=value` query parameter on every ingestion request, so VM stamps every sample in the run with those labels (perfect for `run_id`, `scenario`, `git_sha`, `platform`, …). Label keys are sanitized to match the Prometheus identifier rules (`-`, `.`, etc. become `_`).
+
+Connection knobs are read from environment variables to keep secrets off the command line:
+
+| Env var | Purpose |
+|---------|---------|
+| `VM_BEARER_TOKEN` | Sent as `Authorization: Bearer …` (e.g. for VM Cloud / vmauth) |
+| `VM_USER` / `VM_PASSWORD` | HTTP basic auth credentials |
+| `VM_TENANT_ID` | Cluster VM `accountID` query parameter |
+| `VM_BATCH_SIZE` | Samples per HTTP request (default: `10000`) |
+| `VM_TIMEOUT_SECS` | Per-request HTTP timeout in seconds (default: `60`) |
+
+Example with auth:
+
+```bash
+VM_BEARER_TOKEN=$(cat ~/.vm-token) \
+bench send -i txs.ndjson \
+  --metrics-url http://127.0.0.1:9001/metrics \
+  --report victoriametrics:https://vm.example.com \
+  -m scenario=tip20-10k -m run_id=$(uuidgen)
+```
 
 ## Output Format
 
