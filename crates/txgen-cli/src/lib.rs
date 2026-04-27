@@ -10,7 +10,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{io::Write, path::PathBuf};
 use tokio::sync::mpsc;
 use txgen_core::{
-    AccountManager, ArtifactManager, BuildContext, GeneratedTx, MixItem, NdjsonWriter,
+    merge_yaml, AccountManager, ArtifactManager, BuildContext, GeneratedTx, MixItem, NdjsonWriter,
     NonceTracker, SequenceBinding, WorkloadSpec,
 };
 
@@ -238,14 +238,6 @@ where
 // Public helpers — used by per-network generate implementations
 // ---------------------------------------------------------------------------
 
-/// Deserialize a named template from the spec.
-pub fn load_template<T: serde::de::DeserializeOwned>(spec: &WorkloadSpec, name: &str) -> Result<T> {
-    let value =
-        spec.templates.get(name).ok_or_else(|| eyre::eyre!("template '{}' not found", name))?;
-    serde_yaml::from_value(value.clone())
-        .wrap_err_with(|| format!("failed to parse template '{}'", name))
-}
-
 /// Fetch protocol nonces (nonce_key=0) for all accounts from an EVM RPC.
 ///
 /// Uses `eth_getTransactionCount` to fetch the current nonce for each
@@ -336,12 +328,6 @@ where
 }
 
 #[derive(Debug, Clone)]
-enum WorkloadItem {
-    Template(String),
-    Sequence(String),
-}
-
-#[derive(Debug, Clone)]
 enum ResolvedBinding {
     Account { pool: String, index: usize, address: Address },
     Address(Address),
@@ -354,16 +340,12 @@ fn pick_workload_item(
     spec: &WorkloadSpec,
     rng: &mut StdRng,
     remaining_txs: u64,
-) -> Result<Option<WorkloadItem>> {
+) -> Result<Option<MixItem>> {
     let mut total_weight = 0u64;
     let mut candidates = Vec::new();
 
     for entry in &spec.mix {
-        let item = match &entry.item {
-            MixItem::Template(template) => WorkloadItem::Template(template.clone()),
-            MixItem::Sequence(sequence) => WorkloadItem::Sequence(sequence.clone()),
-        };
-
+        let item = entry.item.clone();
         let tx_count = workload_item_tx_count(spec, &item)?;
         if tx_count > 0 && tx_count <= remaining_txs && entry.weight > 0 {
             total_weight = total_weight
@@ -389,15 +371,15 @@ fn pick_workload_item(
     unreachable!("workload selection failed with roll={roll} total_weight={total_weight}")
 }
 
-fn workload_item_tx_count(spec: &WorkloadSpec, item: &WorkloadItem) -> Result<u64> {
+fn workload_item_tx_count(spec: &WorkloadSpec, item: &MixItem) -> Result<u64> {
     match item {
-        WorkloadItem::Template(name) => {
+        MixItem::Template(name) => {
             if !spec.templates.contains_key(name) {
                 bail!("template '{}' not found", name);
             }
             Ok(1)
         }
-        WorkloadItem::Sequence(name) => {
+        MixItem::Sequence(name) => {
             let sequence = spec
                 .sequences
                 .get(name)
@@ -432,7 +414,7 @@ where
         };
 
         match item {
-            WorkloadItem::Template(name) => {
+            MixItem::Template(name) => {
                 let value = spec
                     .templates
                     .get(&name)
@@ -441,7 +423,7 @@ where
                 emit_template_value(adapter, &name, value, &[], ctx, writer)?;
                 written += 1;
             }
-            WorkloadItem::Sequence(name) => {
+            MixItem::Sequence(name) => {
                 let sequence = spec
                     .sequences
                     .get(&name)
@@ -583,29 +565,8 @@ fn merge_template_overlay(
     mut base: serde_yaml::Value,
     overlay: serde_yaml::Value,
 ) -> serde_yaml::Value {
-    if matches!(overlay, serde_yaml::Value::Null) {
-        return base;
-    }
     merge_yaml(&mut base, overlay);
     base
-}
-
-fn merge_yaml(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
-    match (base, overlay) {
-        (serde_yaml::Value::Mapping(base_map), serde_yaml::Value::Mapping(overlay_map)) => {
-            for (key, value) in overlay_map {
-                match base_map.get_mut(&key) {
-                    Some(base_value) => merge_yaml(base_value, value),
-                    None => {
-                        base_map.insert(key, value);
-                    }
-                }
-            }
-        }
-        (base_value, overlay_value) => {
-            *base_value = overlay_value;
-        }
-    }
 }
 
 fn substitute_vars(
