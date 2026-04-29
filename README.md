@@ -305,7 +305,7 @@ Transactions are output as NDJSON with scheduling keys split by release policy:
 | `submission_keys` | 20-byte ordering constraints released after RPC submission succeeds |
 | `inclusion_keys` | 20-byte ordering constraints released after the transaction is included in a block |
 
-**Scheduling rule:** Transactions that share any scheduling key must be sent sequentially until that key's release condition is met. Normal transactions carry their natural nonce-lane key in `submission_keys`, because the chain enforces nonce order after admission. Sequence steps additionally carry a sequence-instance key in `inclusion_keys`, because cross-lane dependencies require actual block inclusion before the next step is submitted.
+**Scheduling rule:** Transactions that share any scheduling key must be sent sequentially until that key's release condition is met. Normal transactions carry their natural nonce-lane key in `submission_keys`, because the chain enforces nonce order after admission. Sequence steps on the same nonce lane are submitted back-to-back; txgen only adds synthetic `inclusion_keys` at cross-lane sequence boundaries where nonce order cannot guarantee execution order.
 
 ## Workload Specification
 
@@ -594,7 +594,7 @@ bindings:
         - { var: chain_id }
 ```
 
-Each emitted sequence step gets its natural nonce-lane key as a `submission_key` and a synthetic sequence-instance key as an `inclusion_key`. This lets bench pipeline nonce-ordered transactions while waiting for sequence dependencies to be included before submitting later steps.
+Each emitted sequence step gets its natural nonce-lane key as a `submission_key`. Txgen then groups adjacent sequence steps by lane. Steps in the same lane rely on nonce order and can be submitted back-to-back. When a sequence crosses lanes, txgen adds a synthetic boundary key: the previous run releases it after inclusion, and the next run requires it as a `submission_key`. This preserves cross-lane ordering without receipt-gating same-lane nonce chains.
 
 `txgen generate -n` counts emitted transactions, not sequence instances. txgen never emits a partial sequence; if no remaining mix entry fits the remaining transaction budget, generation stops early.
 
