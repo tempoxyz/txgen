@@ -5,7 +5,7 @@
 //! - Applying rate limiting
 
 use crate::metrics::MetricsCollector;
-use alloy_network::AnyNetwork;
+use alloy_network::{primitives::ReceiptResponse, AnyNetwork};
 use alloy_primitives::Bytes;
 use alloy_provider::{DynProvider, Provider};
 use eyre::Result;
@@ -19,7 +19,7 @@ use tokio::{
     sync::{mpsc, Semaphore},
     task::JoinHandle,
 };
-use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey};
+use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey, TxPhase};
 
 /// Configuration for the sender.
 #[derive(Debug, Clone)]
@@ -51,6 +51,8 @@ const RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A transaction to be sent.
 struct PendingTx {
+    phase: TxPhase,
+    id: Option<String>,
     raw: Bytes,
     submission_keys: SchedulingKeys,
     inclusion_keys: SchedulingKeys,
@@ -124,10 +126,10 @@ impl Sender {
 
         self.drain_completions();
 
-        let GeneratedTx { raw, submission_keys, inclusion_keys } = tx;
+        let GeneratedTx { phase, id, raw, submission_keys, inclusion_keys } = tx;
         let (submission_keys, inclusion_keys) =
             normalize_key_sets(submission_keys, inclusion_keys)?;
-        self.pending.push_back(PendingTx { raw, submission_keys, inclusion_keys });
+        self.pending.push_back(PendingTx { phase, id, raw, submission_keys, inclusion_keys });
         self.schedule_ready();
 
         Ok(())
@@ -264,13 +266,20 @@ async fn submit_tx(
 
     release_keys(&completion_tx, pending.submission_keys);
 
-    if pending.inclusion_keys.is_empty() {
+    if pending.inclusion_keys.is_empty() && pending.phase != TxPhase::Setup {
         return;
     }
 
-    if let Err(e) = wait_for_receipt(provider, tx_hash).await {
-        tracing::warn!(error = %e, %tx_hash, "Failed waiting for transaction receipt");
-        metrics.record_failure();
+    match wait_for_receipt(provider, tx_hash).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::error!(id = pending.id.as_deref(), phase = ?pending.phase, %tx_hash, "Transaction reverted");
+            metrics.record_failure();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %tx_hash, "Failed waiting for transaction receipt");
+            metrics.record_failure();
+        }
     }
 
     release_keys(&completion_tx, pending.inclusion_keys);
@@ -285,12 +294,12 @@ fn release_keys(completion_tx: &mpsc::UnboundedSender<SchedulingKeys>, keys: Sch
 async fn wait_for_receipt(
     provider: &DynProvider<AnyNetwork>,
     tx_hash: alloy_primitives::TxHash,
-) -> Result<()> {
+) -> Result<bool> {
     let deadline = tokio::time::Instant::now() + RECEIPT_TIMEOUT;
 
     loop {
-        if provider.get_transaction_receipt(tx_hash).await?.is_some() {
-            return Ok(());
+        if let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? {
+            return Ok(receipt.status());
         }
 
         if tokio::time::Instant::now() >= deadline {

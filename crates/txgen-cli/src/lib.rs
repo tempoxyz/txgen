@@ -504,6 +504,8 @@ where
     let raw = Bytes::from(envelope.encoded_2718());
 
     writer.write(&GeneratedTx {
+        phase: txgen_core::TxPhase::Workload,
+        id: Some(name.to_string()),
         raw,
         submission_keys: vec![SchedulingKey::from(tx_req.key)],
         inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),

@@ -38,4 +38,5 @@ pub use sample::{Sample, SampleStore};
 pub use scraper::{start_scraper, SampleCallback, ScraperConfig, ScraperHandle};
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource, TxgenSource};
+pub use txgen_core::{GeneratedTx, TxPhase};
 pub use victoriametrics::{VictoriaMetricsConfig, VictoriaMetricsReporter};

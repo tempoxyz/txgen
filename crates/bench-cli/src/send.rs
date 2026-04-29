@@ -2,13 +2,14 @@
 
 use crate::SendArgs;
 use alloy_network::AnyNetwork;
-use alloy_provider::{ext::TxPoolApi, Provider, ProviderBuilder};
+use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     collect_block_stats, parse_reporters, start_scraper, trim_trailing_empty_blocks,
-    ConsoleReporter, FileSource, FinalReport, MetricsCollector, ProgressState, Reporter, RunClock,
-    RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, StdinSource, TxSource,
+    ConsoleReporter, FileSource, FinalReport, GeneratedTx, MetricsCollector, ProgressState,
+    Reporter, RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, StdinSource,
+    TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, time::Duration};
@@ -18,6 +19,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         input = args.input.as_ref().map(|p| p.display().to_string()).as_deref().unwrap_or("stdin"),
         rpc_urls = ?args.rpc_urls,
         tps = args.tps,
+        skip_setup = args.skip_setup,
         "Starting send"
     );
 
@@ -37,17 +39,39 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
+    match &args.input {
+        Some(path) => {
+            let mut source = FileSource::new(path).wrap_err("failed to open input file")?;
+            execute_source(&args, &metadata, providers, &mut source).await
+        }
+        None => {
+            let mut source = StdinSource::new();
+            execute_source(&args, &metadata, providers, &mut source).await
+        }
+    }
+}
+
+async fn execute_source<S: TxSource>(
+    args: &SendArgs,
+    metadata: &HashMap<String, String>,
+    providers: Vec<DynProvider<AnyNetwork>>,
+    source: &mut S,
+) -> Result<()> {
+    let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
+    let query_provider = &providers[0];
+
+    let first_workload = run_setup_phase(args, source, &providers, &config, query_provider).await?;
+
     let clock = RunClock::new();
     let store = SampleStore::new();
     let metrics = MetricsCollector::new(clock.clone());
 
-    // Start background scraper + internal snapshotter if metrics URL is configured.
+    // Start background scraper + internal snapshotter after setup so setup is
+    // excluded from benchmark metrics.
     let scraper_handle = if let Some(ref url) = args.metrics_url {
         let scraper_config =
             ScraperConfig::new(url).with_interval(Duration::from_millis(args.scrape_interval_ms));
 
-        // Internal metrics are snapshotted on the same tick as the Prometheus
-        // scrape so all samples share identical timestamps.
         let snap_metrics = metrics.clone();
         let callback: bench_core::SampleCallback =
             std::sync::Arc::new(move || snap_metrics.snapshot_samples());
@@ -60,30 +84,22 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         None
     };
 
-    let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
     let mut sender = Sender::new(providers.clone(), config.clone(), metrics.clone());
 
-    let mut reporters = parse_reporters(&args.reports, "send", &metadata)?;
+    let mut reporters = parse_reporters(&args.reports, "send", metadata)?;
     if reporters.is_empty() {
         reporters.push(Box::new(ConsoleReporter::stderr(true)));
     }
 
-    // Record the block number before sending so we can collect per-block stats
-    // afterwards. Use the first provider for block queries.
-    let query_provider = &providers[0];
+    // Record the block number after setup and before workload sending so per-block
+    // stats exclude setup blocks.
     let start_block =
         query_provider.get_block_number().await.wrap_err("failed to get starting block number")?;
 
-    match &args.input {
-        Some(path) => {
-            let mut source = FileSource::new(path).wrap_err("failed to open input file")?;
-            send_from_source(&mut source, &mut sender, &metrics, &config, &mut reporters).await?;
-        }
-        None => {
-            let mut source = StdinSource::new();
-            send_from_source(&mut source, &mut sender, &metrics, &config, &mut reporters).await?;
-        }
+    if let Some(tx) = first_workload {
+        send_workload_tx(tx, &mut sender, &metrics, &config, &mut reporters).await?;
     }
+    send_workload_from_source(source, &mut sender, &metrics, &config, &mut reporters).await?;
 
     sender.flush().await;
 
@@ -124,7 +140,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         ..Default::default()
     };
 
-    report.apply_labels(&metadata);
+    report.apply_labels(metadata);
 
     if end_block > start_block {
         let block_range_start = start_block + 1;
@@ -163,6 +179,79 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_setup_phase<S: TxSource, P: TxPoolApi<AnyNetwork>>(
+    args: &SendArgs,
+    source: &mut S,
+    providers: &[DynProvider<AnyNetwork>],
+    config: &SenderConfig,
+    query_provider: &P,
+) -> Result<Option<GeneratedTx>> {
+    let setup_clock = RunClock::new();
+    let setup_metrics = MetricsCollector::new(setup_clock);
+    let mut setup_sender = Sender::new(providers.to_vec(), config.clone(), setup_metrics.clone());
+    let mut setup_seen = 0u64;
+
+    while let Some(tx) = source.next_tx().await? {
+        match tx.phase {
+            TxPhase::Setup if args.skip_setup => {
+                setup_seen += 1;
+                tracing::debug!(id = tx.id.as_deref(), "Skipping setup transaction");
+            }
+            TxPhase::Setup => {
+                setup_seen += 1;
+                setup_sender.send(tx).await?;
+            }
+            TxPhase::Workload => {
+                finish_setup_phase(
+                    args,
+                    setup_seen,
+                    &mut setup_sender,
+                    &setup_metrics,
+                    query_provider,
+                )
+                .await?;
+                return Ok(Some(tx));
+            }
+        }
+    }
+
+    finish_setup_phase(args, setup_seen, &mut setup_sender, &setup_metrics, query_provider).await?;
+    Ok(None)
+}
+
+async fn finish_setup_phase<P: TxPoolApi<AnyNetwork>>(
+    args: &SendArgs,
+    setup_seen: u64,
+    setup_sender: &mut Sender,
+    setup_metrics: &MetricsCollector,
+    query_provider: &P,
+) -> Result<()> {
+    if setup_seen == 0 {
+        return Ok(());
+    }
+
+    if args.skip_setup {
+        tracing::info!(setup_txs = setup_seen, "Skipped setup transactions");
+        return Ok(());
+    }
+
+    tracing::info!(setup_txs = setup_seen, "Waiting for setup transactions");
+    setup_sender.flush().await;
+
+    let (_, _, failed) = setup_metrics.counts();
+    if failed > 0 {
+        bail!("setup phase failed: {failed} setup transaction(s) failed or reverted");
+    }
+
+    if args.drain_timeout > 0 {
+        wait_for_pool_drain(query_provider, args.drain_timeout).await;
+    } else {
+        tracing::warn!("Skipping setup txpool drain because --drain-timeout=0");
+    }
+
+    Ok(())
+}
+
 /// Parse `key=value` metadata strings into a HashMap.
 pub(crate) fn parse_metadata(args: &[String]) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
@@ -177,7 +266,7 @@ pub(crate) fn parse_metadata(args: &[String]) -> Result<HashMap<String, String>>
     Ok(map)
 }
 
-async fn send_from_source<S: TxSource>(
+async fn send_workload_from_source<S: TxSource>(
     source: &mut S,
     sender: &mut Sender,
     metrics: &MetricsCollector,
@@ -185,24 +274,39 @@ async fn send_from_source<S: TxSource>(
     reporters: &mut [Box<dyn Reporter>],
 ) -> Result<()> {
     while let Some(tx) = source.next_tx().await? {
-        sender.send(tx).await?;
+        if tx.phase == TxPhase::Setup {
+            bail!("setup transaction appeared after workload started");
+        }
+        send_workload_tx(tx, sender, metrics, config, reporters).await?;
+    }
+    Ok(())
+}
 
-        let (sent, success, failed) = metrics.counts();
-        if sent % 1000 == 0 {
-            let state = ProgressState {
-                sent,
-                success,
-                failed,
-                elapsed: metrics.elapsed_since_start(),
-                max_concurrent: config.max_concurrent,
-                target_tps: (config.rate_limit > 0).then_some(config.rate_limit),
-                unit: "tx",
-            };
-            for reporter in reporters.iter_mut() {
-                reporter.on_progress(&state)?;
-            }
+async fn send_workload_tx(
+    tx: GeneratedTx,
+    sender: &mut Sender,
+    metrics: &MetricsCollector,
+    config: &SenderConfig,
+    reporters: &mut [Box<dyn Reporter>],
+) -> Result<()> {
+    sender.send(tx).await?;
+
+    let (sent, success, failed) = metrics.counts();
+    if sent % 1000 == 0 {
+        let state = ProgressState {
+            sent,
+            success,
+            failed,
+            elapsed: metrics.elapsed_since_start(),
+            max_concurrent: config.max_concurrent,
+            target_tps: (config.rate_limit > 0).then_some(config.rate_limit),
+            unit: "tx",
+        };
+        for reporter in reporters.iter_mut() {
+            reporter.on_progress(&state)?;
         }
     }
+
     Ok(())
 }
 
