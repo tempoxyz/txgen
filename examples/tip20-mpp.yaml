@@ -1,22 +1,18 @@
-# TIP20 + MPP workload.
+# TIP20 + MPP workload with deterministic setup.
 #
-# This emits roughly 50% standalone TIP20 transfers and 50% MPP channel
-# transactions by emitted transaction count. The MPP workload item is a
-# two-transaction sequence (open, then close), so the mix uses weights 2:1:
-#   - transfer template emits 1 tx
-#   - open_then_close sequence emits 2 txs
+# txgen emits setup transactions before workload transactions:
+#   1. deploy TempoStreamChannel from examples/mpp-channel.json
+# bench send waits for setup inclusion and txpool drain before measuring the
+# workload. Use `bench send --skip-setup` only when the chain is already set up.
 #
-# The close step cannot be submitted before the open is included. txgen gives
-# both sequence steps the same inclusion key, so bench waits for the open
-# receipt before submitting the close.
+# The workload mixes standalone TIP20 transfers with MPP approve -> open -> close
+# sequences. The approve is part of the sequence so each channel instance is
+# self-contained; there is no generated per-user setup approval list.
 #
 # The channel id is deterministic and precomputed as:
 #   keccak256(abi.encode(payer, payee, token, salt, authorizedSigner, channel, chainId))
-# matching Tempo's MPP channel contract.
-#
-# Replace the channel binding below with your deployed TempoStreamChannel
-# contract address. Payers also need to approve that contract to spend the TIP20
-# token before running this workload, because the open step deposits 1 token.
+# matching TempoStreamChannel. close() uses the contract's packed channel key:
+#   abi.encodePacked(channelId, token, authorizedSigner, salt)
 
 chain_id: 1337
 
@@ -31,10 +27,24 @@ accounts:
 
 artifacts:
   ERC20: erc20.abi.json
-  MPPChannel: mpp-channel.abi.json
+  MPPChannel:
+    abi: mpp-channel.json
+    bytecode: mpp-channel.json
+
+setup:
+  steps:
+    - id: channel
+      deploy:
+        type: eip1559
+        from:
+          pool: users
+          select: { index: 0 }
+        artifact: MPPChannel
+        gas_limit: 20000000
+        constructor_args: []
 
 templates:
-  # Standalone TIP20 transfer.
+  # Standalone TIP20 transfer against the existing genesis TIP20 token.
   tip20_transfer:
     type: tempo
     from:
@@ -44,17 +54,29 @@ templates:
     max_fee_per_gas: 100000000000
     max_priority_fee_per_gas: 100000000000
     call:
-      to: "0x20c0000000000000000000000000000000000000" # TIP20 predeploy.
+      to: "0x20c0000000000000000000000000000000000000" # existing genesis TIP20.
       abi: ERC20
       function: transfer
       args:
         - "0x000000000000000000000000000000000000dEaD"
         - 1
 
+  # Approve exactly one token for this channel instance.
+  mpp_approve:
+    type: tempo
+    gas_limit: 2000000
+    max_fee_per_gas: 100000000000
+    max_priority_fee_per_gas: 100000000000
+    call:
+      to: "0x20c0000000000000000000000000000000000001" # existing genesis fee TIP20.
+      abi: ERC20
+      function: approve
+      args: []
+
   # MPP open. The sequence fills in from/payee/token/salt/authorizedSigner.
   mpp_open:
     type: tempo
-    gas_limit: 1000000
+    gas_limit: 2000000
     max_fee_per_gas: 100000000000
     max_priority_fee_per_gas: 100000000000
     call:
@@ -62,10 +84,10 @@ templates:
       function: open
       args: []
 
-  # MPP close. The sequence fills in from/channelId.
+  # MPP close. The sequence fills in from/packed channel key.
   mpp_close:
     type: tempo
-    gas_limit: 1000000
+    gas_limit: 2000000
     max_fee_per_gas: 100000000000
     max_priority_fee_per_gas: 100000000000
     call:
@@ -74,7 +96,7 @@ templates:
       args: []
 
 sequences:
-  mpp_open_then_close:
+  mpp_approve_open_close:
     bindings:
       payer:
         account:
@@ -84,11 +106,7 @@ sequences:
       # empty signature and cumulativeAmount = 0.
       token:
         address:
-          const: "0x20c0000000000000000000000000000000000000"
-      channel:
-        # Replace with the deployed TempoStreamChannel contract address.
-        address:
-          const: "0x0000000000000000000000000000000000000000"
+          const: "0x20c0000000000000000000000000000000000001"
       authorized_signer:
         address:
           const: "0x0000000000000000000000000000000000000000"
@@ -99,24 +117,40 @@ sequences:
         abi_hash:
           types: [address, address, address, bytes32, address, address, uint256]
           values:
-            - { var: payer.address }       # payer / msg.sender
-            - { var: payer.address }       # payee
+            - { var: payer.address }          # payer / msg.sender
+            - { var: payer.address }          # payee
             - { var: token }
             - { var: salt }
             - { var: authorized_signer }
-            - { var: channel }
+            - { var: setup.channel.address }  # deployed TempoStreamChannel
             - { var: chain_id }
+      channel_key:
+        abi_encode_packed:
+          types: [bytes32, address, address, bytes32]
+          values:
+            - { var: channel_id }
+            - { var: token }
+            - { var: authorized_signer }
+            - { var: salt }
     steps:
+      - name: approve
+        template: mpp_approve
+        with:
+          from: { var: payer.ref }
+          call:
+            args:
+              - { var: setup.channel.address }
+              - 1                             # deposit for this channel instance
       - name: open
         template: mpp_open
         with:
           from: { var: payer.ref }
           call:
-            to: { var: channel }
+            to: { var: setup.channel.address }
             args:
-              - { var: payer.address }     # payee
+              - { var: payer.address }        # payee
               - { var: token }
-              - 1                          # deposit
+              - 1                             # deposit
               - { var: salt }
               - { var: authorized_signer }
       - name: close
@@ -124,16 +158,16 @@ sequences:
         with:
           from: { var: payer.ref }
           call:
-            to: { var: channel }
+            to: { var: setup.channel.address }
             args:
-              - { var: channel_id }
-              - 0                          # cumulativeAmount
-              - "0x"                       # signature
+              - { var: channel_key }
+              - 0                             # cumulativeAmount
+              - "0x"                          # signature not needed for zero settlement
 
 mix:
-  # 2:1 by workload item gives roughly 1 standalone transfer for every 2 MPP
-  # sequence transactions, i.e. 50/50 by emitted transaction count.
+  # 3:1 by workload item gives roughly equal standalone transfer txs and
+  # approve/open/close sequence txs by emitted transaction count.
   - template: tip20_transfer
-    weight: 2
-  - sequence: mpp_open_then_close
+    weight: 3
+  - sequence: mpp_approve_open_close
     weight: 1
