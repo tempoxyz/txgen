@@ -34,9 +34,7 @@ impl NetworkAdapter for EthereumAdapter {
         req.set_nonce(nonce);
         req.set_gas_limit(template.gas_limit);
 
-        if let TxKind::Call(addr) = to {
-            req.set_to(addr);
-        }
+        req.set_kind(to);
         req.set_value(value);
         if !input.is_empty() {
             req.set_input(input);
