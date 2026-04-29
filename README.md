@@ -128,6 +128,7 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
 | `--metrics-url <URL>` | Prometheus endpoint to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
+| `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 300, 0 to disable) |
 
 **Required RPC methods:** `eth_sendRawTransaction`, `eth_getBlockByNumber`, `txpool_status` (for `--drain-timeout`)
@@ -286,6 +287,8 @@ Transactions are output as NDJSON with scheduling keys split by release policy:
 
 ```json
 {
+  "phase": "workload",
+  "id": "transfer",
   "raw": "0x02f86c01...",
   "submission_keys": [
     "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc"
@@ -296,6 +299,8 @@ Transactions are output as NDJSON with scheduling keys split by release policy:
 
 | Field | Description |
 |-------|-------------|
+| `phase` | `setup` or `workload`; missing phase is treated as `workload` by `bench` |
+| `id` | Optional diagnostic identifier |
 | `raw` | RLP-encoded signed transaction (EIP-2718 envelope) |
 | `submission_keys` | 20-byte ordering constraints released after RPC submission succeeds |
 | `inclusion_keys` | 20-byte ordering constraints released after the transaction is included in a block |
@@ -327,9 +332,25 @@ accounts:
     mnemonic: "${MNEMONIC}"
     index: 0                 # Single account
 
-# ABI artifacts for contract calls
+# ABI/deployment artifacts for contract calls and setup deploys
 artifacts:
   erc20: "./abis/ERC20.json"
+  token:
+    abi: "./out/Token.sol/Token.json"
+    bytecode: "./out/Token.sol/Token.json"
+
+# Optional deterministic setup transactions emitted before workload txs
+setup:
+  steps:
+    - id: token
+      deploy:
+        type: eip1559
+        artifact: token
+        from:
+          pool: deployer
+          select: { index: 0 }
+        gas_limit: 5000000
+        constructor_args: ["Benchmark Token", "BENCH"]
 
 # Transaction templates
 templates:
@@ -433,6 +454,74 @@ templates:
         - 1000000           # amount
       value: 0
 ```
+
+### Setup Transactions
+
+Use `setup.steps` for deterministic transactions that prepare the chain before the measured workload, such as contract deployments and mint/configuration calls. `txgen` emits all setup transactions first with `phase: "setup"`; workload transactions are emitted afterwards with `phase: "workload"`.
+
+`bench send` treats the first workload transaction as a setup barrier: it waits for all setup transactions to be included, waits for the txpool to drain, resets benchmark timing/metrics, and only then sends workload transactions. Use `bench send --skip-setup` to ignore setup transactions when the target chain is already prepared.
+
+```yaml
+artifacts:
+  token:
+    abi: ./out/Token.sol/Token.json
+    bytecode: ./out/Token.sol/Token.json
+
+setup:
+  steps:
+    - id: token
+      bindings:
+        deployer:
+          account: { pool: deployer, select: { index: 0 } }
+      deploy:
+        type: eip1559
+        artifact: token
+        from: { var: deployer.ref }
+        gas_limit: 5000000
+        constructor_args: ["Benchmark Token", "BENCH"]
+
+    - id: mint_user0
+      bindings:
+        deployer:
+          account: { pool: deployer, select: { index: 0 } }
+        user:
+          account: { pool: users, select: { index: 0 } }
+      tx:
+        type: eip1559
+        from: { var: deployer.ref }
+        gas_limit: 100000
+        call:
+          to: { var: setup.token.address }
+          abi: token
+          function: mint
+          args:
+            - { var: user.address }
+            - 1000000000000000000000
+
+templates:
+  transfer_token:
+    type: eip1559
+    from: { pool: users, select: random }
+    gas_limit: 65000
+    call:
+      to: { var: setup.token.address }
+      abi: token
+      function: transfer
+      args:
+        - { pool: users, select: random }
+        - 1000000000000000000
+```
+
+Setup outputs are deterministic only. Supported references are:
+
+| Reference | Description |
+|-----------|-------------|
+| `setup.<id>.address` | Contract address for deployment steps |
+| `setup.<id>.tx_hash` | Signed transaction hash |
+| `setup.<id>.sender` | Sender address |
+| `setup.<id>.nonce` | Sender nonce used by the setup transaction |
+
+Setup does not support using contract call return values, logs, or receipt fields as later inputs.
 
 ### Transaction Sequences
 
