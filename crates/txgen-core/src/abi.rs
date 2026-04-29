@@ -13,7 +13,8 @@ use crate::{GenValue, ValueResolver};
 pub enum ArtifactDef {
     /// Path to an ABI JSON file or a compiler artifact containing an `abi` field.
     Path(PathBuf),
-    /// Separate ABI and bytecode paths. `bytecode` may point at a raw hex file or compiler artifact.
+    /// Separate ABI and bytecode paths. `bytecode` may point at a raw hex file or compiler
+    /// artifact.
     Object { abi: PathBuf, bytecode: Option<PathBuf> },
 }
 
@@ -71,17 +72,19 @@ impl ArtifactManager {
         args: &[serde_yaml::Value],
         resolver: &mut ValueResolver<'_>,
     ) -> Result<Bytes> {
-        let artifact = self
-            .artifacts
-            .get(name)
-            .ok_or_else(|| eyre::eyre!("artifact '{}' not found", name))?;
+        let artifact =
+            self.artifacts.get(name).ok_or_else(|| eyre::eyre!("artifact '{}' not found", name))?;
         let bytecode = artifact
             .bytecode
             .as_ref()
             .ok_or_else(|| eyre::eyre!("artifact '{}' has no bytecode", name))?;
         let mut initcode = bytecode.to_vec();
 
-        let inputs = artifact.abi.constructor().map(|constructor| constructor.inputs.as_slice()).unwrap_or(&[]);
+        let inputs = artifact
+            .abi
+            .constructor()
+            .map(|constructor| constructor.inputs.as_slice())
+            .unwrap_or(&[]);
         if inputs.len() != args.len() {
             bail!(
                 "constructor for artifact '{}' expects {} arguments, got {}",
@@ -124,7 +127,11 @@ fn load_artifact(
 }
 
 fn resolve_path(path: &PathBuf, base_path: &std::path::Path) -> PathBuf {
-    if path.is_absolute() { path.clone() } else { base_path.join(path) }
+    if path.is_absolute() {
+        path.clone()
+    } else {
+        base_path.join(path)
+    }
 }
 
 fn parse_abi_json(json: &serde_json::Value) -> Result<JsonAbi> {
