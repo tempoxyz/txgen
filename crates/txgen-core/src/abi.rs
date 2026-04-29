@@ -7,30 +7,47 @@ use std::{collections::HashMap, path::PathBuf};
 
 use crate::{GenValue, ValueResolver};
 
-/// Manages loaded ABI artifacts.
+/// Artifact definition in the workload spec.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ArtifactDef {
+    /// Path to an ABI JSON file or a compiler artifact containing an `abi` field.
+    Path(PathBuf),
+    /// Separate ABI and bytecode paths. `bytecode` may point at a raw hex file or compiler artifact.
+    Object { abi: PathBuf, bytecode: Option<PathBuf> },
+}
+
+#[derive(Debug)]
+struct Artifact {
+    abi: JsonAbi,
+    bytecode: Option<Bytes>,
+}
+
+/// Manages loaded ABI/deployment artifacts.
 #[derive(Debug, Default)]
 pub struct ArtifactManager {
-    abis: HashMap<String, JsonAbi>,
+    artifacts: HashMap<String, Artifact>,
 }
 
 impl ArtifactManager {
     /// Load artifacts from path mappings.
-    pub fn load(artifacts: &HashMap<String, PathBuf>, base_path: &std::path::Path) -> Result<Self> {
-        let mut abis = HashMap::new();
+    pub fn load(
+        artifacts: &HashMap<String, ArtifactDef>,
+        base_path: &std::path::Path,
+    ) -> Result<Self> {
+        let mut loaded = HashMap::new();
 
-        for (name, path) in artifacts {
-            let full_path = if path.is_absolute() { path.clone() } else { base_path.join(path) };
-
-            let content = std::fs::read_to_string(&full_path)
-                .wrap_err_with(|| format!("failed to read artifact: {}", full_path.display()))?;
-
-            let abi: JsonAbi = serde_json::from_str(&content)
-                .wrap_err_with(|| format!("failed to parse ABI: {}", full_path.display()))?;
-
-            abis.insert(name.clone(), abi);
+        for (name, def) in artifacts {
+            let artifact = match def {
+                ArtifactDef::Path(path) => load_artifact(path, None, base_path)?,
+                ArtifactDef::Object { abi, bytecode } => {
+                    load_artifact(abi, bytecode.as_ref(), base_path)?
+                }
+            };
+            loaded.insert(name.clone(), artifact);
         }
 
-        Ok(Self { abis })
+        Ok(Self { artifacts: loaded })
     }
 
     /// Create an empty artifact manager (for testing).
@@ -40,8 +57,111 @@ impl ArtifactManager {
 
     /// Get an ABI by name.
     pub fn get(&self, name: &str) -> Result<&JsonAbi> {
-        self.abis.get(name).ok_or_else(|| eyre::eyre!("artifact '{}' not found", name))
+        Ok(&self
+            .artifacts
+            .get(name)
+            .ok_or_else(|| eyre::eyre!("artifact '{}' not found", name))?
+            .abi)
     }
+
+    /// Build EVM initcode by appending ABI-encoded constructor arguments to bytecode.
+    pub fn encode_constructor(
+        &self,
+        name: &str,
+        args: &[serde_yaml::Value],
+        resolver: &mut ValueResolver<'_>,
+    ) -> Result<Bytes> {
+        let artifact = self
+            .artifacts
+            .get(name)
+            .ok_or_else(|| eyre::eyre!("artifact '{}' not found", name))?;
+        let bytecode = artifact
+            .bytecode
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("artifact '{}' has no bytecode", name))?;
+        let mut initcode = bytecode.to_vec();
+
+        let inputs = artifact.abi.constructor().map(|constructor| constructor.inputs.as_slice()).unwrap_or(&[]);
+        if inputs.len() != args.len() {
+            bail!(
+                "constructor for artifact '{}' expects {} arguments, got {}",
+                name,
+                inputs.len(),
+                args.len()
+            );
+        }
+
+        let mut encoded_args = Vec::with_capacity(args.len());
+        for (arg, param) in args.iter().zip(inputs) {
+            encoded_args.push(yaml_to_sol_value(arg, &param.ty.to_string(), resolver)?);
+        }
+        initcode.extend_from_slice(&DynSolValue::Tuple(encoded_args).abi_encode_params());
+
+        Ok(Bytes::from(initcode))
+    }
+}
+
+fn load_artifact(
+    abi_path: &PathBuf,
+    bytecode_path: Option<&PathBuf>,
+    base_path: &std::path::Path,
+) -> Result<Artifact> {
+    let abi_path = resolve_path(abi_path, base_path);
+    let content = std::fs::read_to_string(&abi_path)
+        .wrap_err_with(|| format!("failed to read artifact: {}", abi_path.display()))?;
+    let json: serde_json::Value = serde_json::from_str(&content)
+        .wrap_err_with(|| format!("failed to parse artifact JSON: {}", abi_path.display()))?;
+
+    let abi = parse_abi_json(&json)
+        .wrap_err_with(|| format!("failed to parse ABI: {}", abi_path.display()))?;
+    let bytecode = if let Some(path) = bytecode_path {
+        Some(load_bytecode(path, base_path)?)
+    } else {
+        parse_bytecode_json(&json).transpose()?
+    };
+
+    Ok(Artifact { abi, bytecode })
+}
+
+fn resolve_path(path: &PathBuf, base_path: &std::path::Path) -> PathBuf {
+    if path.is_absolute() { path.clone() } else { base_path.join(path) }
+}
+
+fn parse_abi_json(json: &serde_json::Value) -> Result<JsonAbi> {
+    if let Some(abi) = json.get("abi") {
+        Ok(serde_json::from_value(abi.clone())?)
+    } else {
+        Ok(serde_json::from_value(json.clone())?)
+    }
+}
+
+fn load_bytecode(path: &PathBuf, base_path: &std::path::Path) -> Result<Bytes> {
+    let path = resolve_path(path, base_path);
+    let content = std::fs::read_to_string(&path)
+        .wrap_err_with(|| format!("failed to read bytecode: {}", path.display()))?;
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+        if let Some(bytecode) = parse_bytecode_json(&json).transpose()? {
+            return Ok(bytecode);
+        }
+    }
+    parse_bytecode_str(content.trim())
+        .wrap_err_with(|| format!("failed to parse bytecode: {}", path.display()))
+}
+
+fn parse_bytecode_json(json: &serde_json::Value) -> Option<Result<Bytes>> {
+    let bytecode = json.get("bytecode")?;
+    if let Some(s) = bytecode.as_str() {
+        return Some(parse_bytecode_str(s));
+    }
+    if let Some(s) = bytecode.get("object").and_then(|value| value.as_str()) {
+        return Some(parse_bytecode_str(s));
+    }
+    Some(Err(eyre::eyre!("unsupported bytecode JSON shape")))
+}
+
+fn parse_bytecode_str(value: &str) -> Result<Bytes> {
+    let hex = value.strip_prefix("0x").unwrap_or(value);
+    Ok(Bytes::from(hex::decode(hex)?))
 }
 
 /// Definition of a contract call in the workload spec.

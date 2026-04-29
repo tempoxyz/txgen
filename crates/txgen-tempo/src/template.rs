@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, Bytes, U256};
 use serde::Deserialize;
 use txgen_core::{AccountRef, CallDef, GenValue};
 
@@ -36,6 +36,10 @@ pub struct TempoTemplate {
     /// Recipient address (None for contract creation).
     #[serde(default)]
     pub to: Option<GenValue<Address>>,
+
+    /// Raw input data when not using `call`.
+    #[serde(default)]
+    pub input: Option<GenValue<Bytes>>,
 
     /// Contract call definition (alternative to raw `to`/`value`/`input`).
     #[serde(default)]

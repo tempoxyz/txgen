@@ -91,7 +91,13 @@ fn resolve_call_data(
     } else {
         let to = ctx.resolve_to(&template.to)?;
         let value = ctx.resolve_value(&template.value)?;
-        Ok((to, value, Bytes::new()))
+        let input = template
+            .input
+            .as_ref()
+            .map(|input| ctx.resolve_value(input))
+            .transpose()?
+            .unwrap_or_default();
+        Ok((to, value, input))
     }
 }
 
@@ -135,6 +141,7 @@ mod tests {
             gas_limit: 21000,
             value: GenValue::Literal(U256::from(1000)),
             to: Some(GenValue::Literal(alloy_primitives::Address::ZERO)),
+            input: None,
             call: None,
             gas_price: None,
             max_fee_per_gas: Some(1_000_000_000),
