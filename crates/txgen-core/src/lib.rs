@@ -17,8 +17,8 @@ pub use output::{GeneratedTx, NdjsonWriter, TxPhase};
 pub use plugin::{BuildContext, SelectedSigner};
 pub use scheduling_key::{dedup_scheduling_keys, SchedulingKey};
 pub use spec::{
-    AbiHashDef, GasConfig, MixEntry, MixItem, SequenceBinding, SequenceDef, SequenceStep, SetupDef,
-    SetupStep, WorkloadSpec,
+    AbiEncodePackedDef, AbiHashDef, GasConfig, MixEntry, MixItem, SequenceBinding, SequenceDef,
+    SequenceStep, SetupDef, SetupStep, WorkloadSpec,
 };
 pub use value::{FromGenerator, GenValue, Generator, ValueResolver};
 pub use yaml::merge_yaml;

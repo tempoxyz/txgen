@@ -11,9 +11,9 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{collections::HashSet, io::Write, path::PathBuf};
 use tokio::sync::mpsc;
 use txgen_core::{
-    dedup_scheduling_keys, merge_yaml, AbiHashDef, AccountManager, ArtifactManager, BuildContext,
-    GeneratedTx, MixItem, NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, SetupStep,
-    TxPhase, WorkloadSpec,
+    dedup_scheduling_keys, merge_yaml, AbiEncodePackedDef, AbiHashDef, AccountManager,
+    ArtifactManager, BuildContext, GeneratedTx, MixItem, NdjsonWriter, NonceTracker, SchedulingKey,
+    SequenceBinding, SetupStep, TxPhase, WorkloadSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -343,6 +343,7 @@ enum ResolvedBinding {
     Account { pool: String, index: usize, address: Address },
     Address(Address),
     Bytes32(B256),
+    Bytes(Bytes),
     U256(U256),
     U64(u64),
     String(String),
@@ -732,6 +733,9 @@ fn resolve_sequence_binding(
         }
         SequenceBinding::Address(address) => ResolvedBinding::Address(ctx.resolve_value(address)?),
         SequenceBinding::Bytes32(bytes32) => ResolvedBinding::Bytes32(ctx.resolve_value(bytes32)?),
+        SequenceBinding::AbiEncodePacked(def) => {
+            ResolvedBinding::Bytes(resolve_abi_encode_packed(def, resolved)?)
+        }
         SequenceBinding::AbiHash(abi_hash) => {
             ResolvedBinding::Bytes32(resolve_abi_hash(abi_hash, resolved)?)
         }
@@ -766,39 +770,65 @@ fn binding_dependency_names(
     bindings: &std::collections::HashMap<String, SequenceBinding>,
 ) -> HashSet<String> {
     let mut deps = HashSet::new();
-    if let SequenceBinding::AbiHash(abi_hash) = binding {
-        for value in &abi_hash.values {
-            collect_var_names(value, bindings, &mut deps);
+    match binding {
+        SequenceBinding::AbiEncodePacked(def) => {
+            for value in &def.values {
+                collect_var_names(value, bindings, &mut deps);
+            }
         }
+        SequenceBinding::AbiHash(def) => {
+            for value in &def.values {
+                collect_var_names(value, bindings, &mut deps);
+            }
+        }
+        _ => {}
     }
     deps
+}
+
+fn resolve_abi_encode_packed(
+    def: &AbiEncodePackedDef,
+    bindings: &std::collections::HashMap<String, ResolvedBinding>,
+) -> Result<Bytes> {
+    let values = resolve_abi_values(&def.types, &def.values, bindings, "abi_encode_packed")?;
+    Ok(Bytes::from(DynSolValue::Tuple(values).abi_encode_packed()))
 }
 
 fn resolve_abi_hash(
     def: &AbiHashDef,
     bindings: &std::collections::HashMap<String, ResolvedBinding>,
 ) -> Result<B256> {
-    if def.types.len() != def.values.len() {
+    let values = resolve_abi_values(&def.types, &def.values, bindings, "abi_hash")?;
+    Ok(keccak256(DynSolValue::Tuple(values).abi_encode_params()))
+}
+
+fn resolve_abi_values(
+    types: &[String],
+    raw_values: &[serde_yaml::Value],
+    bindings: &std::collections::HashMap<String, ResolvedBinding>,
+    context: &str,
+) -> Result<Vec<DynSolValue>> {
+    if types.len() != raw_values.len() {
         bail!(
-            "abi_hash expects the same number of types and values, got {} types and {} values",
-            def.types.len(),
-            def.values.len()
+            "{context} expects the same number of types and values, got {} types and {} values",
+            types.len(),
+            raw_values.len()
         );
     }
 
-    let mut values = Vec::with_capacity(def.values.len());
-    for (idx, (sol_type, value)) in def.types.iter().zip(&def.values).enumerate() {
+    let mut values = Vec::with_capacity(raw_values.len());
+    for (idx, (sol_type, value)) in types.iter().zip(raw_values).enumerate() {
         let substituted = substitute_vars(value.clone(), bindings)?;
         let json = yaml_to_json(substituted)?;
         let ty = DynSolType::parse(sol_type)
-            .wrap_err_with(|| format!("failed to parse abi_hash type {idx} ('{sol_type}')"))?;
+            .wrap_err_with(|| format!("failed to parse {context} type {idx} ('{sol_type}')"))?;
         let value = ty
             .coerce_json(&json)
-            .wrap_err_with(|| format!("failed to coerce abi_hash value {idx} as '{sol_type}'"))?;
+            .wrap_err_with(|| format!("failed to coerce {context} value {idx} as '{sol_type}'"))?;
         values.push(value);
     }
 
-    Ok(keccak256(DynSolValue::Tuple(values).abi_encode_params()))
+    Ok(values)
 }
 
 fn yaml_to_json(value: serde_yaml::Value) -> Result<serde_json::Value> {
@@ -932,6 +962,7 @@ fn binding_to_value(
             Ok(serde_yaml::Value::String(address.to_string()))
         }
         (ResolvedBinding::Bytes32(value), None) => Ok(serde_yaml::Value::String(value.to_string())),
+        (ResolvedBinding::Bytes(value), None) => Ok(serde_yaml::Value::String(value.to_string())),
         (ResolvedBinding::U256(value), None) => Ok(serde_yaml::Value::String(value.to_string())),
         (ResolvedBinding::U64(value), None) => Ok(serde_yaml::to_value(value)?),
         (ResolvedBinding::String(value), None) => Ok(serde_yaml::Value::String(value.clone())),
