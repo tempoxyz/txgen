@@ -131,7 +131,7 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 300, 0 to disable) |
 
-**Required RPC methods:** `eth_sendRawTransaction`, `eth_getBlockByNumber`, `txpool_status` (for `--drain-timeout`)
+**Required RPC methods:** `eth_sendRawTransaction`, `eth_getTransactionReceipt` (setup and inclusion waits), `eth_getBlockByNumber`, `txpool_status` (for `--drain-timeout`)
 
 #### `bench send-blocks`
 
@@ -680,6 +680,7 @@ Summary of which RPC methods are required by each feature:
 |------------|-------------|
 | `eth_getTransactionCount` | `txgen-ethereum generate --rpc`, `txgen-tempo generate --rpc` |
 | `eth_sendRawTransaction` | `bench send` |
+| `eth_getTransactionReceipt` | `bench send` (setup and inclusion waits) |
 | `eth_getBlockByNumber` | `bench send` (per-block stats collection) |
 | `debug_getRawBlock` | `txgen extract` |
 | `reth_newPayload` | `bench send-blocks` |
