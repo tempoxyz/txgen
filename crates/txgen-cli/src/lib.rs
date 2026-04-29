@@ -2,7 +2,7 @@ use alloy_consensus::{BlockHeader, Sealed, SignableTransaction, Signed};
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_eips::{eip2718::Encodable2718, BlockNumberOrTag};
 use alloy_network::{Network, TransactionBuilder, TxSignerSync};
-use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy_primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
 use alloy_provider::{ext::DebugApi, Provider};
 use alloy_rlp::Decodable;
 use clap::{Args, Parser, Subcommand};
@@ -12,7 +12,8 @@ use std::{collections::HashSet, io::Write, path::PathBuf};
 use tokio::sync::mpsc;
 use txgen_core::{
     dedup_scheduling_keys, merge_yaml, AbiHashDef, AccountManager, ArtifactManager, BuildContext,
-    GeneratedTx, MixItem, NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, WorkloadSpec,
+    GeneratedTx, MixItem, NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, SetupStep,
+    TxPhase, WorkloadSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -316,12 +317,21 @@ where
     match output {
         Some(path) => {
             let mut writer = txgen_core::output::file_writer(&path)?;
-            let written = generate_txs(adapter, &ctx.spec, count, &mut build_ctx, &mut writer)?;
-            eprintln!("wrote {} transactions to {}", written, path.display());
+            let setup_bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+            let written = generate_txs(
+                adapter,
+                &ctx.spec,
+                count,
+                &setup_bindings,
+                &mut build_ctx,
+                &mut writer,
+            )?;
+            eprintln!("wrote {} workload transactions to {}", written, path.display());
         }
         None => {
             let mut writer = txgen_core::output::stdout_writer();
-            generate_txs(adapter, &ctx.spec, count, &mut build_ctx, &mut writer)?;
+            let setup_bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+            generate_txs(adapter, &ctx.spec, count, &setup_bindings, &mut build_ctx, &mut writer)?;
         }
     }
 
@@ -336,6 +346,7 @@ enum ResolvedBinding {
     U256(U256),
     U64(u64),
     String(String),
+    SetupTx { address: Option<Address>, tx_hash: B256, sender: Address, nonce: u64 },
 }
 
 fn pick_workload_item(
@@ -394,10 +405,146 @@ fn workload_item_tx_count(spec: &WorkloadSpec, item: &MixItem) -> Result<u64> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct EmittedTxInfo {
+    sender: Address,
+    nonce: u64,
+    tx_hash: B256,
+    created_address: Option<Address>,
+}
+
+fn emit_setup<A: NetworkAdapter, W: Write>(
+    adapter: &A,
+    spec: &WorkloadSpec,
+    ctx: &mut BuildContext<'_>,
+    writer: &mut NdjsonWriter<W>,
+) -> Result<std::collections::HashMap<String, ResolvedBinding>>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let mut bindings = std::collections::HashMap::new();
+    bindings.insert("chain_id".to_string(), ResolvedBinding::U64(ctx.chain_id));
+
+    let Some(setup) = &spec.setup else {
+        return Ok(bindings);
+    };
+
+    let setup_key = compute_setup_key();
+    for step in &setup.steps {
+        emit_setup_step(adapter, step, &mut bindings, setup_key, ctx, writer)
+            .wrap_err_with(|| format!("failed to emit setup step '{}'", step.id))?;
+    }
+
+    Ok(bindings)
+}
+
+fn emit_setup_step<A: NetworkAdapter, W: Write>(
+    adapter: &A,
+    step: &SetupStep,
+    setup_bindings: &mut std::collections::HashMap<String, ResolvedBinding>,
+    setup_key: SchedulingKey,
+    ctx: &mut BuildContext<'_>,
+    writer: &mut NdjsonWriter<W>,
+) -> Result<()>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let has_deploy = step.deploy.is_some();
+    let has_tx = step.tx.is_some();
+    if has_deploy == has_tx {
+        bail!("setup step must set exactly one of `deploy` or `tx`");
+    }
+
+    let local_bindings = resolve_sequence_bindings(&step.bindings, ctx, setup_bindings)?;
+    let info = if let Some(deploy) = &step.deploy {
+        let materialized = substitute_vars(deploy.clone(), &local_bindings)?;
+        let value = build_deploy_template_value(materialized, ctx)?;
+        let info = emit_template_value(
+            adapter,
+            &format!("setup.{}", step.id),
+            value,
+            TxPhase::Setup,
+            &[setup_key],
+            ctx,
+            writer,
+        )?;
+        if info.created_address.is_none() {
+            bail!("deploy setup step did not produce a contract creation transaction");
+        }
+        info
+    } else {
+        let tx = step.tx.as_ref().expect("checked exactly one setup action");
+        let materialized = substitute_vars(tx.clone(), &local_bindings)?;
+        emit_template_value(
+            adapter,
+            &format!("setup.{}", step.id),
+            materialized,
+            TxPhase::Setup,
+            &[setup_key],
+            ctx,
+            writer,
+        )?
+    };
+
+    setup_bindings.insert(
+        format!("setup.{}", step.id),
+        ResolvedBinding::SetupTx {
+            address: info.created_address,
+            tx_hash: info.tx_hash,
+            sender: info.sender,
+            nonce: info.nonce,
+        },
+    );
+
+    Ok(())
+}
+
+fn build_deploy_template_value(
+    value: serde_yaml::Value,
+    ctx: &mut BuildContext<'_>,
+) -> Result<serde_yaml::Value> {
+    let serde_yaml::Value::Mapping(mut mapping) = value else {
+        bail!("deploy setup step must be a mapping");
+    };
+
+    let artifact_key = serde_yaml::Value::String("artifact".to_string());
+    let constructor_args_key = serde_yaml::Value::String("constructor_args".to_string());
+    let input_key = serde_yaml::Value::String("input".to_string());
+    let to_key = serde_yaml::Value::String("to".to_string());
+
+    if mapping.contains_key(&input_key) || mapping.contains_key(&to_key) {
+        bail!("deploy setup steps must not set `to` or `input`");
+    }
+
+    let artifact_value = mapping
+        .remove(&artifact_key)
+        .ok_or_else(|| eyre::eyre!("deploy setup step requires `artifact`"))?;
+    let artifact: String = serde_yaml::from_value(artifact_value)?;
+    let constructor_args: Vec<serde_yaml::Value> = mapping
+        .remove(&constructor_args_key)
+        .map(serde_yaml::from_value)
+        .transpose()?
+        .unwrap_or_default();
+
+    let initcode = {
+        let artifacts = ctx.artifacts;
+        let mut resolver = ctx.resolver();
+        artifacts.encode_constructor(&artifact, &constructor_args, &mut resolver)?
+    };
+    mapping.insert(input_key, serde_yaml::Value::String(initcode.to_string()));
+
+    Ok(serde_yaml::Value::Mapping(mapping))
+}
+
 fn generate_txs<A: NetworkAdapter, W: Write>(
     adapter: &A,
     spec: &WorkloadSpec,
     count: u64,
+    setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
 ) -> Result<u64>
@@ -422,7 +569,17 @@ where
                     .get(&name)
                     .ok_or_else(|| eyre::eyre!("template '{}' not found", name))?
                     .clone();
-                emit_template_value(adapter, &name, value, &[], ctx, writer)?;
+                let materialized = substitute_vars(value, setup_bindings)
+                    .wrap_err_with(|| format!("failed to materialize template '{name}'"))?;
+                emit_template_value(
+                    adapter,
+                    &name,
+                    materialized,
+                    TxPhase::Workload,
+                    &[],
+                    ctx,
+                    writer,
+                )?;
                 written += 1;
             }
             MixItem::Sequence(name) => {
@@ -435,10 +592,10 @@ where
                     .checked_add(1)
                     .ok_or_else(|| eyre::eyre!("sequence instance counter overflowed u64"))?;
                 let sequence_key = compute_sequence_key(&name, sequence_instance);
-                let bindings =
-                    resolve_sequence_bindings(&sequence.bindings, ctx).wrap_err_with(|| {
-                        format!("failed to resolve bindings for sequence '{name}'")
-                    })?;
+                let bindings = resolve_sequence_bindings(&sequence.bindings, ctx, setup_bindings)
+                    .wrap_err_with(|| {
+                    format!("failed to resolve bindings for sequence '{name}'")
+                })?;
 
                 for (idx, step) in sequence.steps.iter().enumerate() {
                     let label = step.name.as_deref().unwrap_or(&step.template);
@@ -455,6 +612,7 @@ where
                         adapter,
                         &format!("{name}.{label}"),
                         materialized,
+                        TxPhase::Workload,
                         &[sequence_key],
                         ctx,
                         writer,
@@ -473,10 +631,11 @@ fn emit_template_value<A: NetworkAdapter, W: Write>(
     adapter: &A,
     name: &str,
     value: serde_yaml::Value,
+    phase: TxPhase,
     inclusion_keys: &[SchedulingKey],
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
-) -> Result<()>
+) -> Result<EmittedTxInfo>
 where
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
@@ -488,6 +647,14 @@ where
     let tx_req = adapter
         .build_request(template, ctx)
         .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
+
+    let sender = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?.address();
+    let nonce = tx_req
+        .request
+        .nonce()
+        .ok_or_else(|| eyre::eyre!("template '{name}' did not set a nonce"))?;
+    let created_address =
+        matches!(tx_req.request.kind(), Some(TxKind::Create)).then(|| sender.create(nonce));
 
     let mut unsigned = tx_req
         .request
@@ -502,23 +669,28 @@ where
     let signed = unsigned.into_signed(sig);
     let envelope = <A::Network as Network>::TxEnvelope::from(signed);
     let raw = Bytes::from(envelope.encoded_2718());
+    let tx_hash = keccak256(&raw);
 
     writer.write(&GeneratedTx {
-        phase: txgen_core::TxPhase::Workload,
+        phase,
         id: Some(name.to_string()),
         raw,
         submission_keys: vec![SchedulingKey::from(tx_req.key)],
         inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),
     })?;
-    Ok(())
+    Ok(EmittedTxInfo { sender, nonce, tx_hash, created_address })
 }
 
 fn resolve_sequence_bindings(
     bindings: &std::collections::HashMap<String, SequenceBinding>,
     ctx: &mut BuildContext<'_>,
+    globals: &std::collections::HashMap<String, ResolvedBinding>,
 ) -> Result<std::collections::HashMap<String, ResolvedBinding>> {
-    let mut resolved = std::collections::HashMap::new();
-    if !bindings.contains_key("chain_id") {
+    let mut resolved = globals.clone();
+    for name in bindings.keys() {
+        resolved.remove(name);
+    }
+    if !bindings.contains_key("chain_id") && !resolved.contains_key("chain_id") {
         resolved.insert("chain_id".to_string(), ResolvedBinding::U64(ctx.chain_id));
     }
 
@@ -580,7 +752,7 @@ fn resolve_binding_dependencies(
     resolving: &mut HashSet<String>,
     ctx: &mut BuildContext<'_>,
 ) -> Result<()> {
-    for dep in binding_dependency_names(binding) {
+    for dep in binding_dependency_names(binding, bindings) {
         if resolved.contains_key(&dep) {
             continue;
         }
@@ -589,11 +761,14 @@ fn resolve_binding_dependencies(
     Ok(())
 }
 
-fn binding_dependency_names(binding: &SequenceBinding) -> HashSet<String> {
+fn binding_dependency_names(
+    binding: &SequenceBinding,
+    bindings: &std::collections::HashMap<String, SequenceBinding>,
+) -> HashSet<String> {
     let mut deps = HashSet::new();
     if let SequenceBinding::AbiHash(abi_hash) = binding {
         for value in &abi_hash.values {
-            collect_var_names(value, &mut deps);
+            collect_var_names(value, bindings, &mut deps);
         }
     }
     deps
@@ -630,31 +805,55 @@ fn yaml_to_json(value: serde_yaml::Value) -> Result<serde_json::Value> {
     Ok(serde_json::to_value(value)?)
 }
 
-fn collect_var_names(value: &serde_yaml::Value, names: &mut HashSet<String>) {
+fn collect_var_names(
+    value: &serde_yaml::Value,
+    bindings: &std::collections::HashMap<String, SequenceBinding>,
+    names: &mut HashSet<String>,
+) {
     match value {
         serde_yaml::Value::Mapping(mapping) if mapping.len() == 1 => {
             let var_key = serde_yaml::Value::String("var".to_string());
             if let Some(serde_yaml::Value::String(path)) = mapping.get(&var_key) {
-                let name = path.split_once('.').map_or(path.as_str(), |(name, _)| name);
-                names.insert(name.to_string());
+                if let Some(name) = referenced_local_binding(path, bindings) {
+                    names.insert(name);
+                }
                 return;
             }
             for value in mapping.values() {
-                collect_var_names(value, names);
+                collect_var_names(value, bindings, names);
             }
         }
         serde_yaml::Value::Mapping(mapping) => {
             for value in mapping.values() {
-                collect_var_names(value, names);
+                collect_var_names(value, bindings, names);
             }
         }
         serde_yaml::Value::Sequence(values) => {
             for value in values {
-                collect_var_names(value, names);
+                collect_var_names(value, bindings, names);
             }
         }
         _ => {}
     }
+}
+
+fn referenced_local_binding(
+    path: &str,
+    bindings: &std::collections::HashMap<String, SequenceBinding>,
+) -> Option<String> {
+    let first = path.split('.').next().unwrap_or(path);
+    if bindings.contains_key(first) {
+        Some(first.to_string())
+    } else {
+        None
+    }
+}
+
+fn compute_setup_key() -> SchedulingKey {
+    let hash = keccak256(b"txgen:setup");
+    let mut key = [0u8; 20];
+    key.copy_from_slice(&hash[..20]);
+    SchedulingKey::from(key)
 }
 
 fn compute_sequence_key(sequence_name: &str, sequence_instance: u64) -> SchedulingKey {
@@ -715,10 +914,9 @@ fn binding_to_value(
     path: &str,
     bindings: &std::collections::HashMap<String, ResolvedBinding>,
 ) -> Result<serde_yaml::Value> {
-    let (name, field) =
-        path.split_once('.').map_or((path, None), |(name, field)| (name, Some(field)));
-    let binding =
-        bindings.get(name).ok_or_else(|| eyre::eyre!("unknown sequence binding '{name}'"))?;
+    let (name, field) = split_binding_path(path, bindings)
+        .ok_or_else(|| eyre::eyre!("unknown binding '{path}'"))?;
+    let binding = bindings.get(name).ok_or_else(|| eyre::eyre!("unknown binding '{name}'"))?;
 
     match (binding, field) {
         (ResolvedBinding::Account { pool, index, .. }, Some("ref")) => {
@@ -737,8 +935,43 @@ fn binding_to_value(
         (ResolvedBinding::U256(value), None) => Ok(serde_yaml::Value::String(value.to_string())),
         (ResolvedBinding::U64(value), None) => Ok(serde_yaml::to_value(value)?),
         (ResolvedBinding::String(value), None) => Ok(serde_yaml::Value::String(value.clone())),
+        (ResolvedBinding::SetupTx { address: Some(address), .. }, Some("address")) => {
+            Ok(serde_yaml::Value::String(address.to_string()))
+        }
+        (ResolvedBinding::SetupTx { address: None, .. }, Some("address")) => {
+            bail!("setup transaction binding '{name}' has no deployed address")
+        }
+        (ResolvedBinding::SetupTx { tx_hash, .. }, Some("tx_hash")) => {
+            Ok(serde_yaml::Value::String(tx_hash.to_string()))
+        }
+        (ResolvedBinding::SetupTx { sender, .. }, Some("sender")) => {
+            Ok(serde_yaml::Value::String(sender.to_string()))
+        }
+        (ResolvedBinding::SetupTx { nonce, .. }, Some("nonce")) => Ok(serde_yaml::to_value(nonce)?),
+        (ResolvedBinding::SetupTx { .. }, None) => {
+            bail!("setup transaction binding '{name}' requires a field")
+        }
         (_, Some(field)) => bail!("binding '{name}' has no field '{field}'"),
     }
+}
+
+fn split_binding_path<'a>(
+    path: &'a str,
+    bindings: &std::collections::HashMap<String, ResolvedBinding>,
+) -> Option<(&'a str, Option<&'a str>)> {
+    if bindings.contains_key(path) {
+        return Some((path, None));
+    }
+
+    for (idx, _) in path.match_indices('.').rev() {
+        let name = &path[..idx];
+        let field = &path[idx + 1..];
+        if bindings.contains_key(name) {
+            return Some((name, Some(field)));
+        }
+    }
+
+    None
 }
 
 fn account_ref_value(pool: &str, index: usize) -> Result<serde_yaml::Value> {
