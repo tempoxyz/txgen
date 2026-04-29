@@ -12,11 +12,17 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
 };
-use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey};
+use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey, TxPhase};
 
 /// A transaction read from a source.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SourceTx {
+    /// Stream phase for this transaction.
+    #[serde(default)]
+    pub phase: TxPhase,
+    /// Optional human-readable transaction identifier for diagnostics.
+    #[serde(default)]
+    pub id: Option<String>,
     /// Raw transaction bytes (hex-encoded with 0x prefix).
     pub raw: String,
     /// Scheduling keys released once RPC submission succeeds (hex-encoded with 0x prefix).
@@ -44,7 +50,7 @@ impl SourceTx {
             eyre::bail!("transactions must have at least one submission or inclusion key");
         }
 
-        Ok(GeneratedTx { raw, submission_keys, inclusion_keys })
+        Ok(GeneratedTx { phase: self.phase, id: self.id, raw, submission_keys, inclusion_keys })
     }
 }
 
@@ -192,6 +198,7 @@ mod tests {
         .unwrap();
 
         let generated = source_tx.into_generated_tx().unwrap();
+        assert_eq!(generated.phase, TxPhase::Workload);
         assert_eq!(generated.submission_keys, vec![SchedulingKey::from([0x11; 20])]);
         assert_eq!(generated.inclusion_keys, vec![SchedulingKey::from([0x22; 20])]);
     }

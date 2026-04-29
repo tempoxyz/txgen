@@ -65,6 +65,10 @@ pub struct SendArgs {
     #[arg(long, default_value = "500")]
     pub scrape_interval_ms: u64,
 
+    /// Skip setup-phase transactions in the input stream.
+    #[arg(long)]
+    pub skip_setup: bool,
+
     /// Wait for the transaction pool to drain after sending.
     ///
     /// Polls `txpool_status` and waits until the pending count reaches zero
