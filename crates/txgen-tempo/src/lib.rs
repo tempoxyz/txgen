@@ -124,9 +124,7 @@ impl NetworkAdapter for TempoAdapter {
             }
             TempoTxType::Legacy => {
                 req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
-                if let TxKind::Call(addr) = to {
-                    req.set_to(addr);
-                }
+                req.set_kind(to);
                 req.set_value(value);
                 if !input.is_empty() {
                     req.set_input(input);
@@ -135,9 +133,7 @@ impl NetworkAdapter for TempoAdapter {
             TempoTxType::Eip2930 => {
                 req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
                 req.set_access_list(Default::default());
-                if let TxKind::Call(addr) = to {
-                    req.set_to(addr);
-                }
+                req.set_kind(to);
                 req.set_value(value);
                 if !input.is_empty() {
                     req.set_input(input);
@@ -150,9 +146,7 @@ impl NetworkAdapter for TempoAdapter {
                 req.set_max_priority_fee_per_gas(
                     template.max_priority_fee_per_gas.unwrap_or(ctx.gas.max_priority_fee_per_gas),
                 );
-                if let TxKind::Call(addr) = to {
-                    req.set_to(addr);
-                }
+                req.set_kind(to);
                 req.set_value(value);
                 if !input.is_empty() {
                     req.set_input(input);
