@@ -26,3 +26,4 @@ k256 = { version = "0.13", default-features = false }
 rand.workspace = true
 eyre.workspace = true
 thiserror.workspace = true
+hex.workspace = true

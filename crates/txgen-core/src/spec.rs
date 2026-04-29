@@ -1,8 +1,8 @@
-use crate::{AccountPoolDef, AccountRef, GenValue};
+use crate::{AccountPoolDef, AccountRef, ArtifactDef, GenValue};
 use alloy_primitives::{Address, B256, U256};
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Deserializer};
-use std::{collections::HashMap, env, path::PathBuf};
+use std::{collections::HashMap, env};
 
 /// Workload specification parsed from YAML.
 #[derive(Debug, Clone, Deserialize)]
@@ -18,13 +18,17 @@ pub struct WorkloadSpec {
     #[serde(default)]
     pub accounts: HashMap<String, AccountPoolDef>,
 
-    /// ABI artifact paths keyed by name.
+    /// ABI/deployment artifact definitions keyed by name.
     #[serde(default)]
-    pub artifacts: HashMap<String, PathBuf>,
+    pub artifacts: HashMap<String, ArtifactDef>,
 
     /// Transaction templates keyed by name (opaque to core, parsed by plugins).
     #[serde(default)]
     pub templates: HashMap<String, serde_yaml::Value>,
+
+    /// Deterministic setup transactions emitted before workload generation.
+    #[serde(default)]
+    pub setup: Option<SetupDef>,
 
     /// Transaction sequences keyed by name.
     #[serde(default)]
@@ -109,6 +113,30 @@ impl<'de> Deserialize<'de> for MixEntry {
 
         Ok(Self { item, weight: def.weight })
     }
+}
+
+/// Deterministic setup phase.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetupDef {
+    /// Ordered setup steps. All setup transactions are emitted before workload transactions.
+    #[serde(default)]
+    pub steps: Vec<SetupStep>,
+}
+
+/// One deterministic setup step.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SetupStep {
+    /// Step identifier. Exposed to later steps and workload templates as `setup.<id>.*`.
+    pub id: String,
+    /// Values resolved once for this setup step.
+    #[serde(default)]
+    pub bindings: HashMap<String, SequenceBinding>,
+    /// Contract deployment definition.
+    #[serde(default)]
+    pub deploy: Option<serde_yaml::Value>,
+    /// Transaction definition using the same shape as workload templates.
+    #[serde(default)]
+    pub tx: Option<serde_yaml::Value>,
 }
 
 /// A multi-transaction workload unit.

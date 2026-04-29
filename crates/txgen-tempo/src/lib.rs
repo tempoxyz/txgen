@@ -365,15 +365,16 @@ fn resolve_call_data(
     } else {
         let to = ctx.resolve_to(&template.to)?;
         let value: U256 = ctx.resolve_value(&template.value)?;
+        let input = template
+            .input
+            .as_ref()
+            .map(|input| ctx.resolve_value(input))
+            .transpose()?
+            .unwrap_or_default();
         if is_tempo {
-            Ok((
-                TxKind::Create,
-                U256::ZERO,
-                Bytes::new(),
-                vec![Call { to, value, input: Bytes::new() }],
-            ))
+            Ok((TxKind::Create, U256::ZERO, Bytes::new(), vec![Call { to, value, input }]))
         } else {
-            Ok((to, value, Bytes::new(), Vec::new()))
+            Ok((to, value, input, Vec::new()))
         }
     }
 }
@@ -438,6 +439,7 @@ mod tests {
             gas_limit: 21000,
             value: GenValue::Literal(U256::from(1000)),
             to: Some(GenValue::Literal(Address::ZERO)),
+            input: None,
             call: None,
             gas_price: None,
             max_fee_per_gas: Some(1_000_000_000),
