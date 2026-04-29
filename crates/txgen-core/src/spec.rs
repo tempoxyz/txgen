@@ -171,6 +171,8 @@ pub enum SequenceBinding {
     Address(GenValue<Address>),
     /// Resolve a bytes32 value once.
     Bytes32(GenValue<B256>),
+    /// ABI packed-encode values once.
+    AbiEncodePacked(AbiEncodePackedDef),
     /// Resolve a Keccak-256 hash over ABI-encoded values once.
     AbiHash(AbiHashDef),
     /// Resolve a U256 once.
@@ -179,6 +181,16 @@ pub enum SequenceBinding {
     U64(GenValue<u64>),
     /// Resolve a string once.
     String(GenValue<String>),
+}
+
+/// Values to ABI packed-encode.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AbiEncodePackedDef {
+    /// Solidity ABI types, one per value.
+    pub types: Vec<String>,
+    /// Values to encode using the corresponding type.
+    #[serde(alias = "args")]
+    pub values: Vec<serde_yaml::Value>,
 }
 
 /// Values to ABI-encode and hash with Keccak-256.
@@ -201,6 +213,7 @@ impl<'de> Deserialize<'de> for SequenceBinding {
             account: Option<AccountRef>,
             address: Option<GenValue<Address>>,
             bytes32: Option<GenValue<B256>>,
+            abi_encode_packed: Option<AbiEncodePackedDef>,
             abi_hash: Option<AbiHashDef>,
             u256: Option<GenValue<U256>>,
             u64: Option<GenValue<u64>>,
@@ -212,6 +225,7 @@ impl<'de> Deserialize<'de> for SequenceBinding {
         fields_set += usize::from(def.account.is_some());
         fields_set += usize::from(def.address.is_some());
         fields_set += usize::from(def.bytes32.is_some());
+        fields_set += usize::from(def.abi_encode_packed.is_some());
         fields_set += usize::from(def.abi_hash.is_some());
         fields_set += usize::from(def.u256.is_some());
         fields_set += usize::from(def.u64.is_some());
@@ -229,6 +243,8 @@ impl<'de> Deserialize<'de> for SequenceBinding {
             Ok(Self::Address(address))
         } else if let Some(bytes32) = def.bytes32 {
             Ok(Self::Bytes32(bytes32))
+        } else if let Some(abi_encode_packed) = def.abi_encode_packed {
+            Ok(Self::AbiEncodePacked(abi_encode_packed))
         } else if let Some(abi_hash) = def.abi_hash {
             Ok(Self::AbiHash(abi_hash))
         } else if let Some(u256) = def.u256 {
