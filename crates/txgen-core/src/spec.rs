@@ -1,6 +1,6 @@
 use crate::{AccountPoolDef, AccountRef, ArtifactDef, GenValue};
 use alloy_primitives::{Address, B256, U256};
-use eyre::{Result, WrapErr};
+use eyre::{bail, Result, WrapErr};
 use serde::{Deserialize, Deserializer};
 use std::{collections::HashMap, env};
 
@@ -269,7 +269,7 @@ impl WorkloadSpec {
 
     /// Parse a workload spec from YAML string.
     pub fn parse(yaml: &str) -> Result<Self> {
-        let expanded = expand_env_vars(yaml);
+        let expanded = expand_env_vars(yaml).wrap_err("failed to expand environment variables")?;
         let spec: WorkloadSpec =
             serde_yaml::from_str(&expanded).wrap_err("failed to parse workload spec")?;
         Ok(spec)
@@ -282,7 +282,7 @@ impl WorkloadSpec {
 }
 
 /// Expand `${VAR}` patterns with environment variable values.
-fn expand_env_vars(input: &str) -> String {
+fn expand_env_vars(input: &str) -> Result<String> {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
 
@@ -290,21 +290,36 @@ fn expand_env_vars(input: &str) -> String {
         if c == '$' && chars.peek() == Some(&'{') {
             chars.next(); // consume '{'
             let mut var_name = String::new();
+            let mut found_end = false;
             for c in chars.by_ref() {
                 if c == '}' {
+                    found_end = true;
                     break;
                 }
                 var_name.push(c);
             }
-            if let Ok(value) = env::var(&var_name) {
-                result.push_str(&value);
+
+            if !found_end {
+                bail!("unterminated environment variable expansion: ${{{var_name}");
+            }
+
+            match env::var(&var_name) {
+                Ok(value) => result.push_str(&value),
+                Err(env::VarError::NotPresent) => {
+                    bail!("environment variable `{var_name}` referenced in spec is not set")
+                }
+                Err(env::VarError::NotUnicode(_)) => {
+                    bail!(
+                        "environment variable `{var_name}` referenced in spec is not valid Unicode"
+                    )
+                }
             }
         } else {
             result.push(c);
         }
     }
 
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -341,6 +356,25 @@ accounts:
         unsafe {
             env::remove_var("TEST_MNEMONIC");
         }
+    }
+
+    #[test]
+    fn test_missing_env_var_fails() {
+        // SAFETY: This test uses a unique variable name and removes it before parsing.
+        unsafe {
+            env::remove_var("TXGEN_TEST_MISSING_ENV_VAR");
+        }
+        let yaml = r#"
+chain_id: 1
+accounts:
+  users:
+    mnemonic: "${TXGEN_TEST_MISSING_ENV_VAR}"
+    range: [0, 10]
+"#;
+
+        let err = WorkloadSpec::parse(yaml).expect_err("missing env var should fail");
+        assert!(err.to_string().contains("failed to expand environment variables"));
+        assert!(err.chain().any(|cause| cause.to_string().contains("TXGEN_TEST_MISSING_ENV_VAR")));
     }
 
     #[test]
