@@ -312,12 +312,8 @@ fn yaml_to_sol_value(
             Ok(DynSolValue::Bytes(bytes.to_vec()))
         }
         t if t.starts_with("uint") => {
-            let val: U256 = if value.is_number() {
-                U256::from(value.as_u64().unwrap_or(0))
-            } else {
-                let s: String = serde_yaml::from_value(value.clone())?;
-                s.parse()?
-            };
+            let val: U256 = serde_yaml::from_value(value.clone())
+                .wrap_err_with(|| format!("invalid {t} literal"))?;
             Ok(DynSolValue::Uint(val, parse_uint_bits(t)?))
         }
         t if t.starts_with("int") => {
@@ -388,10 +384,49 @@ fn parse_int_bits(t: &str) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AccountManager, ValueResolver};
 
     #[test]
     fn test_artifact_manager_empty() {
         let manager = ArtifactManager::empty();
         assert!(manager.get("nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_negative_uint_literal_fails() {
+        let accounts = AccountManager::empty();
+        let mut rng = rand::rng();
+        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+        let value = serde_yaml::from_str::<serde_yaml::Value>("-1").expect("valid YAML");
+
+        let err = yaml_to_sol_value(&value, "uint256", &mut resolver)
+            .expect_err("negative uint literals should fail");
+
+        assert!(err.to_string().contains("invalid uint256 literal"));
+    }
+
+    #[test]
+    fn test_hex_uint_literal() {
+        let accounts = AccountManager::empty();
+        let mut rng = rand::rng();
+        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+        let value = serde_yaml::from_str::<serde_yaml::Value>("\"0x10\"").expect("valid YAML");
+
+        let sol_value = yaml_to_sol_value(&value, "uint256", &mut resolver).unwrap();
+
+        assert_eq!(sol_value, DynSolValue::Uint(U256::from(16), 256));
+    }
+
+    #[test]
+    fn test_fractional_uint_literal_fails() {
+        let accounts = AccountManager::empty();
+        let mut rng = rand::rng();
+        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+        let value = serde_yaml::from_str::<serde_yaml::Value>("1.5").expect("valid YAML");
+
+        let err = yaml_to_sol_value(&value, "uint256", &mut resolver)
+            .expect_err("fractional uint literals should fail");
+
+        assert!(err.to_string().contains("invalid uint256 literal"));
     }
 }
