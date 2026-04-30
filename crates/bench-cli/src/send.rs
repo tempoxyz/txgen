@@ -29,12 +29,18 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     // while keeping retry-on-429 behavior. The benchmarking tool has its own
     // rate limiter and typically targets local nodes that don't rate-limit.
     let retry_layer = RetryBackoffLayer::new(10, 100, u64::MAX);
+    let http_client = reqwest::Client::builder()
+        .timeout(args.timeout)
+        .build()
+        .wrap_err("failed to build RPC HTTP client")?;
     let providers = args
         .rpc_urls
         .iter()
         .map(|url| {
             let url = url.parse().context("failed to parse RPC URL")?;
-            let client = RpcClient::builder().layer(retry_layer.clone()).http(url);
+            let client = RpcClient::builder()
+                .layer(retry_layer.clone())
+                .http_with_client(http_client.clone(), url);
             Ok(ProviderBuilder::new_with_network::<AnyNetwork>().connect_client(client).erased())
         })
         .collect::<Result<Vec<_>>>()?;

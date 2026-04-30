@@ -1159,6 +1159,7 @@ dependencies = [
  "clap",
  "eyre",
  "humantime",
+ "reqwest 0.13.2",
  "serde",
  "serde_json",
  "tokio",
