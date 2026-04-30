@@ -106,7 +106,7 @@ async fn execute_source<S: TxSource>(
     // Wait for the txpool to drain so all transactions are included in blocks
     // before we collect block stats. The scraper and block poller keep running.
     if args.drain_timeout > 0 {
-        wait_for_pool_drain(query_provider, args.drain_timeout).await;
+        wait_for_pool_drain(query_provider, args.drain_timeout).await?;
     }
 
     // Stop the scraper before finalizing.
@@ -244,7 +244,7 @@ async fn finish_setup_phase<P: TxPoolApi<AnyNetwork>>(
     }
 
     if args.drain_timeout > 0 {
-        wait_for_pool_drain(query_provider, args.drain_timeout).await;
+        wait_for_pool_drain(query_provider, args.drain_timeout).await?;
     } else {
         tracing::warn!("Skipping setup txpool drain because --drain-timeout=0");
     }
@@ -313,8 +313,11 @@ async fn send_workload_tx(
 /// Wait for the transaction pool to drain (pending count reaches zero).
 ///
 /// Polls `txpool_status` every second. Returns after 3 consecutive zero
-/// readings or when the timeout is reached.
-async fn wait_for_pool_drain<P: TxPoolApi<AnyNetwork>>(provider: &P, timeout_secs: u64) {
+/// readings, or fails if polling fails or the timeout is reached.
+async fn wait_for_pool_drain<P: TxPoolApi<AnyNetwork>>(
+    provider: &P,
+    timeout_secs: u64,
+) -> Result<()> {
     tracing::info!(timeout_secs, "Waiting for txpool to drain...");
 
     let mut zero_count: u32 = 0;
@@ -322,31 +325,26 @@ async fn wait_for_pool_drain<P: TxPoolApi<AnyNetwork>>(provider: &P, timeout_sec
 
     loop {
         if tokio::time::Instant::now() >= deadline {
-            tracing::warn!("Txpool drain timeout reached ({timeout_secs}s)");
-            break;
+            bail!("txpool drain timeout reached after {timeout_secs}s");
         }
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        match provider.txpool_status().await {
-            Ok(status) => {
-                let pending = status.pending;
+        let status = provider
+            .txpool_status()
+            .await
+            .wrap_err("failed to query txpool_status while waiting for txpool drain")?;
+        let pending = status.pending;
 
-                if pending == 0 {
-                    zero_count += 1;
-                    if zero_count >= 3 {
-                        tracing::info!("Txpool drained (3 consecutive zero readings)");
-                        break;
-                    }
-                } else {
-                    zero_count = 0;
-                    tracing::debug!(pending, "Txpool still draining...");
-                }
+        if pending == 0 {
+            zero_count += 1;
+            if zero_count >= 3 {
+                tracing::info!("Txpool drained (3 consecutive zero readings)");
+                return Ok(());
             }
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to query txpool_status");
-                zero_count = 0;
-            }
+        } else {
+            zero_count = 0;
+            tracing::debug!(pending, "Txpool still draining...");
         }
     }
 }
