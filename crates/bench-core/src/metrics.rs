@@ -418,6 +418,8 @@ pub struct MetricsCollector {
     event_tx: mpsc::UnboundedSender<TimestampedEvent>,
     latency_rx: Mutex<mpsc::UnboundedReceiver<TimestampedLatency>>,
     event_rx: Mutex<mpsc::UnboundedReceiver<TimestampedEvent>>,
+    latencies: Mutex<Vec<TimestampedLatency>>,
+    events: Mutex<Vec<TimestampedEvent>>,
 }
 
 impl std::fmt::Debug for MetricsCollector {
@@ -444,6 +446,8 @@ impl MetricsCollector {
             event_tx,
             latency_rx: Mutex::new(latency_rx),
             event_rx: Mutex::new(event_rx),
+            latencies: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
         })
     }
 
@@ -558,12 +562,33 @@ impl MetricsCollector {
         events
     }
 
+    /// Collect pending latency samples and return all retained samples.
+    async fn latency_samples(&self) -> Vec<TimestampedLatency> {
+        let mut latency_rx = self.latency_rx.lock().await;
+        let new_latencies = Self::drain_latencies(&mut latency_rx);
+        drop(latency_rx);
+
+        let mut latencies = self.latencies.lock().await;
+        latencies.extend(new_latencies);
+        latencies.clone()
+    }
+
+    /// Collect pending events and return all retained events.
+    async fn event_samples(&self) -> Vec<TimestampedEvent> {
+        let mut event_rx = self.event_rx.lock().await;
+        let new_events = Self::drain_events(&mut event_rx);
+        drop(event_rx);
+
+        let mut events = self.events.lock().await;
+        events.extend(new_events);
+        events.clone()
+    }
+
     /// Compute final metrics.
     pub async fn finalize(&self) -> BenchMetrics {
         let elapsed = self.clock.elapsed();
 
-        let mut latency_rx = self.latency_rx.lock().await;
-        let mut latencies = Self::drain_latencies(&mut latency_rx);
+        let mut latencies = self.latency_samples().await;
         latencies.sort_by_key(|l| l.latency);
         let durations: Vec<Duration> = latencies.iter().map(|l| l.latency).collect();
 
@@ -581,10 +606,8 @@ impl MetricsCollector {
         let total_elapsed = self.clock.elapsed();
         let total_seconds = total_elapsed.as_secs() + 1;
 
-        let mut event_rx = self.event_rx.lock().await;
-        let mut latency_rx = self.latency_rx.lock().await;
-        let events = Self::drain_events(&mut event_rx);
-        let latencies = Self::drain_latencies(&mut latency_rx);
+        let events = self.event_samples().await;
+        let latencies = self.latency_samples().await;
 
         let mut throughput = Vec::with_capacity(total_seconds as usize);
         for second in 0..total_seconds {
@@ -827,6 +850,21 @@ mod tests {
         assert_eq!(first_second.sent, 2);
         assert_eq!(first_second.success, 1);
         assert_eq!(first_second.failed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_finalize_retains_latency_time_series() {
+        let collector = MetricsCollector::new(RunClock::new());
+
+        collector.record_sent();
+        collector.record_success(Duration::from_millis(50));
+
+        let metrics = collector.finalize().await;
+        let ts = collector.time_series().await;
+
+        assert_eq!(metrics.latency.min, Duration::from_millis(50));
+        assert_eq!(ts.latencies.len(), 1);
+        assert_eq!(ts.latencies[0].latency, Duration::from_millis(50));
     }
 
     #[test]
