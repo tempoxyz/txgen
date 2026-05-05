@@ -60,6 +60,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         engine = %args.engine,
         input = args.input.as_ref().map_or("<stdin>", |p| p.to_str().unwrap_or("?")),
         wait_for_persistence = ?persistence_policy,
+        wait_time_ms = args.wait_time.map(|d| d.as_millis()),
         "Starting block submission"
     );
 
@@ -104,8 +105,16 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             let line = line.wrap_err("failed to read line")?;
             let block = parse_block_line(&line)?;
 
-            process_block(&provider, &block, &mut collector, &persistence_policy).await?;
-            report_progress(&collector, start, &mut reporters)?;
+            process_block_and_wait(
+                &provider,
+                &block,
+                &mut collector,
+                &persistence_policy,
+                args.wait_time,
+                start,
+                &mut reporters,
+            )
+            .await?;
         }
     } else {
         let stdin = tokio::io::stdin();
@@ -122,8 +131,16 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
 
             let block = parse_block_line(&line_buf)?;
 
-            process_block(&provider, &block, &mut collector, &persistence_policy).await?;
-            report_progress(&collector, start, &mut reporters)?;
+            process_block_and_wait(
+                &provider,
+                &block,
+                &mut collector,
+                &persistence_policy,
+                args.wait_time,
+                start,
+                &mut reporters,
+            )
+            .await?;
         }
     }
 
@@ -191,6 +208,30 @@ fn report_progress(
     for reporter in reporters.iter_mut() {
         reporter.on_progress(&state)?;
     }
+    Ok(())
+}
+
+async fn process_block_and_wait(
+    provider: &(impl Provider + RethApi<Ethereum>),
+    block: &BlockLine,
+    collector: &mut MetricsCollector,
+    persistence_policy: &WaitForPersistence,
+    wait_time: Option<Duration>,
+    start: Instant,
+    reporters: &mut [Box<dyn Reporter>],
+) -> Result<()> {
+    let block_start = Instant::now();
+
+    process_block(provider, block, collector, persistence_policy).await?;
+    report_progress(collector, start, reporters)?;
+
+    if let Some(wait_time) = wait_time {
+        let remaining = wait_time.saturating_sub(block_start.elapsed());
+        if !remaining.is_zero() {
+            tokio::time::sleep(remaining).await;
+        }
+    }
+
     Ok(())
 }
 

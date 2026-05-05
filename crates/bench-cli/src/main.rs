@@ -101,6 +101,14 @@ pub struct SendBlocksArgs {
     #[arg(long, default_value = "every:2", value_parser = parse_wait_for_persistence)]
     pub wait_for_persistence: bench_core::WaitForPersistence,
 
+    /// Minimum interval between block submissions.
+    ///
+    /// Measures from before reth_newPayload until after reth_forkchoiceUpdated.
+    /// If processing takes longer than this, no extra sleep is added. Bare
+    /// integers are treated as milliseconds.
+    #[arg(long, value_name = "WAIT_TIME", value_parser = parse_duration_millis_fallback)]
+    pub wait_time: Option<Duration>,
+
     /// Report output destinations
     #[arg(long = "report", value_name = "FORMAT")]
     pub reports: Vec<String>,
@@ -147,6 +155,15 @@ fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
     humantime::parse_duration(s)
 }
 
+fn parse_duration_millis_fallback(s: &str) -> Result<Duration, String> {
+    humantime::parse_duration(s).or_else(|_| {
+        s.trim()
+            .parse::<u64>()
+            .map(Duration::from_millis)
+            .map_err(|_| format!("invalid duration: {s:?}"))
+    })
+}
+
 fn parse_wait_for_persistence(s: &str) -> Result<bench_core::WaitForPersistence, String> {
     match s {
         "always" => Ok(bench_core::WaitForPersistence::Always),
@@ -181,5 +198,28 @@ async fn main() -> Result<()> {
         Command::Send(args) => send::execute(args).await,
         Command::SendBlocks(args) => send_blocks::execute(args).await,
         Command::View(args) => view::execute(args),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_duration_millis_fallback_with_unit() {
+        assert_eq!(parse_duration_millis_fallback("100ms"), Ok(Duration::from_millis(100)));
+        assert_eq!(parse_duration_millis_fallback("2s"), Ok(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn test_parse_duration_millis_fallback_bare_millis() {
+        assert_eq!(parse_duration_millis_fallback("400"), Ok(Duration::from_millis(400)));
+        assert_eq!(parse_duration_millis_fallback("0"), Ok(Duration::from_millis(0)));
+    }
+
+    #[test]
+    fn test_parse_duration_millis_fallback_errors() {
+        assert!(parse_duration_millis_fallback("abc").is_err());
+        assert!(parse_duration_millis_fallback("").is_err());
     }
 }

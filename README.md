@@ -147,10 +147,13 @@ bench send-blocks --engine http://localhost:8551 --jwt-secret /path/to/jwt.hex -
 | `--jwt-secret <PATH>` | Path to JWT secret file |
 | `-i, --input <PATH>` | Input NDJSON file (default: stdin) |
 | `--wait-for-persistence <POLICY>` | Persistence wait policy: `always`, `never`, or `every:N` (default: `every:2`) |
+| `--wait-time <DURATION>` | Minimum interval between block submissions. Accepts `100ms`, `2s`, or bare milliseconds like `400` |
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
 | `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
 | `--metrics-url <URL>` | Prometheus endpoint to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
+
+For `send-blocks`, aggregate run rates use benchmark wall-clock duration. Per-block timestamps remain the original chain timestamps from the input.
 
 **Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API)
 
