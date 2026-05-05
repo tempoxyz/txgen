@@ -145,7 +145,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let samples = store.drain().await;
 
     let blocks = std::mem::take(&mut collector.blocks);
-    let run_stats = RunStats::from_blocks(&blocks);
+    let run_stats = RunStats::from_blocks_wall_time(&blocks, start.elapsed());
 
     for block in &blocks {
         for reporter in reporters.iter_mut() {

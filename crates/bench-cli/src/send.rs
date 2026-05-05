@@ -174,7 +174,7 @@ async fn execute_source<S: TxSource>(
             }
         }
 
-        report.run_stats = Some(RunStats::from_blocks(&block_stats));
+        report.run_stats = Some(RunStats::from_blocks_chain_time(&block_stats));
         report.blocks = block_stats;
     }
 
