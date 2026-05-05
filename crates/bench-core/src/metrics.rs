@@ -226,8 +226,20 @@ pub struct RunStats {
 }
 
 impl RunStats {
-    /// Compute run stats from a slice of block stats.
-    pub fn from_blocks(blocks: &[BlockStats]) -> Self {
+    /// Compute run stats from block chain timestamps.
+    pub fn from_blocks_chain_time(blocks: &[BlockStats]) -> Self {
+        let start_ms = blocks.first().map(|b| b.timestamp_ms).unwrap_or(0);
+        let end_ms = blocks.last().map(|b| b.timestamp_ms).unwrap_or(0);
+        Self::from_blocks_with_duration_ms(blocks, end_ms.saturating_sub(start_ms))
+    }
+
+    /// Compute run stats from a wall-clock benchmark duration.
+    pub fn from_blocks_wall_time(blocks: &[BlockStats], elapsed: Duration) -> Self {
+        let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        Self::from_blocks_with_duration_ms(blocks, duration_ms)
+    }
+
+    fn from_blocks_with_duration_ms(blocks: &[BlockStats], duration_ms: u64) -> Self {
         if blocks.is_empty() {
             return Self {
                 start_block: 0,
@@ -251,10 +263,6 @@ impl RunStats {
 
         let total_txs: u64 = blocks.iter().map(|b| b.tx_count as u64).sum();
         let total_gas: u64 = blocks.iter().map(|b| b.gas_used).sum();
-
-        let start_ms = blocks.first().map(|b| b.timestamp_ms).unwrap_or(0);
-        let end_ms = blocks.last().map(|b| b.timestamp_ms).unwrap_or(0);
-        let duration_ms = end_ms.saturating_sub(start_ms);
         let duration_secs = duration_ms as f64 / 1000.0;
 
         let avg_blocks_per_second =
@@ -765,7 +773,7 @@ mod tests {
             },
         ];
 
-        let run_stats = RunStats::from_blocks(&blocks);
+        let run_stats = RunStats::from_blocks_chain_time(&blocks);
 
         assert_eq!(run_stats.start_block, 100);
         assert_eq!(run_stats.end_block, 102);
@@ -775,11 +783,60 @@ mod tests {
     }
 
     #[test]
+    fn test_run_stats_from_blocks_wall_time() {
+        let blocks = vec![
+            BlockStats {
+                number: 100,
+                timestamp_ms: 1_000_000,
+                tx_count: 10,
+                gas_used: 1_000_000,
+                gas_limit: 30_000_000,
+                block_time_ms: None,
+                new_payload_ms: None,
+                forkchoice_updated_ms: None,
+                new_payload_server_latency_us: None,
+                persistence_wait_us: None,
+                execution_cache_wait_us: None,
+                sparse_trie_wait_us: None,
+            },
+            BlockStats {
+                number: 101,
+                timestamp_ms: 1_012_000,
+                tx_count: 15,
+                gas_used: 1_500_000,
+                gas_limit: 30_000_000,
+                block_time_ms: Some(12000),
+                new_payload_ms: None,
+                forkchoice_updated_ms: None,
+                new_payload_server_latency_us: None,
+                persistence_wait_us: None,
+                execution_cache_wait_us: None,
+                sparse_trie_wait_us: None,
+            },
+        ];
+
+        let run_stats = RunStats::from_blocks_wall_time(&blocks, Duration::from_secs(2));
+
+        assert_eq!(run_stats.start_block, 100);
+        assert_eq!(run_stats.end_block, 101);
+        assert_eq!(run_stats.total_blocks, 2);
+        assert_eq!(run_stats.total_txs, 25);
+        assert_eq!(run_stats.total_gas, 2_500_000);
+        assert_eq!(run_stats.duration_ms, 2000);
+        assert_eq!(run_stats.avg_blocks_per_second, 1.0);
+        assert_eq!(run_stats.avg_tps, 12.5);
+        assert_eq!(run_stats.block_time_p50_ms, 12000);
+    }
+
+    #[test]
     fn test_run_stats_empty() {
-        let run_stats = RunStats::from_blocks(&[]);
+        let run_stats = RunStats::from_blocks_chain_time(&[]);
         assert_eq!(run_stats.start_block, 0);
         assert_eq!(run_stats.total_txs, 0);
         assert_eq!(run_stats.avg_tps, 0.0);
+
+        let run_stats = RunStats::from_blocks_wall_time(&[], Duration::from_secs(1));
+        assert_eq!(run_stats.duration_ms, 0);
     }
 
     #[test]
