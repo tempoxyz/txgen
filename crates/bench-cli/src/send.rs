@@ -298,7 +298,7 @@ async fn send_workload_tx(
     sender.send(tx).await?;
 
     let (sent, success, failed) = metrics.counts();
-    if sent % 1000 == 0 {
+    if sent.is_multiple_of(1000) {
         let state = ProgressState {
             sent,
             success,

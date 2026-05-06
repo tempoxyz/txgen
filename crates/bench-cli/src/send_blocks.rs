@@ -324,7 +324,7 @@ async fn process_block(
 
     collector.prev_block_hash = Some(block.key);
 
-    if block.number % 32 == 0 {
+    if block.number.is_multiple_of(32) {
         collector.finalized_hash = Some(block.key);
     }
 
