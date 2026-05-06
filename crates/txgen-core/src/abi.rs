@@ -146,8 +146,8 @@ fn load_bytecode(path: &PathBuf, base_path: &std::path::Path) -> Result<Bytes> {
     let path = resolve_path(path, base_path);
     let content = std::fs::read_to_string(&path)
         .wrap_err_with(|| format!("failed to read bytecode: {}", path.display()))?;
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
-        && let Some(bytecode) = parse_bytecode_json(&json).transpose()?
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) &&
+        let Some(bytecode) = parse_bytecode_json(&json).transpose()?
     {
         return Ok(bytecode);
     }

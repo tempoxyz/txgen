@@ -1139,7 +1139,7 @@ async fn write_extracted_blocks<W: Write>(
         count += 1;
 
         let now = std::time::Instant::now();
-        if count % 1000 == 0 || now.duration_since(last_log).as_secs() >= 5 {
+        if count.is_multiple_of(1000) || now.duration_since(last_log).as_secs() >= 5 {
             let elapsed = now.duration_since(start).as_secs_f64();
             let bps = count as f64 / elapsed;
             eprintln!(

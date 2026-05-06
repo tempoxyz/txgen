@@ -83,7 +83,7 @@ impl WaitForPersistence {
                 if *n == 0 {
                     return Some(false);
                 }
-                Some((block_index + 1) % n == 0)
+                Some((block_index + 1).is_multiple_of(n))
             }
         }
     }
