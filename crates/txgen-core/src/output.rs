@@ -5,6 +5,24 @@ use std::io::Write;
 
 use crate::SchedulingKey;
 
+/// Envelope carrying a deferred signing request.
+///
+/// When a generated transaction needs time-sensitive fields (e.g. Tempo
+/// expiring nonce `valid_before`) that cannot be fixed at generation time,
+/// the generator emits this envelope instead of pre-signed `raw` bytes.
+/// The sender invokes a registered [`crate::output::LateSignSpec`]-aware
+/// signer just before submission to materialize the final signed bytes.
+///
+/// `format` discriminates the typed payload (e.g. `"tempo_expiring_relative"`).
+/// The matching generator/sender pair owns the schema of `payload`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LateSignSpec {
+    /// Signer-side discriminator (e.g. `"tempo_expiring_relative"`).
+    pub format: String,
+    /// Format-specific payload, owned by the generator/signer pair.
+    pub payload: serde_json::Value,
+}
+
 /// Phase a generated transaction belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -24,7 +42,16 @@ pub struct GeneratedTx {
     /// Optional human-readable transaction identifier for diagnostics.
     pub id: Option<String>,
     /// RLP-encoded signed transaction (EIP-2718 envelope).
+    ///
+    /// Empty when [`Self::late_sign`] is set; the sender materializes the
+    /// signed bytes just before submission.
     pub raw: Bytes,
+    /// Optional deferred-signing envelope.
+    ///
+    /// When set, the sender must invoke a registered [`LateSignSpec`]-aware
+    /// signer to produce signed bytes from this envelope before submitting.
+    /// `raw` is then ignored.
+    pub late_sign: Option<LateSignSpec>,
     /// Scheduling keys released once the transaction is accepted by the RPC endpoint.
     ///
     /// Use these for constraints that the chain enforces after submission, such as
@@ -45,6 +72,8 @@ struct OutputTx<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<&'a str>,
     raw: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    late_sign: Option<&'a LateSignSpec>,
     submission_keys: &'a [SchedulingKey],
     inclusion_keys: &'a [SchedulingKey],
 }
@@ -76,6 +105,7 @@ impl<W: Write> NdjsonWriter<W> {
             phase: tx.phase,
             id: tx.id.as_deref(),
             raw: &self.raw_hex,
+            late_sign: tx.late_sign.as_ref(),
             submission_keys: &tx.submission_keys,
             inclusion_keys: &tx.inclusion_keys,
         };
@@ -131,6 +161,7 @@ mod tests {
             phase: TxPhase::Workload,
             id: None,
             raw: Bytes::from(vec![0x02, 0xf8, 0x70]),
+            late_sign: None,
             submission_keys: vec![SchedulingKey::from([0xab; 20])],
             inclusion_keys: vec![SchedulingKey::from([0xcd; 20])],
         };
@@ -159,6 +190,7 @@ mod tests {
             phase: TxPhase::Workload,
             id: None,
             raw: Bytes::from(vec![0x00]),
+            late_sign: None,
             submission_keys: vec![SchedulingKey::from([0x00; 20])],
             inclusion_keys: Vec::new(),
         };

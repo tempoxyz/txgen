@@ -1,6 +1,11 @@
+pub mod late_sign;
 mod nonce;
 mod template;
 
+pub use late_sign::{
+    sign_tempo_expiring, SignerLocator, TempoExpiringPayload, TempoLateSignRequest,
+    FORMAT_TEMPO_EXPIRING_RELATIVE,
+};
 pub use nonce::{prefetch_parallel_nonces, TempoNonceProvider, NONCE_PRECOMPILE};
 pub use txgen_cli::fetch_protocol_nonces;
 
@@ -14,7 +19,7 @@ use tempo_primitives::transaction::{
     Call, TEMPO_EXPIRING_NONCE_KEY, TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS,
 };
 use txgen_cli::{GenerateContext, NetworkAdapter, TxRequest};
-use txgen_core::BuildContext;
+use txgen_core::{BuildContext, LateSignSpec};
 
 pub use template::{TempoTemplate, TempoTxType};
 
@@ -70,6 +75,14 @@ impl NetworkAdapter for TempoAdapter {
         req.set_nonce(nonce);
         req.set_gas_limit(template.gas_limit);
 
+        // Defer signing of expiring-nonce txs that use a relative
+        // `valid_for_secs` window. The protocol caps `valid_for_secs` at 30s
+        // (TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS), so a `valid_before` baked
+        // in at generate time will expire before the sender reaches it on
+        // any non-trivial workload. We instead emit a [`LateSignSpec`] that
+        // the sender materializes immediately before submission.
+        let mut late_sign: Option<LateSignSpec> = None;
+
         match template.tx_type {
             TempoTxType::Tempo => {
                 req.set_max_fee_per_gas(
@@ -82,6 +95,7 @@ impl NetworkAdapter for TempoAdapter {
                 req.calls = calls;
 
                 let is_expiring = matches!(nonce_mode, TempoNonceMode::Expiring);
+                let is_late_sign = is_expiring && template.valid_for_secs.is_some();
                 let valid_before = match nonce_mode {
                     TempoNonceMode::Protocol => template.valid_before,
                     TempoNonceMode::Parallel(nonce_key) => {
@@ -90,7 +104,15 @@ impl NetworkAdapter for TempoAdapter {
                     }
                     TempoNonceMode::Expiring => {
                         req.set_nonce_key(TEMPO_EXPIRING_NONCE_KEY);
-                        Some(resolve_expiring_valid_before(&template)?)
+                        if is_late_sign {
+                            // Validate `valid_for_secs` here (range, not both
+                            // set) but don't compute valid_before — that's the
+                            // sender's job at submit time.
+                            validate_expiring_valid_for_secs(&template)?;
+                            None
+                        } else {
+                            Some(resolve_expiring_valid_before(&template)?)
+                        }
                     }
                 };
 
@@ -107,19 +129,62 @@ impl NetworkAdapter for TempoAdapter {
                     apply_expiring_uniqueness_bump(&mut req, ctx)?;
                 }
 
-                // Handle sponsor signing: build a temporary TempoTransaction to
-                // compute the fee_payer_signature_hash, sign it, then set on the request.
-                if let Some(ref sponsor_ref) = template.sponsor {
-                    let temp_tx = req
-                        .clone()
-                        .build_aa()
-                        .map_err(|e| eyre::eyre!("failed to build AA tx for sponsor: {e}"))?;
-
+                // For non-late-sign txs, handle sponsor signing here. For
+                // late-sign txs the sender re-signs the sponsor as well,
+                // since the sponsor signature commits to `valid_before`.
+                let sponsor_locator = if let Some(ref sponsor_ref) = template.sponsor {
                     let sponsor = ctx.select_signer(sponsor_ref)?;
-                    let sponsor_signer = ctx.accounts.get_by_index(&sponsor.pool, sponsor.index)?;
-                    let fee_payer_hash = temp_tx.fee_payer_signature_hash(selected.address);
-                    let fee_payer_sig = sponsor_signer.sign_hash_sync(&fee_payer_hash)?;
-                    req.set_fee_payer_signature(fee_payer_sig);
+                    if !is_late_sign {
+                        let temp_tx = req
+                            .clone()
+                            .build_aa()
+                            .map_err(|e| {
+                                eyre::eyre!("failed to build AA tx for sponsor: {e}")
+                            })?;
+                        let sponsor_signer =
+                            ctx.accounts.get_by_index(&sponsor.pool, sponsor.index)?;
+                        let fee_payer_hash =
+                            temp_tx.fee_payer_signature_hash(selected.address);
+                        let fee_payer_sig =
+                            sponsor_signer.sign_hash_sync(&fee_payer_hash)?;
+                        req.set_fee_payer_signature(fee_payer_sig);
+                    }
+                    Some(late_sign::SignerLocator {
+                        pool: sponsor.pool,
+                        index: sponsor.index,
+                    })
+                } else {
+                    None
+                };
+
+                if is_late_sign {
+                    let payload = late_sign::TempoExpiringPayload {
+                        signer: late_sign::SignerLocator {
+                            pool: selected.pool.clone(),
+                            index: selected.index,
+                        },
+                        sponsor: sponsor_locator,
+                        // SAFETY: is_late_sign implies valid_for_secs.is_some().
+                        valid_for_secs: template
+                            .valid_for_secs
+                            .expect("late-sign requires valid_for_secs"),
+                        request: late_sign::TempoLateSignRequest {
+                            chain_id: ctx.chain_id,
+                            nonce: 0,
+                            nonce_key: TEMPO_EXPIRING_NONCE_KEY,
+                            gas_limit: template.gas_limit,
+                            max_fee_per_gas: req
+                                .max_fee_per_gas
+                                .unwrap_or(ctx.gas.max_fee_per_gas),
+                            max_priority_fee_per_gas: req
+                                .max_priority_fee_per_gas
+                                .unwrap_or(ctx.gas.max_priority_fee_per_gas),
+                            calls: req.calls.clone(),
+                            fee_token: req.fee_token,
+                            valid_after: req.valid_after,
+                        },
+                    };
+                    late_sign = Some(payload.into_spec()?);
                 }
             }
             TempoTxType::Legacy => {
@@ -159,6 +224,7 @@ impl NetworkAdapter for TempoAdapter {
             signer_pool: selected.pool,
             signer_index: selected.index,
             key: scheduling_key,
+            late_sign,
         })
     }
 
@@ -208,6 +274,32 @@ fn resolve_nonce_mode(
         key if key.is_zero() => Ok(TempoNonceMode::Protocol),
         key => Ok(TempoNonceMode::Parallel(key)),
     }
+}
+
+/// Validate `valid_for_secs` for late-sign expiring-nonce templates.
+///
+/// Mirrors the relative-window checks in [`resolve_expiring_valid_before`] but
+/// does not compute `valid_before`, since for late-sign txs the sender is
+/// responsible for that at submission time.
+fn validate_expiring_valid_for_secs(template: &TempoTemplate) -> Result<()> {
+    if template.valid_before.is_some() {
+        bail!(
+            "expiring nonce templates must set either `valid_before` or `valid_for_secs`, not both"
+        );
+    }
+    let valid_for_secs = template
+        .valid_for_secs
+        .ok_or_else(|| eyre::eyre!("expiring nonce templates require `valid_for_secs`"))?;
+    if valid_for_secs == 0 {
+        bail!("expiring nonce templates require `valid_for_secs` to be greater than 0");
+    }
+    if valid_for_secs > TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS {
+        bail!(
+            "expiring nonce templates require `valid_for_secs` <= {} seconds",
+            TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS
+        );
+    }
+    Ok(())
 }
 
 fn resolve_expiring_valid_before(template: &TempoTemplate) -> Result<u64> {
@@ -598,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expiring_nonce_valid_for_secs_is_resolved_at_build_time() {
+    fn test_expiring_nonce_valid_for_secs_emits_late_sign_payload() {
         let accounts = test_accounts();
         let artifacts = ArtifactManager::empty();
         let gas = GasConfig::default();
@@ -611,13 +703,22 @@ mod tests {
         template.expiring_nonce = true;
         template.valid_for_secs = Some(25);
 
-        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let tx_req = TempoAdapter.build_request(template, &mut ctx).unwrap();
-        let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-        let valid_before = tx_req.request.valid_before.unwrap();
-        assert!(valid_before >= before + 25);
-        assert!(valid_before <= after + 25);
+        // Late-sign mode: valid_before is left unset; sender stamps it.
+        assert!(tx_req.request.valid_before.is_none());
+
+        let spec = tx_req.late_sign.as_ref().expect("late_sign must be present");
+        assert_eq!(spec.format, late_sign::FORMAT_TEMPO_EXPIRING_RELATIVE);
+
+        let payload = late_sign::TempoExpiringPayload::from_spec(spec).unwrap();
+        assert_eq!(payload.valid_for_secs, 25);
+        assert!(payload.sponsor.is_none());
+        assert_eq!(payload.request.nonce_key, TEMPO_EXPIRING_NONCE_KEY);
+        // Uniqueness bump must be baked into the payload's fee fields so the
+        // sender does not need to recompute it.
+        assert_eq!(payload.request.max_fee_per_gas, 1_000_000_001);
+        assert_eq!(payload.request.max_priority_fee_per_gas, 1_000_000_001);
     }
 
     #[test]

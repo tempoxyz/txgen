@@ -12,7 +12,7 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
 };
-use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey, TxPhase};
+use txgen_core::{dedup_scheduling_keys, GeneratedTx, LateSignSpec, SchedulingKey, TxPhase};
 
 /// A transaction read from a source.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -23,8 +23,13 @@ pub struct SourceTx {
     /// Optional human-readable transaction identifier for diagnostics.
     #[serde(default)]
     pub id: Option<String>,
-    /// Raw transaction bytes (hex-encoded with 0x prefix).
+    /// Raw transaction bytes (hex-encoded with 0x prefix). May be empty `"0x"`
+    /// when [`Self::late_sign`] is set, in which case the sender materializes
+    /// the signed bytes just before submission.
     pub raw: String,
+    /// Optional deferred-signing envelope.
+    #[serde(default)]
+    pub late_sign: Option<LateSignSpec>,
     /// Scheduling keys released once RPC submission succeeds (hex-encoded with 0x prefix).
     pub submission_keys: Vec<SchedulingKey>,
     /// Scheduling keys released once a transaction receipt is observed (hex-encoded with 0x
@@ -43,6 +48,10 @@ impl SourceTx {
             .parse::<Bytes>()
             .context("invalid raw tx hex")?;
 
+        if raw.is_empty() && self.late_sign.is_none() {
+            eyre::bail!("transaction has empty `raw` and no `late_sign` envelope");
+        }
+
         let submission_keys = dedup_scheduling_keys(self.submission_keys);
         let inclusion_keys = dedup_scheduling_keys(self.inclusion_keys);
 
@@ -50,7 +59,14 @@ impl SourceTx {
             eyre::bail!("transactions must have at least one submission or inclusion key");
         }
 
-        Ok(GeneratedTx { phase: self.phase, id: self.id, raw, submission_keys, inclusion_keys })
+        Ok(GeneratedTx {
+            phase: self.phase,
+            id: self.id,
+            raw,
+            late_sign: self.late_sign,
+            submission_keys,
+            inclusion_keys,
+        })
     }
 }
 

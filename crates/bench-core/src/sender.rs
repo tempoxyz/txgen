@@ -19,7 +19,19 @@ use tokio::{
     sync::{mpsc, Semaphore},
     task::JoinHandle,
 };
-use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey, TxPhase};
+use txgen_core::{dedup_scheduling_keys, GeneratedTx, LateSignSpec, SchedulingKey, TxPhase};
+
+/// A signer that materializes raw transaction bytes from a deferred-signing
+/// envelope just before submission.
+///
+/// Implementations are network-specific (e.g. Tempo expiring nonces) and
+/// dispatch on [`LateSignSpec::format`].
+pub trait LateSigner: Send + Sync {
+    /// Sign the deferred envelope, returning the RLP-encoded EIP-2718 envelope
+    /// to submit. Called inside the sender's dispatch path, immediately before
+    /// `eth_sendRawTransaction`.
+    fn sign(&self, spec: &LateSignSpec) -> Result<Bytes>;
+}
 
 /// Configuration for the sender.
 #[derive(Debug, Clone)]
@@ -54,6 +66,7 @@ struct PendingTx {
     phase: TxPhase,
     id: Option<String>,
     raw: Bytes,
+    late_sign: Option<LateSignSpec>,
     submission_keys: SchedulingKeys,
     inclusion_keys: SchedulingKeys,
 }
@@ -79,6 +92,8 @@ pub struct Sender {
     worker_handles: Vec<JoinHandle<()>>,
     /// Rate limiter tokens.
     rate_limiter: Option<Arc<RateLimiter>>,
+    /// Optional signer for transactions carrying a [`LateSignSpec`] envelope.
+    late_signer: Option<Arc<dyn LateSigner>>,
 }
 
 impl Sender {
@@ -108,7 +123,17 @@ impl Sender {
             completion_rx,
             worker_handles: Vec::new(),
             rate_limiter,
+            late_signer: None,
         }
+    }
+
+    /// Register a late signer for transactions whose `raw` bytes are
+    /// materialized just before submission (e.g. Tempo expiring nonces).
+    ///
+    /// Returns the modified sender to allow builder-style chaining.
+    pub fn with_late_signer(mut self, signer: Arc<dyn LateSigner>) -> Self {
+        self.late_signer = Some(signer);
+        self
     }
 
     /// Send a transaction.
@@ -126,10 +151,17 @@ impl Sender {
 
         self.drain_completions();
 
-        let GeneratedTx { phase, id, raw, submission_keys, inclusion_keys } = tx;
+        let GeneratedTx { phase, id, raw, late_sign, submission_keys, inclusion_keys } = tx;
         let (submission_keys, inclusion_keys) =
             normalize_key_sets(submission_keys, inclusion_keys)?;
-        self.pending.push_back(PendingTx { phase, id, raw, submission_keys, inclusion_keys });
+        self.pending.push_back(PendingTx {
+            phase,
+            id,
+            raw,
+            late_sign,
+            submission_keys,
+            inclusion_keys,
+        });
         self.schedule_ready();
 
         Ok(())
@@ -197,9 +229,10 @@ impl Sender {
         let metrics = self.metrics.clone();
         let semaphore = self.semaphore.clone();
         let completion_tx = self.completion_tx.clone();
+        let late_signer = self.late_signer.clone();
 
         let handle = tokio::spawn(async move {
-            submit_tx(pending, providers, metrics, semaphore, completion_tx).await;
+            submit_tx(pending, providers, metrics, semaphore, completion_tx, late_signer).await;
         });
         self.worker_handles.push(handle);
     }
@@ -228,6 +261,7 @@ async fn submit_tx(
     metrics: Arc<MetricsCollector>,
     semaphore: Arc<Semaphore>,
     completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
+    late_signer: Option<Arc<dyn LateSigner>>,
 ) {
     let release_all_keys = || {
         let mut keys = pending.submission_keys.clone();
@@ -244,12 +278,31 @@ async fn submit_tx(
 
     metrics.record_sent();
 
+    // Materialize the raw bytes from the late-sign envelope (if any) here,
+    // immediately before submission. This minimizes the gap between signing
+    // any time-sensitive fields (e.g. Tempo `valid_before`) and the RPC
+    // accepting the tx.
+    let raw = match resolve_raw(&pending, late_signer.as_deref()) {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::error!(
+                id = pending.id.as_deref(),
+                phase = ?pending.phase,
+                error = %e,
+                "Failed to materialize raw bytes from late-sign envelope",
+            );
+            metrics.record_failure();
+            release_keys(&completion_tx, release_all_keys());
+            return;
+        }
+    };
+
     // Pick a random provider for this request.
     // SAFETY: `providers` is guaranteed to be non-empty by construction.
     let provider = providers.choose(&mut rand::rng()).unwrap();
 
     let start = Instant::now();
-    let tx_hash = match provider.send_raw_transaction(&pending.raw).await {
+    let tx_hash = match provider.send_raw_transaction(&raw).await {
         Ok(pending_tx) => {
             metrics.record_success(start.elapsed());
             *pending_tx.tx_hash()
@@ -288,6 +341,25 @@ async fn submit_tx(
 fn release_keys(completion_tx: &mpsc::UnboundedSender<SchedulingKeys>, keys: SchedulingKeys) {
     if !keys.is_empty() {
         let _ = completion_tx.send(keys);
+    }
+}
+
+/// Materialize the RLP-encoded EIP-2718 envelope to submit.
+///
+/// If `pending.late_sign` is set, this invokes the registered [`LateSigner`]
+/// (and errors if none is registered). Otherwise it returns the pre-signed
+/// `pending.raw` bytes.
+fn resolve_raw(pending: &PendingTx, late_signer: Option<&dyn LateSigner>) -> Result<Bytes> {
+    if let Some(spec) = &pending.late_sign {
+        let signer = late_signer.ok_or_else(|| {
+            eyre::eyre!(
+                "transaction has `late_sign` envelope (format `{}`) but sender has no late signer registered",
+                spec.format
+            )
+        })?;
+        signer.sign(spec)
+    } else {
+        Ok(pending.raw.clone())
     }
 }
 

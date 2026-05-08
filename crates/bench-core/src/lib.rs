@@ -36,7 +36,7 @@ pub use reth_api::{
 };
 pub use sample::{Sample, SampleStore};
 pub use scraper::{start_scraper, SampleCallback, ScraperConfig, ScraperHandle};
-pub use sender::{Sender, SenderConfig};
+pub use sender::{LateSigner, Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource, TxgenSource};
-pub use txgen_core::{GeneratedTx, TxPhase};
+pub use txgen_core::{GeneratedTx, LateSignSpec, TxPhase};
 pub use victoriametrics::{VictoriaMetricsConfig, VictoriaMetricsReporter};

@@ -12,8 +12,8 @@ use std::{collections::HashSet, io::Write, path::PathBuf};
 use tokio::sync::mpsc;
 use txgen_core::{
     dedup_scheduling_keys, merge_yaml, AbiEncodePackedDef, AbiHashDef, AccountManager,
-    ArtifactManager, BuildContext, GeneratedTx, MixItem, NdjsonWriter, NonceTracker, SchedulingKey,
-    SequenceBinding, SetupStep, TxPhase, WorkloadSpec,
+    ArtifactManager, BuildContext, GeneratedTx, LateSignSpec, MixItem, NdjsonWriter, NonceTracker,
+    SchedulingKey, SequenceBinding, SetupStep, TxPhase, WorkloadSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -145,6 +145,14 @@ pub struct TxRequest<R> {
     pub signer_index: usize,
     /// Scheduling key (e.g. sender address or hash of sender+nonce_key).
     pub key: [u8; 20],
+    /// Optional deferred-signing envelope.
+    ///
+    /// When set, the generic generation loop emits an unsigned record carrying
+    /// this envelope to the NDJSON stream instead of pre-signing the tx. The
+    /// sender materializes the signed bytes via a registered late signer
+    /// immediately before submission. Used for time-sensitive fields like
+    /// Tempo's `valid_before` (TIP-1009 expiring nonces).
+    pub late_sign: Option<LateSignSpec>,
 }
 
 /// Trait for network-specific transaction generation.
@@ -657,6 +665,29 @@ where
     let created_address =
         matches!(tx_req.request.kind(), Some(TxKind::Create)).then(|| sender.create(nonce));
 
+    // Late-sign branch: emit an unsigned record carrying the deferred envelope.
+    // The sender materializes the signed bytes (and final tx_hash) just before
+    // submission. Setup steps must be pre-signed because they depend on a
+    // stable tx_hash, so we reject late_sign there.
+    if let Some(late_sign) = tx_req.late_sign {
+        if phase == TxPhase::Setup {
+            eyre::bail!(
+                "template '{name}' requested deferred signing in the Setup phase, which requires a pre-signed tx_hash"
+            );
+        }
+        writer.write(&GeneratedTx {
+            phase,
+            id: Some(name.to_string()),
+            raw: Bytes::new(),
+            late_sign: Some(late_sign),
+            submission_keys: vec![SchedulingKey::from(tx_req.key)],
+            inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),
+        })?;
+        // tx_hash is unknown until late-signing; return zero. This is only
+        // consumed by sequence/setup bindings which we forbid above.
+        return Ok(EmittedTxInfo { sender, nonce, tx_hash: B256::ZERO, created_address });
+    }
+
     let mut unsigned = tx_req
         .request
         .build_unsigned()
@@ -676,6 +707,7 @@ where
         phase,
         id: Some(name.to_string()),
         raw,
+        late_sign: None,
         submission_keys: vec![SchedulingKey::from(tx_req.key)],
         inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),
     })?;

@@ -63,6 +63,7 @@ impl NetworkAdapter for EthereumAdapter {
             signer_pool: selected.pool,
             signer_index: selected.index,
             key,
+            late_sign: None,
         })
     }
 
