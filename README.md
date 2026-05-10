@@ -96,6 +96,30 @@ txgen-ethereum extract --rpc http://localhost:8545 --from 1000 --to 2000 -o bloc
 
 **Required RPC methods:** `debug_getRawBlock`
 
+#### `extract-big-blocks`
+
+Generate reth-bb-compatible synthetic big-block payloads as NDJSON.
+
+```bash
+txgen-ethereum extract-big-blocks \
+  --rpc http://archive:8545 \
+  --from 910020 \
+  --count 25 \
+  --target-gas 2G \
+  -o big-blocks.ndjson
+```
+
+| Flag | Description |
+|------|-------------|
+| `--rpc <URL>` | RPC endpoint (archive node) |
+| `--from <N>` | First source block number |
+| `--count <N>` | Number of synthetic big blocks to emit |
+| `--target-gas <GAS>` | Target gas per big block; accepts `K`, `M`, `G` suffixes |
+| `-o, --output <PATH>` | Output file (default: stdout) |
+| `--buffer-size <N>` | Reserved for future prefetching compatibility (default: 20) |
+
+**Required RPC methods:** `debug_getRawBlock`
+
 ### `bench`
 
 #### `bench send`
@@ -135,10 +159,11 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 
 #### `bench send-blocks`
 
-Submit RLP-encoded blocks via reth Engine API.
+Submit RLP-encoded blocks or reth-bb big-block payloads via reth Engine API.
 
 ```bash
 bench send-blocks --engine http://localhost:8551 --jwt-secret /path/to/jwt.hex --input blocks.ndjson
+bench send-blocks --engine http://localhost:8551 --jwt-secret /path/to/jwt.hex --input big-blocks.ndjson
 ```
 
 | Flag | Description |
@@ -155,7 +180,7 @@ bench send-blocks --engine http://localhost:8551 --jwt-secret /path/to/jwt.hex -
 
 For `send-blocks`, aggregate run rates use benchmark wall-clock duration. Per-block timestamps remain the original chain timestamps from the input.
 
-**Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API)
+**Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API). Big-block inputs require a `reth-bb` compatible node.
 
 #### `bench view`
 
@@ -685,7 +710,7 @@ Summary of which RPC methods are required by each feature:
 | `eth_sendRawTransaction` | `bench send` |
 | `eth_getTransactionReceipt` | `bench send` (setup and inclusion waits) |
 | `eth_getBlockByNumber` | `bench send` (per-block stats collection) |
-| `debug_getRawBlock` | `txgen extract` |
+| `debug_getRawBlock` | `txgen extract`, `txgen-ethereum extract-big-blocks` |
 | `reth_newPayload` | `bench send-blocks` |
 | `reth_forkchoiceUpdated` | `bench send-blocks` |
 | `txpool_status` | `bench send` (pool drain wait) |

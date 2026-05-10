@@ -12,9 +12,9 @@
 //! automatically available on any `Provider`.
 
 use alloy_network::Network;
-use alloy_primitives::Bytes;
+use alloy_primitives::{Bytes, B256};
 use alloy_provider::Provider;
-use alloy_rpc_types_engine::{ForkchoiceState, ForkchoiceUpdated, PayloadStatus};
+use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, ForkchoiceUpdated, PayloadStatus};
 use alloy_transport::TransportResult;
 use serde::{Deserialize, Serialize};
 
@@ -25,8 +25,41 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RethNewPayloadInput {
+    /// Standard execution data (payload + sidecar).
+    ExecutionData(Box<ExecutionData>),
     /// Raw RLP-encoded block bytes.
     BlockRlp(Bytes),
+}
+
+/// Additional data for big block payloads that merge multiple real blocks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BigBlockData<T> {
+    /// Environment switches at block boundaries.
+    /// Each entry is `(cumulative_tx_count, execution_data_of_next_block)`.
+    pub env_switches: Vec<(usize, T)>,
+    /// Block number → real block hash for blocks covered by previous big blocks in a sequence.
+    pub prior_block_hashes: Vec<(u64, B256)>,
+}
+
+impl<T> Default for BigBlockData<T> {
+    fn default() -> Self {
+        Self { env_switches: Vec::new(), prior_block_hashes: Vec::new() }
+    }
+}
+
+/// A merged big block payload with environment switches at block boundaries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BigBlockPayload {
+    /// The primary execution data with all concatenated transactions.
+    pub execution_data: ExecutionData,
+    /// Big block data containing environment switches and prior block hashes.
+    #[serde(default)]
+    pub big_block_data: BigBlockData<ExecutionData>,
+    /// Flattened BAL across all constituent blocks, if present.
+    // TODO(onbjerg): BAL replay is intentionally not implemented yet; this field is kept so the
+    // JSON shape is compatible with reth-bench payload files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_access_list: Option<serde_json::Value>,
 }
 
 /// Response from `reth_newPayload` with server-side timing.
@@ -120,6 +153,14 @@ pub trait RethApi<N: Network>: Send + Sync {
         wait_for_persistence: Option<bool>,
     ) -> TransportResult<RethPayloadStatus>;
 
+    /// Submit a big-block payload via reth-bb's extended `reth_newPayload`.
+    async fn reth_new_payload_big_block(
+        &self,
+        input: RethNewPayloadInput,
+        wait_for_persistence: Option<bool>,
+        big_block_data: BigBlockData<ExecutionData>,
+    ) -> TransportResult<RethPayloadStatus>;
+
     /// Submit a forkchoice update via `reth_forkchoiceUpdated`.
     async fn reth_forkchoice_updated(
         &self,
@@ -139,6 +180,20 @@ where
         wait_for_persistence: Option<bool>,
     ) -> TransportResult<RethPayloadStatus> {
         self.client().request("reth_newPayload", (input, wait_for_persistence, None::<bool>)).await
+    }
+
+    async fn reth_new_payload_big_block(
+        &self,
+        input: RethNewPayloadInput,
+        wait_for_persistence: Option<bool>,
+        big_block_data: BigBlockData<ExecutionData>,
+    ) -> TransportResult<RethPayloadStatus> {
+        self.client()
+            .request(
+                "reth_newPayload",
+                (input, wait_for_persistence, None::<bool>, Some(big_block_data)),
+            )
+            .await
     }
 
     async fn reth_forkchoice_updated(
@@ -163,6 +218,7 @@ mod tests {
             RethNewPayloadInput::BlockRlp(bytes) => {
                 assert_eq!(bytes.as_ref(), &[0xf8, 0x70, 0x01]);
             }
+            RethNewPayloadInput::ExecutionData(_) => panic!("expected BlockRlp variant"),
         }
     }
 
