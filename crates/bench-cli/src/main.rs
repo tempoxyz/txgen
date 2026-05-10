@@ -145,7 +145,7 @@ struct Cli {
 enum Command {
     /// Send transactions from file or stdin
     Send(SendArgs),
-    /// Submit blocks via reth Engine API
+    /// Submit blocks or reth-bb big blocks via reth Engine API
     SendBlocks(SendBlocksArgs),
     /// Print an existing JSON report to the console
     View(ViewArgs),

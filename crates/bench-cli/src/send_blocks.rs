@@ -12,9 +12,9 @@ use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types_engine::{ForkchoiceState, JwtSecret};
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    parse_reporters, start_scraper, BlockStats, ConsoleReporter, FinalReport, ProgressState,
-    Reporter, RethApi, RethNewPayloadInput, RunClock, RunStats, Sample, SampleStore, ScraperConfig,
-    WaitForPersistence,
+    parse_reporters, start_scraper, BigBlockPayload, BlockStats, ConsoleReporter, FinalReport,
+    ProgressState, Reporter, RethApi, RethNewPayloadInput, RunClock, RunStats, Sample, SampleStore,
+    ScraperConfig, WaitForPersistence,
 };
 use eyre::{Context, Result};
 use std::{
@@ -30,7 +30,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// NDJSON line from the block source (`txgen extract` output).
 #[derive(serde::Deserialize)]
-struct BlockLine {
+pub(crate) struct BlockLine {
     /// RLP-encoded block bytes (hex with 0x prefix).
     raw: Bytes,
     /// Block hash.
@@ -45,6 +45,16 @@ struct BlockLine {
     gas_limit: u64,
     /// Number of transactions in the block.
     tx_count: usize,
+}
+
+/// NDJSON line accepted by `bench send-blocks`.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum InputLine {
+    /// Raw RLP block line produced by `txgen extract`.
+    RawBlock(BlockLine),
+    /// Big-block payload line produced by `txgen extract-big-blocks`.
+    BigBlock(Box<BigBlockPayload>),
 }
 
 pub async fn execute(args: SendBlocksArgs) -> Result<()> {
@@ -103,11 +113,11 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
 
         for line in reader.lines() {
             let line = line.wrap_err("failed to read line")?;
-            let block = parse_block_line(&line)?;
+            let input = parse_input_line(&line)?;
 
-            process_block_and_wait(
+            process_input_and_wait(
                 &provider,
-                &block,
+                &input,
                 &mut collector,
                 &persistence_policy,
                 args.wait_time,
@@ -129,11 +139,11 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                 break;
             }
 
-            let block = parse_block_line(&line_buf)?;
+            let input = parse_input_line(&line_buf)?;
 
-            process_block_and_wait(
+            process_input_and_wait(
                 &provider,
-                &block,
+                &input,
                 &mut collector,
                 &persistence_policy,
                 args.wait_time,
@@ -187,7 +197,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     Ok(())
 }
 
-fn parse_block_line(line: &str) -> Result<BlockLine> {
+fn parse_input_line(line: &str) -> Result<InputLine> {
     serde_json::from_str(line.trim()).wrap_err("failed to parse NDJSON line")
 }
 
@@ -211,9 +221,9 @@ fn report_progress(
     Ok(())
 }
 
-async fn process_block_and_wait(
+async fn process_input_and_wait(
     provider: &(impl Provider + RethApi<Ethereum>),
-    block: &BlockLine,
+    input: &InputLine,
     collector: &mut MetricsCollector,
     persistence_policy: &WaitForPersistence,
     wait_time: Option<Duration>,
@@ -222,7 +232,7 @@ async fn process_block_and_wait(
 ) -> Result<()> {
     let block_start = Instant::now();
 
-    process_block(provider, block, collector, persistence_policy).await?;
+    process_input(provider, input, collector, persistence_policy).await?;
     report_progress(collector, start, reporters)?;
 
     if let Some(wait_time) = wait_time {
@@ -233,6 +243,22 @@ async fn process_block_and_wait(
     }
 
     Ok(())
+}
+
+async fn process_input(
+    provider: &(impl Provider + RethApi<Ethereum>),
+    input: &InputLine,
+    collector: &mut MetricsCollector,
+    persistence_policy: &WaitForPersistence,
+) -> Result<()> {
+    match input {
+        InputLine::RawBlock(block) => {
+            process_block(provider, block, collector, persistence_policy).await
+        }
+        InputLine::BigBlock(big_block) => {
+            process_big_block(provider, big_block, collector, persistence_policy).await
+        }
+    }
 }
 
 async fn process_block(
@@ -326,6 +352,104 @@ async fn process_block(
 
     if block.number.is_multiple_of(32) {
         collector.finalized_hash = Some(block.key);
+    }
+
+    Ok(())
+}
+
+async fn process_big_block(
+    provider: &(impl Provider + RethApi<Ethereum>),
+    big_block: &BigBlockPayload,
+    collector: &mut MetricsCollector,
+    persistence_policy: &WaitForPersistence,
+) -> Result<()> {
+    if big_block.block_access_list.is_some() {
+        tracing::warn!(
+            "big-block payload contains block_access_list, but BAL replay is not implemented yet; ignoring BAL"
+        );
+    }
+
+    let execution_data = big_block.execution_data.clone();
+    let payload = &execution_data.payload;
+    let block_hash = execution_data.block_hash();
+    let block_number = execution_data.block_number();
+    let input = RethNewPayloadInput::ExecutionData(Box::new(execution_data.clone()));
+    let wait = persistence_policy.should_wait(collector.blocks_submitted());
+
+    let new_payload_start = Instant::now();
+    let payload_status = provider
+        .reth_new_payload_big_block(input, wait, big_block.big_block_data.clone())
+        .await
+        .wrap_err("reth_newPayload failed")?;
+    let new_payload_latency = new_payload_start.elapsed();
+
+    if !payload_status.status.is_valid() {
+        collector.record_failure();
+        eyre::bail!(
+            "reth_newPayload returned non-VALID status for big block {}: {:?}",
+            block_number,
+            payload_status.status,
+        );
+    }
+
+    let forkchoice_state = ForkchoiceState {
+        head_block_hash: block_hash,
+        safe_block_hash: block_hash,
+        finalized_block_hash: block_hash,
+    };
+
+    let fcu_start = Instant::now();
+    let fcu_result = provider
+        .reth_forkchoice_updated(forkchoice_state)
+        .await
+        .wrap_err("reth_forkchoiceUpdated failed")?;
+    let fcu_latency = fcu_start.elapsed();
+
+    if !fcu_result.is_valid() {
+        collector.record_failure();
+        eyre::bail!(
+            "reth_forkchoiceUpdated returned non-VALID status for big block {}: {:?}",
+            block_number,
+            fcu_result.payload_status,
+        );
+    }
+
+    let timestamp_ms = payload.timestamp() * 1000;
+    let block_time_ms = collector.prev_timestamp_ms.map(|prev| timestamp_ms.saturating_sub(prev));
+    collector.prev_timestamp_ms = Some(timestamp_ms);
+
+    let block_stats = BlockStats {
+        number: block_number,
+        timestamp_ms,
+        tx_count: execution_data.transaction_count(),
+        gas_used: payload.as_v1().gas_used,
+        gas_limit: payload.gas_limit(),
+        block_time_ms,
+        new_payload_ms: Some(new_payload_latency.as_millis() as u64),
+        forkchoice_updated_ms: Some(fcu_latency.as_millis() as u64),
+        new_payload_server_latency_us: Some(payload_status.latency_us),
+        persistence_wait_us: payload_status.persistence_wait_us,
+        execution_cache_wait_us: payload_status.execution_cache_wait_us,
+        sparse_trie_wait_us: payload_status.sparse_trie_wait_us,
+    };
+
+    collector.record_success(block_stats);
+
+    tracing::info!(
+        block = block_number,
+        txs = execution_data.transaction_count(),
+        gas = payload.as_v1().gas_used,
+        new_payload_ms = new_payload_latency.as_millis(),
+        forkchoice_updated_ms = fcu_latency.as_millis(),
+        total_ms = (new_payload_latency + fcu_latency).as_millis(),
+        new_payload_server_latency_us = payload_status.latency_us,
+        status = %payload_status.status.status,
+        "Submitted big block"
+    );
+
+    collector.prev_block_hash = Some(block_hash);
+    if block_number.is_multiple_of(32) {
+        collector.finalized_hash = Some(block_hash);
     }
 
     Ok(())
