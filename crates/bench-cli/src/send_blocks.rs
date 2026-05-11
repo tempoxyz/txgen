@@ -7,9 +7,12 @@
 
 use crate::{send::parse_metadata, SendBlocksArgs};
 use alloy_network::Ethereum;
-use alloy_primitives::{Bytes, B256};
-use alloy_provider::{Provider, RootProvider};
-use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, JwtSecret};
+use alloy_primitives::{Address, Bytes, B256};
+use alloy_provider::{ext::TestingApi, Provider, RootProvider};
+use alloy_rlp::Header;
+use alloy_rpc_types_engine::{
+    ExecutionData, ForkchoiceState, JwtSecret, PayloadAttributes, TestingBuildBlockRequestV1,
+};
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
     parse_reporters, start_scraper, BigBlockData, BlockStats, ConsoleReporter, FinalReport,
@@ -57,6 +60,31 @@ enum InputLine {
     BigBlock(Box<BigBlockData<ExecutionData>>),
 }
 
+struct ReorgState {
+    depth: usize,
+    fork_length: usize,
+    branch_point_hash: Option<B256>,
+    fork_parent_hash: Option<B256>,
+}
+
+impl ReorgState {
+    const fn new(depth: usize) -> Self {
+        Self { depth, fork_length: 0, branch_point_hash: None, fork_parent_hash: None }
+    }
+
+    fn reset(&mut self) {
+        self.fork_length = 0;
+        self.branch_point_hash = None;
+        self.fork_parent_hash = None;
+    }
+}
+
+struct ProcessingState<'a> {
+    collector: &'a mut MetricsCollector,
+    reorg_state: Option<&'a mut ReorgState>,
+    persistence_policy: &'a WaitForPersistence,
+}
+
 pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let jwt_secret_hex =
         tokio::fs::read_to_string(&args.jwt_secret).await.wrap_err("failed to read JWT secret")?;
@@ -71,12 +99,16 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         input = args.input.as_ref().map_or("<stdin>", |p| p.to_str().unwrap_or("?")),
         wait_for_persistence = ?persistence_policy,
         wait_time_ms = args.wait_time.map(|d| d.as_millis()),
+        reorg_depth = args.reorg,
+        rpc = %args.rpc,
         "Starting block submission"
     );
 
     let hyper_client = HyperClient::new().layer(AuthLayer::new(jwt_secret));
     let transport = Http::with_client(hyper_client, args.engine.parse()?);
     let provider = RootProvider::<Ethereum>::new(alloy_rpc_client::RpcClient::new(transport, true));
+    let testing_provider =
+        RootProvider::<Ethereum>::new_http(args.rpc.parse().wrap_err("invalid RPC URL")?);
 
     let mut reporters = parse_reporters(&args.reports, "send-blocks", &metadata)?;
     if reporters.is_empty() {
@@ -105,6 +137,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     };
 
     let mut collector = MetricsCollector::new(counters);
+    let mut reorg_state = args.reorg.map(ReorgState::new);
     let start = Instant::now();
 
     if let Some(ref path) = args.input {
@@ -117,9 +150,13 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
 
             process_input_and_wait(
                 &provider,
+                &testing_provider,
                 &input,
-                &mut collector,
-                &persistence_policy,
+                ProcessingState {
+                    collector: &mut collector,
+                    reorg_state: reorg_state.as_mut(),
+                    persistence_policy: &persistence_policy,
+                },
                 args.wait_time,
                 start,
                 &mut reporters,
@@ -143,9 +180,13 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
 
             process_input_and_wait(
                 &provider,
+                &testing_provider,
                 &input,
-                &mut collector,
-                &persistence_policy,
+                ProcessingState {
+                    collector: &mut collector,
+                    reorg_state: reorg_state.as_mut(),
+                    persistence_policy: &persistence_policy,
+                },
                 args.wait_time,
                 start,
                 &mut reporters,
@@ -223,17 +264,25 @@ fn report_progress(
 
 async fn process_input_and_wait(
     provider: &(impl Provider + RethApi<Ethereum>),
+    testing_provider: &(impl Provider + TestingApi<Ethereum>),
     input: &InputLine,
-    collector: &mut MetricsCollector,
-    persistence_policy: &WaitForPersistence,
+    state: ProcessingState<'_>,
     wait_time: Option<Duration>,
     start: Instant,
     reporters: &mut [Box<dyn Reporter>],
 ) -> Result<()> {
     let block_start = Instant::now();
 
-    process_input(provider, input, collector, persistence_policy).await?;
-    report_progress(collector, start, reporters)?;
+    process_input(
+        provider,
+        testing_provider,
+        input,
+        state.collector,
+        state.reorg_state,
+        state.persistence_policy,
+    )
+    .await?;
+    report_progress(state.collector, start, reporters)?;
 
     if let Some(wait_time) = wait_time {
         let remaining = wait_time.saturating_sub(block_start.elapsed());
@@ -247,15 +296,28 @@ async fn process_input_and_wait(
 
 async fn process_input(
     provider: &(impl Provider + RethApi<Ethereum>),
+    testing_provider: &(impl Provider + TestingApi<Ethereum>),
     input: &InputLine,
     collector: &mut MetricsCollector,
+    reorg_state: Option<&mut ReorgState>,
     persistence_policy: &WaitForPersistence,
 ) -> Result<()> {
     match input {
         InputLine::RawBlock(block) => {
-            process_block(provider, block, collector, persistence_policy).await
+            process_block(
+                provider,
+                testing_provider,
+                block,
+                collector,
+                reorg_state,
+                persistence_policy,
+            )
+            .await
         }
         InputLine::BigBlock(big_block) => {
+            if reorg_state.is_some() {
+                eyre::bail!("--reorg is only supported for raw RLP block input");
+            }
             process_big_block(provider, big_block, collector, persistence_policy).await
         }
     }
@@ -263,8 +325,10 @@ async fn process_input(
 
 async fn process_block(
     provider: &(impl Provider + RethApi<Ethereum>),
+    testing_provider: &(impl Provider + TestingApi<Ethereum>),
     block: &BlockLine,
     collector: &mut MetricsCollector,
+    reorg_state: Option<&mut ReorgState>,
     persistence_policy: &WaitForPersistence,
 ) -> Result<()> {
     let input = RethNewPayloadInput::BlockRlp(block.raw.clone());
@@ -295,6 +359,7 @@ async fn process_block(
         // SAFETY: finalized_hash is always Some after the check above
         finalized_block_hash: collector.finalized_hash.unwrap(),
     };
+    let canonical_forkchoice_state = forkchoice_state;
 
     let fcu_start = Instant::now();
     let fcu_result = provider
@@ -348,12 +413,210 @@ async fn process_block(
         "Submitted block"
     );
 
+    if let Some(reorg_state) = reorg_state {
+        process_reorg_block(
+            provider,
+            testing_provider,
+            block,
+            collector,
+            reorg_state,
+            canonical_forkchoice_state,
+            persistence_policy,
+        )
+        .await?;
+    }
+
     collector.prev_block_hash = Some(block.key);
 
     if block.number.is_multiple_of(32) {
         collector.finalized_hash = Some(block.key);
     }
 
+    Ok(())
+}
+
+async fn process_reorg_block(
+    provider: &(impl Provider + RethApi<Ethereum>),
+    testing_provider: &(impl Provider + TestingApi<Ethereum>),
+    block: &BlockLine,
+    collector: &MetricsCollector,
+    reorg_state: &mut ReorgState,
+    canonical_forkchoice_state: ForkchoiceState,
+    persistence_policy: &WaitForPersistence,
+) -> Result<()> {
+    let parent_block_hash = if reorg_state.fork_length == 0 {
+        let Some(parent_hash) = collector.prev_block_hash else {
+            tracing::warn!(
+                block = block.number,
+                "Skipping first synthetic fork block because the canonical parent hash is unknown"
+            );
+            return Ok(());
+        };
+        reorg_state.branch_point_hash = Some(parent_hash);
+        parent_hash
+    } else {
+        reorg_state
+            .fork_parent_hash
+            .ok_or_else(|| eyre::eyre!("reorg state is missing synthetic fork parent hash"))?
+    };
+
+    let branch_point_hash = reorg_state
+        .branch_point_hash
+        .ok_or_else(|| eyre::eyre!("reorg state is missing branch point hash"))?;
+    let transactions = extract_tx_bytes_from_block_rlp(block.raw.as_ref()).wrap_err_with(|| {
+        format!("failed to extract raw transaction bytes from block {}", block.number)
+    })?;
+
+    let payload_attributes = PayloadAttributes {
+        timestamp: block.timestamp,
+        prev_randao: B256::ZERO,
+        suggested_fee_recipient: Address::ZERO,
+        withdrawals: None,
+        parent_beacon_block_root: None,
+        slot_number: None,
+    };
+    let parent_beacon_block_root = payload_attributes.parent_beacon_block_root.unwrap_or_default();
+    let request = TestingBuildBlockRequestV1 {
+        parent_block_hash,
+        payload_attributes,
+        transactions,
+        extra_data: Some(Bytes::new()),
+    };
+
+    let envelope = testing_provider.build_block_v1(request).await.wrap_err_with(|| {
+        format!(
+            "testing_buildBlockV1 failed for block {}. Ensure the target exposes the hidden \
+                 testing RPC, for example: reth node --http --http.api eth,testing ...",
+            block.number
+        )
+    })?;
+    let synthetic_block_hash = envelope.execution_payload.payload_inner.payload_inner.block_hash;
+    let (payload, sidecar) = envelope.into_payload_and_sidecar(parent_beacon_block_root);
+    let execution_data = ExecutionData::new(payload, sidecar);
+
+    let wait = persistence_policy.should_wait(collector.blocks_submitted());
+    let payload_status = provider
+        .reth_new_payload(RethNewPayloadInput::ExecutionData(Box::new(execution_data)), wait)
+        .await
+        .wrap_err_with(|| {
+            format!("reth_newPayload failed for synthetic fork block after block {}", block.number)
+        })?;
+
+    if !payload_status.status.is_valid() {
+        eyre::bail!(
+            "reth_newPayload returned non-VALID status for synthetic fork block after block {}: {:?}",
+            block.number,
+            payload_status.status,
+        );
+    }
+
+    let forkchoice_state = ForkchoiceState {
+        head_block_hash: synthetic_block_hash,
+        safe_block_hash: branch_point_hash,
+        finalized_block_hash: branch_point_hash,
+    };
+    let fcu_result =
+        provider.reth_forkchoice_updated(forkchoice_state).await.wrap_err_with(|| {
+            format!(
+                "reth_forkchoiceUpdated failed for synthetic fork block after block {}",
+                block.number
+            )
+        })?;
+
+    if !fcu_result.is_valid() {
+        eyre::bail!(
+            "reth_forkchoiceUpdated returned non-VALID status for synthetic fork block after block {}: {:?}",
+            block.number,
+            fcu_result.payload_status,
+        );
+    }
+
+    reorg_state.fork_length += 1;
+    reorg_state.fork_parent_hash = Some(synthetic_block_hash);
+
+    tracing::info!(
+        block = block.number,
+        fork_length = reorg_state.fork_length,
+        reorg_depth = reorg_state.depth,
+        branch_point = %branch_point_hash,
+        synthetic_head = %synthetic_block_hash,
+        "Submitted synthetic fork block"
+    );
+
+    if reorg_state.fork_length == reorg_state.depth {
+        let fcu_result = provider
+            .reth_forkchoice_updated(canonical_forkchoice_state)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "reth_forkchoiceUpdated failed while switching back to canonical block {}",
+                    block.number
+                )
+            })?;
+
+        if !fcu_result.is_valid() {
+            eyre::bail!(
+                "reth_forkchoiceUpdated returned non-VALID status while switching back to canonical block {}: {:?}",
+                block.number,
+                fcu_result.payload_status,
+            );
+        }
+
+        tracing::info!(
+            block = block.number,
+            reorg_depth = reorg_state.depth,
+            canonical_head = %block.key,
+            "Switched forkchoice back to canonical head"
+        );
+        reorg_state.reset();
+    }
+
+    Ok(())
+}
+
+fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<Vec<Bytes>> {
+    let mut block_buf = raw;
+    let mut block_payload = Header::decode_bytes(&mut block_buf, true)
+        .wrap_err("failed to decode outer block RLP list")?;
+    if !block_buf.is_empty() {
+        eyre::bail!("block RLP has trailing bytes after outer list");
+    }
+
+    skip_rlp_item(&mut block_payload).wrap_err("failed to skip block header")?;
+    let mut txs_payload = Header::decode_bytes(&mut block_payload, true)
+        .wrap_err("failed to decode transactions RLP list")?;
+
+    let mut transactions = Vec::new();
+    let mut skipped_blob_txs = 0usize;
+    while !txs_payload.is_empty() {
+        let item_start = txs_payload;
+        let header =
+            Header::decode(&mut txs_payload).wrap_err("failed to decode transaction RLP item")?;
+        let header_len = item_start.len() - txs_payload.len();
+        let payload = &txs_payload[..header.payload_length];
+        let encoded = &item_start[..header_len + header.payload_length];
+
+        if header.list {
+            transactions.push(Bytes::copy_from_slice(encoded));
+        } else if payload.first() == Some(&0x03) {
+            skipped_blob_txs += 1;
+        } else {
+            transactions.push(Bytes::copy_from_slice(payload));
+        }
+
+        txs_payload = &txs_payload[header.payload_length..];
+    }
+
+    if skipped_blob_txs > 0 {
+        tracing::warn!(skipped_blob_txs, "Skipped blob transactions while building synthetic fork");
+    }
+
+    Ok(transactions)
+}
+
+fn skip_rlp_item(buf: &mut &[u8]) -> Result<()> {
+    let header = Header::decode(buf).wrap_err("failed to decode RLP item header")?;
+    *buf = &buf[header.payload_length..];
     Ok(())
 }
 
