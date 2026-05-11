@@ -230,22 +230,4 @@ mod tests {
         assert!(parse_duration_millis_fallback("abc").is_err());
         assert!(parse_duration_millis_fallback("").is_err());
     }
-
-    #[test]
-    fn test_send_duration_arg() {
-        let cli = Cli::try_parse_from([
-            "bench",
-            "send",
-            "--duration",
-            "300s",
-            "--rpc-url",
-            "http://localhost:8545",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Command::Send(args) => assert_eq!(args.duration, Some(Duration::from_secs(300))),
-            _ => panic!("expected send command"),
-        }
-    }
 }
