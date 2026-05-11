@@ -29,13 +29,13 @@ alloy-primitives = { version = "1", features = ["rand", "serde"] }
 alloy-sol-types = "1"
 alloy-dyn-abi = { version = "1", features = ["eip712"] }
 alloy-json-abi = "1"
-alloy-signer = "1"
-alloy-signer-local = "1"
-alloy-consensus = "1"
-alloy-network = "1"
-alloy-provider = { version = "1", features = ["debug-api", "engine-api"] }
-alloy-rpc-types-eth = "1"
-alloy-eips = "1"
+alloy-signer = "2"
+alloy-signer-local = "2"
+alloy-consensus = "2"
+alloy-network = "2"
+alloy-provider = { version = "2", features = ["debug-api", "engine-api"] }
+alloy-rpc-types-eth = "2"
+alloy-eips = "2"
 alloy-rlp = "0.3"
 
 # tempo

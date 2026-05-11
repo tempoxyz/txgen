@@ -104,7 +104,7 @@ mod tests {
     use super::*;
     use alloy_consensus::SignableTransaction;
     use alloy_eips::eip2718::Encodable2718;
-    use alloy_network::TxSignerSync;
+    use alloy_network::{NetworkTransactionBuilder, TxSignerSync};
     use rand::{rngs::StdRng, SeedableRng};
     use std::collections::HashMap;
     use txgen_core::{
