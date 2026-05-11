@@ -146,6 +146,7 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `-i, --input <PATH>` | Input NDJSON file (default: stdin) |
 | `--rpc-url <URL>` | RPC endpoint URLs, comma-separated or repeated (default: `http://localhost:8545`) |
 | `--tps <N>` | Target transactions per second (0 = unlimited) |
+| `--duration <DUR>` | Stop enqueueing workload transactions after this duration; setup is excluded |
 | `--max-concurrent <N>` | Maximum concurrent requests (default: 100) |
 | `--timeout <DUR>` | Request timeout (default: 30s) |
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
@@ -156,6 +157,8 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 300, 0 to disable) |
 
 **Required RPC methods:** `eth_sendRawTransaction`, `eth_getTransactionReceipt` (setup and inclusion waits), `eth_getBlockByNumber`, `txpool_status` (for `--drain-timeout`)
+
+`--duration` limits workload submission time on the bench side. After the duration elapses, `bench send` stops reading new workload transactions, flushes in-flight RPCs, and then applies `--drain-timeout` before finalizing the report.
 
 #### `bench send-blocks`
 

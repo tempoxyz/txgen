@@ -105,7 +105,20 @@ async fn execute_source<S: TxSource>(
     if let Some(tx) = first_workload {
         send_workload_tx(tx, &mut sender, &metrics, &config, &mut reporters).await?;
     }
-    send_workload_from_source(source, &mut sender, &metrics, &config, &mut reporters).await?;
+
+    let fut = send_workload_from_source(source, &mut sender, &metrics, &config, &mut reporters);
+    if let Some(duration) = args.duration {
+        match tokio::time::timeout(duration, fut).await {
+            Ok(result) => {
+                result?;
+            }
+            Err(err) => {
+                tracing::error!(?err, "Send duration elapsed; stopping workload submission");
+            }
+        }
+    } else {
+        fut.await?;
+    }
 
     sender.flush().await;
 
