@@ -138,6 +138,25 @@ pub struct SendBlocksArgs {
     /// original offset within the run.
     #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
     pub metrics_align: Option<u64>,
+
+    /// Build a synthetic side fork and alternate forkchoice updates.
+    #[arg(
+        long,
+        value_name = "DEPTH",
+        num_args = 0..=1,
+        default_missing_value = "8",
+        value_parser = parse_reorg_depth,
+    )]
+    pub reorg: Option<usize>,
+
+    /// Regular HTTP RPC URL for testing_buildBlockV1.
+    #[arg(
+        long = "rpc",
+        alias = "rpc-url",
+        alias = "local-rpc-url",
+        default_value = "http://localhost:8545"
+    )]
+    pub rpc: String,
 }
 
 /// Arguments for the `view` subcommand.
@@ -187,6 +206,14 @@ fn parse_unix_timestamp_ms(s: &str) -> Result<u64, String> {
     } else {
         Ok(timestamp)
     }
+}
+
+fn parse_reorg_depth(s: &str) -> Result<usize, String> {
+    let depth = s.trim().parse::<usize>().map_err(|e| format!("invalid reorg depth: {e}"))?;
+    if depth == 0 {
+        return Err("reorg depth requires DEPTH > 0".to_string());
+    }
+    Ok(depth)
 }
 
 fn parse_wait_for_persistence(s: &str) -> Result<bench_core::WaitForPersistence, String> {
@@ -263,5 +290,13 @@ mod tests {
         assert!(parse_unix_timestamp_ms("abc").is_err());
         assert!(parse_unix_timestamp_ms("-1").is_err());
         assert!(parse_unix_timestamp_ms("").is_err());
+    }
+
+    #[test]
+    fn test_parse_reorg_depth() {
+        assert_eq!(parse_reorg_depth("1"), Ok(1));
+        assert_eq!(parse_reorg_depth("8"), Ok(8));
+        assert!(parse_reorg_depth("0").is_err());
+        assert!(parse_reorg_depth("abc").is_err());
     }
 }

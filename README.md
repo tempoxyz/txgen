@@ -170,6 +170,14 @@ Big-block inputs use the current reth-bb `BigBlockData` format where each NDJSON
 ```bash
 bench send-blocks --engine http://localhost:8551 --jwt-secret /path/to/jwt.hex --input blocks.ndjson
 bench send-blocks --engine http://localhost:8551 --jwt-secret /path/to/jwt.hex --input big-blocks.ndjson
+
+# Exercise reorg paths by building synthetic side-fork blocks via testing_buildBlockV1.
+bench send-blocks \
+  --engine http://localhost:8551 \
+  --jwt-secret /path/to/jwt.hex \
+  --rpc http://localhost:8545 \
+  --reorg 8 \
+  --input blocks.ndjson
 ```
 
 | Flag | Description |
@@ -179,15 +187,17 @@ bench send-blocks --engine http://localhost:8551 --jwt-secret /path/to/jwt.hex -
 | `-i, --input <PATH>` | Input NDJSON file (default: stdin) |
 | `--wait-for-persistence <POLICY>` | Persistence wait policy: `always`, `never`, or `every:N` (default: `every:2`) |
 | `--wait-time <DURATION>` | Minimum interval between block submissions. Accepts `100ms`, `2s`, or bare milliseconds like `400` |
+| `--reorg [DEPTH]` | Build synthetic side-fork blocks and alternate forkchoice updates to exercise reorg paths. If `DEPTH` is omitted, defaults to `8`. Requires raw RLP block input |
+| `--rpc <URL>` | Regular HTTP RPC endpoint for `testing_buildBlockV1` when `--reorg` is enabled (default: `http://localhost:8545`) |
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
 | `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
 | `--metrics-url <URL>` | Prometheus endpoint to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
 
-For `send-blocks`, aggregate run rates use benchmark wall-clock duration. Per-block timestamps remain the original chain timestamps from the input.
+For `send-blocks`, aggregate run rates use benchmark wall-clock duration. Per-block timestamps remain the original chain timestamps from the input. With `--reorg`, canonical block stats remain canonical-only, but the wall-clock duration includes synthetic fork block build/submission work.
 
-**Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API). Big-block inputs require a `reth-bb` compatible node.
+**Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API). Big-block inputs require a `reth-bb` compatible node. `--reorg` additionally requires `testing_buildBlockV1` on the regular HTTP RPC endpoint, for example from a node started with `--http --http.api eth,testing`. `--rpc-url` and `--local-rpc-url` are accepted as backwards-compatible aliases for `--rpc`.
 
 #### `bench view`
 
@@ -722,6 +732,7 @@ Summary of which RPC methods are required by each feature:
 | `debug_getRawBlock` | `txgen extract`, `txgen-ethereum extract-big-blocks` |
 | `reth_newPayload` | `bench send-blocks` |
 | `reth_forkchoiceUpdated` | `bench send-blocks` |
+| `testing_buildBlockV1` | `bench send-blocks --reorg` |
 | `txpool_status` | `bench send` (pool drain wait) |
 
 > **Note:** `debug_*` methods require a node with the debug namespace enabled (typically archive nodes). `reth_*` methods are custom reth Engine API extensions.

@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 /// Uses `#[serde(untagged)]` to try deserialization in order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum RethNewPayloadInput {
     /// Standard execution data (payload + sidecar).
     ExecutionData(Box<ExecutionData>),
