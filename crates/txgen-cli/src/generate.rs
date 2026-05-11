@@ -7,6 +7,10 @@ use alloy_provider::Provider;
 use clap::Args;
 use eyre::{bail, Result, WrapErr};
 use rand::{rngs::StdRng, Rng, SeedableRng};
+#[cfg(not(unix))]
+use std::io::IsTerminal;
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 use std::{collections::HashSet, io::Write, path::PathBuf};
 use txgen_core::{
     dedup_scheduling_keys, merge_yaml, AbiEncodePackedDef, AbiHashDef, AccountManager,
@@ -22,7 +26,7 @@ pub struct GenerateArgs {
 
     /// Number of transactions to generate
     #[arg(short = 'n', long)]
-    pub count: u64,
+    pub count: Option<u64>,
 
     /// Output file (default: stdout)
     #[arg(short, long)]
@@ -144,7 +148,7 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    let count = args.count;
+    let limit = resolve_generation_limit(&args)?;
     let output = args.output.clone();
     let rpc = args.rpc.clone();
     let mut ctx = GenerateContext::from_args(&args)?;
@@ -153,7 +157,7 @@ where
         adapter.prefetch_nonces(&mut ctx, rpc).await?;
     }
 
-    generate_loop(&adapter, &mut ctx, count, output)
+    generate_loop(&adapter, &mut ctx, limit, output)
 }
 
 // ---------------------------------------------------------------------------
@@ -210,10 +214,67 @@ pub async fn fetch_protocol_nonces(
 // Private helpers
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationLimit {
+    Bounded(u64),
+    Unbounded,
+}
+
+impl GenerationLimit {
+    fn remaining(self, written: u64) -> Option<u64> {
+        match self {
+            Self::Bounded(count) => count.checked_sub(written).filter(|remaining| *remaining > 0),
+            Self::Unbounded => Some(u64::MAX),
+        }
+    }
+}
+
+fn resolve_generation_limit(args: &GenerateArgs) -> Result<GenerationLimit> {
+    generation_limit(args.count, args.output.is_some(), stdout_is_piped())
+}
+
+#[cfg(unix)]
+fn stdout_is_piped() -> bool {
+    stdout_file_type().is_some_and(|file_type| file_type.is_fifo())
+}
+
+#[cfg(unix)]
+fn stdout_file_type() -> Option<std::fs::FileType> {
+    std::fs::metadata("/proc/self/fd/1")
+        .or_else(|_| std::fs::metadata("/dev/fd/1"))
+        .ok()
+        .map(|metadata| metadata.file_type())
+}
+
+#[cfg(not(unix))]
+fn stdout_is_piped() -> bool {
+    !std::io::stdout().is_terminal()
+}
+
+fn generation_limit(
+    count: Option<u64>,
+    output_file: bool,
+    stdout_piped: bool,
+) -> Result<GenerationLimit> {
+    if let Some(count) = count {
+        return Ok(GenerationLimit::Bounded(count));
+    }
+
+    if output_file {
+        bail!("txgen generate needs -n/--count when writing to an output file");
+    }
+
+    if !stdout_piped {
+        bail!("txgen generate needs -n/--count unless stdout is piped");
+    }
+
+    Ok(GenerationLimit::Unbounded)
+}
+
 fn generate_loop<A: NetworkAdapter>(
     adapter: &A,
     ctx: &mut GenerateContext,
-    count: u64,
+    limit: GenerationLimit,
     output: Option<PathBuf>,
 ) -> Result<()>
 where
@@ -241,7 +302,7 @@ where
             let written = generate_txs(
                 adapter,
                 &ctx.spec,
-                count,
+                limit,
                 &setup_bindings,
                 &mut build_ctx,
                 &mut writer,
@@ -251,7 +312,7 @@ where
         None => {
             let mut writer = txgen_core::output::stdout_writer();
             let setup_bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
-            generate_txs(adapter, &ctx.spec, count, &setup_bindings, &mut build_ctx, &mut writer)?;
+            generate_txs(adapter, &ctx.spec, limit, &setup_bindings, &mut build_ctx, &mut writer)?;
         }
     }
 
@@ -464,7 +525,7 @@ fn build_deploy_template_value(
 fn generate_txs<A: NetworkAdapter, W: Write>(
     adapter: &A,
     spec: &WorkloadSpec,
-    count: u64,
+    limit: GenerationLimit,
     setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
@@ -477,8 +538,7 @@ where
     let mut written = 0u64;
     let mut sequence_instances = 0u64;
 
-    while written < count {
-        let remaining = count - written;
+    while let Some(remaining) = limit.remaining(written) {
         let Some(item) = pick_workload_item(spec, ctx.rng, remaining)? else {
             break;
         };
@@ -501,7 +561,7 @@ where
                     ctx,
                     writer,
                 )?;
-                written += 1;
+                written = written.saturating_add(1);
             }
             MixItem::Sequence(name) => {
                 let sequence = spec
@@ -538,7 +598,7 @@ where
                         ctx,
                         writer,
                     )?;
-                    written += 1;
+                    written = written.saturating_add(1);
                 }
             }
         }
@@ -940,4 +1000,32 @@ fn account_ref_value(pool: &str, index: usize) -> Result<serde_yaml::Value> {
     );
 
     Ok(serde_yaml::Value::Mapping(account))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_limit_uses_count_when_present() {
+        assert_eq!(generation_limit(Some(12), false, false).unwrap(), GenerationLimit::Bounded(12));
+        assert_eq!(generation_limit(Some(12), true, true).unwrap(), GenerationLimit::Bounded(12));
+    }
+
+    #[test]
+    fn generation_limit_streams_without_count_when_stdout_is_piped() {
+        assert_eq!(generation_limit(None, false, true).unwrap(), GenerationLimit::Unbounded);
+    }
+
+    #[test]
+    fn generation_limit_requires_count_without_pipe() {
+        let err = generation_limit(None, false, false).unwrap_err().to_string();
+        assert_eq!(err, "txgen generate needs -n/--count unless stdout is piped");
+    }
+
+    #[test]
+    fn generation_limit_requires_count_for_output_file() {
+        let err = generation_limit(None, true, true).unwrap_err().to_string();
+        assert_eq!(err, "txgen generate needs -n/--count when writing to an output file");
+    }
 }

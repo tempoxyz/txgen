@@ -48,12 +48,15 @@ txgen-ethereum generate -s workload.yaml -n 1000 --rpc http://localhost:8545
 
 # Output to file
 txgen-ethereum generate -s workload.yaml -n 1000 -o transactions.ndjson
+
+# Stream indefinitely when stdout is piped
+txgen-ethereum generate -s workload.yaml | bench send --rpc-url http://localhost:8545
 ```
 
 | Flag | Description |
 |------|-------------|
 | `-s, --spec <PATH>` | Workload specification file (YAML) |
-| `-n, --count <N>` | Number of transactions to generate |
+| `-n, --count <N>` | Number of transactions to generate (required unless stdout is piped) |
 | `-o, --output <PATH>` | Output file (default: stdout) |
 | `--rpc <URL>` | RPC endpoint for fetching current nonces |
 | `--rpc-rps <N>` | Rate limit for RPC requests per second (0 = unbounded) |
@@ -133,7 +136,7 @@ After sending completes, queries the node for per-block statistics (transaction 
 bench send --input transactions.ndjson --rpc-url http://localhost:8545 --tps 500
 
 # From stdin (pipe from txgen)
-txgen-ethereum generate -s workload.yaml -n 1000 | bench send --rpc-url http://localhost:8545
+txgen-ethereum generate -s workload.yaml | bench send --rpc-url http://localhost:8545
 
 # With JSON report and metadata
 bench send -i txs.ndjson --rpc-url http://localhost:8545 \
@@ -624,7 +627,7 @@ bindings:
 
 Each emitted sequence step gets its natural nonce-lane key as a `submission_key`. Txgen then groups adjacent sequence steps by lane. Steps in the same lane rely on nonce order and can be submitted back-to-back. When a sequence crosses lanes, txgen adds a synthetic boundary key: the previous run releases it after inclusion, and the next run requires it as a `submission_key`. This preserves cross-lane ordering without receipt-gating same-lane nonce chains.
 
-`txgen generate -n` counts emitted transactions, not sequence instances. txgen never emits a partial sequence; if no remaining mix entry fits the remaining transaction budget, generation stops early.
+`txgen generate -n` counts emitted transactions, not sequence instances. txgen never emits a partial sequence; if no remaining mix entry fits the remaining transaction budget, generation stops early. Without `-n`, txgen streams workload transactions indefinitely only when stdout is piped; terminal output and `-o` file output require `-n`.
 
 See `examples/sequence.yaml` for a small syntax example, `examples/tip20-sequence.yaml` for a Tempo TIP20 `approve -> transferFrom` sequence whose second transaction depends on the first, and `examples/tip20-mpp.yaml` for TIP20 transfers mixed with deterministic MPP channel `open -> close` sequences.
 
