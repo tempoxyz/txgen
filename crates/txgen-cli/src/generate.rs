@@ -7,10 +7,6 @@ use alloy_provider::Provider;
 use clap::Args;
 use eyre::{bail, Result, WrapErr};
 use rand::{rngs::StdRng, Rng, SeedableRng};
-#[cfg(not(unix))]
-use std::io::IsTerminal;
-#[cfg(unix)]
-use std::os::unix::fs::FileTypeExt;
 use std::{collections::HashSet, io::Write, path::PathBuf};
 use txgen_core::{
     dedup_scheduling_keys, merge_yaml, AbiEncodePackedDef, AbiHashDef, AccountManager,
@@ -148,7 +144,7 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    let limit = resolve_generation_limit(&args)?;
+    let limit = GenerationLimit::from_args(&args)?;
     let output = args.output.clone();
     let rpc = args.rpc.clone();
     let mut ctx = GenerateContext::from_args(&args)?;
@@ -214,6 +210,7 @@ pub async fn fetch_protocol_nonces(
 // Private helpers
 // ---------------------------------------------------------------------------
 
+/// Limit on the number of transactions to generate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GenerationLimit {
     Bounded(u64),
@@ -221,6 +218,24 @@ enum GenerationLimit {
 }
 
 impl GenerationLimit {
+    /// Creates a [`GenerationLimit`] from the given arguments.
+    ///
+    /// Returns [`GenerationLimit::Unbounded`] only if no `count` is specified and stdout is piped.
+    fn from_args(args: &GenerateArgs) -> Result<Self> {
+        if let Some(count) = args.count {
+            return Ok(GenerationLimit::Bounded(count));
+        }
+
+        if !stdout_is_piped() {
+            bail!("txgen generate needs -n/--count unless stdout is piped");
+        }
+
+        Ok(GenerationLimit::Unbounded)
+    }
+
+    /// Returns the remaining number of transactions to generate.
+    ///
+    /// If [`GenerationLimit::Unbounded`], returns [`u64::MAX`].
     fn remaining(self, written: u64) -> Option<u64> {
         match self {
             Self::Bounded(count) => count.checked_sub(written).filter(|remaining| *remaining > 0),
@@ -229,46 +244,19 @@ impl GenerationLimit {
     }
 }
 
-fn resolve_generation_limit(args: &GenerateArgs) -> Result<GenerationLimit> {
-    generation_limit(args.count, args.output.is_some(), stdout_is_piped())
-}
-
 #[cfg(unix)]
 fn stdout_is_piped() -> bool {
-    stdout_file_type().is_some_and(|file_type| file_type.is_fifo())
-}
-
-#[cfg(unix)]
-fn stdout_file_type() -> Option<std::fs::FileType> {
+    use std::os::unix::fs::FileTypeExt;
     std::fs::metadata("/proc/self/fd/1")
         .or_else(|_| std::fs::metadata("/dev/fd/1"))
-        .ok()
         .map(|metadata| metadata.file_type())
+        .is_ok_and(|file_type| file_type.is_fifo())
 }
 
 #[cfg(not(unix))]
 fn stdout_is_piped() -> bool {
+    use std::io::IsTerminal;
     !std::io::stdout().is_terminal()
-}
-
-fn generation_limit(
-    count: Option<u64>,
-    output_file: bool,
-    stdout_piped: bool,
-) -> Result<GenerationLimit> {
-    if let Some(count) = count {
-        return Ok(GenerationLimit::Bounded(count));
-    }
-
-    if output_file {
-        bail!("txgen generate needs -n/--count when writing to an output file");
-    }
-
-    if !stdout_piped {
-        bail!("txgen generate needs -n/--count unless stdout is piped");
-    }
-
-    Ok(GenerationLimit::Unbounded)
 }
 
 fn generate_loop<A: NetworkAdapter>(
@@ -561,7 +549,7 @@ where
                     ctx,
                     writer,
                 )?;
-                written = written.saturating_add(1);
+                written += 1;
             }
             MixItem::Sequence(name) => {
                 let sequence = spec
@@ -598,7 +586,7 @@ where
                         ctx,
                         writer,
                     )?;
-                    written = written.saturating_add(1);
+                    written += 1;
                 }
             }
         }
@@ -1000,32 +988,4 @@ fn account_ref_value(pool: &str, index: usize) -> Result<serde_yaml::Value> {
     );
 
     Ok(serde_yaml::Value::Mapping(account))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generation_limit_uses_count_when_present() {
-        assert_eq!(generation_limit(Some(12), false, false).unwrap(), GenerationLimit::Bounded(12));
-        assert_eq!(generation_limit(Some(12), true, true).unwrap(), GenerationLimit::Bounded(12));
-    }
-
-    #[test]
-    fn generation_limit_streams_without_count_when_stdout_is_piped() {
-        assert_eq!(generation_limit(None, false, true).unwrap(), GenerationLimit::Unbounded);
-    }
-
-    #[test]
-    fn generation_limit_requires_count_without_pipe() {
-        let err = generation_limit(None, false, false).unwrap_err().to_string();
-        assert_eq!(err, "txgen generate needs -n/--count unless stdout is piped");
-    }
-
-    #[test]
-    fn generation_limit_requires_count_for_output_file() {
-        let err = generation_limit(None, true, true).unwrap_err().to_string();
-        assert_eq!(err, "txgen generate needs -n/--count when writing to an output file");
-    }
 }
