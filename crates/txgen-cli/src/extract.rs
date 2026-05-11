@@ -1,13 +1,10 @@
 use alloy_consensus::{BlockHeader, Sealed, Transaction};
-use alloy_eips::{eip2718::Encodable2718, eip7685::Requests, BlockNumberOrTag};
+use alloy_eips::{eip2718::Encodable2718, BlockNumberOrTag};
 use alloy_network::Network;
 use alloy_primitives::{Bytes, Sealable, B256};
 use alloy_provider::{ext::DebugApi, Provider};
 use alloy_rlp::Decodable;
-use alloy_rpc_types_engine::{
-    CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar,
-    PraguePayloadFields,
-};
+use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload};
 use clap::Args;
 use eyre::{bail, Result, WrapErr};
 use std::{io::Write, path::PathBuf};
@@ -89,23 +86,11 @@ fn parse_gas_limit(value: &str) -> Result<u64, String> {
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct BigBlockData<T> {
-    env_switches: Vec<(usize, T)>,
+    env_switches: Vec<T>,
     prior_block_hashes: Vec<(u64, B256)>,
-}
-
-impl<T> Default for BigBlockData<T> {
-    fn default() -> Self {
-        Self { env_switches: Vec::new(), prior_block_hashes: Vec::new() }
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct BigBlockPayload {
-    execution_data: ExecutionData,
-    #[serde(default)]
-    big_block_data: BigBlockData<ExecutionData>,
+    block_number: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    block_access_list: Option<serde_json::Value>,
+    merged_block_access_list: Option<Bytes>,
 }
 
 pub(crate) async fn run_extract<N>(args: ExtractArgs) -> Result<()>
@@ -309,7 +294,6 @@ where
     let mut source_block = args.from;
     let mut emitted = 0_u64;
     let mut accumulated_block_hashes = Vec::new();
-    let mut prev_big_block_hash = None;
     let mut first_source_block = None;
 
     while emitted < args.count {
@@ -329,12 +313,10 @@ where
             blocks,
             emitted,
             first_source_block.unwrap_or(args.from),
-            prev_big_block_hash,
             accumulated_block_hashes.clone(),
         )?;
 
-        prev_big_block_hash = Some(big_block.execution_data.block_hash());
-        for (_, switch_data) in &big_block.big_block_data.env_switches {
+        for switch_data in &big_block.env_switches {
             accumulated_block_hashes.push((switch_data.block_number(), switch_data.block_hash()));
         }
         if accumulated_block_hashes.len() > 256 {
@@ -382,94 +364,19 @@ where
 }
 
 fn build_big_block(
-    mut blocks: Vec<ExecutionData>,
+    blocks: Vec<ExecutionData>,
     big_block_idx: u64,
     first_source_block: u64,
-    prev_big_block_hash: Option<B256>,
     prior_block_hashes: Vec<(u64, B256)>,
-) -> Result<BigBlockPayload> {
+) -> Result<BigBlockData<ExecutionData>> {
     if blocks.is_empty() {
         bail!("cannot build a big block with no source blocks");
     }
 
-    let mut base = blocks.remove(0);
-    let mut env_switches = Vec::new();
-
-    if !blocks.is_empty() {
-        env_switches.push((0, base.clone()));
-        let mut cumulative_tx_count = base.payload.transactions().len();
-        let mut total_gas_used = base.payload.as_v1().gas_used;
-        let mut total_gas_limit = base.payload.gas_limit();
-        let final_state_root = blocks
-            .last()
-            .map(|last| last.payload.as_v1().state_root)
-            .ok_or_else(|| eyre::eyre!("missing final block"))?;
-
-        for block_data in blocks {
-            total_gas_used = total_gas_used.saturating_add(block_data.payload.as_v1().gas_used);
-            total_gas_limit = total_gas_limit.saturating_add(block_data.payload.gas_limit());
-            env_switches.push((cumulative_tx_count, block_data.clone()));
-            let txs = block_data.payload.transactions().clone();
-            cumulative_tx_count += txs.len();
-            base.payload.transactions_mut().extend(txs);
-        }
-
-        let base_v1 = base.payload.as_v1_mut();
-        base_v1.state_root = final_state_root;
-        base_v1.gas_used = total_gas_used;
-        base_v1.gas_limit = total_gas_limit;
-        base.sidecar = merged_sidecar(&base.sidecar, &env_switches);
-    }
-
-    if let Some(prev_hash) = prev_big_block_hash {
-        let synthetic_block_number = first_source_block + big_block_idx;
-        let base_v1 = base.payload.as_v1_mut();
-        base_v1.parent_hash = prev_hash;
-        base_v1.block_number = synthetic_block_number;
-    }
-
-    let block_hash = compute_payload_block_hash(&base)?;
-    base.payload.as_v1_mut().block_hash = block_hash;
-
-    Ok(BigBlockPayload {
-        execution_data: base,
-        big_block_data: BigBlockData { env_switches, prior_block_hashes },
-        block_access_list: None,
+    Ok(BigBlockData {
+        env_switches: blocks,
+        prior_block_hashes,
+        block_number: first_source_block + big_block_idx,
+        merged_block_access_list: None,
     })
-}
-
-fn merged_sidecar(
-    base_sidecar: &ExecutionPayloadSidecar,
-    env_switches: &[(usize, ExecutionData)],
-) -> ExecutionPayloadSidecar {
-    let Some(base_cancun) = base_sidecar.cancun() else {
-        return ExecutionPayloadSidecar::none();
-    };
-
-    let mut versioned_hashes = base_cancun.versioned_hashes.clone();
-    for (_, switch_data) in env_switches.iter().skip(1) {
-        if let Some(cancun) = switch_data.sidecar.cancun() {
-            versioned_hashes.extend_from_slice(&cancun.versioned_hashes);
-        }
-    }
-
-    let cancun = CancunPayloadFields {
-        parent_beacon_block_root: base_cancun.parent_beacon_block_root,
-        versioned_hashes,
-    };
-
-    if base_sidecar.prague().is_some() {
-        ExecutionPayloadSidecar::v4(cancun, PraguePayloadFields::new(Requests::default()))
-    } else {
-        ExecutionPayloadSidecar::v3(cancun)
-    }
-}
-
-fn compute_payload_block_hash(data: &ExecutionData) -> Result<B256> {
-    let block = data
-        .payload
-        .clone()
-        .into_block_with_sidecar_raw(&data.sidecar)
-        .wrap_err("failed to convert payload to block for hash computation")?;
-    Ok(block.header.hash_slow())
 }

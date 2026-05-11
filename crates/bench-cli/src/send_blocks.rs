@@ -9,10 +9,10 @@ use crate::{send::parse_metadata, SendBlocksArgs};
 use alloy_network::Ethereum;
 use alloy_primitives::{Bytes, B256};
 use alloy_provider::{Provider, RootProvider};
-use alloy_rpc_types_engine::{ForkchoiceState, JwtSecret};
+use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, JwtSecret};
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    parse_reporters, start_scraper, BigBlockPayload, BlockStats, ConsoleReporter, FinalReport,
+    parse_reporters, start_scraper, BigBlockData, BlockStats, ConsoleReporter, FinalReport,
     ProgressState, Reporter, RethApi, RethNewPayloadInput, RunClock, RunStats, Sample, SampleStore,
     ScraperConfig, WaitForPersistence,
 };
@@ -54,7 +54,7 @@ enum InputLine {
     /// Raw RLP block line produced by `txgen extract`.
     RawBlock(BlockLine),
     /// Big-block payload line produced by `txgen extract-big-blocks`.
-    BigBlock(Box<BigBlockPayload>),
+    BigBlock(Box<BigBlockData<ExecutionData>>),
 }
 
 pub async fn execute(args: SendBlocksArgs) -> Result<()> {
@@ -359,26 +359,29 @@ async fn process_block(
 
 async fn process_big_block(
     provider: &(impl Provider + RethApi<Ethereum>),
-    big_block: &BigBlockPayload,
+    big_block: &BigBlockData<ExecutionData>,
     collector: &mut MetricsCollector,
     persistence_policy: &WaitForPersistence,
 ) -> Result<()> {
-    if big_block.block_access_list.is_some() {
-        tracing::warn!(
-            "big-block payload contains block_access_list, but BAL replay is not implemented yet; ignoring BAL"
-        );
-    }
+    let first_payload = big_block
+        .env_switches
+        .first()
+        .ok_or_else(|| eyre::eyre!("big-block payload contains no execution payloads"))?;
+    let last_payload = big_block
+        .env_switches
+        .last()
+        .ok_or_else(|| eyre::eyre!("big-block payload contains no execution payloads"))?;
 
-    let execution_data = big_block.execution_data.clone();
-    let payload = &execution_data.payload;
-    let block_hash = execution_data.block_hash();
-    let block_number = execution_data.block_number();
-    let input = RethNewPayloadInput::ExecutionData(Box::new(execution_data.clone()));
+    let block_hash = last_payload.block_hash();
+    let block_number = big_block.block_number;
+    let tx_count = big_block.env_switches.iter().map(|data| data.transaction_count()).sum();
+    let gas_used = big_block.env_switches.iter().map(|data| data.payload.as_v1().gas_used).sum();
+    let gas_limit = big_block.env_switches.iter().map(|data| data.payload.gas_limit()).sum();
     let wait = persistence_policy.should_wait(collector.blocks_submitted());
 
     let new_payload_start = Instant::now();
     let payload_status = provider
-        .reth_new_payload_big_block(input, wait, big_block.big_block_data.clone())
+        .reth_new_payload_big_block(big_block.clone(), wait)
         .await
         .wrap_err("reth_newPayload failed")?;
     let new_payload_latency = new_payload_start.elapsed();
@@ -414,16 +417,16 @@ async fn process_big_block(
         );
     }
 
-    let timestamp_ms = payload.timestamp() * 1000;
+    let timestamp_ms = first_payload.payload.timestamp() * 1000;
     let block_time_ms = collector.prev_timestamp_ms.map(|prev| timestamp_ms.saturating_sub(prev));
     collector.prev_timestamp_ms = Some(timestamp_ms);
 
     let block_stats = BlockStats {
         number: block_number,
         timestamp_ms,
-        tx_count: execution_data.transaction_count(),
-        gas_used: payload.as_v1().gas_used,
-        gas_limit: payload.gas_limit(),
+        tx_count,
+        gas_used,
+        gas_limit,
         block_time_ms,
         new_payload_ms: Some(new_payload_latency.as_millis() as u64),
         forkchoice_updated_ms: Some(fcu_latency.as_millis() as u64),
@@ -437,8 +440,8 @@ async fn process_big_block(
 
     tracing::info!(
         block = block_number,
-        txs = execution_data.transaction_count(),
-        gas = payload.as_v1().gas_used,
+        txs = tx_count,
+        gas = gas_used,
         new_payload_ms = new_payload_latency.as_millis(),
         forkchoice_updated_ms = fcu_latency.as_millis(),
         total_ms = (new_payload_latency + fcu_latency).as_millis(),

@@ -31,8 +31,8 @@ pub use reporter::{
     Reporter,
 };
 pub use reth_api::{
-    BigBlockData, BigBlockPayload, RethApi, RethForkchoiceUpdated, RethNewPayloadInput,
-    RethPayloadStatus, WaitForPersistence, DEFAULT_PERSISTENCE_THRESHOLD,
+    BigBlockData, RethApi, RethForkchoiceUpdated, RethNewPayloadInput, RethPayloadStatus,
+    WaitForPersistence, DEFAULT_PERSISTENCE_THRESHOLD,
 };
 pub use sample::{Sample, SampleStore};
 pub use scraper::{start_scraper, SampleCallback, ScraperConfig, ScraperHandle};
