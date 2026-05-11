@@ -30,6 +30,6 @@ alloy-network.workspace = true
 alloy-signer.workspace = true
 alloy-eips.workspace = true
 alloy-rlp.workspace = true
-alloy-rpc-types-engine = "1"
+alloy-rpc-types-engine = "2"
 hex.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "rt", "sync", "time"] }

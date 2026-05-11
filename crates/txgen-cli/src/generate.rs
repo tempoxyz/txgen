@@ -1,7 +1,7 @@
 use alloy_consensus::{SignableTransaction, Signed};
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_eips::eip2718::Encodable2718;
-use alloy_network::{Network, TransactionBuilder, TxSignerSync};
+use alloy_network::{Network, NetworkTransactionBuilder, TransactionBuilder, TxSignerSync};
 use alloy_primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
 use alloy_provider::Provider;
 use clap::Args;

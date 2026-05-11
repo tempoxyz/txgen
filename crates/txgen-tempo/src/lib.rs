@@ -9,6 +9,7 @@ use alloy_primitives::{keccak256, Address, Bytes, TxKind, U256};
 use alloy_signer::SignerSync;
 use eyre::{bail, Result};
 use rand::RngCore;
+use std::num::NonZeroU64;
 use tempo_alloy::{rpc::TempoTransactionRequest, TempoNetwork};
 use tempo_primitives::transaction::{
     Call, TEMPO_EXPIRING_NONCE_KEY, TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS,
@@ -98,9 +99,17 @@ impl NetworkAdapter for TempoAdapter {
                     req.set_fee_token(fee_token);
                 }
                 if let Some(valid_after) = template.valid_after {
+                    let valid_after = NonZeroU64::new(valid_after).ok_or_else(|| {
+                        eyre::eyre!("Tempo transactions require `valid_after` to be greater than 0")
+                    })?;
                     req.set_valid_after(valid_after);
                 }
                 if let Some(valid_before) = valid_before {
+                    let valid_before = NonZeroU64::new(valid_before).ok_or_else(|| {
+                        eyre::eyre!(
+                            "Tempo transactions require `valid_before` to be greater than 0"
+                        )
+                    })?;
                     req.set_valid_before(valid_before);
                 }
                 if is_expiring {
@@ -378,7 +387,7 @@ mod tests {
     use super::*;
     use alloy_consensus::SignableTransaction;
     use alloy_eips::eip2718::Encodable2718;
-    use alloy_network::TxSignerSync;
+    use alloy_network::{NetworkTransactionBuilder, TxSignerSync};
     use alloy_primitives::Address;
     use rand::{rngs::StdRng, SeedableRng};
     use std::{
@@ -528,7 +537,7 @@ mod tests {
 
         assert_eq!(tx_req.request.nonce(), Some(0));
         assert_eq!(tx_req.request.nonce_key, Some(TEMPO_EXPIRING_NONCE_KEY));
-        assert_eq!(tx_req.request.valid_before, Some(1_700_000_000));
+        assert_eq!(tx_req.request.valid_before.map(NonZeroU64::get), Some(1_700_000_000));
         assert_ne!(tx_req.key, sender.0 .0);
     }
 
@@ -616,8 +625,8 @@ mod tests {
         let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
         let valid_before = tx_req.request.valid_before.unwrap();
-        assert!(valid_before >= before + 25);
-        assert!(valid_before <= after + 25);
+        assert!(valid_before.get() >= before + 25);
+        assert!(valid_before.get() <= after + 25);
     }
 
     #[test]
