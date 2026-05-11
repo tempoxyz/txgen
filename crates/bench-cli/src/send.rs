@@ -13,6 +13,7 @@ use bench_core::{
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, time::Duration};
+use tokio::time::{self, Instant};
 
 pub async fn execute(args: SendArgs) -> Result<()> {
     tracing::info!(
@@ -102,10 +103,33 @@ async fn execute_source<S: TxSource>(
     let start_block =
         query_provider.get_block_number().await.wrap_err("failed to get starting block number")?;
 
+    let send_deadline = args.duration.map(|duration| Instant::now() + duration);
+    let mut stopped_by_duration = false;
+
     if let Some(tx) = first_workload {
-        send_workload_tx(tx, &mut sender, &metrics, &config, &mut reporters).await?;
+        stopped_by_duration =
+            !send_workload_tx(tx, &mut sender, &metrics, &config, &mut reporters, send_deadline)
+                .await?;
     }
-    send_workload_from_source(source, &mut sender, &metrics, &config, &mut reporters).await?;
+    if !stopped_by_duration {
+        stopped_by_duration = send_workload_from_source(
+            source,
+            &mut sender,
+            &metrics,
+            &config,
+            &mut reporters,
+            send_deadline,
+        )
+        .await?;
+    }
+    if stopped_by_duration {
+        if let Some(duration) = args.duration {
+            tracing::info!(
+                duration = ?duration,
+                "Send duration elapsed; stopping workload submission"
+            );
+        }
+    }
 
     sender.flush().await;
 
@@ -278,14 +302,24 @@ async fn send_workload_from_source<S: TxSource>(
     metrics: &MetricsCollector,
     config: &SenderConfig,
     reporters: &mut [Box<dyn Reporter>],
-) -> Result<()> {
-    while let Some(tx) = source.next_tx().await? {
+    deadline: Option<Instant>,
+) -> Result<bool> {
+    loop {
+        if send_duration_elapsed(deadline) {
+            return Ok(true);
+        }
+
+        let Some(tx) = next_tx_before_deadline(source, deadline).await? else {
+            return Ok(send_duration_elapsed(deadline));
+        };
+
         if tx.phase == TxPhase::Setup {
             bail!("setup transaction appeared after workload started");
         }
-        send_workload_tx(tx, sender, metrics, config, reporters).await?;
+        if !send_workload_tx(tx, sender, metrics, config, reporters, deadline).await? {
+            return Ok(true);
+        }
     }
-    Ok(())
 }
 
 async fn send_workload_tx(
@@ -294,8 +328,20 @@ async fn send_workload_tx(
     metrics: &MetricsCollector,
     config: &SenderConfig,
     reporters: &mut [Box<dyn Reporter>],
-) -> Result<()> {
-    sender.send(tx).await?;
+    deadline: Option<Instant>,
+) -> Result<bool> {
+    if send_duration_elapsed(deadline) {
+        return Ok(false);
+    }
+
+    if let Some(deadline) = deadline {
+        tokio::select! {
+            result = sender.send(tx) => result?,
+            _ = time::sleep_until(deadline) => return Ok(false),
+        }
+    } else {
+        sender.send(tx).await?;
+    }
 
     let (sent, success, failed) = metrics.counts();
     if sent.is_multiple_of(1000) {
@@ -313,7 +359,29 @@ async fn send_workload_tx(
         }
     }
 
-    Ok(())
+    Ok(true)
+}
+
+async fn next_tx_before_deadline<S: TxSource>(
+    source: &mut S,
+    deadline: Option<Instant>,
+) -> Result<Option<GeneratedTx>> {
+    let Some(deadline) = deadline else {
+        return source.next_tx().await;
+    };
+
+    if send_duration_elapsed(Some(deadline)) {
+        return Ok(None);
+    }
+
+    tokio::select! {
+        tx = source.next_tx() => tx,
+        _ = time::sleep_until(deadline) => Ok(None),
+    }
+}
+
+fn send_duration_elapsed(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
 
 /// Wait for the transaction pool to drain (pending count reaches zero).
@@ -327,14 +395,14 @@ async fn wait_for_pool_drain<P: TxPoolApi<AnyNetwork>>(
     tracing::info!(timeout_secs, "Waiting for txpool to drain...");
 
     let mut zero_count: u32 = 0;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
 
     loop {
-        if tokio::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             bail!("txpool drain timeout reached after {timeout_secs}s");
         }
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        time::sleep(Duration::from_secs(1)).await;
 
         let status = provider
             .txpool_status()
@@ -352,5 +420,28 @@ async fn wait_for_pool_drain<P: TxPoolApi<AnyNetwork>>(
             zero_count = 0;
             tracing::debug!(pending, "Txpool still draining...");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NeverSource;
+
+    impl TxSource for NeverSource {
+        async fn next_tx(&mut self) -> Result<Option<GeneratedTx>> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn next_tx_before_deadline_stops_when_duration_elapses() {
+        let mut source = NeverSource;
+        let deadline = Instant::now() + Duration::from_millis(1);
+
+        let tx = next_tx_before_deadline(&mut source, Some(deadline)).await.unwrap();
+
+        assert!(tx.is_none());
     }
 }

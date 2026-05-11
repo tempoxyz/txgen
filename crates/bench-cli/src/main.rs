@@ -32,6 +32,14 @@ pub struct SendArgs {
     #[arg(long, default_value = "0")]
     pub tps: u64,
 
+    /// Maximum workload submission duration.
+    ///
+    /// The timer starts when workload submission starts. When it expires,
+    /// bench stops reading/enqueueing new workload transactions, then flushes
+    /// in-flight requests and applies --drain-timeout as usual.
+    #[arg(long, value_parser = parse_duration)]
+    pub duration: Option<Duration>,
+
     /// Maximum number of RPC requests in flight simultaneously.
     ///
     /// Controls parallelism independently of --tps. Limits how many
@@ -221,5 +229,23 @@ mod tests {
     fn test_parse_duration_millis_fallback_errors() {
         assert!(parse_duration_millis_fallback("abc").is_err());
         assert!(parse_duration_millis_fallback("").is_err());
+    }
+
+    #[test]
+    fn test_send_duration_arg() {
+        let cli = Cli::try_parse_from([
+            "bench",
+            "send",
+            "--duration",
+            "300s",
+            "--rpc-url",
+            "http://localhost:8545",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Send(args) => assert_eq!(args.duration, Some(Duration::from_secs(300))),
+            _ => panic!("expected send command"),
+        }
     }
 }
