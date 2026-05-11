@@ -98,7 +98,7 @@ txgen-ethereum extract --rpc http://localhost:8545 --from 1000 --to 2000 -o bloc
 
 #### `extract-big-blocks`
 
-Generate reth-bb-compatible synthetic big-block payloads as NDJSON.
+Generate reth-bb-compatible big-block payloads as NDJSON.
 
 ```bash
 txgen-ethereum extract-big-blocks \
@@ -160,6 +160,8 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 #### `bench send-blocks`
 
 Submit RLP-encoded blocks or reth-bb big-block payloads via reth Engine API.
+
+Big-block inputs use the current reth-bb `BigBlockData` format where each NDJSON line contains the constituent execution payloads in `env_switches`, plus `prior_block_hashes`, `block_number`, and optional `merged_block_access_list`.
 
 ```bash
 bench send-blocks --engine http://localhost:8551 --jwt-secret /path/to/jwt.hex --input blocks.ndjson

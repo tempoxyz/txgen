@@ -1,8 +1,9 @@
 //! Types and provider extension for reth's custom Engine API.
 //!
 //! reth exposes two custom RPC methods for benchmarking:
-//! - `reth_newPayload` — accepts either standard `ExecutionData` or raw RLP-encoded block bytes
-//!   (`BlockRlp`), and returns [`RethPayloadStatus`] with server-side timing information.
+//! - `reth_newPayload` — accepts standard `ExecutionData`, reth-bb [`BigBlockData`], or raw
+//!   RLP-encoded block bytes (`BlockRlp`), and returns [`RethPayloadStatus`] with server-side
+//!   timing information.
 //! - `reth_forkchoiceUpdated` — simplified forkchoice update with no payload attributes.
 //!
 //! These types mirror the definitions in reth's `reth-rpc-api` crate but are kept standalone
@@ -20,46 +21,31 @@ use serde::{Deserialize, Serialize};
 
 /// Input for `reth_newPayload`.
 ///
-/// Accepts either standard execution data or raw RLP-encoded block bytes.
+/// Accepts standard execution data, reth-bb big-block data, or raw RLP-encoded block bytes.
 /// Uses `#[serde(untagged)]` to try deserialization in order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RethNewPayloadInput {
     /// Standard execution data (payload + sidecar).
     ExecutionData(Box<ExecutionData>),
+    /// reth-bb big-block data containing all constituent payloads.
+    BigBlockData(Box<BigBlockData<ExecutionData>>),
     /// Raw RLP-encoded block bytes.
     BlockRlp(Bytes),
 }
 
-/// Additional data for big block payloads that merge multiple real blocks.
+/// Big-block payload data for reth-bb.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BigBlockData<T> {
-    /// Environment switches at block boundaries.
-    /// Each entry is `(cumulative_tx_count, execution_data_of_next_block)`.
-    pub env_switches: Vec<(usize, T)>,
+    /// Original execution payloads that form this big block, in execution order.
+    pub env_switches: Vec<T>,
     /// Block number → real block hash for blocks covered by previous big blocks in a sequence.
     pub prior_block_hashes: Vec<(u64, B256)>,
-}
-
-impl<T> Default for BigBlockData<T> {
-    fn default() -> Self {
-        Self { env_switches: Vec::new(), prior_block_hashes: Vec::new() }
-    }
-}
-
-/// A merged big block payload with environment switches at block boundaries.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BigBlockPayload {
-    /// The primary execution data with all concatenated transactions.
-    pub execution_data: ExecutionData,
-    /// Big block data containing environment switches and prior block hashes.
-    #[serde(default)]
-    pub big_block_data: BigBlockData<ExecutionData>,
-    /// Flattened BAL across all constituent blocks, if present.
-    // TODO(onbjerg): BAL replay is intentionally not implemented yet; this field is kept so the
-    // JSON shape is compatible with reth-bench payload files.
+    /// Synthetic block number assigned to this big block.
+    pub block_number: u64,
+    /// RLP-encoded merged block access list for this big block, if present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub block_access_list: Option<serde_json::Value>,
+    pub merged_block_access_list: Option<Bytes>,
 }
 
 /// Response from `reth_newPayload` with server-side timing.
@@ -153,12 +139,11 @@ pub trait RethApi<N: Network>: Send + Sync {
         wait_for_persistence: Option<bool>,
     ) -> TransportResult<RethPayloadStatus>;
 
-    /// Submit a big-block payload via reth-bb's extended `reth_newPayload`.
+    /// Submit a big-block payload via reth-bb's `reth_newPayload`.
     async fn reth_new_payload_big_block(
         &self,
-        input: RethNewPayloadInput,
-        wait_for_persistence: Option<bool>,
         big_block_data: BigBlockData<ExecutionData>,
+        wait_for_persistence: Option<bool>,
     ) -> TransportResult<RethPayloadStatus>;
 
     /// Submit a forkchoice update via `reth_forkchoiceUpdated`.
@@ -184,16 +169,11 @@ where
 
     async fn reth_new_payload_big_block(
         &self,
-        input: RethNewPayloadInput,
-        wait_for_persistence: Option<bool>,
         big_block_data: BigBlockData<ExecutionData>,
+        wait_for_persistence: Option<bool>,
     ) -> TransportResult<RethPayloadStatus> {
-        self.client()
-            .request(
-                "reth_newPayload",
-                (input, wait_for_persistence, None::<bool>, Some(big_block_data)),
-            )
-            .await
+        let input = RethNewPayloadInput::BigBlockData(Box::new(big_block_data));
+        self.client().request("reth_newPayload", (input, wait_for_persistence, None::<bool>)).await
     }
 
     async fn reth_forkchoice_updated(
@@ -211,14 +191,17 @@ mod tests {
     #[test]
     fn test_block_rlp_roundtrip() {
         let input = RethNewPayloadInput::BlockRlp(Bytes::from(vec![0xf8, 0x70, 0x01]));
-        let json = serde_json::to_string(&input).unwrap();
-        let deserialized: RethNewPayloadInput = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&input).expect("block RLP input should serialize");
+        let deserialized: RethNewPayloadInput =
+            serde_json::from_str(&json).expect("serialized block RLP input should deserialize");
 
         match deserialized {
             RethNewPayloadInput::BlockRlp(bytes) => {
                 assert_eq!(bytes.as_ref(), &[0xf8, 0x70, 0x01]);
             }
-            RethNewPayloadInput::ExecutionData(_) => panic!("expected BlockRlp variant"),
+            RethNewPayloadInput::ExecutionData(_) | RethNewPayloadInput::BigBlockData(_) => {
+                panic!("expected BlockRlp variant")
+            }
         }
     }
 
@@ -233,7 +216,8 @@ mod tests {
             "sparse_trie_wait_us": 1000
         }"#;
 
-        let status: RethPayloadStatus = serde_json::from_str(json).unwrap();
+        let status: RethPayloadStatus =
+            serde_json::from_str(json).expect("valid status with timing should deserialize");
         assert_eq!(status.latency_us, 12345);
         assert_eq!(status.persistence_wait_us, Some(5000));
         assert_eq!(status.execution_cache_wait_us, Some(2000));
@@ -248,7 +232,8 @@ mod tests {
             "latency_us": 500
         }"#;
 
-        let status: RethPayloadStatus = serde_json::from_str(json).unwrap();
+        let status: RethPayloadStatus = serde_json::from_str(json)
+            .expect("valid status without optional timing should deserialize");
         assert_eq!(status.latency_us, 500);
         assert_eq!(status.persistence_wait_us, None);
         assert_eq!(status.execution_cache_wait_us, None);
@@ -261,7 +246,8 @@ mod tests {
             "status": "SYNCING"
         }"#;
 
-        let status: RethPayloadStatus = serde_json::from_str(json).unwrap();
+        let status: RethPayloadStatus =
+            serde_json::from_str(json).expect("status without latency should deserialize");
         assert_eq!(status.latency_us, 0);
         assert_eq!(status.persistence_wait_us, None);
     }
