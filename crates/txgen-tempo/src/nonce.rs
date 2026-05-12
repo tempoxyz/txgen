@@ -222,17 +222,30 @@ fn collect_nonce_key_from_template_value(
     }
 }
 
-/// Compute the storage key for a (address, nonce_key) pair in the nonce precompile.
-/// Storage key = keccak256(abi.encode(address, nonce_key))
+/// Compute the storage slot for `nonces[address][nonce_key]` in the nonce
+/// precompile.
+///
+/// The precompile lays out parallel-nonce state as a Solidity nested mapping
+/// `mapping(address => mapping(uint256 => uint64)) public nonces` at base
+/// slot 0, so the slot is:
+///
+/// ```text
+/// outer = keccak256(abi.encode(address, 0))
+/// slot  = keccak256(abi.encode(nonce_key, outer))
+/// ```
 fn compute_nonce_storage_key(address: Address, nonce_key: U256) -> U256 {
-    // abi.encode(address, uint256) = 32 bytes (address padded) + 32 bytes (nonce_key)
-    let mut data = [0u8; 64];
-    // Address is left-padded to 32 bytes
-    data[12..32].copy_from_slice(address.as_slice());
-    // nonce_key as big-endian U256
-    data[32..64].copy_from_slice(&nonce_key.to_be_bytes::<32>());
+    // outer = keccak256(abi.encode(address, 0))
+    let mut outer_data = [0u8; 64];
+    outer_data[12..32].copy_from_slice(address.as_slice());
+    // remaining 32 bytes are zero (base slot 0).
+    let outer = keccak256(outer_data);
 
-    let hash: B256 = keccak256(data);
+    // slot = keccak256(abi.encode(nonce_key, outer))
+    let mut slot_data = [0u8; 64];
+    slot_data[..32].copy_from_slice(&nonce_key.to_be_bytes::<32>());
+    slot_data[32..64].copy_from_slice(outer.as_slice());
+
+    let hash: B256 = keccak256(slot_data);
     U256::from_be_bytes(hash.0)
 }
 
@@ -264,6 +277,26 @@ mod tests {
         // Different nonce_key should give different storage key
         let key3 = compute_nonce_storage_key(address, U256::from(43));
         assert_ne!(key, key3);
+    }
+
+    #[test]
+    fn test_compute_storage_key_matches_solidity_nested_mapping() {
+        // Lock in the slot formula against an externally computed reference
+        // so the layout assumption stays in sync with the on-chain
+        // `mapping(address => mapping(uint256 => uint64)) public nonces`.
+        //
+        // Reference (computed with `cast keccak`):
+        //   addr  = 0x000000000000000000000000000000000000abAB
+        //   lane  = 42
+        //   outer = keccak256(abi.encode(addr, 0))
+        //         = 0xf11631168a553db43e44374e1de6445a95a7667e3724045d06ba239ddc4b0939
+        //   slot  = keccak256(abi.encode(lane, outer))
+        //         = 0x2028c9f493f53a125e5a3e03d423a869339e3d2dd8a77340dd393eab48750b1c
+        let address: Address = "0x000000000000000000000000000000000000abAB".parse().unwrap();
+        let nonce_key = U256::from(42);
+        let expected: U256 =
+            "0x2028c9f493f53a125e5a3e03d423a869339e3d2dd8a77340dd393eab48750b1c".parse().unwrap();
+        assert_eq!(compute_nonce_storage_key(address, nonce_key), expected);
     }
 
     #[test]
