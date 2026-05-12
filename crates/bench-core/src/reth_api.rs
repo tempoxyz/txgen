@@ -139,13 +139,6 @@ pub trait RethApi<N: Network>: Send + Sync {
         wait_for_persistence: Option<bool>,
     ) -> TransportResult<RethPayloadStatus>;
 
-    /// Submit a big-block payload via reth-bb's `reth_newPayload`.
-    async fn reth_new_payload_big_block(
-        &self,
-        big_block_data: BigBlockData<ExecutionData>,
-        wait_for_persistence: Option<bool>,
-    ) -> TransportResult<RethPayloadStatus>;
-
     /// Submit a forkchoice update via `reth_forkchoiceUpdated`.
     async fn reth_forkchoice_updated(
         &self,
@@ -164,15 +157,6 @@ where
         input: RethNewPayloadInput,
         wait_for_persistence: Option<bool>,
     ) -> TransportResult<RethPayloadStatus> {
-        self.client().request("reth_newPayload", (input, wait_for_persistence, None::<bool>)).await
-    }
-
-    async fn reth_new_payload_big_block(
-        &self,
-        big_block_data: BigBlockData<ExecutionData>,
-        wait_for_persistence: Option<bool>,
-    ) -> TransportResult<RethPayloadStatus> {
-        let input = RethNewPayloadInput::BigBlockData(Box::new(big_block_data));
         self.client().request("reth_newPayload", (input, wait_for_persistence, None::<bool>)).await
     }
 
