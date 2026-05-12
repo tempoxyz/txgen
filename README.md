@@ -56,7 +56,6 @@ txgen-ethereum generate -s workload.yaml -n 1000 -o transactions.ndjson
 | `-n, --count <N>` | Number of transactions to generate |
 | `-o, --output <PATH>` | Output file (default: stdout) |
 | `--rpc <URL>` | RPC endpoint for fetching current nonces |
-| `--rpc-rps <N>` | Rate limit for RPC requests per second (0 = unbounded) |
 | `--seed <SEED>` | RNG seed for reproducibility |
 
 **Required RPC methods:** `eth_getTransactionCount` (only when `--rpc` is provided)
