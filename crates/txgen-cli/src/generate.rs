@@ -32,10 +32,6 @@ pub struct GenerateArgs {
     #[arg(long)]
     pub rpc: Option<String>,
 
-    /// Rate limit for RPC requests per second (0 = unbounded)
-    #[arg(long, default_value = "0")]
-    pub rpc_rps: u64,
-
     /// RNG seed for reproducibility
     #[arg(long)]
     pub seed: Option<u64>,
