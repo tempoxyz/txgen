@@ -25,7 +25,6 @@ alloy-signer.workspace = true
 alloy-network.workspace = true
 alloy-provider.workspace = true
 alloy-eips.workspace = true
-alloy-rlp.workspace = true
 
 # tempo
 tempo-alloy.workspace = true

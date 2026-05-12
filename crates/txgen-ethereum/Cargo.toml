@@ -19,7 +19,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 # serde
 serde.workspace = true
-serde_yaml.workspace = true
 
 # alloy
 alloy-primitives.workspace = true
@@ -27,7 +26,6 @@ alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-network.workspace = true
 alloy-rpc-types-eth.workspace = true
-alloy-provider.workspace = true
 
 # misc
 rand.workspace = true

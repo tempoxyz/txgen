@@ -19,23 +19,19 @@ alloy-consensus.workspace = true
 alloy-network.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-types-engine = "2"
-alloy-rpc-types-eth.workspace = true
 alloy-transport = "2"
 alloy-eips.workspace = true
 
 # async
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "process", "io-util", "io-std"] }
-futures = "0.3"
 
 # http
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # misc
 async-trait = "0.1"
-hex.workspace = true
 rand.workspace = true
 eyre.workspace = true
-thiserror.workspace = true
 tracing = "0.1"
 urlencoding = "2"
 uuid.workspace = true
