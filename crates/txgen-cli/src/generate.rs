@@ -4,10 +4,15 @@ use alloy_eips::eip2718::Encodable2718;
 use alloy_network::{Network, NetworkTransactionBuilder, TransactionBuilder, TxSignerSync};
 use alloy_primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
 use alloy_provider::Provider;
-use clap::Args;
+use clap::{ArgGroup, Args};
 use eyre::{bail, Result, WrapErr};
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use std::{collections::HashSet, io::Write, path::PathBuf};
+use std::{
+    collections::HashSet,
+    io::Write,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use txgen_core::{
     dedup_scheduling_keys, merge_yaml, AbiEncodePackedDef, AbiHashDef, AccountManager,
     ArtifactManager, BuildContext, GeneratedTx, MixItem, NdjsonWriter, NonceTracker, SchedulingKey,
@@ -15,14 +20,28 @@ use txgen_core::{
 };
 
 #[derive(Args)]
+#[command(group(
+    ArgGroup::new("limit")
+        .required(true)
+        .multiple(true)
+        .args(["count", "duration"])
+))]
 pub struct GenerateArgs {
     /// Workload spec file (YAML)
     #[arg(short, long)]
     pub spec: PathBuf,
 
-    /// Number of transactions to generate
+    /// Maximum number of workload transactions to generate
     #[arg(short = 'n', long)]
-    pub count: u64,
+    pub count: Option<u64>,
+
+    /// Maximum workload generation duration.
+    ///
+    /// The timer starts after setup transactions are emitted. Txgen checks the
+    /// deadline before starting each workload item, so transaction sequences
+    /// are never emitted partially.
+    #[arg(long, value_parser = parse_duration)]
+    pub duration: Option<Duration>,
 
     /// Output file (default: stdout)
     #[arg(short, long)]
@@ -128,7 +147,7 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    let count = args.count;
+    let limit = GenerationLimit { count: args.count, duration: args.duration };
     let output = args.output.clone();
     let rpc = args.rpc.clone();
     let mut ctx = GenerateContext::from_args(&args)?;
@@ -137,7 +156,7 @@ where
         adapter.prefetch_nonces(&mut ctx, rpc).await?;
     }
 
-    generate_loop(&adapter, &mut ctx, count, output)
+    generate_loop(&adapter, &mut ctx, limit, output)
 }
 
 // ---------------------------------------------------------------------------
@@ -194,10 +213,20 @@ pub async fn fetch_protocol_nonces(
 // Private helpers
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy)]
+struct GenerationLimit {
+    count: Option<u64>,
+    duration: Option<Duration>,
+}
+
+fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
+    humantime::parse_duration(s)
+}
+
 fn generate_loop<A: NetworkAdapter>(
     adapter: &A,
     ctx: &mut GenerateContext,
-    count: u64,
+    limit: GenerationLimit,
     output: Option<PathBuf>,
 ) -> Result<()>
 where
@@ -225,7 +254,7 @@ where
             let written = generate_txs(
                 adapter,
                 &ctx.spec,
-                count,
+                limit,
                 &setup_bindings,
                 &mut build_ctx,
                 &mut writer,
@@ -235,7 +264,7 @@ where
         None => {
             let mut writer = txgen_core::output::stdout_writer();
             let setup_bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
-            generate_txs(adapter, &ctx.spec, count, &setup_bindings, &mut build_ctx, &mut writer)?;
+            generate_txs(adapter, &ctx.spec, limit, &setup_bindings, &mut build_ctx, &mut writer)?;
         }
     }
 
@@ -448,7 +477,7 @@ fn build_deploy_template_value(
 fn generate_txs<A: NetworkAdapter, W: Write>(
     adapter: &A,
     spec: &WorkloadSpec,
-    count: u64,
+    limit: GenerationLimit,
     setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
@@ -460,9 +489,21 @@ where
 {
     let mut written = 0u64;
     let mut sequence_instances = 0u64;
+    let deadline = limit
+        .duration
+        .map(|duration| {
+            Instant::now()
+                .checked_add(duration)
+                .ok_or_else(|| eyre::eyre!("--duration is too large"))
+        })
+        .transpose()?;
 
-    while written < count {
-        let remaining = count - written;
+    while limit.count.is_none_or(|count| written < count) {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
+
+        let remaining = limit.count.map(|count| count - written).unwrap_or(u64::MAX);
         let Some(item) = pick_workload_item(spec, ctx.rng, remaining)? else {
             break;
         };
