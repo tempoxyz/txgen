@@ -31,7 +31,7 @@ pub struct GenerateArgs {
     #[arg(short, long)]
     pub spec: PathBuf,
 
-    /// Maximum number of workload transactions to generate
+    /// Number of transactions to generate
     #[arg(short = 'n', long)]
     pub count: Option<u64>,
 
@@ -40,7 +40,7 @@ pub struct GenerateArgs {
     /// The timer starts after setup transactions are emitted. Txgen checks the
     /// deadline before starting each workload item, so transaction sequences
     /// are never emitted partially.
-    #[arg(long, value_parser = parse_duration)]
+    #[arg(long, value_parser = humantime::parse_duration)]
     pub duration: Option<Duration>,
 
     /// Output file (default: stdout)
@@ -66,6 +66,7 @@ pub struct GenerateContext {
     artifacts: ArtifactManager,
     nonces: NonceTracker,
     rng: StdRng,
+    limit: GenerationLimit,
 }
 
 impl GenerateContext {
@@ -80,7 +81,8 @@ impl GenerateContext {
             Some(seed) => StdRng::seed_from_u64(seed),
             None => StdRng::from_os_rng(),
         };
-        Ok(Self { spec, accounts, artifacts, nonces, rng })
+        let limit = GenerationLimit { count: args.count, duration: args.duration };
+        Ok(Self { spec, accounts, artifacts, nonces, rng, limit })
     }
 
     /// Borrow accounts and nonces simultaneously for prefetching.
@@ -147,7 +149,6 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    let limit = GenerationLimit { count: args.count, duration: args.duration };
     let output = args.output.clone();
     let rpc = args.rpc.clone();
     let mut ctx = GenerateContext::from_args(&args)?;
@@ -156,7 +157,7 @@ where
         adapter.prefetch_nonces(&mut ctx, rpc).await?;
     }
 
-    generate_loop(&adapter, &mut ctx, limit, output)
+    generate_loop(&adapter, &mut ctx, output)
 }
 
 // ---------------------------------------------------------------------------
@@ -219,14 +220,9 @@ struct GenerationLimit {
     duration: Option<Duration>,
 }
 
-fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
-    humantime::parse_duration(s)
-}
-
 fn generate_loop<A: NetworkAdapter>(
     adapter: &A,
     ctx: &mut GenerateContext,
-    limit: GenerationLimit,
     output: Option<PathBuf>,
 ) -> Result<()>
 where
@@ -254,7 +250,7 @@ where
             let written = generate_txs(
                 adapter,
                 &ctx.spec,
-                limit,
+                ctx.limit,
                 &setup_bindings,
                 &mut build_ctx,
                 &mut writer,
@@ -264,7 +260,14 @@ where
         None => {
             let mut writer = txgen_core::output::stdout_writer();
             let setup_bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
-            generate_txs(adapter, &ctx.spec, limit, &setup_bindings, &mut build_ctx, &mut writer)?;
+            generate_txs(
+                adapter,
+                &ctx.spec,
+                ctx.limit,
+                &setup_bindings,
+                &mut build_ctx,
+                &mut writer,
+            )?;
         }
     }
 
@@ -489,17 +492,10 @@ where
 {
     let mut written = 0u64;
     let mut sequence_instances = 0u64;
-    let deadline = limit
-        .duration
-        .map(|duration| {
-            Instant::now()
-                .checked_add(duration)
-                .ok_or_else(|| eyre::eyre!("--duration is too large"))
-        })
-        .transpose()?;
+    let start = Instant::now();
 
     while limit.count.is_none_or(|count| written < count) {
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if limit.duration.is_some_and(|duration| start.elapsed() > duration) {
             break;
         }
 

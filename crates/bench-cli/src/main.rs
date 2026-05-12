@@ -40,7 +40,7 @@ pub struct SendArgs {
     pub max_concurrent: usize,
 
     /// Request timeout
-    #[arg(long, default_value = "30s", value_parser = parse_duration)]
+    #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
     pub timeout: Duration,
 
     /// Report output destinations
@@ -149,10 +149,6 @@ enum Command {
     SendBlocks(SendBlocksArgs),
     /// Print an existing JSON report to the console
     View(ViewArgs),
-}
-
-fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
-    humantime::parse_duration(s)
 }
 
 fn parse_duration_millis_fallback(s: &str) -> Result<Duration, String> {
