@@ -71,6 +71,9 @@ cargo build --release -p bench-cli -p txgen-tempo
 # 1M transactions, unlimited TPS
 ./scripts/bench/run.sh --count 1000000 --tps 0
 
+# Generate workload transactions for five minutes
+./scripts/bench/run.sh --duration 5m
+
 # Custom block time and gas limit
 ./scripts/bench/run.sh --block-time 1s --gas-limit 1000000000
 

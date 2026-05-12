@@ -32,14 +32,6 @@ pub struct SendArgs {
     #[arg(long, default_value = "0")]
     pub tps: u64,
 
-    /// Maximum workload submission duration.
-    ///
-    /// The timer starts when workload submission starts. When it expires,
-    /// bench stops reading/enqueueing new workload transactions, then flushes
-    /// in-flight requests and applies --drain-timeout as usual.
-    #[arg(long, value_parser = parse_duration)]
-    pub duration: Option<Duration>,
-
     /// Maximum number of RPC requests in flight simultaneously.
     ///
     /// Controls parallelism independently of --tps. Limits how many

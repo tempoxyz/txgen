@@ -20,7 +20,8 @@
 #
 # Send mode options:
 #   --spec <PATH>          Workload spec (default: examples/bench-spec.yaml)
-#   --count <N>            Transactions to generate (default: 200000)
+#   --count <N>            Transactions to generate (default: 200000 unless --duration is set)
+#   --duration <DUR>       Max workload generation time (for txgen)
 #   --seed <N>             RNG seed for tx generation (default: 99)
 #   --tps <N>              Target TPS (default: 5000)
 #   --max-concurrent <N>   Max concurrent HTTP requests (default: 500)
@@ -64,6 +65,8 @@ DO_PLOT=true
 # Send mode
 SPEC="examples/bench-spec.yaml"
 COUNT=200000
+COUNT_SET=false
+DURATION=""
 SEED=99
 TPS=5000
 MAX_CONCURRENT=500
@@ -101,7 +104,8 @@ while [[ $# -gt 0 ]]; do
     --no-plot)          DO_PLOT=false; shift ;;
     # Send mode
     --spec)             SPEC="$2"; shift 2 ;;
-    --count)            COUNT="$2"; shift 2 ;;
+    --count)            COUNT="$2"; COUNT_SET=true; shift 2 ;;
+    --duration)         DURATION="$2"; shift 2 ;;
     --seed)             SEED="$2"; shift 2 ;;
     --tps)              TPS="$2"; shift 2 ;;
     --max-concurrent)   MAX_CONCURRENT="$2"; shift 2 ;;
@@ -209,16 +213,38 @@ START_TIME=$(date +%s)
 
 if [[ "$MODE" == "send" ]]; then
   cd "$REPO_ROOT"
-  echo "=== Generate $COUNT txs | bench send (tps=$TPS, max_concurrent=$MAX_CONCURRENT) ==="
+  LIMIT_LABEL="$COUNT txs"
+  if [[ -n "$DURATION" ]]; then
+    LIMIT_LABEL="$DURATION"
+    if [[ "$COUNT_SET" == true ]]; then
+      LIMIT_LABEL="$COUNT txs or $DURATION"
+    fi
+  fi
+  echo "=== Generate $LIMIT_LABEL | bench send (tps=$TPS, max_concurrent=$MAX_CONCURRENT) ==="
   echo "  RPC:         $RPC"
+  if [[ "$COUNT_SET" == true || -z "$DURATION" ]]; then
+    echo "  Count:       $COUNT"
+  fi
+  if [[ -n "$DURATION" ]]; then
+    echo "  Duration:    $DURATION"
+  fi
   echo "  Metrics:     $METRICS_URL (interval=${SCRAPE_INTERVAL}ms)"
   echo ""
 
-  "$TXGEN_BIN" generate \
-    -s "$SPEC" \
-    -n "$COUNT" \
-    --seed "$SEED" \
-    --rpc "$RPC" \
+  TXGEN_ARGS=(
+    generate
+    -s "$SPEC"
+    --seed "$SEED"
+    --rpc "$RPC"
+  )
+  if [[ "$COUNT_SET" == true || -z "$DURATION" ]]; then
+    TXGEN_ARGS+=(-n "$COUNT")
+  fi
+  if [[ -n "$DURATION" ]]; then
+    TXGEN_ARGS+=(--duration "$DURATION")
+  fi
+
+  "$TXGEN_BIN" "${TXGEN_ARGS[@]}" \
   | "$BENCH_BIN" send \
       --rpc-url "$RPC" \
       --tps "$TPS" \

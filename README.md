@@ -43,6 +43,9 @@ txgen-ethereum generate -s workload.yaml -n 1000
 # Generate Tempo transactions with reproducible seed
 txgen-tempo generate -s workload.yaml -n 1000 --seed 42
 
+# Generate for a bounded wall-clock duration
+txgen-tempo generate -s workload.yaml --duration 5m
+
 # Fetch nonces from chain before generating
 txgen-ethereum generate -s workload.yaml -n 1000 --rpc http://localhost:8545
 
@@ -53,7 +56,8 @@ txgen-ethereum generate -s workload.yaml -n 1000 -o transactions.ndjson
 | Flag | Description |
 |------|-------------|
 | `-s, --spec <PATH>` | Workload specification file (YAML) |
-| `-n, --count <N>` | Number of transactions to generate |
+| `-n, --count <N>` | Maximum number of workload transactions to generate; required unless `--duration` is set |
+| `--duration <DUR>` | Maximum workload generation duration; setup is emitted first and excluded |
 | `-o, --output <PATH>` | Output file (default: stdout) |
 | `--rpc <URL>` | RPC endpoint for fetching current nonces |
 | `--seed <SEED>` | RNG seed for reproducibility |
@@ -145,7 +149,6 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `-i, --input <PATH>` | Input NDJSON file (default: stdin) |
 | `--rpc-url <URL>` | RPC endpoint URLs, comma-separated or repeated (default: `http://localhost:8545`) |
 | `--tps <N>` | Target transactions per second (0 = unlimited) |
-| `--duration <DUR>` | Stop enqueueing workload transactions after this duration; setup is excluded |
 | `--max-concurrent <N>` | Maximum concurrent requests (default: 100) |
 | `--timeout <DUR>` | Request timeout (default: 30s) |
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
@@ -156,8 +159,6 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 300, 0 to disable) |
 
 **Required RPC methods:** `eth_sendRawTransaction`, `eth_getTransactionReceipt` (setup and inclusion waits), `eth_getBlockByNumber`, `txpool_status` (for `--drain-timeout`)
-
-`--duration` limits workload submission time on the bench side. After the duration elapses, `bench send` stops reading new workload transactions, flushes in-flight RPCs, and then applies `--drain-timeout` before finalizing the report.
 
 #### `bench send-blocks`
 
@@ -628,7 +629,7 @@ bindings:
 
 Each emitted sequence step gets its natural nonce-lane key as a `submission_key`. Txgen then groups adjacent sequence steps by lane. Steps in the same lane rely on nonce order and can be submitted back-to-back. When a sequence crosses lanes, txgen adds a synthetic boundary key: the previous run releases it after inclusion, and the next run requires it as a `submission_key`. This preserves cross-lane ordering without receipt-gating same-lane nonce chains.
 
-`txgen generate -n` counts emitted transactions, not sequence instances. txgen never emits a partial sequence; if no remaining mix entry fits the remaining transaction budget, generation stops early.
+When set, `txgen generate -n` counts emitted transactions, not sequence instances. txgen never emits a partial sequence; if no remaining mix entry fits the remaining transaction budget or `--duration` elapses before the next workload item starts, generation stops early.
 
 See `examples/sequence.yaml` for a small syntax example, `examples/tip20-sequence.yaml` for a Tempo TIP20 `approve -> transferFrom` sequence whose second transaction depends on the first, and `examples/tip20-mpp.yaml` for TIP20 transfers mixed with deterministic MPP channel `open -> close` sequences.
 
