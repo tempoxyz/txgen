@@ -379,11 +379,11 @@ async fn process_big_block(
     let gas_limit = big_block.env_switches.iter().map(|data| data.payload.gas_limit()).sum();
     let wait = persistence_policy.should_wait(collector.blocks_submitted());
 
+    let input = RethNewPayloadInput::BigBlockData(Box::new(big_block.clone()));
+
     let new_payload_start = Instant::now();
-    let payload_status = provider
-        .reth_new_payload_big_block(big_block.clone(), wait)
-        .await
-        .wrap_err("reth_newPayload failed")?;
+    let payload_status =
+        provider.reth_new_payload(input, wait).await.wrap_err("reth_newPayload failed")?;
     let new_payload_latency = new_payload_start.elapsed();
 
     if !payload_status.status.is_valid() {
