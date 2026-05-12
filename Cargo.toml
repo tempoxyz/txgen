@@ -26,7 +26,6 @@ serde_yaml = "0.9"
 
 # alloy
 alloy-primitives = { version = "1", features = ["rand", "serde"] }
-alloy-sol-types = "1"
 alloy-dyn-abi = { version = "1", features = ["eip712"] }
 alloy-json-abi = "1"
 alloy-signer = "2"
@@ -46,6 +45,5 @@ tempo-primitives = "1"
 hex = "0.4"
 rand = "0.9"
 eyre = "0.6"
-thiserror = "2"
 tokio = "1"
 uuid = { version = "1", features = ["v4", "serde"] }

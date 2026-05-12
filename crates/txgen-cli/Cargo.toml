@@ -27,7 +27,6 @@ alloy-dyn-abi.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-network.workspace = true
-alloy-signer.workspace = true
 alloy-eips.workspace = true
 alloy-rlp.workspace = true
 alloy-rpc-types-engine = "2"

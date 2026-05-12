@@ -13,7 +13,6 @@ serde_yaml.workspace = true
 
 # alloy
 alloy-primitives.workspace = true
-alloy-sol-types.workspace = true
 alloy-dyn-abi.workspace = true
 alloy-json-abi.workspace = true
 alloy-signer.workspace = true
@@ -25,5 +24,4 @@ k256 = { version = "0.13", default-features = false }
 # misc
 rand.workspace = true
 eyre.workspace = true
-thiserror.workspace = true
 hex.workspace = true
