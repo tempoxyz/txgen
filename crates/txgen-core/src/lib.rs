@@ -12,7 +12,7 @@ pub use abi::{ArtifactDef, ArtifactManager, CallDef, EncodedCall};
 pub use accounts::{
     AccountManager, AccountPoolDef, AccountRef, EcdsaSigner, SelectMode, SignerExt,
 };
-pub use nonce::{NonceProvider, NonceTracker};
+pub use nonce::NonceTracker;
 pub use output::{GeneratedTx, NdjsonWriter, TxPhase};
 pub use plugin::{BuildContext, SelectedSigner};
 pub use scheduling_key::{dedup_scheduling_keys, SchedulingKey};

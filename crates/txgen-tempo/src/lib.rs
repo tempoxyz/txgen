@@ -1,7 +1,7 @@
 mod nonce;
 mod template;
 
-pub use nonce::{prefetch_parallel_nonces, TempoNonceProvider, NONCE_PRECOMPILE};
+pub use nonce::{prefetch_parallel_nonces, NONCE_PRECOMPILE};
 pub use txgen_cli::fetch_protocol_nonces;
 
 use alloy_network::TransactionBuilder;

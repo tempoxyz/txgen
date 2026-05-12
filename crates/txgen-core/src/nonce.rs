@@ -1,26 +1,4 @@
-use alloy_primitives::Address;
-use eyre::Result;
-use std::{collections::HashMap, future::Future, pin::Pin};
-
-/// Trait for fetching nonces from the chain.
-///
-/// Different chains may have different nonce schemes (e.g., Tempo's parallel nonces).
-/// Implement this trait to provide chain-specific nonce fetching.
-pub trait NonceProvider: Send + Sync {
-    /// Fetch the current nonce for a given address and nonce key.
-    ///
-    /// - `address`: The sender address
-    /// - `nonce_key`: The nonce lane key (0 for protocol nonce, non-zero for parallel lanes)
-    /// - `scheduling_key`: The computed scheduling key for this (address, nonce_key) pair
-    ///
-    /// Returns the current nonce value from the chain.
-    fn fetch_nonce(
-        &self,
-        address: Address,
-        nonce_key: alloy_primitives::U256,
-        scheduling_key: [u8; 20],
-    ) -> Pin<Box<dyn Future<Output = Result<u64>> + Send + '_>>;
-}
+use std::collections::HashMap;
 
 /// Tracks nonces per scheduling key.
 ///
@@ -78,23 +56,6 @@ impl NonceTracker {
     /// Check if a key has been initialized.
     pub fn contains(&self, key: &[u8; 20]) -> bool {
         self.nonces.contains_key(key)
-    }
-
-    /// Get the next nonce, fetching from provider if not already tracked.
-    ///
-    /// This is the async version that will fetch from chain on first access.
-    pub async fn next_with_provider<P: NonceProvider>(
-        &mut self,
-        key: [u8; 20],
-        address: Address,
-        nonce_key: alloy_primitives::U256,
-        provider: &P,
-    ) -> Result<u64> {
-        if let std::collections::hash_map::Entry::Vacant(e) = self.nonces.entry(key) {
-            let nonce = provider.fetch_nonce(address, nonce_key, key).await?;
-            e.insert(nonce);
-        }
-        Ok(self.next(key))
     }
 }
 
