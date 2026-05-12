@@ -1,17 +1,13 @@
 //! Transaction sources for bench.
 //!
 //! Sources produce [`GeneratedTx`] items from various inputs:
-//! - txgen subprocess (spawns txgen and reads NDJSON from stdout)
 //! - file (reads NDJSON from a file)
 //! - stdin (reads NDJSON from stdin)
 
 use alloy_primitives::Bytes;
 use eyre::{Context, Result};
-use std::{io::BufRead, path::Path, process::Stdio};
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    process::{Child, Command},
-};
+use std::{io::BufRead, path::Path};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey, TxPhase};
 
 /// A transaction read from a source.
@@ -124,55 +120,6 @@ impl TxSource for StdinSource {
 
         let source_tx: SourceTx =
             serde_json::from_str(&self.line_buf).context("failed to parse NDJSON line")?;
-        Ok(Some(source_tx.into_generated_tx()?))
-    }
-}
-
-/// Source that spawns txgen as a subprocess and reads from its stdout.
-pub struct TxgenSource {
-    child: Child,
-    reader: BufReader<tokio::process::ChildStdout>,
-    line_buf: String,
-}
-
-impl TxgenSource {
-    /// Spawn txgen with the given arguments.
-    pub async fn spawn(txgen_bin: &str, args: &[String]) -> Result<Self> {
-        let mut child = Command::new(txgen_bin)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .context("failed to spawn txgen")?;
-
-        let stdout = child.stdout.take().ok_or_else(|| eyre::eyre!("txgen stdout not captured"))?;
-
-        let reader = BufReader::new(stdout);
-
-        Ok(Self { child, reader, line_buf: String::new() })
-    }
-
-    /// Wait for the txgen process to exit.
-    pub async fn wait(&mut self) -> Result<std::process::ExitStatus> {
-        self.child.wait().await.context("failed to wait for txgen")
-    }
-}
-
-impl TxSource for TxgenSource {
-    async fn next_tx(&mut self) -> Result<Option<GeneratedTx>> {
-        self.line_buf.clear();
-        let bytes_read = self
-            .reader
-            .read_line(&mut self.line_buf)
-            .await
-            .context("failed to read from txgen stdout")?;
-
-        if bytes_read == 0 {
-            return Ok(None);
-        }
-
-        let source_tx: SourceTx =
-            serde_json::from_str(&self.line_buf).context("failed to parse NDJSON from txgen")?;
         Ok(Some(source_tx.into_generated_tx()?))
     }
 }
