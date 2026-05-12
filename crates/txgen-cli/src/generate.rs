@@ -64,18 +64,6 @@ impl GenerateContext {
         Ok(Self { spec, accounts, artifacts, nonces, rng })
     }
 
-    pub fn spec(&self) -> &WorkloadSpec {
-        &self.spec
-    }
-
-    pub fn accounts(&self) -> &AccountManager {
-        &self.accounts
-    }
-
-    pub fn nonces_mut(&mut self) -> &mut NonceTracker {
-        &mut self.nonces
-    }
-
     /// Borrow accounts and nonces simultaneously for prefetching.
     pub fn accounts_and_nonces(&mut self) -> (&AccountManager, &mut NonceTracker) {
         (&self.accounts, &mut self.nonces)
