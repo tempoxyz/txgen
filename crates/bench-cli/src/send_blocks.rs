@@ -85,6 +85,8 @@ struct ProcessingState<'a> {
     persistence_policy: &'a WaitForPersistence,
 }
 
+const REORG_NON_BLOB_TX_DROP_INTERVAL: usize = 10;
+
 pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let jwt_secret_hex =
         tokio::fs::read_to_string(&args.jwt_secret).await.wrap_err("failed to read JWT secret")?;
@@ -588,6 +590,8 @@ fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<Vec<Bytes>> {
 
     let mut transactions = Vec::new();
     let mut skipped_blob_txs = 0usize;
+    let mut non_blob_txs = 0usize;
+    let mut dropped_non_blob_txs = 0usize;
     while !txs_payload.is_empty() {
         let item_start = txs_payload;
         let header =
@@ -597,11 +601,21 @@ fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<Vec<Bytes>> {
         let encoded = &item_start[..header_len + header.payload_length];
 
         if header.list {
-            transactions.push(Bytes::copy_from_slice(encoded));
+            non_blob_txs += 1;
+            if should_keep_reorg_transaction(non_blob_txs) {
+                transactions.push(Bytes::copy_from_slice(encoded));
+            } else {
+                dropped_non_blob_txs += 1;
+            }
         } else if payload.first() == Some(&0x03) {
             skipped_blob_txs += 1;
         } else {
-            transactions.push(Bytes::copy_from_slice(payload));
+            non_blob_txs += 1;
+            if should_keep_reorg_transaction(non_blob_txs) {
+                transactions.push(Bytes::copy_from_slice(payload));
+            } else {
+                dropped_non_blob_txs += 1;
+            }
         }
 
         txs_payload = &txs_payload[header.payload_length..];
@@ -610,14 +624,96 @@ fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<Vec<Bytes>> {
     if skipped_blob_txs > 0 {
         tracing::warn!(skipped_blob_txs, "Skipped blob transactions while building synthetic fork");
     }
+    if dropped_non_blob_txs > 0 {
+        tracing::info!(
+            kept_non_blob_txs = transactions.len(),
+            dropped_non_blob_txs,
+            "Kept 90% of non-blob transactions while building synthetic fork"
+        );
+    }
 
     Ok(transactions)
+}
+
+fn should_keep_reorg_transaction(non_blob_tx_index: usize) -> bool {
+    !non_blob_tx_index.is_multiple_of(REORG_NON_BLOB_TX_DROP_INTERVAL)
 }
 
 fn skip_rlp_item(buf: &mut &[u8]) -> Result<()> {
     let header = Header::decode(buf).wrap_err("failed to decode RLP item header")?;
     *buf = &buf[header.payload_length..];
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_rlp::Encodable;
+
+    fn rlp_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        payload.encode(&mut out);
+        out
+    }
+
+    fn rlp_list_from_encoded(items: &[Vec<u8>]) -> Vec<u8> {
+        let payload_length = items.iter().map(Vec::len).sum();
+        let mut out = Vec::new();
+        Header { list: true, payload_length }.encode(&mut out);
+        for item in items {
+            out.extend_from_slice(item);
+        }
+        out
+    }
+
+    fn legacy_tx(id: u8) -> Vec<u8> {
+        rlp_list_from_encoded(&[rlp_bytes(&[id])])
+    }
+
+    fn typed_tx(tx_type: u8, id: u8) -> Vec<u8> {
+        rlp_bytes(&[tx_type, id])
+    }
+
+    fn block_with_transactions(transactions: &[Vec<u8>]) -> Vec<u8> {
+        let header = rlp_list_from_encoded(&[]);
+        let transactions = rlp_list_from_encoded(transactions);
+        let ommers = rlp_list_from_encoded(&[]);
+        rlp_list_from_encoded(&[header, transactions, ommers])
+    }
+
+    #[test]
+    fn extracts_nine_of_ten_non_blob_transactions_for_reorg_payloads() {
+        let source_transactions = (0..10).map(legacy_tx).collect::<Vec<_>>();
+        let block = block_with_transactions(&source_transactions);
+
+        let extracted = extract_tx_bytes_from_block_rlp(&block)
+            .expect("valid block RLP should extract transactions");
+
+        let expected = source_transactions
+            .into_iter()
+            .take(REORG_NON_BLOB_TX_DROP_INTERVAL - 1)
+            .map(Bytes::from)
+            .collect::<Vec<_>>();
+        assert_eq!(extracted, expected);
+    }
+
+    #[test]
+    fn blob_transactions_do_not_count_toward_reorg_payload_keep_ratio() {
+        let mut source_transactions = (0..9).map(legacy_tx).collect::<Vec<_>>();
+        source_transactions.push(typed_tx(0x03, 0));
+        source_transactions.push(legacy_tx(9));
+        let block = block_with_transactions(&source_transactions);
+
+        let extracted = extract_tx_bytes_from_block_rlp(&block)
+            .expect("valid block RLP should extract transactions");
+
+        let expected = source_transactions
+            .into_iter()
+            .take(REORG_NON_BLOB_TX_DROP_INTERVAL - 1)
+            .map(Bytes::from)
+            .collect::<Vec<_>>();
+        assert_eq!(extracted, expected);
+    }
 }
 
 async fn process_big_block(
