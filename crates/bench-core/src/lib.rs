@@ -1,7 +1,7 @@
 //! Core library for the bench tool.
 //!
 //! Provides shared foundation components:
-//! - [`source`] - Transaction sources (txgen subprocess, file, stdin)
+//! - [`source`] - Transaction sources (file, stdin)
 //! - [`sender`] - Sending with scheduling key ordering + rate limiting
 //! - [`metrics`] - Collection (sent/success/failed counts, timing)
 //! - [`reporter`] - Output (console, JSON, ClickHouse, VictoriaMetrics)
@@ -37,6 +37,6 @@ pub use reth_api::{
 pub use sample::{Sample, SampleStore};
 pub use scraper::{start_scraper, SampleCallback, ScraperConfig, ScraperHandle};
 pub use sender::{Sender, SenderConfig};
-pub use source::{FileSource, SourceTx, StdinSource, TxSource, TxgenSource};
+pub use source::{FileSource, SourceTx, StdinSource, TxSource};
 pub use txgen_core::{GeneratedTx, TxPhase};
 pub use victoriametrics::{VictoriaMetricsConfig, VictoriaMetricsReporter};

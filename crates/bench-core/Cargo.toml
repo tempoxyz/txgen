@@ -23,7 +23,7 @@ alloy-transport = "2"
 alloy-eips.workspace = true
 
 # async
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "process", "io-util", "io-std"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "io-util", "io-std"] }
 
 # http
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
