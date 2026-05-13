@@ -189,6 +189,14 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     };
 
     report.apply_labels(&metadata);
+    if let Some(start_unix_ms) = args.metrics_align {
+        report.align_metric_timestamps(start_unix_ms);
+        tracing::info!(
+            start_unix_ms,
+            samples = report.samples.len(),
+            "Aligned metric sample timestamps"
+        );
+    }
 
     for reporter in reporters.iter_mut() {
         reporter.finalize(&report)?;

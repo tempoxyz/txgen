@@ -149,6 +149,16 @@ async fn execute_source<S: TxSource>(
 
     report.apply_labels(metadata);
 
+    let metrics_start_unix_ms = args.metrics_align.unwrap_or_else(|| clock.start_unix_ms());
+    if let Some(start_unix_ms) = args.metrics_align {
+        report.align_metric_timestamps(start_unix_ms);
+        tracing::info!(
+            start_unix_ms,
+            samples = report.samples.len(),
+            "Aligned metric sample timestamps"
+        );
+    }
+
     if end_block > start_block {
         let block_range_start = start_block + 1;
         tracing::info!(start = block_range_start, end = end_block, "Collecting per-block stats");
@@ -163,9 +173,9 @@ async fn execute_source<S: TxSource>(
             report.samples.retain(|s| s.unix_ms <= cutoff_ms);
             if let Some(ts) = report.time_series.as_mut() {
                 ts.latencies
-                    .retain(|l| l.offset_ms <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
+                    .retain(|l| l.offset_ms <= cutoff_ms.saturating_sub(metrics_start_unix_ms));
                 ts.throughput
-                    .retain(|t| t.second * 1000 <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
+                    .retain(|t| t.second * 1000 <= cutoff_ms.saturating_sub(metrics_start_unix_ms));
             }
         }
 

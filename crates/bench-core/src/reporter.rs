@@ -47,6 +47,16 @@ impl FinalReport {
             }
         }
     }
+
+    /// Shift metric sample wall-clock timestamps to a new benchmark start.
+    ///
+    /// `offset_ms` is left untouched; `unix_ms` is recomputed as
+    /// `start_unix_ms + offset_ms` for each sample.
+    pub fn align_metric_timestamps(&mut self, start_unix_ms: u64) {
+        for sample in &mut self.samples {
+            sample.unix_ms = start_unix_ms.saturating_add(sample.offset_ms);
+        }
+    }
 }
 
 /// Snapshot of progress state passed to reporters.
@@ -958,5 +968,37 @@ mod tests {
 
         // No prior "host" label → gets the new value.
         assert_eq!(report.samples[0].labels["host"], "override-me");
+    }
+
+    #[test]
+    fn test_align_metric_timestamps() {
+        use crate::sample::Sample;
+        use std::collections::BTreeMap;
+
+        let mut report = FinalReport {
+            samples: vec![
+                Sample {
+                    name: "txgen_sent_total".to_string(),
+                    labels: BTreeMap::new(),
+                    value: 100.0,
+                    offset_ms: 0,
+                    unix_ms: 1,
+                },
+                Sample {
+                    name: "reth_metric".to_string(),
+                    labels: BTreeMap::new(),
+                    value: 42.0,
+                    offset_ms: 250,
+                    unix_ms: 2,
+                },
+            ],
+            ..Default::default()
+        };
+
+        report.align_metric_timestamps(1_700_000_000_000);
+
+        assert_eq!(report.samples[0].unix_ms, 1_700_000_000_000);
+        assert_eq!(report.samples[1].unix_ms, 1_700_000_000_250);
+        assert_eq!(report.samples[1].offset_ms, 250);
     }
 }

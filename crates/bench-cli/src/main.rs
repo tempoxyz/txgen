@@ -65,6 +65,13 @@ pub struct SendArgs {
     #[arg(long, default_value = "500")]
     pub scrape_interval_ms: u64,
 
+    /// Align exported metric timestamps to this benchmark-start Unix timestamp.
+    ///
+    /// Accepts Unix seconds or milliseconds. Exported samples keep their
+    /// original offset within the run.
+    #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
+    pub metrics_align: Option<u64>,
+
     /// Skip setup-phase transactions in the input stream.
     #[arg(long)]
     pub skip_setup: bool,
@@ -124,6 +131,13 @@ pub struct SendBlocksArgs {
     /// Scrape interval in milliseconds for the metrics scraper.
     #[arg(long, default_value = "500")]
     pub scrape_interval_ms: u64,
+
+    /// Align exported metric timestamps to this benchmark-start Unix timestamp.
+    ///
+    /// Accepts Unix seconds or milliseconds. Exported samples keep their
+    /// original offset within the run.
+    #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
+    pub metrics_align: Option<u64>,
 }
 
 /// Arguments for the `view` subcommand.
@@ -158,6 +172,21 @@ fn parse_duration_millis_fallback(s: &str) -> Result<Duration, String> {
             .map(Duration::from_millis)
             .map_err(|_| format!("invalid duration: {s:?}"))
     })
+}
+
+fn parse_unix_timestamp_ms(s: &str) -> Result<u64, String> {
+    const UNIX_SECONDS_CUTOFF: u64 = 100_000_000_000;
+
+    let timestamp =
+        s.trim().parse::<u64>().map_err(|_| format!("invalid Unix timestamp: {s:?}"))?;
+
+    if timestamp < UNIX_SECONDS_CUTOFF {
+        timestamp
+            .checked_mul(1000)
+            .ok_or_else(|| format!("Unix timestamp overflows milliseconds: {s:?}"))
+    } else {
+        Ok(timestamp)
+    }
 }
 
 fn parse_wait_for_persistence(s: &str) -> Result<bench_core::WaitForPersistence, String> {
@@ -217,5 +246,22 @@ mod tests {
     fn test_parse_duration_millis_fallback_errors() {
         assert!(parse_duration_millis_fallback("abc").is_err());
         assert!(parse_duration_millis_fallback("").is_err());
+    }
+
+    #[test]
+    fn test_parse_unix_timestamp_ms_seconds() {
+        assert_eq!(parse_unix_timestamp_ms("1700000000"), Ok(1_700_000_000_000));
+    }
+
+    #[test]
+    fn test_parse_unix_timestamp_ms_millis() {
+        assert_eq!(parse_unix_timestamp_ms("1700000000123"), Ok(1_700_000_000_123));
+    }
+
+    #[test]
+    fn test_parse_unix_timestamp_ms_errors() {
+        assert!(parse_unix_timestamp_ms("abc").is_err());
+        assert!(parse_unix_timestamp_ms("-1").is_err());
+        assert!(parse_unix_timestamp_ms("").is_err());
     }
 }
