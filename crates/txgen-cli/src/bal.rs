@@ -1,6 +1,6 @@
 use alloy_eips::{
     eip7928::{AccountChanges, BlockAccessList, SlotChanges},
-    BlockNumberOrTag,
+    BlockId, BlockNumberOrTag,
 };
 use alloy_network::Network;
 use alloy_primitives::Bytes;
@@ -32,7 +32,11 @@ where
     N: Network,
     P: Provider<N>,
 {
-    Ok(alloy_rlp::encode(fetch_block_access_list(provider, block_num).await?).into())
+    provider
+        .get_block_access_list_raw(BlockId::number(block_num))
+        .await
+        .wrap_err_with(|| format!("failed to fetch raw block access list {block_num}"))?
+        .ok_or_else(|| eyre::eyre!("raw block access list not found for block {block_num}"))
 }
 
 pub(crate) fn merge_block_access_lists(

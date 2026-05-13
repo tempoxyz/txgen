@@ -18,6 +18,7 @@ Use `txgen-ethereum` for standard Ethereum transactions and `txgen-tempo` for Te
 - [Send a fixed number of synthetic transactions](#send-a-fixed-number-of-synthetic-transactions)
 - [Run a timed stress test](#run-a-timed-stress-test)
 - [Replay historical blocks through Engine API](#replay-historical-blocks-through-engine-api)
+- [Replay blocks with Block Access Lists](#replay-blocks-with-block-access-lists)
 - [Pace block replay](#pace-block-replay)
 - [Build and replay big-block payloads](#build-and-replay-big-block-payloads)
 - [Exercise reorg paths](#exercise-reorg-paths)
@@ -136,6 +137,42 @@ txgen-ethereum extract \
 ```
 
 Required source RPC method: `debug_getRawBlock`.
+
+## Replay blocks with Block Access Lists
+
+For Amsterdam/EIP-7928 payloads, include block access lists (BALs) in the extracted stream. `txgen` fetches BALs from the source RPC, RLP-encodes them into each raw block line, and `bench send-blocks` forwards them to `reth_newPayload` alongside the block RLP:
+
+```bash
+txgen-ethereum extract \
+  --rpc http://archive:8545 \
+  --from 20000000 \
+  --to 20000100 \
+  --bal \
+| bench send-blocks \
+  --engine http://localhost:8551 \
+  --jwt-secret /path/to/jwt.hex \
+  --report json:bal-replay-report.json
+```
+
+Required source RPC methods: `debug_getRawBlock` and `eth_getBlockAccessListByBlockNumber`.
+
+Big-block extraction supports BALs too. `txgen` fetches each constituent block's BAL, shifts and merges the access indexes the same way `reth-bench generate-big-block --bal` does, and writes the merged RLP bytes to `merged_block_access_list`:
+
+```bash
+txgen-ethereum extract-big-blocks \
+  --rpc http://archive:8545 \
+  --from 910020 \
+  --count 25 \
+  --target-gas 2G \
+  --bal \
+  --output big-blocks-with-bal.ndjson
+
+bench send-blocks \
+  --engine http://localhost:8551 \
+  --jwt-secret /path/to/jwt.hex \
+  --input big-blocks-with-bal.ndjson \
+  --report json:big-block-bal-report.json
+```
 
 ## Pace block replay
 
