@@ -9,6 +9,8 @@ use clap::{Args, Parser, Subcommand};
 use eyre::Result;
 use std::{path::PathBuf, time::Duration};
 
+use crate::metrics_url::{parse_metrics_url, MetricsURL};
+
 mod metrics_url;
 mod send;
 mod send_blocks;
@@ -63,9 +65,9 @@ pub struct SendArgs {
         long,
         value_name = "URL|NODE:URL",
         value_delimiter = ',',
-        value_parser = metrics_url::parse_metrics_url
+        value_parser = parse_metrics_url
     )]
-    pub metrics_url: Vec<metrics_url::MetricsURL>,
+    pub metrics_url: Vec<MetricsURL>,
 
     /// Scrape interval in milliseconds for the metrics scraper.
     #[arg(long, default_value = "500")]
@@ -138,9 +140,9 @@ pub struct SendBlocksArgs {
         long,
         value_name = "URL|NODE:URL",
         value_delimiter = ',',
-        value_parser = metrics_url::parse_metrics_url
+        value_parser = parse_metrics_url
     )]
-    pub metrics_url: Vec<metrics_url::MetricsURL>,
+    pub metrics_url: Vec<MetricsURL>,
 
     /// Scrape interval in milliseconds for the metrics scraper.
     #[arg(long, default_value = "500")]
