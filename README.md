@@ -284,12 +284,12 @@ The JSON report includes:
 
 ### Prometheus Reporting
 
-The Prometheus reporter forwards every sample in the unified time series (internal `txgen_*` counters plus scraped node Prometheus metrics) to a Prometheus-compatible endpoint via the `/api/v1/write` endpoint. Samples are sent in Prometheus Remote Write format with their original `unix_ms` timestamps, so backfilling at the end of the run does not lose fidelity.
+The Prometheus reporter forwards every sample in the unified time series (internal `txgen_*` counters plus scraped node Prometheus metrics) to a Prometheus-compatible endpoint via the `/api/v1/write` endpoint. The same endpoint works with VictoriaMetrics, Cortex, Thanos, etc. Samples are sent in Prometheus Remote Write format with their original `unix_ms` timestamps, so backfilling at the end of the run does not lose fidelity.
 
 ```bash
 bench send -i txs.ndjson \
   --metrics-url http://127.0.0.1:9001/metrics \
-  --report remote_write:http://prometheus:8428 \
+  --report prometheus:http://prometheus:8428 \
   -m scenario=tip20-10k \
   -m platform=tempo \
   -m git-sha=abc123 \
