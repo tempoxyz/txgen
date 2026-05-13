@@ -235,7 +235,7 @@ Report destinations are specified with `--report` and can be repeated:
 | `console` | Print summary to stderr (default if no reporters specified) |
 | `json:<path>` | Write JSON report to file |
 | `clickhouse:<url>` | Push benchmark data to ClickHouse |
-| `victoriametrics:<url>` | Push samples to VictoriaMetrics (`/api/v1/import/prometheus`) |
+| `prometheus:<url>` | Push samples via Prometheus remote write (`/api/v1/write`) |
 
 ### Metrics Scraping
 
@@ -289,7 +289,7 @@ The VictoriaMetrics reporter forwards every sample in the unified time series (i
 ```bash
 bench send -i txs.ndjson \
   --metrics-url http://127.0.0.1:9001/metrics \
-  --report victoriametrics:http://vm:8428 \
+  --report remote_write:http://vm:8428 \
   -m scenario=tip20-10k \
   -m platform=tempo \
   -m git-sha=abc123 \
@@ -314,7 +314,7 @@ Example with auth:
 VM_BEARER_TOKEN=$(cat ~/.vm-token) \
 bench send -i txs.ndjson \
   --metrics-url http://127.0.0.1:9001/metrics \
-  --report victoriametrics:https://vm.example.com \
+  --report remote_write:https://vm.example.com \
   -m scenario=tip20-10k -m run_id=$(uuidgen)
 ```
 

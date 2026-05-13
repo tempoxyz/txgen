@@ -1,29 +1,34 @@
-//! VictoriaMetrics reporter.
+//! Prometheus remote write reporter.
 //!
-//! Pushes the unified [`Sample`] stream from a benchmark run to a
-//! VictoriaMetrics instance via the `/api/v1/import/prometheus`
-//! endpoint, which accepts Prometheus text exposition format.
+//! Pushes the unified [`Sample`] stream from a benchmark run to any
+//! Prometheus-compatible remote write endpoint (VictoriaMetrics,
+//! Prometheus, Cortex, Thanos, etc.) via `/api/v1/write` using the
+//! standard remote write protocol (protobuf + snappy compression).
 //!
-//! User-provided metadata (`-m key=value`) is forwarded as `extra_label`
-//! query parameters so VM stamps every sample in the request with those
-//! labels server-side. This keeps request bodies small and avoids
-//! mutating the in-memory [`FinalReport`].
+//! User-provided metadata (`-m key=value`) are forwarded as `extra_label`
+//! query parameters so the server stamps every sample in the request with
+//! those labels. This keeps request bodies small and avoids mutating the
+//! in-memory [`FinalReport`].
 //!
 //! Connection knobs (auth, tenant, batching) are read from environment
 //! variables so secrets never end up on the command line:
 //!
 //! | Env var               | Purpose                                              |
 //! |-----------------------|------------------------------------------------------|
-//! | `VM_BEARER_TOKEN`     | `Authorization: Bearer …` header (e.g. VM Cloud)    |
+//! | `VM_BEARER_TOKEN`     | `Authorization: Bearer …` header                    |
 //! | `VM_USER`             | HTTP basic auth username (used with `VM_PASSWORD`)   |
 //! | `VM_PASSWORD`         | HTTP basic auth password                             |
-//! | `VM_TENANT_ID`        | Cluster VM accountID, sent as `?accountID=…`         |
+//! | `VM_TENANT_ID`        | Cluster tenant / accountID query param               |
 //! | `VM_BATCH_SIZE`       | Samples per HTTP request (default: 10_000)           |
 //! | `VM_TIMEOUT_SECS`     | Per-request timeout in seconds (default: 60)         |
 
 use crate::{reporter::FinalReport, sample::Sample, Reporter};
 use eyre::{bail, Context, Result};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use prometheus_remote_write::{
+    Label, Sample as PromSample, TimeSeries, WriteRequest, CONTENT_TYPE,
+    HEADER_NAME_REMOTE_WRITE_VERSION, LABEL_NAME, REMOTE_WRITE_VERSION_01,
+};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use std::{collections::BTreeMap, time::Duration};
 
 /// Default samples per ingestion request.
@@ -31,10 +36,10 @@ const DEFAULT_BATCH_SIZE: usize = 10_000;
 /// Default per-request HTTP timeout.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
-/// Configuration for the VictoriaMetrics reporter.
+/// Configuration for the Prometheus remote write reporter.
 #[derive(Debug, Clone)]
-pub struct VictoriaMetricsConfig {
-    /// Base URL of the VM instance, e.g. `http://localhost:8428`.
+pub struct PrometheusConfig {
+    /// Base URL of the remote write endpoint, e.g. `http://localhost:8428`.
     pub base_url: String,
     /// Run-level labels added to every sample (server-side via `extra_label`).
     pub extra_labels: BTreeMap<String, String>,
@@ -42,7 +47,7 @@ pub struct VictoriaMetricsConfig {
     pub bearer_token: Option<String>,
     /// Optional HTTP basic auth `(user, password)`.
     pub basic_auth: Option<(String, String)>,
-    /// Optional cluster VM tenant id (sent as `accountID` query param).
+    /// Optional cluster tenant id (sent as `accountID` query param).
     pub tenant_id: Option<String>,
     /// Samples per HTTP request.
     pub batch_size: usize,
@@ -50,7 +55,7 @@ pub struct VictoriaMetricsConfig {
     pub timeout: Duration,
 }
 
-impl VictoriaMetricsConfig {
+impl PrometheusConfig {
     /// Build a config from a base URL and the user `--metadata` map.
     ///
     /// Connection knobs (auth, tenant, batching) are read from environment
@@ -100,23 +105,23 @@ impl VictoriaMetricsConfig {
     }
 }
 
-/// VictoriaMetrics reporter.
-pub struct VictoriaMetricsReporter {
-    config: VictoriaMetricsConfig,
+/// Prometheus remote write reporter.
+pub struct PrometheusReporter {
+    config: PrometheusConfig,
     client: reqwest::Client,
     import_url: String,
 }
 
-impl VictoriaMetricsReporter {
+impl PrometheusReporter {
     /// Construct a new reporter.
-    pub fn new(config: VictoriaMetricsConfig) -> Result<Self> {
+    pub fn new(config: PrometheusConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(config.timeout)
             .build()
             .context("failed to create HTTP client")?;
 
-        // Build the import URL once with extra_label + accountID query params.
-        let mut url = format!("{}/api/v1/import/prometheus", config.base_url);
+        // Build the import URL with extra_label + accountID query params.
+        let mut url = format!("{}/api/v1/write", config.base_url);
         let mut params: Vec<(String, String)> = Vec::new();
         for (k, v) in &config.extra_labels {
             params.push(("extra_label".to_string(), format!("{k}={v}")));
@@ -138,7 +143,7 @@ impl VictoriaMetricsReporter {
             extra_labels = config.extra_labels.len(),
             batch_size = config.batch_size,
             tenant = ?config.tenant_id,
-            "VictoriaMetrics reporter initialized"
+            "Prometheus remote write reporter initialized"
         );
 
         Ok(Self { config, client, import_url: url })
@@ -147,7 +152,15 @@ impl VictoriaMetricsReporter {
     /// Build common request headers (auth + content-type).
     fn headers(&self) -> Result<HeaderMap> {
         let mut h = HeaderMap::new();
-        h.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+        h.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static(CONTENT_TYPE),
+        );
+        h.insert("Content-Encoding", HeaderValue::from_static("snappy"));
+        h.insert(
+            HEADER_NAME_REMOTE_WRITE_VERSION,
+            HeaderValue::from_static(REMOTE_WRITE_VERSION_01),
+        );
         if let Some(token) = &self.config.bearer_token {
             let v = HeaderValue::from_str(&format!("Bearer {token}"))
                 .context("invalid VM_BEARER_TOKEN")?;
@@ -156,12 +169,16 @@ impl VictoriaMetricsReporter {
         Ok(h)
     }
 
-    /// Send a single batch of samples as Prometheus text.
+    /// Send a single batch of samples as a snappy-compressed protobuf WriteRequest.
     fn send_batch(&self, batch: &[Sample]) -> Result<()> {
-        let body = encode_samples(batch);
-        if body.is_empty() {
+        if batch.is_empty() {
             return Ok(());
         }
+
+        let write_req = build_write_request(batch);
+        let body = write_req
+            .encode_compressed()
+            .context("snappy compression failed")?;
 
         let headers = self.headers()?;
         let rt = tokio::runtime::Handle::current();
@@ -172,29 +189,29 @@ impl VictoriaMetricsReporter {
         }
 
         let resp = tokio::task::block_in_place(|| rt.block_on(req.send()))
-            .wrap_err("failed to POST to VictoriaMetrics")?;
+            .wrap_err("failed to POST remote write")?;
 
         let status = resp.status();
         if !status.is_success() {
             let body = tokio::task::block_in_place(|| rt.block_on(resp.text()))
                 .unwrap_or_else(|_| "<no body>".to_string());
-            bail!("VictoriaMetrics import failed (HTTP {status}): {body}");
+            bail!("remote write failed (HTTP {status}): {body}");
         }
         Ok(())
     }
 }
 
-impl Reporter for VictoriaMetricsReporter {
+impl Reporter for PrometheusReporter {
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
         if report.samples.is_empty() {
-            tracing::info!("VictoriaMetrics: no samples to push");
+            tracing::info!("remote write: no samples to push");
             return Ok(());
         }
 
         tracing::info!(
             samples = report.samples.len(),
             url = %self.config.base_url,
-            "Pushing samples to VictoriaMetrics"
+            "Pushing samples via Prometheus remote write"
         );
 
         let mut pushed = 0usize;
@@ -203,79 +220,70 @@ impl Reporter for VictoriaMetricsReporter {
             pushed += chunk.len();
         }
 
-        tracing::info!(samples = pushed, "VictoriaMetrics push complete");
+        tracing::info!(samples = pushed, "remote write push complete");
         Ok(())
     }
 }
 
-/// Encode a batch of samples as Prometheus text exposition format.
+/// Build a [`WriteRequest`] from a batch of [`Sample`]s.
 ///
-/// Skips samples whose name is not a valid Prometheus metric identifier
-/// or whose value is non-finite (NaN/±Inf are not representable in the
-/// text format).
-fn encode_samples(samples: &[Sample]) -> String {
-    let mut out = String::with_capacity(samples.len() * 96);
+/// Each unique combination of (metric name + labels) becomes one `TimeSeries`
+/// entry. Samples with non-finite values or invalid metric names are skipped.
+fn build_write_request(samples: &[Sample]) -> WriteRequest {
+    use std::collections::HashMap;
+
+    // Group samples by their time series identity (name + sorted labels).
+    let mut series_map: HashMap<String, TimeSeries> = HashMap::new();
+
     for s in samples {
         if !is_valid_metric_name(&s.name) || !s.value.is_finite() {
             continue;
         }
-        out.push_str(&s.name);
-        if !s.labels.is_empty() {
-            out.push('{');
-            let mut first = true;
-            for (k, v) in &s.labels {
-                let key = sanitize_label_name(k);
-                if key.is_empty() {
-                    continue;
-                }
-                if !first {
-                    out.push(',');
-                }
-                first = false;
-                out.push_str(&key);
-                out.push_str("=\"");
-                escape_label_value(v, &mut out);
-                out.push('"');
+
+        // Build the label set: __name__ + user labels.
+        let mut labels: Vec<Label> = Vec::with_capacity(s.labels.len() + 1);
+        labels.push(Label {
+            name: LABEL_NAME.to_string(),
+            value: s.name.clone(),
+        });
+        for (k, v) in &s.labels {
+            let key = sanitize_label_name(k);
+            if !key.is_empty() {
+                labels.push(Label { name: key, value: v.clone() });
             }
-            out.push('}');
         }
-        // Format value compactly; Prometheus text format allows decimal
-        // and scientific notation. f64::to_string handles both.
-        out.push(' ');
-        out.push_str(&format_value(s.value));
-        out.push(' ');
-        out.push_str(&s.unix_ms.to_string());
-        out.push('\n');
-    }
-    out
-}
+        // Labels must be sorted by name per the remote write spec.
+        labels.sort_by(|a, b| a.name.cmp(&b.name));
 
-/// Format a finite f64 for Prometheus text exposition.
-fn format_value(v: f64) -> String {
-    // Avoid `inf`/`-inf`/`NaN` (already filtered) and scientific edge
-    // cases by relying on Rust's default Display for f64, which is
-    // accepted by VictoriaMetrics' parser.
-    let mut s = v.to_string();
-    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
-        // Keep integer-valued floats unambiguous (`1` is fine for
-        // Prometheus, but a trailing `.0` makes intent explicit).
-        s.push_str(".0");
-    }
-    s
-}
+        // Build a stable key for grouping.
+        let series_key: String = labels
+            .iter()
+            .map(|l| format!("{}={}", l.name, l.value))
+            .collect::<Vec<_>>()
+            .join(",");
 
-/// Escape a Prometheus label value into `out`.
-///
-/// Per the spec, only `\\`, `\"` and `\n` need escaping inside `"…"`.
-fn escape_label_value(v: &str, out: &mut String) {
-    for c in v.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            _ => out.push(c),
-        }
+        let prom_sample = PromSample {
+            value: s.value,
+            timestamp: s.unix_ms as i64,
+        };
+
+        series_map
+            .entry(series_key)
+            .or_insert_with(|| TimeSeries { labels: labels.clone(), samples: Vec::new() })
+            .samples
+            .push(prom_sample);
     }
+
+    // Sort samples within each time series by timestamp.
+    let timeseries: Vec<TimeSeries> = series_map
+        .into_values()
+        .map(|mut ts| {
+            ts.samples.sort_by_key(|s| s.timestamp);
+            ts
+        })
+        .collect();
+
+    WriteRequest { timeseries }
 }
 
 /// Whether a metric name matches `[a-zA-Z_:][a-zA-Z0-9_:]*`.
@@ -307,7 +315,6 @@ fn sanitize_label_name(name: &str) -> String {
         if ok {
             out.push(c);
         } else if i == 0 {
-            // Prepend `_` and re-evaluate the first char as a body char.
             out.push('_');
             if c.is_ascii_alphanumeric() {
                 out.push(c);
@@ -338,23 +345,47 @@ mod tests {
     #[test]
     fn encodes_basic_sample() {
         let s = sample("txgen_sent_total", 42.0, &[]);
-        let out = encode_samples(&[s]);
-        assert_eq!(out, "txgen_sent_total 42.0 1700000000000\n");
+        let wr = build_write_request(&[s]);
+        assert_eq!(wr.timeseries.len(), 1);
+        let ts = &wr.timeseries[0];
+        assert_eq!(ts.labels.len(), 1);
+        assert_eq!(ts.labels[0].name, "__name__");
+        assert_eq!(ts.labels[0].value, "txgen_sent_total");
+        assert_eq!(ts.samples.len(), 1);
+        assert!((ts.samples[0].value - 42.0).abs() < f64::EPSILON);
+        assert_eq!(ts.samples[0].timestamp, 1_700_000_000_000);
     }
 
     #[test]
-    fn encodes_labels_in_sorted_order() {
+    fn encodes_labels_sorted() {
         let s = sample("reth_metric", 3.5, &[("zeta", "z"), ("alpha", "a")]);
-        let out = encode_samples(&[s]);
-        // BTreeMap orders keys alphabetically.
-        assert_eq!(out, "reth_metric{alpha=\"a\",zeta=\"z\"} 3.5 1700000000000\n");
+        let wr = build_write_request(&[s]);
+        let ts = &wr.timeseries[0];
+        // __name__ comes first, then alpha, then zeta.
+        assert_eq!(ts.labels[0].name, "__name__");
+        assert_eq!(ts.labels[1].name, "alpha");
+        assert_eq!(ts.labels[2].name, "zeta");
     }
 
     #[test]
-    fn escapes_label_values() {
-        let s = sample("m", 1.0, &[("path", "a\"b\\c\nd")]);
-        let out = encode_samples(&[s]);
-        assert!(out.contains(r#"path="a\"b\\c\nd""#), "got: {out}");
+    fn groups_same_series() {
+        let s1 = Sample {
+            name: "m".to_string(),
+            labels: [("host".to_string(), "a".to_string())].into(),
+            value: 1.0,
+            offset_ms: 0,
+            unix_ms: 1000,
+        };
+        let s2 = Sample {
+            name: "m".to_string(),
+            labels: [("host".to_string(), "a".to_string())].into(),
+            value: 2.0,
+            offset_ms: 100,
+            unix_ms: 2000,
+        };
+        let wr = build_write_request(&[s1, s2]);
+        assert_eq!(wr.timeseries.len(), 1);
+        assert_eq!(wr.timeseries[0].samples.len(), 2);
     }
 
     #[test]
@@ -363,8 +394,18 @@ mod tests {
         let nan = sample("ok_metric", f64::NAN, &[]);
         let inf = sample("ok_metric", f64::INFINITY, &[]);
         let good = sample("ok_metric", 7.0, &[]);
-        let out = encode_samples(&[bad, nan, inf, good]);
-        assert_eq!(out, "ok_metric 7.0 1700000000000\n");
+        let wr = build_write_request(&[bad, nan, inf, good]);
+        assert_eq!(wr.timeseries.len(), 1);
+        assert_eq!(wr.timeseries[0].samples[0].value, 7.0);
+    }
+
+    #[test]
+    fn encode_compressed_succeeds() {
+        let s = sample("test_metric", 99.0, &[("env", "dev")]);
+        let wr = build_write_request(&[s]);
+        // Verify that protobuf + snappy encoding doesn't panic or error.
+        let compressed = wr.encode_compressed().unwrap();
+        assert!(!compressed.is_empty());
     }
 
     #[test]
@@ -382,10 +423,9 @@ mod tests {
             ("git-sha".to_string(), "abc".to_string()),
             ("scenario".to_string(), "tip20".to_string()),
         ]);
-        let cfg = VictoriaMetricsConfig::from_metadata("http://vm:8428/", &metadata).unwrap();
+        let cfg = PrometheusConfig::from_metadata("http://vm:8428/", &metadata).unwrap();
 
         assert_eq!(cfg.base_url, "http://vm:8428");
-        // metadata key "git-sha" sanitized to "git_sha".
         assert!(cfg.extra_labels.contains_key("git_sha"));
         assert!(cfg.extra_labels.contains_key("scenario"));
     }
