@@ -6,6 +6,8 @@ A chain-agnostic transaction generation tool for blockchain load testing and ben
 
 txgen generates signed, RLP-encoded transactions from YAML workload specifications. It outputs transactions as newline-delimited JSON (NDJSON) that can be piped to sending tools or saved for later use.
 
+For end-to-end workflow examples, see the [txgen Cookbook](COOKBOOK.md).
+
 **Key features:**
 - **Chain-agnostic**: Plugin architecture supports multiple chains (Ethereum, Tempo)
 - **Deterministic**: Seed-based RNG for reproducible transaction generation
