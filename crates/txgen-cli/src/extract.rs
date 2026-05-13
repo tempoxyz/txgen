@@ -1,5 +1,5 @@
 use alloy_consensus::{BlockHeader, Sealed, Transaction};
-use alloy_eips::{eip2718::Encodable2718, BlockNumberOrTag};
+use alloy_eips::{eip2718::Encodable2718, eip7928::BlockAccessList, BlockNumberOrTag};
 use alloy_network::Network;
 use alloy_primitives::{Bytes, Sealable, B256};
 use alloy_provider::{ext::DebugApi, Provider};
@@ -31,6 +31,10 @@ pub struct ExtractArgs {
     /// Number of blocks to prefetch ahead
     #[arg(long, default_value = "20")]
     pub buffer_size: usize,
+
+    /// Include RLP-encoded block access lists from eth_getBlockAccessListByBlockNumber.
+    #[arg(long, default_value_t = false)]
+    pub bal: bool,
 }
 
 #[derive(Args)]
@@ -110,8 +114,11 @@ where
 
     let from = args.from;
     let to = args.to;
+    let include_bal = args.bal;
     let fetch_handle =
-        tokio::spawn(async move { fetch_blocks::<N, _>(provider, from, to, tx).await });
+        tokio::spawn(
+            async move { fetch_blocks::<N, _>(provider, from, to, include_bal, tx).await },
+        );
 
     let total = to - from + 1;
     let write_result = match args.output {
@@ -171,6 +178,8 @@ where
 #[derive(serde::Serialize)]
 struct BlockOutputLine<'a> {
     raw: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bal: Option<&'a str>,
     key: &'a str,
     number: u64,
     timestamp: u64,
@@ -192,9 +201,11 @@ async fn write_extracted_blocks<W: Write>(
         let block = result?;
 
         let raw_hex = format!("0x{}", hex::encode(&block.rlp_bytes));
+        let bal_hex = block.bal_rlp.as_ref().map(|bal| format!("0x{}", hex::encode(bal)));
         let key_hex = format!("{}", block.hash);
         let line = BlockOutputLine {
             raw: &raw_hex,
+            bal: bal_hex.as_deref(),
             key: &key_hex,
             number: block.number,
             timestamp: block.timestamp,
@@ -227,6 +238,7 @@ async fn write_extracted_blocks<W: Write>(
 
 struct FetchedBlock {
     rlp_bytes: Bytes,
+    bal_rlp: Option<Bytes>,
     hash: alloy_primitives::B256,
     number: u64,
     timestamp: u64,
@@ -235,8 +247,13 @@ struct FetchedBlock {
     tx_count: usize,
 }
 
-async fn fetch_blocks<N, P>(provider: P, from: u64, to: u64, tx: mpsc::Sender<Result<FetchedBlock>>)
-where
+async fn fetch_blocks<N, P>(
+    provider: P,
+    from: u64,
+    to: u64,
+    include_bal: bool,
+    tx: mpsc::Sender<Result<FetchedBlock>>,
+) where
     N: Network,
     N::TxEnvelope: Decodable,
     N::Header: Decodable,
@@ -249,6 +266,12 @@ where
                 .await
                 .wrap_err_with(|| format!("failed to fetch raw block {block_num}"))?;
 
+            let bal_rlp = if include_bal {
+                Some(fetch_encoded_block_access_list(&provider, block_num).await?)
+            } else {
+                None
+            };
+
             let sealed: Sealed<alloy_consensus::Block<N::TxEnvelope, N::Header>> =
                 alloy_consensus::Block::decode_sealed(&mut rlp_bytes.as_ref())
                     .map_err(|e| eyre::eyre!("failed to decode block {block_num}: {e}"))?;
@@ -258,6 +281,7 @@ where
 
             Ok(FetchedBlock {
                 rlp_bytes,
+                bal_rlp,
                 hash,
                 number: block.header.number(),
                 timestamp: block.header.timestamp(),
@@ -276,6 +300,20 @@ where
             break;
         }
     }
+}
+
+async fn fetch_encoded_block_access_list<N, P>(provider: &P, block_num: u64) -> Result<Bytes>
+where
+    N: Network,
+    P: Provider<N>,
+{
+    let block_access_list: BlockAccessList = provider
+        .get_block_access_list_by_number(BlockNumberOrTag::Number(block_num))
+        .await
+        .wrap_err_with(|| format!("failed to fetch block access list {block_num}"))?
+        .ok_or_else(|| eyre::eyre!("block access list not found for block {block_num}"))?;
+
+    Ok(alloy_rlp::encode(block_access_list).into())
 }
 
 async fn write_big_blocks<N, P, W>(
