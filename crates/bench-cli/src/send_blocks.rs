@@ -5,7 +5,7 @@
 //! via `reth_newPayload` (as `BlockRlp`) and `reth_forkchoiceUpdated`,
 //! collecting per-block timing and engine status from [`RethPayloadStatus`].
 
-use crate::{metrics_url::parse_metrics_scraper_configs, send::parse_metadata, SendBlocksArgs};
+use crate::{metrics_url::metrics_scraper_configs, send::parse_metadata, SendBlocksArgs};
 use alloy_network::Ethereum;
 use alloy_primitives::{Address, Bytes, B256};
 use alloy_provider::{ext::TestingApi, Provider, RootProvider};
@@ -94,6 +94,8 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         JwtSecret::from_hex(jwt_secret_hex.trim()).wrap_err("invalid JWT secret hex")?;
 
     let metadata = parse_metadata(&args.metadata)?;
+    let scraper_configs =
+        metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
     let persistence_policy = args.wait_for_persistence;
 
     tracing::info!(
@@ -122,17 +124,15 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let counters = Arc::new(BlockCounters::default());
 
     // Start background scraper if metrics URL is configured.
-    let scraper_handles = if let Some(ref url) = args.metrics_url {
+    let scraper_handles = if !scraper_configs.is_empty() {
         let snap_counters = counters.clone();
         let snap_clock = clock.clone();
         let callback: bench_core::SampleCallback =
             Arc::new(move || snap_counters.snapshot_samples(&snap_clock));
 
-        let scraper_configs =
-            parse_metrics_scraper_configs(url, Duration::from_millis(args.scrape_interval_ms))?;
         let mut handles = Vec::with_capacity(scraper_configs.len());
 
-        for (idx, scraper_config) in scraper_configs.into_iter().enumerate() {
+        for (idx, scraper_config) in scraper_configs.iter().cloned().enumerate() {
             tracing::info!(
                 url = %scraper_config.url,
                 node = scraper_config.node_label.as_deref().unwrap_or(""),

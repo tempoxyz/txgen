@@ -59,8 +59,13 @@ pub struct SendArgs {
     ///
     /// Use a single URL, or comma-separated `node:URL` entries for multiple
     /// endpoints. Labeled endpoints add `node=<label>` to scraped samples.
-    #[arg(long, value_name = "URL|NODE:URL,...")]
-    pub metrics_url: Option<String>,
+    #[arg(
+        long,
+        value_name = "URL|NODE:URL",
+        value_delimiter = ',',
+        value_parser = metrics_url::parse_metrics_url
+    )]
+    pub metrics_url: Vec<metrics_url::MetricsURL>,
 
     /// Scrape interval in milliseconds for the metrics scraper.
     #[arg(long, default_value = "500")]
@@ -129,8 +134,13 @@ pub struct SendBlocksArgs {
     ///
     /// Use a single URL, or comma-separated `node:URL` entries for multiple
     /// endpoints. Labeled endpoints add `node=<label>` to scraped samples.
-    #[arg(long, value_name = "URL|NODE:URL,...")]
-    pub metrics_url: Option<String>,
+    #[arg(
+        long,
+        value_name = "URL|NODE:URL",
+        value_delimiter = ',',
+        value_parser = metrics_url::parse_metrics_url
+    )]
+    pub metrics_url: Vec<metrics_url::MetricsURL>,
 
     /// Scrape interval in milliseconds for the metrics scraper.
     #[arg(long, default_value = "500")]
@@ -260,6 +270,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics_url::MetricsURL;
 
     #[test]
     fn test_parse_duration_millis_fallback_with_unit() {
@@ -302,5 +313,58 @@ mod tests {
         assert_eq!(parse_reorg_depth("8"), Ok(8));
         assert!(parse_reorg_depth("0").is_err());
         assert!(parse_reorg_depth("abc").is_err());
+    }
+
+    #[test]
+    fn test_metrics_url_value_parser_single_url() {
+        let cli = Cli::try_parse_from([
+            "bench",
+            "send",
+            "--metrics-url",
+            "http://127.0.0.1:9001/metrics",
+        ])
+        .unwrap();
+
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+
+        assert_eq!(
+            args.metrics_url,
+            vec![MetricsURL::Unlabeled("http://127.0.0.1:9001/metrics".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_metrics_url_value_parser_splits_comma_entries() {
+        let cli = Cli::try_parse_from([
+            "bench",
+            "send-blocks",
+            "--engine",
+            "http://localhost:8551",
+            "--jwt-secret",
+            "/tmp/jwt.hex",
+            "--metrics-url",
+            "a:http://node-a:9001/metrics,b:http://node-b:9001/metrics",
+        ])
+        .unwrap();
+
+        let Command::SendBlocks(args) = cli.command else {
+            panic!("expected send-blocks command");
+        };
+
+        assert_eq!(
+            args.metrics_url,
+            vec![
+                MetricsURL::Labeled {
+                    node: "a".to_string(),
+                    url: "http://node-a:9001/metrics".to_string(),
+                },
+                MetricsURL::Labeled {
+                    node: "b".to_string(),
+                    url: "http://node-b:9001/metrics".to_string(),
+                },
+            ]
+        );
     }
 }
