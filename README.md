@@ -85,7 +85,7 @@ txgen-ethereum addresses -s workload.yaml -f shell   # space-separated for xargs
 
 #### `extract`
 
-Extract raw RLP-encoded blocks from an archive node as NDJSON.
+Extract raw RLP-encoded blocks from an archive node as NDJSON. Use `--bal` to attach RLP-encoded block access lists for replaying EIP-7928/Amsterdam payloads.
 
 ```bash
 txgen-ethereum extract --rpc http://localhost:8545 --from 1000 --to 2000 -o blocks.ndjson
@@ -98,12 +98,13 @@ txgen-ethereum extract --rpc http://localhost:8545 --from 1000 --to 2000 -o bloc
 | `--to <N>` | Last block number (inclusive) |
 | `-o, --output <PATH>` | Output file (default: stdout) |
 | `--buffer-size <N>` | Number of blocks to prefetch ahead (default: 20) |
+| `--bal` | Include RLP-encoded block access lists in the `bal` field |
 
-**Required RPC methods:** `debug_getRawBlock`
+**Required RPC methods:** `debug_getRawBlock`; with `--bal`: `eth_getBlockAccessListByBlockNumber`
 
 #### `extract-big-blocks`
 
-Generate reth-bb-compatible big-block payloads as NDJSON.
+Generate reth-bb-compatible big-block payloads as NDJSON. Use `--bal` to fetch and merge constituent block access lists into `merged_block_access_list`.
 
 ```bash
 txgen-ethereum extract-big-blocks \
@@ -122,8 +123,9 @@ txgen-ethereum extract-big-blocks \
 | `--target-gas <GAS>` | Target gas per big block; accepts `K`, `M`, `G` suffixes |
 | `-o, --output <PATH>` | Output file (default: stdout) |
 | `--buffer-size <N>` | Reserved for future prefetching compatibility (default: 20) |
+| `--bal` | Include a merged RLP-encoded block access list for each synthetic big block |
 
-**Required RPC methods:** `debug_getRawBlock`
+**Required RPC methods:** `debug_getRawBlock`; with `--bal`: `eth_getBlockAccessListByBlockNumber`
 
 ### `bench`
 
@@ -167,7 +169,7 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 
 Submit RLP-encoded blocks or reth-bb big-block payloads via reth Engine API.
 
-Big-block inputs use the current reth-bb `BigBlockData` format where each NDJSON line contains the constituent execution payloads in `env_switches`, plus `prior_block_hashes`, `block_number`, and optional `merged_block_access_list`.
+Raw-block inputs may include an optional `bal` field produced by `txgen extract --bal`; `bench send-blocks` forwards it to `reth_newPayload` alongside the block RLP. Big-block inputs use the current reth-bb `BigBlockData` format where each NDJSON line contains the constituent execution payloads in `env_switches`, plus `prior_block_hashes`, `block_number`, and optional `merged_block_access_list`.
 
 ```bash
 bench send-blocks --engine http://localhost:8551 --jwt-secret /path/to/jwt.hex --input blocks.ndjson
@@ -732,6 +734,7 @@ Summary of which RPC methods are required by each feature:
 | `eth_getTransactionReceipt` | `bench send` (setup and inclusion waits) |
 | `eth_getBlockByNumber` | `bench send` (per-block stats collection) |
 | `debug_getRawBlock` | `txgen extract`, `txgen-ethereum extract-big-blocks` |
+| `eth_getBlockAccessListByBlockNumber` | `txgen extract --bal`, `txgen-ethereum extract-big-blocks --bal` |
 | `reth_newPayload` | `bench send-blocks` |
 | `reth_forkchoiceUpdated` | `bench send-blocks` |
 | `testing_buildBlockV1` | `bench send-blocks --reorg` |
