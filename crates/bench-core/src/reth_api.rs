@@ -39,8 +39,6 @@ pub enum RethNewPayloadInput {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bal: Option<Bytes>,
     },
-    /// Legacy raw RLP-encoded block bytes accepted by older reth versions.
-    LegacyBlockRlp(Bytes),
 }
 
 /// Big-block payload data for reth-bb.
@@ -196,9 +194,9 @@ mod tests {
                 assert_eq!(block.as_ref(), &[0xf8, 0x70, 0x01]);
                 assert_eq!(bal.as_ref().map(Bytes::as_ref), Some(&[0xc0][..]));
             }
-            RethNewPayloadInput::ExecutionData(_) |
-            RethNewPayloadInput::BigBlockData(_) |
-            RethNewPayloadInput::LegacyBlockRlp(_) => panic!("expected BlockRlp variant"),
+            RethNewPayloadInput::ExecutionData(_) | RethNewPayloadInput::BigBlockData(_) => {
+                panic!("expected BlockRlp variant")
+            }
         }
     }
 
