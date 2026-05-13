@@ -155,6 +155,7 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
 | `--metrics-url <URL>` | Prometheus endpoint to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
+| `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 300, 0 to disable) |
 
@@ -182,6 +183,7 @@ bench send-blocks --engine http://localhost:8551 --jwt-secret /path/to/jwt.hex -
 | `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
 | `--metrics-url <URL>` | Prometheus endpoint to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
+| `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
 
 For `send-blocks`, aggregate run rates use benchmark wall-clock duration. Per-block timestamps remain the original chain timestamps from the input.
 
@@ -250,6 +252,8 @@ bench send -i txs.ndjson --metrics-url http://127.0.0.1:9001/metrics --scrape-in
 Internal txgen metrics are snapshotted on the same interval and included alongside node metrics. In `send` mode: `txgen_transactions_sent_total`, `txgen_transactions_success_total`, etc. In `send-blocks` mode: `txgen_blocks_sent_total`, `txgen_blocks_success_total`, `txgen_blocks_failed_total`.
 
 Metadata key=value pairs (`-m key=value`) are applied as labels to all samples, useful for tagging runs with build SHAs, profiles, or experiment IDs.
+
+Use `--metrics-align <TIMESTAMP>` to shift exported sample timestamps while preserving each sample's offset within the run. The timestamp is treated as benchmark start time and may be Unix seconds or milliseconds; after conversion to milliseconds, exported sample `unix_ms` values become `TIMESTAMP + offset_ms`.
 
 ### ClickHouse Reporting
 
