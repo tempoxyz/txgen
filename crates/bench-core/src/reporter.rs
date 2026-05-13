@@ -741,11 +741,10 @@ fn system_time_to_millis(t: std::time::SystemTime) -> u64 {
 /// - `console` - Human-readable output to stderr
 /// - `json:<path>` - JSON output to file
 /// - `clickhouse:<url>` - Push benchmark data to ClickHouse
-/// - `prometheus:<url>` - Push samples via Prometheus remote write protocol
-///   (protobuf + snappy on `/api/v1/write`). Works with VictoriaMetrics,
-///   Prometheus, Cortex, Thanos, etc.
-///   Auth and other knobs are read from environment variables (`VM_BEARER_TOKEN`, `VM_USER`,
-///   `VM_PASSWORD`, `VM_TENANT_ID`, `VM_BATCH_SIZE`, `VM_TIMEOUT_SECS`).
+/// - `prometheus:<url>` - Push samples via Prometheus remote write protocol (protobuf + snappy on
+///   `/api/v1/write`). Works with VictoriaMetrics, Prometheus, Cortex, Thanos, etc. Auth and other
+///   knobs are read from environment variables (`VM_BEARER_TOKEN`, `VM_USER`, `VM_PASSWORD`,
+///   `VM_TENANT_ID`, `VM_BATCH_SIZE`, `VM_TIMEOUT_SECS`).
 ///
 /// The ClickHouse reporter requires metadata keys: `scenario`, `platform`,
 /// `git-sha`, `git-ref`. Pass them via `-m key=value`.
@@ -773,9 +772,8 @@ pub fn parse_reporters(
             reporters.push(Box::new(
                 ClickHouseReporter::new(config).wrap_err("failed to create ClickHouse reporter")?,
             ));
-        } else if let Some(url) = spec
-            .strip_prefix("prometheus:")
-            .or_else(|| spec.strip_prefix("victoriametrics:"))
+        } else if let Some(url) =
+            spec.strip_prefix("prometheus:").or_else(|| spec.strip_prefix("victoriametrics:"))
         {
             let config =
                 crate::prometheus_reporter::PrometheusConfig::from_metadata(url, metadata)?;

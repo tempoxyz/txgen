@@ -10,13 +10,13 @@
 pub mod clock;
 pub mod metrics;
 pub mod prometheus;
+pub mod prometheus_reporter;
 pub mod reporter;
 pub mod reth_api;
 pub mod sample;
 pub mod scraper;
 pub mod sender;
 pub mod source;
-pub mod prometheus_reporter;
 
 pub use clock::RunClock;
 pub use metrics::{
@@ -25,6 +25,7 @@ pub use metrics::{
     TimeSeriesMetrics,
 };
 pub use prometheus::parse_prometheus_text;
+pub use prometheus_reporter::{PrometheusConfig, PrometheusReporter};
 pub use reporter::{
     parse_reporters, ClickHouseConfig, ClickHouseReporter, ConsoleReporter, FinalReport,
     JsonLatency, JsonLatencySample, JsonReport, JsonReporter, JsonTimeSeries, ProgressState,
@@ -39,4 +40,3 @@ pub use scraper::{start_scraper, SampleCallback, ScraperConfig, ScraperHandle};
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource};
 pub use txgen_core::{GeneratedTx, TxPhase};
-pub use prometheus_reporter::{PrometheusConfig, PrometheusReporter};
