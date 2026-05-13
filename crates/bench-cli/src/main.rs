@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use eyre::Result;
 use std::{path::PathBuf, time::Duration};
 
+mod metrics_url;
 mod send;
 mod send_blocks;
 mod view;
@@ -54,11 +55,11 @@ pub struct SendArgs {
     #[arg(short = 'm', long = "metadata", value_name = "KEY=VALUE")]
     pub metadata: Vec<String>,
 
-    /// Prometheus metrics endpoint to scrape during the benchmark.
+    /// Prometheus metrics endpoint(s) to scrape during the benchmark.
     ///
-    /// If set, a background scraper fetches node metrics at the configured
-    /// interval and includes them in the final report.
-    #[arg(long)]
+    /// Use a single URL, or comma-separated `node:URL` entries for multiple
+    /// endpoints. Labeled endpoints add `node=<label>` to scraped samples.
+    #[arg(long, value_name = "URL|NODE:URL,...")]
     pub metrics_url: Option<String>,
 
     /// Scrape interval in milliseconds for the metrics scraper.
@@ -124,8 +125,11 @@ pub struct SendBlocksArgs {
     #[arg(short = 'm', long = "metadata", value_name = "KEY=VALUE")]
     pub metadata: Vec<String>,
 
-    /// Prometheus metrics endpoint to scrape during the benchmark.
-    #[arg(long)]
+    /// Prometheus metrics endpoint(s) to scrape during the benchmark.
+    ///
+    /// Use a single URL, or comma-separated `node:URL` entries for multiple
+    /// endpoints. Labeled endpoints add `node=<label>` to scraped samples.
+    #[arg(long, value_name = "URL|NODE:URL,...")]
     pub metrics_url: Option<String>,
 
     /// Scrape interval in milliseconds for the metrics scraper.

@@ -28,6 +28,8 @@ pub type SampleCallback = Arc<dyn Fn() -> Vec<Sample> + Send + Sync>;
 pub struct ScraperConfig {
     /// URL of the Prometheus metrics endpoint (e.g. `http://127.0.0.1:9001/metrics`).
     pub url: String,
+    /// Optional node label to add to scraped Prometheus samples.
+    pub node_label: Option<String>,
     /// Scrape interval.
     pub interval: Duration,
     /// HTTP request timeout per scrape.
@@ -39,9 +41,16 @@ impl ScraperConfig {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
+            node_label: None,
             interval: Duration::from_millis(500),
             timeout: Duration::from_secs(2),
         }
+    }
+
+    /// Set the `node` label applied to scraped Prometheus samples.
+    pub fn with_node_label(mut self, label: impl Into<String>) -> Self {
+        self.node_label = Some(label.into());
+        self
     }
 
     /// Set the scrape interval.
@@ -155,7 +164,8 @@ async fn scraper_loop(
         match client.get(&config.url).send().await {
             Ok(resp) => match resp.text().await {
                 Ok(text) => {
-                    let samples = parse_prometheus_text(&text, offset_ms, unix_ms);
+                    let mut samples = parse_prometheus_text(&text, offset_ms, unix_ms);
+                    apply_node_label(&mut samples, config.node_label.as_deref());
                     if !samples.is_empty() {
                         store.push_batch(samples).await;
                     }
@@ -171,5 +181,60 @@ async fn scraper_loop(
                 error_count.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+}
+
+fn apply_node_label(samples: &mut [Sample], node_label: Option<&str>) {
+    if let Some(node_label) = node_label {
+        for sample in samples {
+            sample.labels.insert("node".to_string(), node_label.to_string());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn apply_node_label_adds_label_to_all_samples() {
+        let mut samples = vec![
+            Sample {
+                name: "reth_db_size".to_string(),
+                labels: BTreeMap::new(),
+                value: 1.0,
+                offset_ms: 10,
+                unix_ms: 1000,
+            },
+            Sample {
+                name: "reth_table_size".to_string(),
+                labels: BTreeMap::from([("table".to_string(), "Headers".to_string())]),
+                value: 2.0,
+                offset_ms: 10,
+                unix_ms: 1000,
+            },
+        ];
+
+        apply_node_label(&mut samples, Some("a"));
+
+        assert_eq!(samples[0].labels["node"], "a");
+        assert_eq!(samples[1].labels["node"], "a");
+        assert_eq!(samples[1].labels["table"], "Headers");
+    }
+
+    #[test]
+    fn apply_node_label_overwrites_existing_node_label() {
+        let mut samples = vec![Sample {
+            name: "reth_db_size".to_string(),
+            labels: BTreeMap::from([("node".to_string(), "old".to_string())]),
+            value: 1.0,
+            offset_ms: 10,
+            unix_ms: 1000,
+        }];
+
+        apply_node_label(&mut samples, Some("new"));
+
+        assert_eq!(samples[0].labels["node"], "new");
     }
 }

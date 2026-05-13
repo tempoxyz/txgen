@@ -155,7 +155,7 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `--timeout <DUR>` | Request timeout (default: 30s) |
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
 | `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
-| `--metrics-url <URL>` | Prometheus endpoint to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
+| `--metrics-url <URL or NODE:URL,...>` | Prometheus endpoint(s) to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
@@ -193,7 +193,7 @@ bench send-blocks \
 | `--rpc <URL>` | Regular HTTP RPC endpoint for `testing_buildBlockV1` when `--reorg` is enabled (default: `http://localhost:8545`) |
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
 | `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
-| `--metrics-url <URL>` | Prometheus endpoint to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
+| `--metrics-url <URL or NODE:URL,...>` | Prometheus endpoint(s) to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
 
@@ -251,7 +251,7 @@ Report destinations are specified with `--report` and can be repeated:
 
 ### Metrics Scraping
 
-All bench commands support built-in Prometheus metrics scraping via `--metrics-url`. When enabled, a background scraper periodically fetches the node's `/metrics` endpoint and includes all samples in the JSON report.
+All bench commands support built-in Prometheus metrics scraping via `--metrics-url`. When enabled, one or more background scrapers periodically fetch node `/metrics` endpoints and include all samples in the JSON report.
 
 ```bash
 # Scrape node metrics alongside the benchmark
@@ -259,7 +259,12 @@ bench send -i txs.ndjson --metrics-url http://127.0.0.1:9001/metrics --report js
 
 # Custom scrape interval (default: 500ms)
 bench send -i txs.ndjson --metrics-url http://127.0.0.1:9001/metrics --scrape-interval-ms 200
+
+# Scrape multiple nodes and tag each scraped sample with node=<label>
+bench send -i txs.ndjson --metrics-url a:http://node-a:9001/metrics,b:http://node-b:9001/metrics
 ```
+
+For a single endpoint, pass the URL directly. For multiple endpoints, every comma-separated entry must use `node_label:URL`; the label is added to scraped Prometheus samples as `node=<node_label>`.
 
 Internal txgen metrics are snapshotted on the same interval and included alongside node metrics. In `send` mode: `txgen_transactions_sent_total`, `txgen_transactions_success_total`, etc. In `send-blocks` mode: `txgen_blocks_sent_total`, `txgen_blocks_success_total`, `txgen_blocks_failed_total`.
 

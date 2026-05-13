@@ -10,7 +10,7 @@
 #
 # Common options:
 #   --mode <MODE>          Benchmark mode: send or replay (default: send)
-#   --metrics-url <URL>    Prometheus metrics endpoint (default: http://127.0.0.1:9001/metrics)
+#   --metrics-url <URL>    Prometheus metrics endpoint; use a:URL,b:URL for multiple
 #   --scrape-interval <N>  Metrics scrape interval in ms (default: 500)
 #   --datadir <PATH>       Explicit datadir (default: mktemp)
 #   --metadata <K=V>       Extra metadata key=value (repeatable)

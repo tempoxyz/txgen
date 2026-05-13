@@ -1,6 +1,6 @@
 //! `bench send` - Send transactions from file or stdin
 
-use crate::SendArgs;
+use crate::{metrics_url::parse_metrics_scraper_configs, SendArgs};
 use alloy_network::AnyNetwork;
 use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
@@ -8,8 +8,8 @@ use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     collect_block_stats, parse_reporters, start_scraper, trim_trailing_empty_blocks,
     ConsoleReporter, FileSource, FinalReport, GeneratedTx, MetricsCollector, ProgressState,
-    Reporter, RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, StdinSource,
-    TxPhase, TxSource,
+    Reporter, RunClock, RunStats, SampleStore, Sender, SenderConfig, StdinSource, TxPhase,
+    TxSource,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, time::Duration};
@@ -78,20 +78,29 @@ async fn execute_source<S: TxSource>(
 
     // Start background scraper + internal snapshotter after setup so setup is
     // excluded from benchmark metrics.
-    let scraper_handle = if let Some(ref url) = args.metrics_url {
-        let scraper_config =
-            ScraperConfig::new(url).with_interval(Duration::from_millis(args.scrape_interval_ms));
-
+    let scraper_handles = if let Some(ref url) = args.metrics_url {
         let snap_metrics = metrics.clone();
         let callback: bench_core::SampleCallback =
             std::sync::Arc::new(move || snap_metrics.snapshot_samples());
 
-        let handle = start_scraper(scraper_config, clock.clone(), store.clone(), Some(callback));
+        let scraper_configs =
+            parse_metrics_scraper_configs(url, Duration::from_millis(args.scrape_interval_ms))?;
+        let mut handles = Vec::with_capacity(scraper_configs.len());
 
-        tracing::info!(url, "Started metrics scraper");
-        Some(handle)
+        for (idx, scraper_config) in scraper_configs.into_iter().enumerate() {
+            tracing::info!(
+                url = %scraper_config.url,
+                node = scraper_config.node_label.as_deref().unwrap_or(""),
+                "Started metrics scraper"
+            );
+            let extra_samples = (idx == 0).then(|| callback.clone());
+            let handle = start_scraper(scraper_config, clock.clone(), store.clone(), extra_samples);
+            handles.push(handle);
+        }
+
+        handles
     } else {
-        None
+        Vec::new()
     };
 
     let mut sender = Sender::new(providers.clone(), config.clone(), metrics.clone());
@@ -121,13 +130,16 @@ async fn execute_source<S: TxSource>(
     }
 
     // Stop the scraper before finalizing.
-    if let Some(handle) = scraper_handle {
+    if !scraper_handles.is_empty() {
         tracing::info!(
-            scrapes = handle.scrape_count(),
-            errors = handle.error_count(),
-            "Stopping metrics scraper"
+            scrapers = scraper_handles.len(),
+            scrapes = scraper_handles.iter().map(|h| h.scrape_count()).sum::<u64>(),
+            errors = scraper_handles.iter().map(|h| h.error_count()).sum::<u64>(),
+            "Stopping metrics scrapers"
         );
-        handle.stop().await;
+        for handle in scraper_handles {
+            handle.stop().await;
+        }
     }
 
     let final_metrics = metrics.finalize().await;
