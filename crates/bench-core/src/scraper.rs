@@ -92,36 +92,47 @@ impl ScraperHandle {
     }
 }
 
-/// Start a background scraper task.
+/// Start background scraper tasks for given configs.
 ///
-/// Returns a [`ScraperHandle`] to stop the scraper and query stats.
+/// Returns [`ScraperHandle`]s to stop the scrapers and query stats.
 /// Scrape failures are logged but never propagated — they do not
 /// affect the benchmark.
 ///
-/// An optional `extra_samples` callback is invoked on every tick at the
-/// same offset as the Prometheus scrape, ensuring internal and node
-/// metrics share identical timestamps.
-pub fn start_scraper(
-    config: ScraperConfig,
+/// An `extra_samples` callback is invoked on every tick at the
+/// same offset as the Prometheus scrape for the first config,
+/// ensuring internal and node metrics share identical timestamps.
+pub fn start_scrapers(
+    configs: &[ScraperConfig],
     clock: RunClock,
     store: SampleStore,
-    extra_samples: Option<SampleCallback>,
-) -> ScraperHandle {
+    callback: SampleCallback,
+) -> Vec<ScraperHandle> {
     let (stop_tx, stop_rx) = watch::channel(false);
     let scrape_count = Arc::new(AtomicU64::new(0));
     let error_count = Arc::new(AtomicU64::new(0));
 
-    let handle = tokio::spawn(scraper_loop(
-        config,
-        clock,
-        store,
-        extra_samples,
-        stop_rx,
-        scrape_count.clone(),
-        error_count.clone(),
-    ));
+    configs
+        .iter()
+        .enumerate()
+        .map(|(idx, config)| {
+            let handle = tokio::spawn(scraper_loop(
+                config.clone(),
+                clock.clone(),
+                store.clone(),
+                (idx == 0).then(|| callback.clone()),
+                stop_rx.clone(),
+                scrape_count.clone(),
+                error_count.clone(),
+            ));
 
-    ScraperHandle { stop_tx, handle, scrape_count, error_count }
+            ScraperHandle {
+                stop_tx: stop_tx.clone(),
+                handle,
+                scrape_count: scrape_count.clone(),
+                error_count: error_count.clone(),
+            }
+        })
+        .collect()
 }
 
 async fn scraper_loop(

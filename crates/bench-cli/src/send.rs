@@ -6,7 +6,7 @@ use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
-    collect_block_stats, parse_reporters, start_scraper, trim_trailing_empty_blocks,
+    collect_block_stats, parse_reporters, start_scrapers, trim_trailing_empty_blocks,
     ConsoleReporter, FileSource, FinalReport, GeneratedTx, MetricsCollector, ProgressState,
     Reporter, RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, StdinSource,
     TxPhase, TxSource,
@@ -86,20 +86,7 @@ async fn execute_source<S: TxSource>(
         let callback: bench_core::SampleCallback =
             std::sync::Arc::new(move || snap_metrics.snapshot_samples());
 
-        let mut handles = Vec::with_capacity(scraper_configs.len());
-
-        for (idx, scraper_config) in scraper_configs.iter().cloned().enumerate() {
-            tracing::info!(
-                url = %scraper_config.url,
-                node = scraper_config.node_label.as_deref().unwrap_or(""),
-                "Started metrics scraper"
-            );
-            let extra_samples = (idx == 0).then(|| callback.clone());
-            let handle = start_scraper(scraper_config, clock.clone(), store.clone(), extra_samples);
-            handles.push(handle);
-        }
-
-        handles
+        start_scrapers(scraper_configs, clock.clone(), store.clone(), callback)
     } else {
         Vec::new()
     };

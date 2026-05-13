@@ -15,7 +15,7 @@ use alloy_rpc_types_engine::{
 };
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    parse_reporters, start_scraper, BigBlockData, BlockStats, ConsoleReporter, FinalReport,
+    parse_reporters, start_scrapers, BigBlockData, BlockStats, ConsoleReporter, FinalReport,
     ProgressState, Reporter, RethApi, RethNewPayloadInput, RunClock, RunStats, Sample, SampleStore,
     WaitForPersistence,
 };
@@ -130,19 +130,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         let callback: bench_core::SampleCallback =
             Arc::new(move || snap_counters.snapshot_samples(&snap_clock));
 
-        scraper_configs
-            .into_iter()
-            .enumerate()
-            .map(|(idx, scraper_config)| {
-                tracing::info!(
-                    url = %scraper_config.url,
-                    node = scraper_config.node_label.as_deref().unwrap_or(""),
-                    "Started metrics scraper"
-                );
-                let extra_samples = (idx == 0).then(|| callback.clone());
-                start_scraper(scraper_config, clock.clone(), store.clone(), extra_samples)
-            })
-            .collect()
+        start_scrapers(&scraper_configs, clock.clone(), store.clone(), callback)
     } else {
         Vec::new()
     };
