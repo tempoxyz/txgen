@@ -1,8 +1,8 @@
 //! Prometheus remote write reporter.
 //!
 //! Pushes the unified [`Sample`] stream from a benchmark run to any
-//! Prometheus-compatible remote write endpoint (VictoriaMetrics,
-//! Prometheus, Cortex, Thanos, etc.) via `/api/v1/write` using the
+//! Prometheus-compatible remote write endpoint (Prometheus, VictoriaMetrics,
+//! Cortex, Thanos, etc.) via `/api/v1/write` using the
 //! standard remote write protocol (protobuf + snappy compression).
 //!
 //! User-provided metadata (`-m key=value`) are forwarded as `extra_label`
@@ -15,12 +15,12 @@
 //!
 //! | Env var               | Purpose                                              |
 //! |-----------------------|------------------------------------------------------|
-//! | `VM_BEARER_TOKEN`     | `Authorization: Bearer …` header                    |
-//! | `VM_USER`             | HTTP basic auth username (used with `VM_PASSWORD`)   |
-//! | `VM_PASSWORD`         | HTTP basic auth password                             |
-//! | `VM_TENANT_ID`        | Cluster tenant / accountID query param               |
-//! | `VM_BATCH_SIZE`       | Samples per HTTP request (default: 10_000)           |
-//! | `VM_TIMEOUT_SECS`     | Per-request timeout in seconds (default: 60)         |
+//! | `PROMETHEUS_BEARER_TOKEN`     | `Authorization: Bearer …` header                    |
+//! | `PROMETHEUS_USER`             | HTTP basic auth username (used with `PROMETHEUS_PASSWORD`)   |
+//! | `PROMETHEUS_PASSWORD`         | HTTP basic auth password                             |
+//! | `PROMETHEUS_TENANT_ID`        | Cluster tenant / accountID query param               |
+//! | `PROMETHEUS_BATCH_SIZE`       | Samples per HTTP request (default: 10_000)           |
+//! | `PROMETHEUS_TIMEOUT_SECS`     | Per-request timeout in seconds (default: 60)         |
 
 use crate::{reporter::FinalReport, sample::Sample, Reporter};
 use eyre::{bail, Context, Result};
@@ -64,18 +64,21 @@ impl PrometheusConfig {
         base_url: &str,
         metadata: &std::collections::HashMap<String, String>,
     ) -> Result<Self> {
-        let bearer_token = std::env::var("VM_BEARER_TOKEN").ok().filter(|s| !s.is_empty());
-        let basic_auth = match (std::env::var("VM_USER").ok(), std::env::var("VM_PASSWORD").ok()) {
+        let bearer_token = std::env::var("PROMETHEUS_BEARER_TOKEN").ok().filter(|s| !s.is_empty());
+        let basic_auth = match (
+            std::env::var("PROMETHEUS_USER").ok(),
+            std::env::var("PROMETHEUS_PASSWORD").ok(),
+        ) {
             (Some(u), Some(p)) if !u.is_empty() => Some((u, p)),
             _ => None,
         };
-        let tenant_id = std::env::var("VM_TENANT_ID").ok().filter(|s| !s.is_empty());
-        let batch_size = std::env::var("VM_BATCH_SIZE")
+        let tenant_id = std::env::var("PROMETHEUS_TENANT_ID").ok().filter(|s| !s.is_empty());
+        let batch_size = std::env::var("PROMETHEUS_BATCH_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|n: &usize| *n > 0)
             .unwrap_or(DEFAULT_BATCH_SIZE);
-        let timeout_secs = std::env::var("VM_TIMEOUT_SECS")
+        let timeout_secs = std::env::var("PROMETHEUS_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|n: &u64| *n > 0)
@@ -152,10 +155,7 @@ impl PrometheusReporter {
     /// Build common request headers (auth + content-type).
     fn headers(&self) -> Result<HeaderMap> {
         let mut h = HeaderMap::new();
-        h.insert(
-            reqwest::header::CONTENT_TYPE,
-            HeaderValue::from_static(CONTENT_TYPE),
-        );
+        h.insert(reqwest::header::CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE));
         h.insert("Content-Encoding", HeaderValue::from_static("snappy"));
         h.insert(
             HEADER_NAME_REMOTE_WRITE_VERSION,
@@ -163,7 +163,7 @@ impl PrometheusReporter {
         );
         if let Some(token) = &self.config.bearer_token {
             let v = HeaderValue::from_str(&format!("Bearer {token}"))
-                .context("invalid VM_BEARER_TOKEN")?;
+                .context("invalid PROMETHEUS_BEARER_TOKEN")?;
             h.insert(AUTHORIZATION, v);
         }
         Ok(h)
@@ -176,9 +176,7 @@ impl PrometheusReporter {
         }
 
         let write_req = build_write_request(batch);
-        let body = write_req
-            .encode_compressed()
-            .context("snappy compression failed")?;
+        let body = write_req.encode_compressed().context("snappy compression failed")?;
 
         let headers = self.headers()?;
         let rt = tokio::runtime::Handle::current();
@@ -242,10 +240,7 @@ fn build_write_request(samples: &[Sample]) -> WriteRequest {
 
         // Build the label set: __name__ + user labels.
         let mut labels: Vec<Label> = Vec::with_capacity(s.labels.len() + 1);
-        labels.push(Label {
-            name: LABEL_NAME.to_string(),
-            value: s.name.clone(),
-        });
+        labels.push(Label { name: LABEL_NAME.to_string(), value: s.name.clone() });
         for (k, v) in &s.labels {
             let key = sanitize_label_name(k);
             if !key.is_empty() {
@@ -256,16 +251,10 @@ fn build_write_request(samples: &[Sample]) -> WriteRequest {
         labels.sort_by(|a, b| a.name.cmp(&b.name));
 
         // Build a stable key for grouping.
-        let series_key: String = labels
-            .iter()
-            .map(|l| format!("{}={}", l.name, l.value))
-            .collect::<Vec<_>>()
-            .join(",");
+        let series_key: String =
+            labels.iter().map(|l| format!("{}={}", l.name, l.value)).collect::<Vec<_>>().join(",");
 
-        let prom_sample = PromSample {
-            value: s.value,
-            timestamp: s.unix_ms as i64,
-        };
+        let prom_sample = PromSample { value: s.value, timestamp: s.unix_ms as i64 };
 
         series_map
             .entry(series_key)
@@ -423,9 +412,9 @@ mod tests {
             ("git-sha".to_string(), "abc".to_string()),
             ("scenario".to_string(), "tip20".to_string()),
         ]);
-        let cfg = PrometheusConfig::from_metadata("http://vm:8428/", &metadata).unwrap();
+        let cfg = PrometheusConfig::from_metadata("http://prometheus:8428/", &metadata).unwrap();
 
-        assert_eq!(cfg.base_url, "http://vm:8428");
+        assert_eq!(cfg.base_url, "http://prometheus:8428");
         assert!(cfg.extra_labels.contains_key("git_sha"));
         assert!(cfg.extra_labels.contains_key("scenario"));
     }
