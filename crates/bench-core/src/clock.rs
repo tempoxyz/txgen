@@ -34,7 +34,11 @@ impl RunClock {
         // SAFETY: `SystemTime::now()` is always after `UNIX_EPOCH`.
         let start_unix_ms =
             SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64;
+        Self::new_with_start_unix_ms(start_unix_ms)
+    }
 
+    /// Create a new clock with a specific Unix start time.
+    pub fn new_with_start_unix_ms(start_unix_ms: u64) -> Self {
         Self { inner: Arc::new(Inner { start_instant: Instant::now(), start_unix_ms }) }
     }
 
