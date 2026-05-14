@@ -180,9 +180,8 @@ pub async fn fetch_protocol_nonces(
 
     for (pool_name, addresses) in accounts.all_addresses() {
         let total = addresses.len();
+        eprintln!("fetching nonces for {} ({} accounts)...", pool_name, total);
         for (idx, address) in addresses.iter().enumerate() {
-            eprintln!("fetching nonce for {}[{}/{}] ({})...", pool_name, idx + 1, total, address);
-
             let nonce = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 Provider::get_transaction_count(&provider, *address),
@@ -195,16 +194,8 @@ pub async fn fetch_protocol_nonces(
 
             let scheduling_key = address.0 .0;
             nonces.reset(scheduling_key, nonce);
-
-            eprintln!(
-                "fetched nonce for {}[{}/{}] ({}): {}",
-                pool_name,
-                idx + 1,
-                total,
-                address,
-                nonce
-            );
         }
+        eprintln!("fetched nonces for {} ({} accounts)", pool_name, total);
     }
 
     Ok(())
