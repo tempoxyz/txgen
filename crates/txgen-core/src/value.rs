@@ -33,9 +33,8 @@ pub enum Generator {
     Pool { pool: String, select: SelectMode },
     /// Random bytes of given length.
     RandomBytes(usize),
-    /// Random address.
-    #[serde(rename = "random")]
-    RandomAddress,
+    /// Random value.
+    Random,
     /// Explicit constant value.
     Const(serde_yaml::Value),
 }
@@ -90,6 +89,7 @@ impl FromGenerator for u64 {
                 let idx = resolver.rng.random_range(0..choices.len());
                 Ok(serde_yaml::from_value(choices[idx].clone())?)
             }
+            Generator::Random => Ok(resolver.rng.random()),
             _ => bail!("cannot generate u64 from {:?}", generator),
         }
     }
@@ -106,6 +106,7 @@ impl FromGenerator for u128 {
                 let idx = resolver.rng.random_range(0..choices.len());
                 Ok(serde_yaml::from_value(choices[idx].clone())?)
             }
+            Generator::Random => Ok(resolver.rng.random()),
             _ => bail!("cannot generate u128 from {:?}", generator),
         }
     }
@@ -139,6 +140,7 @@ impl FromGenerator for U256 {
                     bail!("cannot parse U256 from {:?}", v)
                 }
             }
+            Generator::Random => Ok(resolver.rng.random()),
             _ => bail!("cannot generate U256 from {:?}", generator),
         }
     }
@@ -163,16 +165,10 @@ impl FromGenerator for Address {
                 let s: String = serde_yaml::from_value(choices[idx].clone())?;
                 Ok(s.parse()?)
             }
-            Generator::RandomAddress => Ok(random_address(resolver)),
+            Generator::Random => Ok(resolver.rng.random()),
             _ => bail!("cannot generate Address from {:?}", generator),
         }
     }
-}
-
-fn random_address(resolver: &mut ValueResolver<'_>) -> Address {
-    let mut bytes = [0u8; 20];
-    resolver.rng.fill(&mut bytes[..]);
-    Address::from(bytes)
 }
 
 impl FromGenerator for Bytes {
@@ -212,6 +208,7 @@ impl FromGenerator for B256 {
                 let s: String = serde_yaml::from_value(choices[idx].clone())?;
                 Ok(s.parse()?)
             }
+            Generator::Random => Ok(resolver.rng.random()),
             _ => bail!("cannot generate B256 from {:?}", generator),
         }
     }
