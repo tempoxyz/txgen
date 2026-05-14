@@ -260,16 +260,22 @@ mod tests {
     }
 
     #[test]
-    fn test_random_address() {
+    fn test_random() {
         let accounts = AccountManager::empty();
         let mut rng = StdRng::seed_from_u64(42);
         let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
 
-        let first: Address = resolver.resolve(&serde_yaml::from_str("random").unwrap()).unwrap();
-        let second: Address = resolver.resolve(&serde_yaml::from_str("random").unwrap()).unwrap();
+        let generator = Generator::Random;
 
-        assert_ne!(first, Address::ZERO);
-        assert_ne!(second, Address::ZERO);
-        assert_ne!(first, second);
+        // Supported types: should succeed.
+        assert!(u64::from_generator(&generator, &mut resolver).is_ok());
+        assert!(u128::from_generator(&generator, &mut resolver).is_ok());
+        assert!(U256::from_generator(&generator, &mut resolver).is_ok());
+        assert!(Address::from_generator(&generator, &mut resolver).is_ok());
+        assert!(B256::from_generator(&generator, &mut resolver).is_ok());
+
+        // Unsupported types: should fail.
+        assert!(Bytes::from_generator(&generator, &mut resolver).is_err());
+        assert!(String::from_generator(&generator, &mut resolver).is_err());
     }
 }

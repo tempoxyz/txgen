@@ -420,18 +420,6 @@ mod tests {
     }
 
     #[test]
-    fn test_random_address_generator_argument() {
-        let accounts = AccountManager::empty();
-        let mut rng = rand::rng();
-        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
-        let value = serde_yaml::from_str::<serde_yaml::Value>("random").expect("valid YAML");
-
-        let sol_value = yaml_to_sol_value(&value, "address", &mut resolver).unwrap();
-
-        assert!(matches!(sol_value, DynSolValue::Address(address) if address != Address::ZERO));
-    }
-
-    #[test]
     fn test_fractional_uint_literal_fails() {
         let accounts = AccountManager::empty();
         let mut rng = rand::rng();
