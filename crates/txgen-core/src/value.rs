@@ -33,6 +33,8 @@ pub enum Generator {
     Pool { pool: String, select: SelectMode },
     /// Random bytes of given length.
     RandomBytes(usize),
+    /// Random value.
+    Random,
     /// Explicit constant value.
     Const(serde_yaml::Value),
 }
@@ -87,6 +89,7 @@ impl FromGenerator for u64 {
                 let idx = resolver.rng.random_range(0..choices.len());
                 Ok(serde_yaml::from_value(choices[idx].clone())?)
             }
+            Generator::Random => Ok(resolver.rng.random()),
             _ => bail!("cannot generate u64 from {:?}", generator),
         }
     }
@@ -103,6 +106,7 @@ impl FromGenerator for u128 {
                 let idx = resolver.rng.random_range(0..choices.len());
                 Ok(serde_yaml::from_value(choices[idx].clone())?)
             }
+            Generator::Random => Ok(resolver.rng.random()),
             _ => bail!("cannot generate u128 from {:?}", generator),
         }
     }
@@ -136,6 +140,7 @@ impl FromGenerator for U256 {
                     bail!("cannot parse U256 from {:?}", v)
                 }
             }
+            Generator::Random => Ok(resolver.rng.random()),
             _ => bail!("cannot generate U256 from {:?}", generator),
         }
     }
@@ -160,6 +165,7 @@ impl FromGenerator for Address {
                 let s: String = serde_yaml::from_value(choices[idx].clone())?;
                 Ok(s.parse()?)
             }
+            Generator::Random => Ok(resolver.rng.random()),
             _ => bail!("cannot generate Address from {:?}", generator),
         }
     }
@@ -202,6 +208,7 @@ impl FromGenerator for B256 {
                 let s: String = serde_yaml::from_value(choices[idx].clone())?;
                 Ok(s.parse()?)
             }
+            Generator::Random => Ok(resolver.rng.random()),
             _ => bail!("cannot generate B256 from {:?}", generator),
         }
     }
@@ -250,5 +257,25 @@ mod tests {
             addr,
             Address::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
         );
+    }
+
+    #[test]
+    fn test_random() {
+        let accounts = AccountManager::empty();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+
+        let generator = Generator::Random;
+
+        // Supported types: should succeed.
+        assert!(u64::from_generator(&generator, &mut resolver).is_ok());
+        assert!(u128::from_generator(&generator, &mut resolver).is_ok());
+        assert!(U256::from_generator(&generator, &mut resolver).is_ok());
+        assert!(Address::from_generator(&generator, &mut resolver).is_ok());
+        assert!(B256::from_generator(&generator, &mut resolver).is_ok());
+
+        // Unsupported types: should fail.
+        assert!(Bytes::from_generator(&generator, &mut resolver).is_err());
+        assert!(String::from_generator(&generator, &mut resolver).is_err());
     }
 }

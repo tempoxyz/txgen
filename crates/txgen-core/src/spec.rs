@@ -412,6 +412,8 @@ sequences:
         account: { pool: users, select: { index: 1 } }
       amount:
         u256: { uniform: [1, 10] }
+      random_recipient:
+        address: random
       salt:
         bytes32: { random_bytes: 32 }
       channel_id:
@@ -436,6 +438,7 @@ mix:
         let sequence = &spec.sequences["pair"];
         assert_eq!(sequence.steps.len(), 2);
         assert!(matches!(sequence.bindings["amount"], SequenceBinding::U256(_)));
+        assert!(matches!(sequence.bindings["random_recipient"], SequenceBinding::Address(_)));
         assert!(matches!(sequence.bindings["salt"], SequenceBinding::Bytes32(_)));
         assert!(matches!(sequence.bindings["channel_id"], SequenceBinding::AbiHash(_)));
         assert_eq!(spec.mix[0].item, MixItem::Sequence("pair".to_string()));

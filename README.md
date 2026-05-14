@@ -477,6 +477,9 @@ to:
   pool: users
   select: random
 
+# Random address
+to: random
+
 # Random bytes
 input:
   random_bytes: 32
@@ -628,6 +631,8 @@ Hash bindings can reference other sequence bindings and are resolved once per se
 bindings:
   payer:
     account: { pool: users, select: random }
+  ephemeral_recipient:
+    address: random
   salt:
     bytes32: { random_bytes: 32 }
   channel_id:

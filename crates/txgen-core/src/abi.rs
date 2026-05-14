@@ -289,6 +289,8 @@ fn yaml_to_sol_value(
         {
             return resolve_generator_to_sol(value, sol_type, resolver);
         }
+    } else if matches!(value, serde_yaml::Value::String(s) if s == "random") {
+        return resolve_generator_to_sol(value, sol_type, resolver);
     }
 
     // Direct value conversion
