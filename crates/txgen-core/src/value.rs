@@ -33,6 +33,9 @@ pub enum Generator {
     Pool { pool: String, select: SelectMode },
     /// Random bytes of given length.
     RandomBytes(usize),
+    /// Random address.
+    #[serde(rename = "random")]
+    RandomAddress,
     /// Explicit constant value.
     Const(serde_yaml::Value),
 }
@@ -160,9 +163,16 @@ impl FromGenerator for Address {
                 let s: String = serde_yaml::from_value(choices[idx].clone())?;
                 Ok(s.parse()?)
             }
+            Generator::RandomAddress => Ok(random_address(resolver)),
             _ => bail!("cannot generate Address from {:?}", generator),
         }
     }
+}
+
+fn random_address(resolver: &mut ValueResolver<'_>) -> Address {
+    let mut bytes = [0u8; 20];
+    resolver.rng.fill(&mut bytes[..]);
+    Address::from(bytes)
 }
 
 impl FromGenerator for Bytes {
@@ -250,5 +260,19 @@ mod tests {
             addr,
             Address::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
         );
+    }
+
+    #[test]
+    fn test_random_address() {
+        let accounts = AccountManager::empty();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+
+        let first: Address = resolver.resolve(&serde_yaml::from_str("random").unwrap()).unwrap();
+        let second: Address = resolver.resolve(&serde_yaml::from_str("random").unwrap()).unwrap();
+
+        assert_ne!(first, Address::ZERO);
+        assert_ne!(second, Address::ZERO);
+        assert_ne!(first, second);
     }
 }

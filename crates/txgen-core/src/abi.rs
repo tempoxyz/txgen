@@ -289,6 +289,8 @@ fn yaml_to_sol_value(
         {
             return resolve_generator_to_sol(value, sol_type, resolver);
         }
+    } else if matches!(value, serde_yaml::Value::String(s) if s == "random") {
+        return resolve_generator_to_sol(value, sol_type, resolver);
     }
 
     // Direct value conversion
@@ -415,6 +417,18 @@ mod tests {
         let sol_value = yaml_to_sol_value(&value, "uint256", &mut resolver).unwrap();
 
         assert_eq!(sol_value, DynSolValue::Uint(U256::from(16), 256));
+    }
+
+    #[test]
+    fn test_random_address_generator_argument() {
+        let accounts = AccountManager::empty();
+        let mut rng = rand::rng();
+        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+        let value = serde_yaml::from_str::<serde_yaml::Value>("random").expect("valid YAML");
+
+        let sol_value = yaml_to_sol_value(&value, "address", &mut resolver).unwrap();
+
+        assert!(matches!(sol_value, DynSolValue::Address(address) if address != Address::ZERO));
     }
 
     #[test]
