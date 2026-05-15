@@ -10,6 +10,7 @@ use alloy_rlp::Decodable;
 use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload};
 use clap::Args;
 use eyre::{bail, Result, WrapErr};
+use futures::{stream, StreamExt};
 use std::{io::Write, path::PathBuf};
 use tokio::sync::mpsc;
 
@@ -107,8 +108,8 @@ struct BigBlockData<T> {
 pub(crate) async fn run_extract<N>(args: ExtractArgs) -> Result<()>
 where
     N: Network,
-    N::TxEnvelope: Decodable,
-    N::Header: Decodable,
+    N::TxEnvelope: Decodable + 'static,
+    N::Header: Decodable + 'static,
 {
     if args.from > args.to {
         bail!("--from must be <= --to");
@@ -122,10 +123,10 @@ where
     let from = args.from;
     let to = args.to;
     let include_bal = args.bal;
-    let fetch_handle =
-        tokio::spawn(
-            async move { fetch_blocks::<N, _>(provider, from, to, include_bal, tx).await },
-        );
+    let buffer_size = args.buffer_size;
+    let fetch_handle = tokio::spawn(async move {
+        fetch_blocks::<N, _>(provider, from, to, include_bal, buffer_size, tx).await
+    });
 
     let total = to - from + 1;
     let write_result = match args.output {
@@ -152,8 +153,8 @@ where
 pub(crate) async fn run_extract_big_blocks<N>(args: ExtractBigBlocksArgs) -> Result<()>
 where
     N: Network,
-    N::TxEnvelope: Decodable + Encodable2718 + Transaction,
-    N::Header: Decodable + BlockHeader + Sealable,
+    N::TxEnvelope: Decodable + Encodable2718 + Transaction + 'static,
+    N::Header: Decodable + BlockHeader + Sealable + 'static,
 {
     if args.count == 0 {
         bail!("--count must be greater than 0");
@@ -259,46 +260,52 @@ async fn fetch_blocks<N, P>(
     from: u64,
     to: u64,
     include_bal: bool,
+    buffer_size: usize,
     tx: mpsc::Sender<Result<FetchedBlock>>,
 ) where
     N: Network,
-    N::TxEnvelope: Decodable,
-    N::Header: Decodable,
-    P: Provider<N> + DebugApi<N>,
+    N::TxEnvelope: Decodable + 'static,
+    N::Header: Decodable + 'static,
+    P: Provider<N> + DebugApi<N> + Clone + 'static,
 {
-    for block_num in from..=to {
-        let result = async {
-            let rlp_bytes: Bytes = provider
-                .debug_get_raw_block(BlockNumberOrTag::Number(block_num).into())
-                .await
-                .wrap_err_with(|| format!("failed to fetch raw block {block_num}"))?;
+    let buffer_size = buffer_size.max(1);
+    let mut block_stream = stream::iter(from..=to)
+        .map(move |block_num| {
+            let provider = provider.clone();
+            async move {
+                let rlp_bytes: Bytes = provider
+                    .debug_get_raw_block(BlockNumberOrTag::Number(block_num).into())
+                    .await
+                    .wrap_err_with(|| format!("failed to fetch raw block {block_num}"))?;
 
-            let bal_rlp = if include_bal {
-                Some(fetch_encoded_block_access_list(&provider, block_num).await?)
-            } else {
-                None
-            };
+                let bal_rlp = if include_bal {
+                    Some(fetch_encoded_block_access_list(&provider, block_num).await?)
+                } else {
+                    None
+                };
 
-            let sealed: Sealed<alloy_consensus::Block<N::TxEnvelope, N::Header>> =
-                alloy_consensus::Block::decode_sealed(&mut rlp_bytes.as_ref())
-                    .map_err(|e| eyre::eyre!("failed to decode block {block_num}: {e}"))?;
+                let sealed: Sealed<alloy_consensus::Block<N::TxEnvelope, N::Header>> =
+                    alloy_consensus::Block::decode_sealed(&mut rlp_bytes.as_ref())
+                        .map_err(|e| eyre::eyre!("failed to decode block {block_num}: {e}"))?;
 
-            let hash = sealed.hash();
-            let block = sealed.inner();
+                let hash = sealed.hash();
+                let block = sealed.inner();
 
-            Ok(FetchedBlock {
-                rlp_bytes,
-                bal_rlp,
-                hash,
-                number: block.header.number(),
-                timestamp: block.header.timestamp(),
-                gas_used: block.header.gas_used(),
-                gas_limit: block.header.gas_limit(),
-                tx_count: block.body.transactions.len(),
-            })
-        }
-        .await;
+                Ok(FetchedBlock {
+                    rlp_bytes,
+                    bal_rlp,
+                    hash,
+                    number: block.header.number(),
+                    timestamp: block.header.timestamp(),
+                    gas_used: block.header.gas_used(),
+                    gas_limit: block.header.gas_limit(),
+                    tx_count: block.body.transactions.len(),
+                })
+            }
+        })
+        .buffered(buffer_size);
 
+    while let Some(result) = block_stream.next().await {
         let is_err = result.is_err();
         if tx.send(result).await.is_err() {
             break;
@@ -316,16 +323,26 @@ async fn write_big_blocks<N, P, W>(
 ) -> Result<()>
 where
     N: Network,
-    N::TxEnvelope: Decodable + Encodable2718 + Transaction,
-    N::Header: Decodable + BlockHeader + Sealable,
-    P: Provider<N> + DebugApi<N>,
+    N::TxEnvelope: Decodable + Encodable2718 + Transaction + 'static,
+    N::Header: Decodable + BlockHeader + Sealable + 'static,
+    P: Provider<N> + DebugApi<N> + Clone + 'static,
     W: Write,
 {
     let start = std::time::Instant::now();
-    let mut source_block = args.from;
     let mut emitted = 0_u64;
     let mut accumulated_block_hashes = Vec::new();
     let mut first_source_block = None;
+
+    // Buffered prefetch stream: keeps `buffer_size` block fetches in flight concurrently.
+    let buffer_size = args.buffer_size.max(1);
+    let include_bal = args.bal;
+    let provider = provider.clone();
+    let mut block_stream = stream::iter(args.from..)
+        .map(move |block_num| {
+            let provider = provider.clone();
+            async move { fetch_execution_data::<N, _>(&provider, block_num, include_bal).await }
+        })
+        .buffered(buffer_size);
 
     while emitted < args.count {
         let mut blocks = Vec::new();
@@ -333,13 +350,15 @@ where
         let mut accumulated_gas = 0_u64;
 
         while accumulated_gas < args.target_gas {
-            let fetched = fetch_execution_data::<N, _>(provider, source_block, args.bal).await?;
+            let fetched = block_stream
+                .next()
+                .await
+                .ok_or_else(|| eyre::eyre!("block stream exhausted unexpectedly"))??;
             first_source_block.get_or_insert(fetched.execution_data.block_number());
             accumulated_gas =
                 accumulated_gas.saturating_add(fetched.execution_data.payload.as_v1().gas_used);
             blocks.push(fetched.execution_data);
             block_access_lists.push(fetched.block_access_list);
-            source_block = source_block.saturating_add(1);
         }
 
         let merged_block_access_list = merge_block_access_lists(&blocks, block_access_lists);
