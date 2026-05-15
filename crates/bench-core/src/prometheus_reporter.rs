@@ -135,7 +135,17 @@ impl PrometheusReporter {
         if !params.is_empty() {
             let qs: Vec<String> = params
                 .into_iter()
-                .map(|(k, v)| format!("{}={}", urlencoding::encode(&k), urlencoding::encode(&v)))
+                .map(|(k, v)| {
+                    // Encode the param key but NOT the value — VictoriaMetrics
+                    // expects `extra_label=key=value` with a literal `=` between
+                    // the label name and label value.  Encoding the value would
+                    // turn that `=` into `%3D` and VM silently ignores the param.
+                    format!(
+                        "{}={}",
+                        urlencoding::encode(&k),
+                        v.replace(' ', "%20"),
+                    )
+                })
                 .collect();
             url.push('?');
             url.push_str(&qs.join("&"));
