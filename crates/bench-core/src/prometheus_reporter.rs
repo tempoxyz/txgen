@@ -164,7 +164,7 @@ impl PrometheusReporter {
         let body = write_req.encode_compressed().context("snappy compression failed")?;
         let body_len = body.len();
 
-        tracing::debug!(
+        tracing::info!(
             batch = batch_idx,
             samples = batch.len(),
             timeseries = timeseries_count,
@@ -199,7 +199,7 @@ impl PrometheusReporter {
             bail!("remote write failed (HTTP {status}): {resp_body}");
         }
 
-        tracing::debug!(
+        tracing::info!(
             batch = batch_idx,
             %status,
             body = %resp_body,
