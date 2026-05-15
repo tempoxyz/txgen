@@ -36,7 +36,7 @@ pub use reth_api::{
     WaitForPersistence, DEFAULT_PERSISTENCE_THRESHOLD,
 };
 pub use sample::{Sample, SampleStore};
-pub use scraper::{start_scraper, SampleCallback, ScraperConfig, ScraperHandle};
+pub use scraper::{start_scrapers, SampleCallback, ScraperConfig, ScraperHandle};
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource};
 pub use txgen_core::{GeneratedTx, TxPhase};

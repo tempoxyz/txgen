@@ -6,7 +6,7 @@
 //! (as `BlockRlp`) and `reth_forkchoiceUpdated`,
 //! collecting per-block timing and engine status from [`RethPayloadStatus`].
 
-use crate::{send::parse_metadata, SendBlocksArgs};
+use crate::{metrics_url::metrics_scraper_configs, send::parse_metadata, SendBlocksArgs};
 use alloy_network::Ethereum;
 use alloy_primitives::{Address, Bytes, B256};
 use alloy_provider::{ext::TestingApi, Provider, RootProvider};
@@ -16,9 +16,9 @@ use alloy_rpc_types_engine::{
 };
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    parse_reporters, start_scraper, BigBlockData, BlockStats, ConsoleReporter, FinalReport,
+    parse_reporters, start_scrapers, BigBlockData, BlockStats, ConsoleReporter, FinalReport,
     ProgressState, Reporter, RethApi, RethNewPayloadInput, RunClock, RunStats, Sample, SampleStore,
-    ScraperConfig, WaitForPersistence,
+    WaitForPersistence,
 };
 use eyre::{Context, Result};
 use std::{
@@ -98,6 +98,8 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         JwtSecret::from_hex(jwt_secret_hex.trim()).wrap_err("invalid JWT secret hex")?;
 
     let metadata = parse_metadata(&args.metadata)?;
+    let scraper_configs =
+        metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
     let persistence_policy = args.wait_for_persistence;
 
     tracing::info!(
@@ -126,20 +128,15 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let counters = Arc::new(BlockCounters::default());
 
     // Start background scraper if metrics URL is configured.
-    let scraper_handle = if let Some(ref url) = args.metrics_url {
-        let scraper_config =
-            ScraperConfig::new(url).with_interval(Duration::from_millis(args.scrape_interval_ms));
-
+    let scraper_handles = if !scraper_configs.is_empty() {
         let snap_counters = counters.clone();
         let snap_clock = clock.clone();
         let callback: bench_core::SampleCallback =
             Arc::new(move || snap_counters.snapshot_samples(&snap_clock));
 
-        let handle = start_scraper(scraper_config, clock.clone(), store.clone(), Some(callback));
-        tracing::info!(url, "Started metrics scraper");
-        Some(handle)
+        start_scrapers(&scraper_configs, clock.clone(), store.clone(), callback)
     } else {
-        None
+        Vec::new()
     };
 
     let mut collector = MetricsCollector::new(counters);
@@ -202,13 +199,16 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     }
 
     // Stop the scraper before finalizing.
-    if let Some(handle) = scraper_handle {
+    if !scraper_handles.is_empty() {
         tracing::info!(
-            scrapes = handle.scrape_count(),
-            errors = handle.error_count(),
-            "Stopping metrics scraper"
+            scrapers = scraper_handles.len(),
+            scrapes = scraper_handles.iter().map(|h| h.scrape_count()).sum::<u64>(),
+            errors = scraper_handles.iter().map(|h| h.error_count()).sum::<u64>(),
+            "Stopping metrics scrapers"
         );
-        handle.stop().await;
+        for handle in scraper_handles {
+            handle.stop().await;
+        }
     }
 
     // Push a final snapshot so counter totals are captured even if the

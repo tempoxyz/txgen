@@ -1,12 +1,12 @@
 //! `bench send` - Send transactions from file or stdin
 
-use crate::SendArgs;
+use crate::{metrics_url::metrics_scraper_configs, SendArgs};
 use alloy_network::AnyNetwork;
 use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
-    collect_block_stats, parse_reporters, start_scraper, trim_trailing_empty_blocks,
+    collect_block_stats, parse_reporters, start_scrapers, trim_trailing_empty_blocks,
     ConsoleReporter, FileSource, FinalReport, GeneratedTx, MetricsCollector, ProgressState,
     Reporter, RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, StdinSource,
     TxPhase, TxSource,
@@ -24,6 +24,8 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     );
 
     let metadata = parse_metadata(&args.metadata)?;
+    let scraper_configs =
+        metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
 
     // CU/s set to u64::MAX to disable the layer's built-in rate limiting
     // while keeping retry-on-429 behavior. The benchmarking tool has its own
@@ -48,11 +50,11 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     match &args.input {
         Some(path) => {
             let mut source = FileSource::new(path).wrap_err("failed to open input file")?;
-            execute_source(&args, &metadata, providers, &mut source).await
+            execute_source(&args, &metadata, providers, &mut source, &scraper_configs).await
         }
         None => {
             let mut source = StdinSource::new();
-            execute_source(&args, &metadata, providers, &mut source).await
+            execute_source(&args, &metadata, providers, &mut source, &scraper_configs).await
         }
     }
 }
@@ -62,6 +64,7 @@ async fn execute_source<S: TxSource>(
     metadata: &HashMap<String, String>,
     providers: Vec<DynProvider<AnyNetwork>>,
     source: &mut S,
+    scraper_configs: &[ScraperConfig],
 ) -> Result<()> {
     let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
     let query_provider = &providers[0];
@@ -78,20 +81,14 @@ async fn execute_source<S: TxSource>(
 
     // Start background scraper + internal snapshotter after setup so setup is
     // excluded from benchmark metrics.
-    let scraper_handle = if let Some(ref url) = args.metrics_url {
-        let scraper_config =
-            ScraperConfig::new(url).with_interval(Duration::from_millis(args.scrape_interval_ms));
-
+    let scraper_handles = if !scraper_configs.is_empty() {
         let snap_metrics = metrics.clone();
         let callback: bench_core::SampleCallback =
             std::sync::Arc::new(move || snap_metrics.snapshot_samples());
 
-        let handle = start_scraper(scraper_config, clock.clone(), store.clone(), Some(callback));
-
-        tracing::info!(url, "Started metrics scraper");
-        Some(handle)
+        start_scrapers(scraper_configs, clock.clone(), store.clone(), callback)
     } else {
-        None
+        Vec::new()
     };
 
     let mut sender = Sender::new(providers.clone(), config.clone(), metrics.clone());
@@ -121,13 +118,16 @@ async fn execute_source<S: TxSource>(
     }
 
     // Stop the scraper before finalizing.
-    if let Some(handle) = scraper_handle {
+    if !scraper_handles.is_empty() {
         tracing::info!(
-            scrapes = handle.scrape_count(),
-            errors = handle.error_count(),
-            "Stopping metrics scraper"
+            scrapers = scraper_handles.len(),
+            scrapes = scraper_handles.iter().map(|h| h.scrape_count()).sum::<u64>(),
+            errors = scraper_handles.iter().map(|h| h.error_count()).sum::<u64>(),
+            "Stopping metrics scrapers"
         );
-        handle.stop().await;
+        for handle in scraper_handles {
+            handle.stop().await;
+        }
     }
 
     let final_metrics = metrics.finalize().await;

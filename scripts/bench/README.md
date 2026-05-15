@@ -83,6 +83,9 @@ cargo build --release -p bench-cli -p txgen-tempo
 # Custom metrics endpoint
 ./scripts/bench/run.sh --metrics-url http://127.0.0.1:9001/metrics
 
+# Multiple metrics endpoints, tagged as node=a and node=b
+./scripts/bench/run.sh --metrics-url a:http://node-a:9001/metrics,b:http://node-b:9001/metrics
+
 # Skip plot generation
 ./scripts/bench/run.sh --no-plot
 
@@ -124,6 +127,9 @@ Metrics scraping is handled by the `bench` binary itself via `--metrics-url`.
 The scraper runs in-process alongside the benchmark, fetching the node's
 Prometheus `/metrics` endpoint at the configured interval (default: 500ms).
 All scraped samples are included in the JSON report's `samples` array.
+
+Pass a single URL directly, or pass multiple comma-separated `node:URL` entries.
+For multiple endpoints, the `node` label is added to scraped Prometheus samples.
 
 In send mode, internal metrics (`txgen_transactions_sent_total`, etc.) are
 snapshotted on the same interval. In replay mode, block submission counters
