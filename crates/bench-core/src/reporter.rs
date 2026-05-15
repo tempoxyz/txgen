@@ -457,24 +457,24 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
 
         // Stream samples to NDJSON — one JSON object per line, no buffering
         // of the entire serialized payload in memory.
-        if write_ndjson {
-            if let Some(samples_path) = &self.samples_path {
-                if !report.samples.is_empty() {
-                    let file = std::fs::File::create(samples_path)
-                        .wrap_err_with(|| format!("failed to create samples file {}", samples_path.display()))?;
-                    let mut writer = std::io::BufWriter::new(file);
-                    for sample in &report.samples {
-                        serde_json::to_writer(&mut writer, sample)?;
-                        writeln!(writer)?;
-                    }
-                    writer.flush()?;
-                    tracing::info!(
-                        path = %samples_path.display(),
-                        count = report.samples.len(),
-                        "Wrote samples to NDJSON file"
-                    );
-                }
+        if write_ndjson &&
+            let Some(samples_path) = &self.samples_path &&
+            !report.samples.is_empty()
+        {
+            let file = std::fs::File::create(samples_path).wrap_err_with(|| {
+                format!("failed to create samples file {}", samples_path.display())
+            })?;
+            let mut writer = std::io::BufWriter::new(file);
+            for sample in &report.samples {
+                serde_json::to_writer(&mut writer, sample)?;
+                writeln!(writer)?;
             }
+            writer.flush()?;
+            tracing::info!(
+                path = %samples_path.display(),
+                count = report.samples.len(),
+                "Wrote samples to NDJSON file"
+            );
         }
 
         Ok(())
@@ -1104,8 +1104,8 @@ mod tests {
         let report_json: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&report_path).unwrap()).unwrap();
         assert!(
-            report_json.get("samples").is_none()
-                || report_json["samples"].as_array().unwrap().is_empty()
+            report_json.get("samples").is_none() ||
+                report_json["samples"].as_array().unwrap().is_empty()
         );
 
         // Samples NDJSON should exist with 2 lines.
