@@ -17,7 +17,7 @@ use std::{
 };
 use tokio::{
     sync::{mpsc, Semaphore},
-    task::JoinHandle,
+    task::JoinSet,
 };
 use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey, TxPhase};
 
@@ -75,8 +75,8 @@ pub struct Sender {
     active_keys: HashSet<SchedulingKey>,
     completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
     completion_rx: mpsc::UnboundedReceiver<SchedulingKeys>,
-    /// Worker task handles for awaiting completion.
-    worker_handles: Vec<JoinHandle<()>>,
+    /// Worker tasks for awaiting completion and reaping completed task state.
+    worker_tasks: JoinSet<()>,
     /// Rate limiter tokens.
     rate_limiter: Option<Arc<RateLimiter>>,
 }
@@ -106,7 +106,7 @@ impl Sender {
             active_keys: HashSet::new(),
             completion_tx,
             completion_rx,
-            worker_handles: Vec::new(),
+            worker_tasks: JoinSet::new(),
             rate_limiter,
         }
     }
@@ -151,14 +151,25 @@ impl Sender {
             }
         }
 
-        for handle in self.worker_handles.drain(..) {
-            let _ = handle.await;
+        while let Some(result) = self.worker_tasks.join_next().await {
+            if let Err(err) = result {
+                tracing::warn!(%err, "sender worker task failed");
+            }
         }
     }
 
     fn drain_completions(&mut self) {
         while let Ok(keys) = self.completion_rx.try_recv() {
             self.release_keys(&keys);
+        }
+        self.reap_worker_tasks();
+    }
+
+    fn reap_worker_tasks(&mut self) {
+        while let Some(result) = self.worker_tasks.try_join_next() {
+            if let Err(err) = result {
+                tracing::warn!(%err, "sender worker task failed");
+            }
         }
     }
 
@@ -198,10 +209,9 @@ impl Sender {
         let semaphore = self.semaphore.clone();
         let completion_tx = self.completion_tx.clone();
 
-        let handle = tokio::spawn(async move {
+        self.worker_tasks.spawn(async move {
             submit_tx(pending, providers, metrics, semaphore, completion_tx).await;
         });
-        self.worker_handles.push(handle);
     }
 }
 

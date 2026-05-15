@@ -21,7 +21,10 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::{
+    sync::{mpsc, oneshot, Mutex},
+    task::JoinHandle,
+};
 
 /// Metrics collected during a benchmark run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,10 +415,80 @@ struct TimestampedEvent {
     event: TxEvent,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ThroughputCounts {
+    sent: u64,
+    success: u64,
+    failed: u64,
+}
+
+#[derive(Debug, Default)]
+struct MetricsAggregation {
+    throughput: BTreeMap<u64, ThroughputCounts>,
+    latencies: Vec<TimestampedLatency>,
+}
+
+impl MetricsAggregation {
+    fn record_event(&mut self, event: TimestampedEvent) {
+        let bucket = self.throughput.entry(event.offset.as_secs()).or_default();
+        match event.event {
+            TxEvent::Sent => bucket.sent += 1,
+            TxEvent::Success => bucket.success += 1,
+            TxEvent::Failed => bucket.failed += 1,
+        }
+    }
+
+    fn record_latency(&mut self, latency: TimestampedLatency) {
+        self.latencies.push(latency);
+    }
+}
+
+async fn metrics_aggregation_loop(
+    aggregation: Arc<Mutex<MetricsAggregation>>,
+    mut latency_rx: mpsc::UnboundedReceiver<TimestampedLatency>,
+    mut event_rx: mpsc::UnboundedReceiver<TimestampedEvent>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = &mut shutdown_rx => break,
+            Some(event) = event_rx.recv() => {
+                let mut aggregation = aggregation.lock().await;
+                aggregation.record_event(event);
+                drain_available_metrics(&mut aggregation, &mut latency_rx, &mut event_rx);
+            }
+            Some(latency) = latency_rx.recv() => {
+                let mut aggregation = aggregation.lock().await;
+                aggregation.record_latency(latency);
+                drain_available_metrics(&mut aggregation, &mut latency_rx, &mut event_rx);
+            }
+            else => break,
+        }
+    }
+
+    let mut aggregation = aggregation.lock().await;
+    drain_available_metrics(&mut aggregation, &mut latency_rx, &mut event_rx);
+}
+
+fn drain_available_metrics(
+    aggregation: &mut MetricsAggregation,
+    latency_rx: &mut mpsc::UnboundedReceiver<TimestampedLatency>,
+    event_rx: &mut mpsc::UnboundedReceiver<TimestampedEvent>,
+) {
+    while let Ok(event) = event_rx.try_recv() {
+        aggregation.record_event(event);
+    }
+    while let Ok(latency) = latency_rx.try_recv() {
+        aggregation.record_latency(latency);
+    }
+}
+
 /// Atomic counters for concurrent metrics collection.
 ///
 /// Events and latencies are sent through lock-free mpsc channels to avoid
-/// write-lock contention on the hot path at high TPS.
+/// write-lock contention on the hot path at high TPS. A background aggregation
+/// task drains those channels continuously so they do not retain one queued
+/// allocation per transaction until final reporting.
 pub struct MetricsCollector {
     sent: AtomicU64,
     success: AtomicU64,
@@ -423,8 +496,9 @@ pub struct MetricsCollector {
     clock: RunClock,
     latency_tx: mpsc::UnboundedSender<TimestampedLatency>,
     event_tx: mpsc::UnboundedSender<TimestampedEvent>,
-    latency_rx: Mutex<mpsc::UnboundedReceiver<TimestampedLatency>>,
-    event_rx: Mutex<mpsc::UnboundedReceiver<TimestampedEvent>>,
+    aggregation: Arc<Mutex<MetricsAggregation>>,
+    aggregation_shutdown: Mutex<Option<oneshot::Sender<()>>>,
+    aggregation_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for MetricsCollector {
@@ -442,6 +516,15 @@ impl MetricsCollector {
     pub fn new(clock: RunClock) -> Arc<Self> {
         let (latency_tx, latency_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (aggregation_shutdown_tx, aggregation_shutdown_rx) = oneshot::channel();
+        let aggregation = Arc::new(Mutex::new(MetricsAggregation::default()));
+        let aggregation_handle = tokio::spawn(metrics_aggregation_loop(
+            aggregation.clone(),
+            latency_rx,
+            event_rx,
+            aggregation_shutdown_rx,
+        ));
+
         Arc::new(Self {
             sent: AtomicU64::new(0),
             success: AtomicU64::new(0),
@@ -449,8 +532,9 @@ impl MetricsCollector {
             clock,
             latency_tx,
             event_tx,
-            latency_rx: Mutex::new(latency_rx),
-            event_rx: Mutex::new(event_rx),
+            aggregation,
+            aggregation_shutdown: Mutex::new(Some(aggregation_shutdown_tx)),
+            aggregation_handle: Mutex::new(Some(aggregation_handle)),
         })
     }
 
@@ -545,41 +629,37 @@ impl MetricsCollector {
         ]
     }
 
-    /// Drain all pending latency samples from the channel.
-    fn drain_latencies(
-        rx: &mut mpsc::UnboundedReceiver<TimestampedLatency>,
-    ) -> Vec<TimestampedLatency> {
-        let mut latencies = Vec::new();
-        while let Ok(l) = rx.try_recv() {
-            latencies.push(l);
+    async fn finish_aggregation(&self) {
+        if let Some(shutdown) = self.aggregation_shutdown.lock().await.take() {
+            let _ = shutdown.send(());
         }
-        latencies
-    }
 
-    /// Drain all pending events from the channel.
-    fn drain_events(rx: &mut mpsc::UnboundedReceiver<TimestampedEvent>) -> Vec<TimestampedEvent> {
-        let mut events = Vec::new();
-        while let Ok(e) = rx.try_recv() {
-            events.push(e);
+        if let Some(handle) = self.aggregation_handle.lock().await.take() &&
+            let Err(err) = handle.await
+        {
+            tracing::warn!(%err, "metrics aggregation task failed");
         }
-        events
     }
 
     /// Compute final metrics.
     pub async fn finalize(&self) -> BenchMetrics {
         let elapsed = self.clock.elapsed();
+        self.finish_aggregation().await;
 
-        let mut latency_rx = self.latency_rx.lock().await;
-        let mut latencies = Self::drain_latencies(&mut latency_rx);
-        latencies.sort_by_key(|l| l.latency);
-        let durations: Vec<Duration> = latencies.iter().map(|l| l.latency).collect();
+        let latency = {
+            let aggregation = self.aggregation.lock().await;
+            let mut durations: Vec<Duration> =
+                aggregation.latencies.iter().map(|l| l.latency).collect();
+            durations.sort();
+            LatencyStats::from_sorted(&durations)
+        };
 
         BenchMetrics {
             sent: self.sent.load(Ordering::Relaxed),
             success: self.success.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
             elapsed,
-            latency: LatencyStats::from_sorted(&durations),
+            latency,
         }
     }
 
@@ -587,35 +667,22 @@ impl MetricsCollector {
     pub async fn time_series(&self) -> TimeSeriesMetrics {
         let total_elapsed = self.clock.elapsed();
         let total_seconds = total_elapsed.as_secs() + 1;
+        self.finish_aggregation().await;
 
-        let mut event_rx = self.event_rx.lock().await;
-        let mut latency_rx = self.latency_rx.lock().await;
-        let events = Self::drain_events(&mut event_rx);
-        let latencies = Self::drain_latencies(&mut latency_rx);
-
+        let aggregation = self.aggregation.lock().await;
         let mut throughput = Vec::with_capacity(total_seconds as usize);
         for second in 0..total_seconds {
-            let start_offset = Duration::from_secs(second);
-            let end_offset = Duration::from_secs(second + 1);
-
-            let mut sent = 0u64;
-            let mut success = 0u64;
-            let mut failed = 0u64;
-
-            for event in events.iter() {
-                if event.offset >= start_offset && event.offset < end_offset {
-                    match event.event {
-                        TxEvent::Sent => sent += 1,
-                        TxEvent::Success => success += 1,
-                        TxEvent::Failed => failed += 1,
-                    }
-                }
-            }
-
-            throughput.push(ThroughputSample { second, sent, success, failed });
+            let counts = aggregation.throughput.get(&second).copied().unwrap_or_default();
+            throughput.push(ThroughputSample {
+                second,
+                sent: counts.sent,
+                success: counts.success,
+                failed: counts.failed,
+            });
         }
 
-        let latency_samples: Vec<LatencySample> = latencies
+        let latency_samples: Vec<LatencySample> = aggregation
+            .latencies
             .iter()
             .map(|l| LatencySample { offset_ms: l.offset.as_millis() as u64, latency: l.latency })
             .collect();
@@ -883,6 +950,31 @@ mod tests {
         assert_eq!(first_second.sent, 2);
         assert_eq!(first_second.success, 1);
         assert_eq!(first_second.failed, 1);
+    }
+
+    #[tokio::test]
+    async fn finalize_then_time_series_retains_aggregated_samples() {
+        let collector = MetricsCollector::new(RunClock::new());
+
+        collector.record_sent();
+        collector.record_success(Duration::from_millis(20));
+        collector.record_sent();
+        collector.record_success(Duration::from_millis(10));
+
+        let metrics = collector.finalize().await;
+        let ts = collector.time_series().await;
+
+        assert_eq!(metrics.sent, 2);
+        assert_eq!(metrics.success, 2);
+        assert_eq!(metrics.failed, 0);
+        assert_eq!(metrics.latency.min, Duration::from_millis(10));
+        assert_eq!(metrics.latency.max, Duration::from_millis(20));
+        assert_eq!(ts.latencies.len(), 2);
+        assert_eq!(ts.latencies[0].latency, Duration::from_millis(20));
+        assert_eq!(ts.latencies[1].latency, Duration::from_millis(10));
+        assert_eq!(ts.throughput.iter().map(|sample| sample.sent).sum::<u64>(), 2);
+        assert_eq!(ts.throughput.iter().map(|sample| sample.success).sum::<u64>(), 2);
+        assert_eq!(ts.throughput.iter().map(|sample| sample.failed).sum::<u64>(), 0);
     }
 
     #[test]
