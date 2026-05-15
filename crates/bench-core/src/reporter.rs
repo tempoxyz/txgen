@@ -325,27 +325,58 @@ pub struct JsonLatencySample {
 }
 
 /// JSON reporter for machine-readable output.
+///
+/// When writing to a file, samples are written to a separate NDJSON
+/// (newline-delimited JSON) sibling file instead of being embedded in the
+/// report. This avoids loading millions of metric samples into memory when
+/// the report is later consumed by the summary generator.
+///
+/// The samples file path is derived from the report path:
+/// `report-<phase>.json` → `samples-<phase>.ndjson`.
 pub struct JsonReporter<W: Write + Send = Box<dyn Write + Send>> {
     writer: W,
+    /// Path to the NDJSON samples file (only set for file-based reporters).
+    samples_path: Option<std::path::PathBuf>,
 }
 
 impl JsonReporter {
     /// Create a JSON reporter writing to stdout.
     pub fn stdout() -> Self {
-        Self { writer: Box::new(std::io::stdout()) }
+        Self { writer: Box::new(std::io::stdout()), samples_path: None }
     }
 
     /// Create a JSON reporter writing to a file.
+    ///
+    /// Samples are written to a sibling NDJSON file derived from `path`:
+    /// `report-foo.json` → `samples-foo.ndjson`.
     pub fn file(path: &Path) -> Result<JsonReporter<std::io::BufWriter<std::fs::File>>> {
         let file = std::fs::File::create(path).context("failed to create output file")?;
-        Ok(JsonReporter { writer: std::io::BufWriter::new(file) })
+        let samples_path = samples_path_from_report(path);
+        Ok(JsonReporter { writer: std::io::BufWriter::new(file), samples_path })
     }
 }
 
 impl<W: Write + Send> JsonReporter<W> {
     /// Create a new JSON reporter with a custom writer.
     pub fn new(writer: W) -> Self {
-        Self { writer }
+        Self { writer, samples_path: None }
+    }
+}
+
+/// Derive the NDJSON samples path from a report path.
+///
+/// `report-baseline-1.json` → `samples-baseline-1.ndjson`
+/// `output.json`            → `output.samples.ndjson`
+fn samples_path_from_report(report_path: &Path) -> Option<std::path::PathBuf> {
+    let stem = report_path.file_stem()?.to_str()?;
+    let filename = if let Some(rest) = stem.strip_prefix("report") {
+        format!("samples{rest}.ndjson")
+    } else {
+        format!("{stem}.samples.ndjson")
+    };
+    match report_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => Some(p.join(filename)),
+        _ => Some(std::path::PathBuf::from(filename)),
     }
 }
 
@@ -398,6 +429,14 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         let metadata =
             if report.metadata.is_empty() { None } else { Some(report.metadata.clone()) };
 
+        // When writing to a file, samples go to a separate NDJSON file to
+        // avoid embedding millions of rows in the report JSON (which caused
+        // OOM when the summary generator loaded it later).
+        let (embed_samples, write_ndjson) = match &self.samples_path {
+            Some(_) => (false, true),
+            None => (true, false),
+        };
+
         let json_report = JsonReport {
             sent,
             success,
@@ -410,11 +449,33 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             blocks,
             run_stats: report.run_stats.clone(),
             metadata,
-            samples: report.samples.clone(),
+            samples: if embed_samples { report.samples.clone() } else { Vec::new() },
         };
 
         serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
         writeln!(self.writer)?;
+
+        // Stream samples to NDJSON — one JSON object per line, no buffering
+        // of the entire serialized payload in memory.
+        if write_ndjson {
+            if let Some(samples_path) = &self.samples_path {
+                if !report.samples.is_empty() {
+                    let file = std::fs::File::create(samples_path)
+                        .wrap_err_with(|| format!("failed to create samples file {}", samples_path.display()))?;
+                    let mut writer = std::io::BufWriter::new(file);
+                    for sample in &report.samples {
+                        serde_json::to_writer(&mut writer, sample)?;
+                        writeln!(writer)?;
+                    }
+                    writer.flush()?;
+                    tracing::info!(
+                        path = %samples_path.display(),
+                        count = report.samples.len(),
+                        "Wrote samples to NDJSON file"
+                    );
+                }
+            }
+        }
 
         Ok(())
     }
@@ -961,5 +1022,103 @@ mod tests {
 
         // No prior "host" label → gets the new value.
         assert_eq!(report.samples[0].labels["host"], "override-me");
+    }
+
+    #[test]
+    fn test_samples_path_from_report() {
+        assert_eq!(
+            samples_path_from_report(Path::new("/tmp/results/report-baseline-1.json")),
+            Some(std::path::PathBuf::from("/tmp/results/samples-baseline-1.ndjson"))
+        );
+        assert_eq!(
+            samples_path_from_report(Path::new("report-feature-1.json")),
+            Some(std::path::PathBuf::from("samples-feature-1.ndjson"))
+        );
+        assert_eq!(
+            samples_path_from_report(Path::new("report.json")),
+            Some(std::path::PathBuf::from("samples.ndjson"))
+        );
+        assert_eq!(
+            samples_path_from_report(Path::new("output.json")),
+            Some(std::path::PathBuf::from("output.samples.ndjson"))
+        );
+    }
+
+    #[test]
+    fn test_json_reporter_stdout_embeds_samples() {
+        use crate::sample::Sample;
+        use std::collections::BTreeMap;
+
+        let mut output = Vec::new();
+        {
+            let mut reporter = JsonReporter::new(&mut output);
+            let mut report = sample_report();
+            report.samples = vec![Sample {
+                name: "test_metric".to_string(),
+                labels: BTreeMap::new(),
+                value: 1.0,
+                offset_ms: 0,
+                unix_ms: 1000,
+            }];
+            reporter.finalize(&report).unwrap();
+        }
+
+        let output_str = String::from_utf8(output).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output_str).unwrap();
+        assert_eq!(parsed["samples"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_json_reporter_file_splits_samples() {
+        use crate::sample::Sample;
+        use std::collections::BTreeMap;
+
+        let dir = std::env::temp_dir().join("txgen-test-split-samples");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let report_path = dir.join("report-test.json");
+        {
+            let mut reporter = JsonReporter::file(&report_path).unwrap();
+            let mut report = sample_report();
+            report.samples = vec![
+                Sample {
+                    name: "m1".to_string(),
+                    labels: BTreeMap::new(),
+                    value: 1.0,
+                    offset_ms: 0,
+                    unix_ms: 1000,
+                },
+                Sample {
+                    name: "m2".to_string(),
+                    labels: BTreeMap::new(),
+                    value: 2.0,
+                    offset_ms: 100,
+                    unix_ms: 1100,
+                },
+            ];
+            reporter.finalize(&report).unwrap();
+        }
+
+        // Report JSON should not contain samples.
+        let report_json: serde_json::Value =
+            serde_json::from_reader(std::fs::File::open(&report_path).unwrap()).unwrap();
+        assert!(
+            report_json.get("samples").is_none()
+                || report_json["samples"].as_array().unwrap().is_empty()
+        );
+
+        // Samples NDJSON should exist with 2 lines.
+        let samples_path = dir.join("samples-test.ndjson");
+        assert!(samples_path.exists(), "samples NDJSON file should exist");
+        let content = std::fs::read_to_string(&samples_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let s1: Sample = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(s1.name, "m1");
+        let s2: Sample = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(s2.name, "m2");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
