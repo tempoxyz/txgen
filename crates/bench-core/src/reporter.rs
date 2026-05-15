@@ -328,8 +328,7 @@ pub struct JsonLatencySample {
 ///
 /// When writing to a file, samples are written to a separate NDJSON
 /// (newline-delimited JSON) sibling file instead of being embedded in the
-/// report. This avoids loading millions of metric samples into memory when
-/// the report is later consumed by the summary generator.
+/// report.
 ///
 /// The samples file path is derived from the report path by replacing the
 /// extension with `.samples.ndjson`:
@@ -427,9 +426,6 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         let metadata =
             if report.metadata.is_empty() { None } else { Some(report.metadata.clone()) };
 
-        // When writing to a file, samples go to a separate NDJSON file to
-        // avoid embedding millions of rows in the report JSON (which caused
-        // OOM when the summary generator loaded it later).
         let (embed_samples, write_ndjson) = match &self.samples_path {
             Some(_) => (false, true),
             None => (true, false),
@@ -453,8 +449,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
         writeln!(self.writer)?;
 
-        // Stream samples to NDJSON — one JSON object per line, no buffering
-        // of the entire serialized payload in memory.
+        // Stream samples to a separate NDJSON file (one JSON object per line).
         if write_ndjson &&
             let Some(samples_path) = &self.samples_path &&
             !report.samples.is_empty()
