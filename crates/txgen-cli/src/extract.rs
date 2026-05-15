@@ -124,12 +124,9 @@ where
     let to = args.to;
     let include_bal = args.bal;
     let buffer_size = args.buffer_size;
-    let fetch_handle =
-        tokio::spawn(
-            async move {
-                fetch_blocks::<N, _>(provider, from, to, include_bal, buffer_size, tx).await
-            },
-        );
+    let fetch_handle = tokio::spawn(async move {
+        fetch_blocks::<N, _>(provider, from, to, include_bal, buffer_size, tx).await
+    });
 
     let total = to - from + 1;
     let write_result = match args.output {
