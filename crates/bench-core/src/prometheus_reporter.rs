@@ -143,11 +143,15 @@ impl PrometheusReporter {
 
         tracing::info!(
             url = %config.base_url,
+            import_url = %url,
             extra_labels = config.extra_labels.len(),
             batch_size = config.batch_size,
             tenant = ?config.tenant_id,
             "Prometheus remote write reporter initialized"
         );
+        for (k, v) in &config.extra_labels {
+            tracing::info!(key = %k, value = %v, "  extra_label");
+        }
 
         Ok(Self { config, client, import_url: url })
     }
@@ -170,13 +174,24 @@ impl PrometheusReporter {
     }
 
     /// Send a single batch of samples as a snappy-compressed protobuf WriteRequest.
-    fn send_batch(&self, batch: &[Sample]) -> Result<()> {
+    fn send_batch(&self, batch: &[Sample], batch_idx: usize) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
 
         let write_req = build_write_request(batch);
+        let timeseries_count = write_req.timeseries.len();
         let body = write_req.encode_compressed().context("snappy compression failed")?;
+        let body_len = body.len();
+
+        tracing::info!(
+            batch = batch_idx,
+            samples = batch.len(),
+            timeseries = timeseries_count,
+            body_bytes = body_len,
+            url = %self.import_url,
+            "Sending remote write batch"
+        );
 
         let headers = self.headers()?;
         let rt = tokio::runtime::Handle::current();
@@ -190,11 +205,25 @@ impl PrometheusReporter {
             .wrap_err("failed to POST remote write")?;
 
         let status = resp.status();
+        let resp_body = tokio::task::block_in_place(|| rt.block_on(resp.text()))
+            .unwrap_or_else(|_| "<no body>".to_string());
+
         if !status.is_success() {
-            let body = tokio::task::block_in_place(|| rt.block_on(resp.text()))
-                .unwrap_or_else(|_| "<no body>".to_string());
-            bail!("remote write failed (HTTP {status}): {body}");
+            tracing::error!(
+                batch = batch_idx,
+                status = %status,
+                body = %resp_body,
+                "Remote write batch FAILED"
+            );
+            bail!("remote write failed (HTTP {status}): {resp_body}");
         }
+
+        tracing::info!(
+            batch = batch_idx,
+            status = %status,
+            resp_body = %resp_body,
+            "Remote write batch OK"
+        );
         Ok(())
     }
 }
@@ -213,8 +242,10 @@ impl Reporter for PrometheusReporter {
         );
 
         let mut pushed = 0usize;
-        for chunk in report.samples.chunks(self.config.batch_size) {
-            self.send_batch(chunk)?;
+        let total_batches = (report.samples.len() + self.config.batch_size - 1) / self.config.batch_size;
+        tracing::info!(total_batches, batch_size = self.config.batch_size, "Starting remote write batches");
+        for (i, chunk) in report.samples.chunks(self.config.batch_size).enumerate() {
+            self.send_batch(chunk, i)?;
             pushed += chunk.len();
         }
 
