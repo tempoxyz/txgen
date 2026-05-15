@@ -1,8 +1,9 @@
 //! `bench send-blocks` - Submit blocks via reth Engine API
 //!
 //! Reads NDJSON `{raw, key, number, timestamp, gas_used, gas_limit, tx_count}`
-//! lines from stdin or file (produced by `txgen extract`). Submits each block
-//! via `reth_newPayload` (as `BlockRlp`) and `reth_forkchoiceUpdated`,
+//! lines from stdin or file (produced by `txgen extract`). Lines may include
+//! optional RLP-encoded `bal` bytes. Submits each block via `reth_newPayload`
+//! (as `BlockRlp`) and `reth_forkchoiceUpdated`,
 //! collecting per-block timing and engine status from [`RethPayloadStatus`].
 
 use crate::{send::parse_metadata, SendBlocksArgs};
@@ -36,6 +37,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 pub(crate) struct BlockLine {
     /// RLP-encoded block bytes (hex with 0x prefix).
     raw: Bytes,
+    /// Optional RLP-encoded block access list bytes (hex with 0x prefix).
+    #[serde(default)]
+    bal: Option<Bytes>,
     /// Block hash.
     key: B256,
     /// Block number.
@@ -333,7 +337,7 @@ async fn process_block(
     reorg_state: Option<&mut ReorgState>,
     persistence_policy: &WaitForPersistence,
 ) -> Result<()> {
-    let input = RethNewPayloadInput::BlockRlp(block.raw.clone());
+    let input = RethNewPayloadInput::BlockRlp { block: block.raw.clone(), bal: block.bal.clone() };
     let wait = persistence_policy.should_wait(collector.blocks_submitted());
 
     let new_payload_start = Instant::now();

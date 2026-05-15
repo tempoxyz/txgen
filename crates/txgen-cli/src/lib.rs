@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use eyre::Result;
 
 mod addresses;
+mod bal;
 mod extract;
 mod generate;
 

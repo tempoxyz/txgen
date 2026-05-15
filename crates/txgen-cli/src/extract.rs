@@ -1,5 +1,8 @@
+use crate::bal::{
+    fetch_block_access_list, fetch_encoded_block_access_list, merge_block_access_lists,
+};
 use alloy_consensus::{BlockHeader, Sealed, Transaction};
-use alloy_eips::{eip2718::Encodable2718, BlockNumberOrTag};
+use alloy_eips::{eip2718::Encodable2718, eip7928::BlockAccessList, BlockNumberOrTag};
 use alloy_network::Network;
 use alloy_primitives::{Bytes, Sealable, B256};
 use alloy_provider::{ext::DebugApi, Provider};
@@ -31,6 +34,10 @@ pub struct ExtractArgs {
     /// Number of blocks to prefetch ahead
     #[arg(long, default_value = "20")]
     pub buffer_size: usize,
+
+    /// Include RLP-encoded block access lists from eth_getBlockAccessListByBlockNumber.
+    #[arg(long, default_value_t = false)]
+    pub bal: bool,
 }
 
 #[derive(Args)]
@@ -61,6 +68,10 @@ pub struct ExtractBigBlocksArgs {
     /// compatibility with `extract` and future pipelining.
     #[arg(long, default_value = "20")]
     pub buffer_size: usize,
+
+    /// Include and merge block access lists from eth_getBlockAccessListByBlockNumber.
+    #[arg(long, default_value_t = false)]
+    pub bal: bool,
 }
 
 fn parse_gas_limit(value: &str) -> Result<u64, String> {
@@ -110,8 +121,11 @@ where
 
     let from = args.from;
     let to = args.to;
+    let include_bal = args.bal;
     let fetch_handle =
-        tokio::spawn(async move { fetch_blocks::<N, _>(provider, from, to, tx).await });
+        tokio::spawn(
+            async move { fetch_blocks::<N, _>(provider, from, to, include_bal, tx).await },
+        );
 
     let total = to - from + 1;
     let write_result = match args.output {
@@ -171,6 +185,8 @@ where
 #[derive(serde::Serialize)]
 struct BlockOutputLine<'a> {
     raw: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bal: Option<&'a str>,
     key: &'a str,
     number: u64,
     timestamp: u64,
@@ -192,9 +208,11 @@ async fn write_extracted_blocks<W: Write>(
         let block = result?;
 
         let raw_hex = format!("0x{}", hex::encode(&block.rlp_bytes));
+        let bal_hex = block.bal_rlp.as_ref().map(|bal| format!("0x{}", hex::encode(bal)));
         let key_hex = format!("{}", block.hash);
         let line = BlockOutputLine {
             raw: &raw_hex,
+            bal: bal_hex.as_deref(),
             key: &key_hex,
             number: block.number,
             timestamp: block.timestamp,
@@ -227,6 +245,7 @@ async fn write_extracted_blocks<W: Write>(
 
 struct FetchedBlock {
     rlp_bytes: Bytes,
+    bal_rlp: Option<Bytes>,
     hash: alloy_primitives::B256,
     number: u64,
     timestamp: u64,
@@ -235,8 +254,13 @@ struct FetchedBlock {
     tx_count: usize,
 }
 
-async fn fetch_blocks<N, P>(provider: P, from: u64, to: u64, tx: mpsc::Sender<Result<FetchedBlock>>)
-where
+async fn fetch_blocks<N, P>(
+    provider: P,
+    from: u64,
+    to: u64,
+    include_bal: bool,
+    tx: mpsc::Sender<Result<FetchedBlock>>,
+) where
     N: Network,
     N::TxEnvelope: Decodable,
     N::Header: Decodable,
@@ -249,6 +273,12 @@ where
                 .await
                 .wrap_err_with(|| format!("failed to fetch raw block {block_num}"))?;
 
+            let bal_rlp = if include_bal {
+                Some(fetch_encoded_block_access_list(&provider, block_num).await?)
+            } else {
+                None
+            };
+
             let sealed: Sealed<alloy_consensus::Block<N::TxEnvelope, N::Header>> =
                 alloy_consensus::Block::decode_sealed(&mut rlp_bytes.as_ref())
                     .map_err(|e| eyre::eyre!("failed to decode block {block_num}: {e}"))?;
@@ -258,6 +288,7 @@ where
 
             Ok(FetchedBlock {
                 rlp_bytes,
+                bal_rlp,
                 hash,
                 number: block.header.number(),
                 timestamp: block.header.timestamp(),
@@ -298,22 +329,26 @@ where
 
     while emitted < args.count {
         let mut blocks = Vec::new();
+        let mut block_access_lists = Vec::new();
         let mut accumulated_gas = 0_u64;
 
         while accumulated_gas < args.target_gas {
-            let execution_data = fetch_execution_data::<N, _>(provider, source_block).await?;
-            first_source_block.get_or_insert(execution_data.block_number());
+            let fetched = fetch_execution_data::<N, _>(provider, source_block, args.bal).await?;
+            first_source_block.get_or_insert(fetched.execution_data.block_number());
             accumulated_gas =
-                accumulated_gas.saturating_add(execution_data.payload.as_v1().gas_used);
-            blocks.push(execution_data);
+                accumulated_gas.saturating_add(fetched.execution_data.payload.as_v1().gas_used);
+            blocks.push(fetched.execution_data);
+            block_access_lists.push(fetched.block_access_list);
             source_block = source_block.saturating_add(1);
         }
 
+        let merged_block_access_list = merge_block_access_lists(&blocks, block_access_lists);
         let big_block = build_big_block(
             blocks,
             emitted,
             first_source_block.unwrap_or(args.from),
             accumulated_block_hashes.clone(),
+            merged_block_access_list,
         )?;
 
         for switch_data in &big_block.env_switches {
@@ -343,7 +378,16 @@ where
     Ok(())
 }
 
-async fn fetch_execution_data<N, P>(provider: &P, block_num: u64) -> Result<ExecutionData>
+struct FetchedExecutionData {
+    execution_data: ExecutionData,
+    block_access_list: Option<BlockAccessList>,
+}
+
+async fn fetch_execution_data<N, P>(
+    provider: &P,
+    block_num: u64,
+    include_bal: bool,
+) -> Result<FetchedExecutionData>
 where
     N: Network,
     N::TxEnvelope: Decodable + Encodable2718 + Transaction,
@@ -355,12 +399,18 @@ where
         .await
         .wrap_err_with(|| format!("failed to fetch raw block {block_num}"))?;
 
+    let block_access_list =
+        if include_bal { Some(fetch_block_access_list(provider, block_num).await?) } else { None };
+
     let sealed: Sealed<alloy_consensus::Block<N::TxEnvelope, N::Header>> =
         alloy_consensus::Block::decode_sealed(&mut rlp_bytes.as_ref())
             .map_err(|e| eyre::eyre!("failed to decode block {block_num}: {e}"))?;
     let (block, _) = sealed.split();
     let (payload, sidecar) = ExecutionPayload::from_block_slow(&block);
-    Ok(ExecutionData { payload, sidecar })
+    Ok(FetchedExecutionData {
+        execution_data: ExecutionData { payload, sidecar },
+        block_access_list,
+    })
 }
 
 fn build_big_block(
@@ -368,6 +418,7 @@ fn build_big_block(
     big_block_idx: u64,
     first_source_block: u64,
     prior_block_hashes: Vec<(u64, B256)>,
+    merged_block_access_list: Option<Bytes>,
 ) -> Result<BigBlockData<ExecutionData>> {
     if blocks.is_empty() {
         bail!("cannot build a big block with no source blocks");
@@ -377,6 +428,6 @@ fn build_big_block(
         env_switches: blocks,
         prior_block_hashes,
         block_number: first_source_block + big_block_idx,
-        merged_block_access_list: None,
+        merged_block_access_list,
     })
 }

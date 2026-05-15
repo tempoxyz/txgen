@@ -2,8 +2,8 @@
 //!
 //! reth exposes two custom RPC methods for benchmarking:
 //! - `reth_newPayload` — accepts standard `ExecutionData`, reth-bb [`BigBlockData`], or raw
-//!   RLP-encoded block bytes (`BlockRlp`), and returns [`RethPayloadStatus`] with server-side
-//!   timing information.
+//!   RLP-encoded block bytes plus optional block access list bytes (`BlockRlp`), and returns
+//!   [`RethPayloadStatus`] with server-side timing information.
 //! - `reth_forkchoiceUpdated` — simplified forkchoice update with no payload attributes.
 //!
 //! These types mirror the definitions in reth's `reth-rpc-api` crate but are kept standalone
@@ -31,8 +31,14 @@ pub enum RethNewPayloadInput {
     ExecutionData(Box<ExecutionData>),
     /// reth-bb big-block data containing all constituent payloads.
     BigBlockData(Box<BigBlockData<ExecutionData>>),
-    /// Raw RLP-encoded block bytes.
-    BlockRlp(Bytes),
+    /// Raw RLP-encoded block bytes and optional RLP-encoded block access list bytes.
+    BlockRlp {
+        /// Raw RLP-encoded block bytes.
+        block: Bytes,
+        /// RLP-encoded block access list bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bal: Option<Bytes>,
+    },
 }
 
 /// Big-block payload data for reth-bb.
@@ -175,14 +181,18 @@ mod tests {
 
     #[test]
     fn test_block_rlp_roundtrip() {
-        let input = RethNewPayloadInput::BlockRlp(Bytes::from(vec![0xf8, 0x70, 0x01]));
+        let input = RethNewPayloadInput::BlockRlp {
+            block: Bytes::from(vec![0xf8, 0x70, 0x01]),
+            bal: Some(Bytes::from(vec![0xc0])),
+        };
         let json = serde_json::to_string(&input).expect("block RLP input should serialize");
         let deserialized: RethNewPayloadInput =
             serde_json::from_str(&json).expect("serialized block RLP input should deserialize");
 
         match deserialized {
-            RethNewPayloadInput::BlockRlp(bytes) => {
-                assert_eq!(bytes.as_ref(), &[0xf8, 0x70, 0x01]);
+            RethNewPayloadInput::BlockRlp { block, bal } => {
+                assert_eq!(block.as_ref(), &[0xf8, 0x70, 0x01]);
+                assert_eq!(bal.as_ref().map(Bytes::as_ref), Some(&[0xc0][..]));
             }
             RethNewPayloadInput::ExecutionData(_) | RethNewPayloadInput::BigBlockData(_) => {
                 panic!("expected BlockRlp variant")
