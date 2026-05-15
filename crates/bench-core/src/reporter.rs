@@ -331,8 +331,9 @@ pub struct JsonLatencySample {
 /// report. This avoids loading millions of metric samples into memory when
 /// the report is later consumed by the summary generator.
 ///
-/// The samples file path is derived from the report path:
-/// `report-<phase>.json` → `samples-<phase>.ndjson`.
+/// The samples file path is derived from the report path by replacing the
+/// extension with `.samples.ndjson`:
+/// `report-baseline-1.json` → `report-baseline-1.samples.ndjson`.
 pub struct JsonReporter<W: Write + Send = Box<dyn Write + Send>> {
     writer: W,
     /// Path to the NDJSON samples file (only set for file-based reporters).
@@ -348,7 +349,7 @@ impl JsonReporter {
     /// Create a JSON reporter writing to a file.
     ///
     /// Samples are written to a sibling NDJSON file derived from `path`:
-    /// `report-foo.json` → `samples-foo.ndjson`.
+    /// `report-foo.json` → `report-foo.samples.ndjson`.
     pub fn file(path: &Path) -> Result<JsonReporter<std::io::BufWriter<std::fs::File>>> {
         let file = std::fs::File::create(path).context("failed to create output file")?;
         let samples_path = samples_path_from_report(path);
@@ -365,15 +366,12 @@ impl<W: Write + Send> JsonReporter<W> {
 
 /// Derive the NDJSON samples path from a report path.
 ///
-/// `report-baseline-1.json` → `samples-baseline-1.ndjson`
-/// `output.json`            → `output.samples.ndjson`
+/// Replaces the file extension with `.samples.ndjson`:
+/// - `report-baseline-1.json` → `report-baseline-1.samples.ndjson`
+/// - `output.json`            → `output.samples.ndjson`
 fn samples_path_from_report(report_path: &Path) -> Option<std::path::PathBuf> {
     let stem = report_path.file_stem()?.to_str()?;
-    let filename = if let Some(rest) = stem.strip_prefix("report") {
-        format!("samples{rest}.ndjson")
-    } else {
-        format!("{stem}.samples.ndjson")
-    };
+    let filename = format!("{stem}.samples.ndjson");
     match report_path.parent() {
         Some(p) if !p.as_os_str().is_empty() => Some(p.join(filename)),
         _ => Some(std::path::PathBuf::from(filename)),
@@ -800,7 +798,7 @@ fn system_time_to_millis(t: std::time::SystemTime) -> u64 {
 ///
 /// Supported formats:
 /// - `console` - Human-readable output to stderr
-/// - `json:<path>` - JSON output to file
+/// - `json:<path>` - JSON output to file (samples written to `<stem>.samples.ndjson` sibling)
 /// - `clickhouse:<url>` - Push benchmark data to ClickHouse
 /// - `prometheus:<url>` - Push samples via Prometheus remote write protocol (protobuf + snappy on
 ///   `/api/v1/write`). Works with VictoriaMetrics, Prometheus, Cortex, Thanos, etc. Auth and other
@@ -1028,15 +1026,15 @@ mod tests {
     fn test_samples_path_from_report() {
         assert_eq!(
             samples_path_from_report(Path::new("/tmp/results/report-baseline-1.json")),
-            Some(std::path::PathBuf::from("/tmp/results/samples-baseline-1.ndjson"))
+            Some(std::path::PathBuf::from("/tmp/results/report-baseline-1.samples.ndjson"))
         );
         assert_eq!(
             samples_path_from_report(Path::new("report-feature-1.json")),
-            Some(std::path::PathBuf::from("samples-feature-1.ndjson"))
+            Some(std::path::PathBuf::from("report-feature-1.samples.ndjson"))
         );
         assert_eq!(
             samples_path_from_report(Path::new("report.json")),
-            Some(std::path::PathBuf::from("samples.ndjson"))
+            Some(std::path::PathBuf::from("report.samples.ndjson"))
         );
         assert_eq!(
             samples_path_from_report(Path::new("output.json")),
@@ -1109,7 +1107,7 @@ mod tests {
         );
 
         // Samples NDJSON should exist with 2 lines.
-        let samples_path = dir.join("samples-test.ndjson");
+        let samples_path = dir.join("report-test.samples.ndjson");
         assert!(samples_path.exists(), "samples NDJSON file should exist");
         let content = std::fs::read_to_string(&samples_path).unwrap();
         let lines: Vec<&str> = content.lines().collect();

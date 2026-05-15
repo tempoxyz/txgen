@@ -4,7 +4,7 @@
 //! - [`source`] - Transaction sources (file, stdin)
 //! - [`sender`] - Sending with scheduling key ordering + rate limiting
 //! - [`metrics`] - Collection (sent/success/failed counts, timing)
-//! - [`reporter`] - Output (console, JSON, ClickHouse, Prometheus remote write)
+//! - [`reporter`] - Output (console, JSON + NDJSON samples, ClickHouse, Prometheus remote write)
 //! - [`reth_api`] - reth custom Engine API types (`reth_newPayload`, `reth_forkchoiceUpdated`)
 
 pub mod clock;
