@@ -5,14 +5,19 @@ use alloy_consensus::{BlockHeader, Sealed, Transaction};
 use alloy_eips::{eip2718::Encodable2718, eip7928::BlockAccessList, BlockNumberOrTag};
 use alloy_network::Network;
 use alloy_primitives::{Bytes, Sealable, B256};
-use alloy_provider::{ext::DebugApi, Provider};
+use alloy_provider::{ext::DebugApi, Provider, RootProvider};
 use alloy_rlp::Decodable;
+use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload};
+use alloy_transport::layers::RetryBackoffLayer;
 use clap::Args;
 use eyre::{bail, Result, WrapErr};
 use futures::{stream, StreamExt};
 use std::{io::Write, path::PathBuf};
 use tokio::sync::mpsc;
+
+const RAW_BLOCK_FETCH_ATTEMPTS: u32 = 5;
+const RAW_BLOCK_FETCH_INITIAL_BACKOFF_MS: u64 = 250;
 
 #[derive(Args)]
 pub struct ExtractArgs {
@@ -115,8 +120,7 @@ where
         bail!("--from must be <= --to");
     }
 
-    let provider =
-        alloy_provider::RootProvider::<N>::new_http(args.rpc.parse().wrap_err("invalid RPC URL")?);
+    let provider = retrying_http_provider::<N>(&args.rpc)?;
 
     let (tx, mut rx) = mpsc::channel::<Result<FetchedBlock>>(args.buffer_size);
 
@@ -163,8 +167,7 @@ where
         bail!("--target-gas must be greater than 0");
     }
 
-    let provider =
-        alloy_provider::RootProvider::<N>::new_http(args.rpc.parse().wrap_err("invalid RPC URL")?);
+    let provider = retrying_http_provider::<N>(&args.rpc)?;
 
     match args.output {
         Some(ref path) => {
@@ -430,6 +433,20 @@ where
         execution_data: ExecutionData { payload, sidecar },
         block_access_list,
     })
+}
+
+fn retrying_http_provider<N>(rpc: &str) -> Result<RootProvider<N>>
+where
+    N: Network,
+{
+    let retry_layer = RetryBackoffLayer::new(
+        RAW_BLOCK_FETCH_ATTEMPTS,
+        RAW_BLOCK_FETCH_INITIAL_BACKOFF_MS,
+        u64::MAX,
+    );
+    let client =
+        RpcClient::builder().layer(retry_layer).http(rpc.parse().wrap_err("invalid RPC URL")?);
+    Ok(RootProvider::<N>::new(client))
 }
 
 fn build_big_block(
