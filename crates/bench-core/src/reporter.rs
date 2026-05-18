@@ -503,10 +503,13 @@ pub struct ClickHouseConfig {
     pub config: HashMap<String, String>,
     /// Additional metadata key-value pairs.
     pub metadata: HashMap<String, String>,
+    /// Number of metric sample rows to insert per ClickHouse request.
+    pub sample_batch_size: usize,
 }
 
 /// Required metadata keys for the ClickHouse reporter.
 const REQUIRED_METADATA: &[&str] = &["scenario", "platform", "git-sha", "git-ref"];
+const DEFAULT_CLICKHOUSE_SAMPLE_BATCH_SIZE: usize = 50_000;
 
 impl ClickHouseConfig {
     /// Create a ClickHouse config from the reporter URL and user metadata.
@@ -533,6 +536,11 @@ impl ClickHouseConfig {
             std::env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "default".to_string());
         let user = std::env::var("CLICKHOUSE_USER").ok();
         let password = std::env::var("CLICKHOUSE_PASSWORD").ok();
+        let sample_batch_size = std::env::var("CLICKHOUSE_SAMPLE_BATCH_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_CLICKHOUSE_SAMPLE_BATCH_SIZE);
 
         // Separate config-like keys from remaining metadata.
         let config_keys = ["tps", "max_concurrent", "chain_id", "scrape_interval_ms"];
@@ -561,6 +569,7 @@ impl ClickHouseConfig {
             git_ref: metadata["git-ref"].clone(),
             config,
             metadata: remaining_metadata,
+            sample_batch_size,
         })
     }
 }
@@ -591,6 +600,7 @@ impl ClickHouseReporter {
             mode = %config.mode,
             url = %config.url,
             database = %config.database,
+            sample_batch_size = config.sample_batch_size,
             "ClickHouse reporter initialized"
         );
 
@@ -718,8 +728,7 @@ impl Reporter for ClickHouseReporter {
         // Insert metric samples.
         let sample_rows = self.build_sample_rows(&report.samples);
         if !sample_rows.is_empty() {
-            const BATCH_SIZE: usize = 100_000;
-            for chunk in sample_rows.chunks(BATCH_SIZE) {
+            for chunk in sample_rows.chunks(self.config.sample_batch_size) {
                 self.insert_rows("txgen_metric_samples", chunk)?;
             }
         }
