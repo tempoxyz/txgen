@@ -91,6 +91,7 @@ Credentials and database are configured via environment variables:
 | `CLICKHOUSE_USER` | ClickHouse user | *(none)* |
 | `CLICKHOUSE_PASSWORD` | ClickHouse password | *(none)* |
 | `CLICKHOUSE_DATABASE` | Database name | `default` |
+| `CLICKHOUSE_SAMPLE_BATCH_SIZE` | Metric sample rows per insert | `50000` |
 
 ```bash
 export CLICKHOUSE_USER=default

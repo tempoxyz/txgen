@@ -295,7 +295,7 @@ bench send -i txs.ndjson \
 | `git-sha` | Node commit SHA being benchmarked |
 | `git-ref` | Node git branch/ref |
 
-Authentication is configured via environment variables: `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE`. See [`scripts/clickhouse/README.md`](scripts/clickhouse/README.md) for schema setup and example queries.
+Authentication and insert batching are configured via environment variables: `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE`, and `CLICKHOUSE_SAMPLE_BATCH_SIZE` (default: `50000`). See [`scripts/clickhouse/README.md`](scripts/clickhouse/README.md) for schema setup and example queries.
 
 The JSON report includes:
 - `samples` — point-in-time metric snapshots (internal + node), stored as a time series
