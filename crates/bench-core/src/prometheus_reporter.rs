@@ -5,10 +5,12 @@
 //! Cortex, Thanos, etc.) via `/api/v1/write` using the
 //! standard remote write protocol (protobuf + snappy compression).
 //!
-//! User-provided metadata (`-m key=value`) are forwarded as `extra_label`
-//! query parameters so the server stamps every sample in the request with
-//! those labels. This keeps request bodies small and avoids mutating the
-//! in-memory [`FinalReport`].
+//! User-provided metadata (`-m key=value`) are already applied to samples by
+//! [`FinalReport`] before reporters run, so the remote-write request carries
+//! run labels in the protobuf payload. The reporter intentionally does not
+//! also send them as VictoriaMetrics `extra_label` query parameters, since
+//! duplicating labels can make VictoriaMetrics accept the request but drop the
+//! affected series.
 //!
 //! Connection knobs (auth, tenant, batching) are read from environment
 //! variables so secrets never end up on the command line:
@@ -29,7 +31,7 @@ use prometheus_remote_write::{
     HEADER_NAME_REMOTE_WRITE_VERSION, LABEL_NAME, REMOTE_WRITE_VERSION_01,
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-use std::{collections::BTreeMap, time::Duration};
+use std::time::Duration;
 
 /// Default samples per ingestion request.
 const DEFAULT_BATCH_SIZE: usize = 10_000;
@@ -41,8 +43,6 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60;
 pub struct PrometheusConfig {
     /// Base URL of the remote write endpoint, e.g. `http://localhost:8428`.
     pub base_url: String,
-    /// Run-level labels added to every sample (server-side via `extra_label`).
-    pub extra_labels: BTreeMap<String, String>,
     /// Optional bearer token (`Authorization: Bearer …`).
     pub bearer_token: Option<String>,
     /// Optional HTTP basic auth `(user, password)`.
@@ -58,11 +58,12 @@ pub struct PrometheusConfig {
 impl PrometheusConfig {
     /// Build a config from a base URL and the user `--metadata` map.
     ///
-    /// Connection knobs (auth, tenant, batching) are read from environment
-    /// variables; see the module docs for the list.
+    /// Metadata labels are applied to samples before reporters run; this
+    /// config only reads connection knobs (auth, tenant, batching) from
+    /// environment variables. See the module docs for the list.
     pub fn from_metadata(
         base_url: &str,
-        metadata: &std::collections::HashMap<String, String>,
+        _metadata: &std::collections::HashMap<String, String>,
     ) -> Result<Self> {
         let bearer_token = std::env::var("PROMETHEUS_BEARER_TOKEN").ok().filter(|s| !s.is_empty());
         let basic_auth = match (
@@ -84,21 +85,8 @@ impl PrometheusConfig {
             .filter(|n: &u64| *n > 0)
             .unwrap_or(DEFAULT_TIMEOUT_SECS);
 
-        let extra_labels: BTreeMap<String, String> = metadata
-            .iter()
-            .filter_map(|(k, v)| {
-                let key = sanitize_label_name(k);
-                if key.is_empty() {
-                    None
-                } else {
-                    Some((key, v.clone()))
-                }
-            })
-            .collect();
-
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            extra_labels,
             bearer_token,
             basic_auth,
             tenant_id,
@@ -123,12 +111,10 @@ impl PrometheusReporter {
             .build()
             .context("failed to create HTTP client")?;
 
-        // Build the import URL with extra_label + accountID query params.
+        // Build the import URL with accountID query params. Run labels are encoded in
+        // the remote-write payload itself; don't duplicate them via `extra_label`.
         let mut url = format!("{}/api/v1/write", config.base_url);
         let mut params: Vec<(String, String)> = Vec::new();
-        for (k, v) in &config.extra_labels {
-            params.push(("extra_label".to_string(), format!("{k}={v}")));
-        }
         if let Some(tenant) = &config.tenant_id {
             params.push(("accountID".to_string(), tenant.clone()));
         }
@@ -143,7 +129,6 @@ impl PrometheusReporter {
 
         tracing::info!(
             url = %config.base_url,
-            extra_labels = config.extra_labels.len(),
             batch_size = config.batch_size,
             tenant = ?config.tenant_id,
             "Prometheus remote write reporter initialized"
@@ -407,15 +392,15 @@ mod tests {
     }
 
     #[test]
-    fn config_trims_url_and_sanitizes_metadata_labels() {
+    fn config_trims_url_and_does_not_forward_metadata_as_extra_labels() {
         let metadata = std::collections::HashMap::from([
             ("git-sha".to_string(), "abc".to_string()),
             ("scenario".to_string(), "tip20".to_string()),
         ]);
         let cfg = PrometheusConfig::from_metadata("http://prometheus:8428/", &metadata).unwrap();
+        let reporter = PrometheusReporter::new(cfg.clone()).unwrap();
 
         assert_eq!(cfg.base_url, "http://prometheus:8428");
-        assert!(cfg.extra_labels.contains_key("git_sha"));
-        assert!(cfg.extra_labels.contains_key("scenario"));
+        assert_eq!(reporter.import_url, "http://prometheus:8428/api/v1/write");
     }
 }
