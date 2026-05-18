@@ -315,7 +315,7 @@ bench send -i txs.ndjson \
   -m git-ref=main
 ```
 
-Each `-m key=value` pair from `--metadata` is forwarded as a server-side `extra_label=key=value` query parameter on every ingestion request, so Prometheus stamps every sample in the run with those labels (perfect for `run_id`, `scenario`, `git_sha`, `platform`, …). Label keys are sanitized to match the Prometheus identifier rules (`-`, `.`, etc. become `_`).
+Each `-m key=value` pair from `--metadata` is encoded as a label on every sample (perfect for `run_id`, `scenario`, `git_sha`, `platform`, …). Label keys are sanitized to match the Prometheus identifier rules (`-`, `.`, etc. become `_`).
 
 Connection knobs are read from environment variables to keep secrets off the command line:
 

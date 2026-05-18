@@ -797,8 +797,9 @@ fn system_time_to_millis(t: std::time::SystemTime) -> u64 {
 /// - `clickhouse:<url>` - Push benchmark data to ClickHouse
 /// - `prometheus:<url>` - Push samples via Prometheus remote write protocol (protobuf + snappy on
 ///   `/api/v1/write`). Works with VictoriaMetrics, Prometheus, Cortex, Thanos, etc. Auth and other
-///   knobs are read from environment variables (`VM_BEARER_TOKEN`, `VM_USER`, `VM_PASSWORD`,
-///   `VM_TENANT_ID`, `VM_BATCH_SIZE`, `VM_TIMEOUT_SECS`).
+///   knobs are read from environment variables (`PROMETHEUS_BEARER_TOKEN`, `PROMETHEUS_USER`,
+///   `PROMETHEUS_PASSWORD`, `PROMETHEUS_TENANT_ID`, `PROMETHEUS_BATCH_SIZE`,
+///   `PROMETHEUS_TIMEOUT_SECS`).
 ///
 /// The ClickHouse reporter requires metadata keys: `scenario`, `platform`,
 /// `git-sha`, `git-ref`. Pass them via `-m key=value`.
