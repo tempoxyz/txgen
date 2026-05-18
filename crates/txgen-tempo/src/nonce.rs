@@ -38,30 +38,63 @@ pub async fn prefetch_parallel_nonces<P: Provider<Ethereum> + Clone + Send + Syn
 
     eprintln!("prefetching nonces for {} parallel lane(s)...", nonce_keys.len());
 
+    // Count instead of per-lane eprintln: the cross product of accounts ×
+    // lanes can be in the thousands, and one `eprintln!` per pair would
+    // serialize on the global stderr lock and dominate the loop.
+    let mut fetched = 0usize;
     for (pool_name, addresses) in accounts.all_addresses() {
         for address in addresses {
             for &nonce_key in &nonce_keys {
-                let storage_key = compute_nonce_storage_key(address, nonce_key);
-                let storage_value = provider
-                    .get_storage_at(NONCE_PRECOMPILE, storage_key)
+                let nonce = fetch_parallel_lane_nonce(provider, address, nonce_key)
                     .await
-                    .wrap_err_with(|| {
-                        format!(
-                            "failed to fetch parallel nonce for {} lane {} ({})",
-                            pool_name, nonce_key, address
-                        )
-                    })?;
-
-                let nonce = storage_value.to::<u64>();
+                    .wrap_err_with(|| format!("pool {pool_name} lane {nonce_key} ({address})"))?;
                 let scheduling_key = compute_parallel_scheduling_key(address, nonce_key);
                 nonces.reset(scheduling_key, nonce);
-
-                eprintln!("fetched lane nonce: {} lane={} nonce={}", address, nonce_key, nonce);
+                fetched += 1;
             }
         }
     }
+    eprintln!("prefetched {fetched} (account, lane) nonce(s)");
 
     Ok(())
+}
+
+/// Fetch the on-chain nonce for `(address, nonce_key)`.
+///
+/// Dispatches between standard `eth_getTransactionCount` (protocol nonce,
+/// `key=0`), the reserved expiring-nonce key (always 0), and the nonce
+/// precompile storage read (any other parallel lane). Used both by the
+/// up-front [`prefetch_parallel_nonces`] path and the lazy first-touch path
+/// in [`crate::TempoAdapter`].
+pub(crate) async fn fetch_lane_nonce<P: Provider<Ethereum>>(
+    provider: &P,
+    address: Address,
+    nonce_key: U256,
+) -> Result<u64> {
+    if nonce_key.is_zero() {
+        provider.get_transaction_count(address).await.wrap_err("failed to fetch protocol nonce")
+    } else if nonce_key == TEMPO_EXPIRING_NONCE_KEY {
+        Ok(0)
+    } else {
+        fetch_parallel_lane_nonce(provider, address, nonce_key).await
+    }
+}
+
+/// Read the parallel-lane nonce for `(address, nonce_key)` from the nonce
+/// precompile storage. Caller is responsible for handling reserved keys
+/// (`0` and [`TEMPO_EXPIRING_NONCE_KEY`]); this function unconditionally
+/// reads the precompile storage.
+async fn fetch_parallel_lane_nonce<P: Provider<Ethereum>>(
+    provider: &P,
+    address: Address,
+    nonce_key: U256,
+) -> Result<u64> {
+    let storage_key = compute_nonce_storage_key(address, nonce_key);
+    let storage_value =
+        provider.get_storage_at(NONCE_PRECOMPILE, storage_key).await.wrap_err_with(|| {
+            format!("failed to fetch parallel nonce for {address} lane {nonce_key}")
+        })?;
+    Ok(storage_value.to::<u64>())
 }
 
 /// Collect constant 2D nonce lanes that can be prefetched before generation.
