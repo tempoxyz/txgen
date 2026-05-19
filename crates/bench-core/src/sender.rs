@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{mpsc, Semaphore},
+    sync::{mpsc, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
 };
 use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey, TxPhase};
@@ -26,8 +26,8 @@ use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey, TxPhase};
 pub struct SenderConfig {
     /// Maximum transactions submitted per second (0 = unlimited).
     ///
-    /// Controls throughput via a token bucket. Provides backpressure to the
-    /// transaction source before enqueueing.
+    /// Controls RPC submission throughput via a token bucket. Provides
+    /// backpressure to the transaction source when submissions cannot keep up.
     pub rate_limit: u64,
     /// Maximum number of RPC requests in flight simultaneously.
     ///
@@ -48,6 +48,7 @@ type KeySets = (SchedulingKeys, SchedulingKeys);
 
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
+const PENDING_BACKLOG_FACTOR: usize = 4;
 
 /// A transaction to be sent.
 struct PendingTx {
@@ -79,6 +80,9 @@ pub struct Sender {
     worker_tasks: JoinSet<()>,
     /// Rate limiter tokens.
     rate_limiter: Option<Arc<RateLimiter>>,
+    /// Maximum number of transactions buffered internally before applying
+    /// backpressure to the transaction source.
+    max_buffered: usize,
 }
 
 impl Sender {
@@ -96,6 +100,7 @@ impl Sender {
             None
         };
 
+        let max_buffered = max_buffered_transactions(&config, rate_limiter.as_deref());
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
 
         Self {
@@ -108,6 +113,7 @@ impl Sender {
             completion_rx,
             worker_tasks: JoinSet::new(),
             rate_limiter,
+            max_buffered,
         }
     }
 
@@ -117,35 +123,26 @@ impl Sender {
     /// are sent sequentially, while transactions with disjoint key sets can be
     /// sent in parallel.
     pub async fn send(&mut self, tx: GeneratedTx) -> Result<()> {
-        // Apply rate limiting before enqueueing to provide backpressure
-        // to the source reader. This makes the rate limit global rather
-        // than per-key.
-        if let Some(ref limiter) = self.rate_limiter {
-            limiter.acquire().await;
-        }
-
-        self.drain_completions();
+        self.wait_for_buffer_capacity().await;
 
         let GeneratedTx { phase, id, raw, submission_keys, inclusion_keys } = tx;
         let (submission_keys, inclusion_keys) =
             normalize_key_sets(submission_keys, inclusion_keys)?;
         self.pending.push_back(PendingTx { phase, id, raw, submission_keys, inclusion_keys });
-        self.schedule_ready();
+        self.pump().await;
 
         Ok(())
     }
 
     /// Wait for all pending transactions to complete.
     pub async fn flush(&mut self) {
-        self.drain_completions();
-        self.schedule_ready();
+        self.pump().await;
 
         while !self.pending.is_empty() || !self.active_keys.is_empty() {
             match self.completion_rx.recv().await {
                 Some(keys) => {
                     self.release_keys(&keys);
-                    self.drain_completions();
-                    self.schedule_ready();
+                    self.pump().await;
                 }
                 None => break,
             }
@@ -179,40 +176,86 @@ impl Sender {
         }
     }
 
-    fn schedule_ready(&mut self) {
-        let mut blocked_keys = self.active_keys.clone();
-        let mut index = 0;
+    async fn wait_for_buffer_capacity(&mut self) {
+        while self.pending.len() >= self.max_buffered {
+            self.pump().await;
+            if self.pending.len() < self.max_buffered {
+                break;
+            }
 
-        while index < self.pending.len() {
-            let is_blocked =
-                self.pending[index].scheduling_keys().any(|key| blocked_keys.contains(key));
-
-            if is_blocked {
-                for key in self.pending[index].scheduling_keys() {
-                    blocked_keys.insert(*key);
-                }
-                index += 1;
-            } else {
-                let pending = self.pending.remove(index).expect("pending index exists");
-                for key in pending.scheduling_keys() {
-                    self.active_keys.insert(*key);
-                    blocked_keys.insert(*key);
-                }
-                self.dispatch(pending);
+            match self.completion_rx.recv().await {
+                Some(keys) => self.release_keys(&keys),
+                None => break,
             }
         }
     }
 
-    fn dispatch(&mut self, pending: PendingTx) {
+    async fn pump(&mut self) {
+        loop {
+            self.drain_completions();
+
+            let Some(index) = self.next_ready_index() else {
+                break;
+            };
+
+            let Ok(permit) = self.semaphore.clone().try_acquire_owned() else {
+                break;
+            };
+
+            if let Some(limiter) = &self.rate_limiter &&
+                let Some(delay) = limiter.try_acquire_or_delay().await
+            {
+                drop(permit);
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            let pending = self.pending.remove(index).expect("pending index exists");
+            self.activate_keys(&pending);
+            self.dispatch(pending, permit);
+        }
+    }
+
+    fn next_ready_index(&self) -> Option<usize> {
+        let mut blocked_keys = self.active_keys.clone();
+
+        for (index, pending) in self.pending.iter().enumerate() {
+            let is_blocked = pending.scheduling_keys().any(|key| blocked_keys.contains(key));
+
+            if is_blocked {
+                for key in pending.scheduling_keys() {
+                    blocked_keys.insert(*key);
+                }
+            } else {
+                return Some(index);
+            }
+        }
+
+        None
+    }
+
+    fn activate_keys(&mut self, pending: &PendingTx) {
+        for key in pending.scheduling_keys() {
+            self.active_keys.insert(*key);
+        }
+    }
+
+    fn dispatch(&mut self, pending: PendingTx, permit: OwnedSemaphorePermit) {
         let providers = self.providers.clone();
         let metrics = self.metrics.clone();
-        let semaphore = self.semaphore.clone();
         let completion_tx = self.completion_tx.clone();
 
         self.worker_tasks.spawn(async move {
-            submit_tx(pending, providers, metrics, semaphore, completion_tx).await;
+            submit_tx(pending, providers, metrics, permit, completion_tx).await;
         });
     }
+}
+
+fn max_buffered_transactions(config: &SenderConfig, limiter: Option<&RateLimiter>) -> usize {
+    let concurrency_buffer = config.max_concurrent.saturating_mul(PENDING_BACKLOG_FACTOR).max(1);
+    let burst_buffer =
+        limiter.map(|l| (l.burst_capacity.ceil() as usize).saturating_mul(2)).unwrap_or(0);
+    concurrency_buffer.max(burst_buffer)
 }
 
 fn normalize_key_sets(
@@ -236,20 +279,13 @@ async fn submit_tx(
     pending: PendingTx,
     providers: Vec<DynProvider<AnyNetwork>>,
     metrics: Arc<MetricsCollector>,
-    semaphore: Arc<Semaphore>,
+    permit: OwnedSemaphorePermit,
     completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
 ) {
     let release_all_keys = || {
         let mut keys = pending.submission_keys.clone();
         keys.extend_from_slice(&pending.inclusion_keys);
         keys
-    };
-
-    let Ok(permit) = semaphore.acquire().await else {
-        tracing::warn!("Failed to acquire concurrency permit");
-        metrics.record_failure();
-        release_keys(&completion_tx, release_all_keys());
-        return;
     };
 
     metrics.record_sent();
@@ -267,6 +303,7 @@ async fn submit_tx(
         Err(e) => {
             tracing::warn!(error = %e, "Failed to send transaction");
             metrics.record_failure();
+            drop(permit);
             release_keys(&completion_tx, release_all_keys());
             return;
         }
@@ -354,19 +391,16 @@ impl RateLimiter {
         }
     }
 
-    async fn acquire(&self) {
+    async fn try_acquire_or_delay(&self) -> Option<Duration> {
         let mut state = self.state.lock().await;
+        state.refill(self.rate, self.burst_capacity);
 
-        loop {
-            state.refill(self.rate, self.burst_capacity);
-
-            if state.tokens >= 1.0 {
-                state.tokens -= 1.0;
-                return;
-            }
-
+        if state.tokens >= 1.0 {
+            state.tokens -= 1.0;
+            None
+        } else {
             let missing_tokens = 1.0 - state.tokens;
-            tokio::time::sleep(Duration::from_secs_f64(missing_tokens / self.rate)).await;
+            Some(Duration::from_secs_f64(missing_tokens / self.rate))
         }
     }
 }
@@ -395,5 +429,34 @@ mod tests {
     fn test_rate_limiter_burst_capacity_is_bounded() {
         let limiter = RateLimiter::new(10_000);
         assert_eq!(limiter.burst_capacity, 100.0);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_does_not_accumulate_unbounded_catch_up_credit() {
+        let limiter = RateLimiter::new(1_000);
+        assert_eq!(limiter.burst_capacity, 10.0);
+
+        {
+            let mut state = limiter.state.lock().await;
+            state.tokens = 0.0;
+            state.last_refill = Instant::now() - Duration::from_secs(1);
+        }
+
+        assert_eq!(limiter.try_acquire_or_delay().await, None);
+
+        let state = limiter.state.lock().await;
+        assert!(state.tokens <= 9.0, "tokens: {}", state.tokens);
+        assert!(state.tokens > 8.0, "tokens: {}", state.tokens);
+    }
+
+    #[test]
+    fn test_max_buffered_transactions_uses_existing_sender_knobs() {
+        let config = SenderConfig { rate_limit: 10_000, max_concurrent: 100 };
+        let limiter = RateLimiter::new(config.rate_limit);
+        assert_eq!(max_buffered_transactions(&config, Some(&limiter)), 400);
+
+        let config = SenderConfig { rate_limit: 100_000, max_concurrent: 100 };
+        let limiter = RateLimiter::new(config.rate_limit);
+        assert_eq!(max_buffered_transactions(&config, Some(&limiter)), 2_000);
     }
 }
