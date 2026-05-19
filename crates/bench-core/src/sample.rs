@@ -182,11 +182,23 @@ impl SampleStore {
         };
 
         let mut written = 0usize;
+        let mut skipped_non_finite = 0usize;
         for mut sample in samples {
+            if !sample.value.is_finite() {
+                skipped_non_finite += 1;
+                continue;
+            }
+
             apply_labels(&mut sample, &labels);
             serde_json::to_writer(&mut *writer, &sample)?;
             writeln!(writer)?;
             written += 1;
+        }
+        if skipped_non_finite > 0 {
+            tracing::debug!(
+                samples = skipped_non_finite,
+                "Skipped non-finite metric samples while writing sample archive"
+            );
         }
         writer.flush()?;
         inner.len += written;
@@ -285,6 +297,28 @@ mod tests {
         let samples = archive.iter().unwrap().collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(samples[0].labels["run_id"], "abc");
         assert_eq!(samples[0].labels["node"], "a");
+    }
+
+    #[tokio::test]
+    async fn non_finite_values_are_not_archived() {
+        let store = SampleStore::new().unwrap();
+        store
+            .push_batch(vec![
+                make_sample("finite", 1.0, 0),
+                make_sample("nan", f64::NAN, 100),
+                make_sample("inf", f64::INFINITY, 200),
+                make_sample("neg_inf", f64::NEG_INFINITY, 300),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(store.len().await, 1);
+
+        let archive = store.finish().await.unwrap();
+        let samples = archive.iter().unwrap().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].name, "finite");
+        assert_eq!(samples[0].value, 1.0);
     }
 
     #[tokio::test]
