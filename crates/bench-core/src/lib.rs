@@ -35,7 +35,7 @@ pub use reth_api::{
     BigBlockData, RethApi, RethForkchoiceUpdated, RethNewPayloadInput, RethPayloadStatus,
     WaitForPersistence, DEFAULT_PERSISTENCE_THRESHOLD,
 };
-pub use sample::{Sample, SampleStore};
+pub use sample::{Sample, SampleArchive, SampleStore};
 pub use scraper::{start_scrapers, SampleCallback, ScraperConfig, ScraperHandle};
 pub use sender::{Sender, SenderConfig};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource};

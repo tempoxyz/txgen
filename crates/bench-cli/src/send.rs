@@ -76,7 +76,7 @@ async fn execute_source<S: TxSource>(
     } else {
         RunClock::new()
     };
-    let store = SampleStore::new();
+    let store = SampleStore::with_labels(metadata.clone())?;
     let metrics = MetricsCollector::new(clock.clone());
 
     // Start background scraper + internal snapshotter after setup so setup is
@@ -133,8 +133,8 @@ async fn execute_source<S: TxSource>(
     let final_metrics = metrics.finalize().await;
     let time_series = metrics.time_series().await;
 
-    // Drain all collected samples and apply metadata as labels.
-    let samples = store.drain().await;
+    // Finalize the compressed sample archive before reporters read it.
+    let sample_archive = store.finish().await?;
 
     // Collect per-block stats from the chain. The range starts one block after
     // the block that was current before sending (start_block is the last
@@ -147,11 +147,9 @@ async fn execute_source<S: TxSource>(
         metadata: metadata.clone(),
         bench_metrics: Some(final_metrics),
         time_series: Some(time_series),
-        samples,
+        sample_archive: Some(sample_archive),
         ..Default::default()
     };
-
-    report.apply_labels(metadata);
 
     if end_block > start_block {
         let block_range_start = start_block + 1;
@@ -164,7 +162,7 @@ async fn execute_source<S: TxSource>(
         // accumulated during the txpool drain wait. Also trim metric
         // samples captured after the last real block.
         if let Some(cutoff_ms) = trim_trailing_empty_blocks(&mut block_stats) {
-            report.samples.retain(|s| s.unix_ms <= cutoff_ms);
+            report.retain_samples_until(cutoff_ms)?;
             if let Some(ts) = report.time_series.as_mut() {
                 ts.latencies
                     .retain(|l| l.offset_ms <= cutoff_ms.saturating_sub(clock.start_unix_ms()));

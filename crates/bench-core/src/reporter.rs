@@ -7,10 +7,16 @@
 
 use crate::{
     metrics::{BenchMetrics, BlockStats, RunStats, ThroughputSample, TimeSeriesMetrics},
-    sample::Sample,
+    sample::{Sample, SampleArchive},
 };
 use eyre::{bail, Context, Result};
-use std::{collections::HashMap, io::Write, path::Path};
+use flate2::{write::GzEncoder, Compression};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{BufWriter, Write},
+    path::Path,
+};
 
 /// Unified final report passed to reporters at finalization.
 ///
@@ -28,15 +34,19 @@ pub struct FinalReport {
     pub run_stats: Option<RunStats>,
     /// Unified time-series samples (internal + node).
     pub samples: Vec<Sample>,
+    /// Disk-backed compressed sample archive for long benchmark runs.
+    pub sample_archive: Option<SampleArchive>,
     /// Per-block statistics.
     pub blocks: Vec<BlockStats>,
 }
 
 impl FinalReport {
-    /// Merge run-level labels into all samples.
+    /// Merge run-level labels into in-memory samples.
     ///
     /// Labels from `extra` are added to each sample. If a sample already
     /// has a label with the same key, the existing (node) value wins.
+    /// Disk-backed samples should be written through `SampleStore::with_labels`
+    /// so labels are applied before they enter the archive.
     pub fn apply_labels(&mut self, extra: &HashMap<String, String>) {
         if extra.is_empty() {
             return;
@@ -46,6 +56,89 @@ impl FinalReport {
                 sample.labels.entry(k.clone()).or_insert_with(|| v.clone());
             }
         }
+    }
+
+    /// Total number of in-memory and archived metric samples.
+    pub fn sample_count(&self) -> usize {
+        self.samples.len() + self.sample_archive.as_ref().map_or(0, SampleArchive::len)
+    }
+
+    /// Whether the report has metric samples.
+    pub fn has_samples(&self) -> bool {
+        self.sample_count() > 0
+    }
+
+    /// Iterate over samples in bounded chunks.
+    pub fn for_each_sample_chunk<F>(&self, chunk_size: usize, mut f: F) -> Result<()>
+    where
+        F: FnMut(&[Sample]) -> Result<()>,
+    {
+        let chunk_size = chunk_size.max(1);
+        let mut chunk = Vec::with_capacity(chunk_size);
+
+        for sample in &self.samples {
+            chunk.push(sample.clone());
+            if chunk.len() >= chunk_size {
+                f(&chunk)?;
+                chunk.clear();
+            }
+        }
+
+        if let Some(archive) = &self.sample_archive {
+            for sample in archive.iter()? {
+                chunk.push(sample?);
+                if chunk.len() >= chunk_size {
+                    f(&chunk)?;
+                    chunk.clear();
+                }
+            }
+        }
+
+        if !chunk.is_empty() {
+            f(&chunk)?;
+        }
+
+        Ok(())
+    }
+
+    /// Collect all samples into memory. Intended only for stdout JSON reports
+    /// and tests; file/remote reporters should stream chunks instead.
+    pub fn collect_samples(&self) -> Result<Vec<Sample>> {
+        let mut samples = Vec::with_capacity(self.sample_count());
+        self.for_each_sample_chunk(10_000, |chunk| {
+            samples.extend_from_slice(chunk);
+            Ok(())
+        })?;
+        Ok(samples)
+    }
+
+    /// Write all samples to a gzip-compressed NDJSON file.
+    pub fn write_samples_ndjson_gz(&self, path: &Path) -> Result<usize> {
+        let file = File::create(path)
+            .wrap_err_with(|| format!("failed to create samples file {}", path.display()))?;
+        let mut writer = GzEncoder::new(BufWriter::new(file), Compression::default());
+        let mut count = 0usize;
+
+        self.for_each_sample_chunk(10_000, |chunk| {
+            for sample in chunk {
+                serde_json::to_writer(&mut writer, sample)?;
+                writeln!(writer)?;
+                count += 1;
+            }
+            Ok(())
+        })?;
+
+        writer.finish()?.flush()?;
+        Ok(count)
+    }
+
+    /// Retain only samples at or before the given Unix millisecond timestamp.
+    pub fn retain_samples_until(&mut self, cutoff_ms: u64) -> Result<()> {
+        self.samples.retain(|sample| sample.unix_ms <= cutoff_ms);
+        if let Some(archive) = self.sample_archive.as_mut() {
+            archive.retain(|sample| sample.unix_ms <= cutoff_ms)?;
+        }
+        Ok(())
     }
 }
 
@@ -326,16 +419,16 @@ pub struct JsonLatencySample {
 
 /// JSON reporter for machine-readable output.
 ///
-/// When writing to a file, samples are written to a separate NDJSON
-/// (newline-delimited JSON) sibling file instead of being embedded in the
-/// report.
+/// When writing to a file, samples are written to a separate gzip-compressed
+/// NDJSON (newline-delimited JSON) sibling file instead of being embedded in
+/// the report.
 ///
 /// The samples file path is derived from the report path by replacing the
-/// extension with `.samples.ndjson`:
-/// `report-baseline-1.json` → `report-baseline-1.samples.ndjson`.
+/// extension with `.samples.ndjson.gz`:
+/// `report-baseline-1.json` → `report-baseline-1.samples.ndjson.gz`.
 pub struct JsonReporter<W: Write + Send = Box<dyn Write + Send>> {
     writer: W,
-    /// Path to the NDJSON samples file (only set for file-based reporters).
+    /// Path to the gzip-compressed NDJSON samples file (only set for file-based reporters).
     samples_path: Option<std::path::PathBuf>,
 }
 
@@ -347,8 +440,8 @@ impl JsonReporter {
 
     /// Create a JSON reporter writing to a file.
     ///
-    /// Samples are written to a sibling NDJSON file derived from `path`:
-    /// `report-foo.json` → `report-foo.samples.ndjson`.
+    /// Samples are written to a sibling gzip-compressed NDJSON file derived
+    /// from `path`: `report-foo.json` → `report-foo.samples.ndjson.gz`.
     pub fn file(path: &Path) -> Result<JsonReporter<std::io::BufWriter<std::fs::File>>> {
         let file = std::fs::File::create(path).context("failed to create output file")?;
         let samples_path = samples_path_from_report(path);
@@ -363,14 +456,14 @@ impl<W: Write + Send> JsonReporter<W> {
     }
 }
 
-/// Derive the NDJSON samples path from a report path.
+/// Derive the gzip-compressed NDJSON samples path from a report path.
 ///
-/// Replaces the file extension with `.samples.ndjson`:
-/// - `report-baseline-1.json` → `report-baseline-1.samples.ndjson`
-/// - `output.json`            → `output.samples.ndjson`
+/// Replaces the file extension with `.samples.ndjson.gz`:
+/// - `report-baseline-1.json` → `report-baseline-1.samples.ndjson.gz`
+/// - `output.json`            → `output.samples.ndjson.gz`
 fn samples_path_from_report(report_path: &Path) -> Option<std::path::PathBuf> {
     let stem = report_path.file_stem()?.to_str()?;
-    let filename = format!("{stem}.samples.ndjson");
+    let filename = format!("{stem}.samples.ndjson.gz");
     match report_path.parent() {
         Some(p) if !p.as_os_str().is_empty() => Some(p.join(filename)),
         _ => Some(std::path::PathBuf::from(filename)),
@@ -379,9 +472,8 @@ fn samples_path_from_report(report_path: &Path) -> Option<std::path::PathBuf> {
 
 impl<W: Write + Send> Reporter for JsonReporter<W> {
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
-        let has_data = report.bench_metrics.is_some() ||
-            !report.blocks.is_empty() ||
-            !report.samples.is_empty();
+        let has_data =
+            report.bench_metrics.is_some() || !report.blocks.is_empty() || report.has_samples();
         if !has_data {
             return Ok(());
         }
@@ -443,30 +535,22 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             blocks,
             run_stats: report.run_stats.clone(),
             metadata,
-            samples: if embed_samples { report.samples.clone() } else { Vec::new() },
+            samples: if embed_samples { report.collect_samples()? } else { Vec::new() },
         };
 
         serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
         writeln!(self.writer)?;
 
-        // Stream samples to a separate NDJSON file (one JSON object per line).
-        if write_ndjson &&
-            let Some(samples_path) = &self.samples_path &&
-            !report.samples.is_empty()
+        // Stream samples to a separate gzip-compressed NDJSON file.
+        if write_ndjson
+            && let Some(samples_path) = &self.samples_path
+            && report.has_samples()
         {
-            let file = std::fs::File::create(samples_path).wrap_err_with(|| {
-                format!("failed to create samples file {}", samples_path.display())
-            })?;
-            let mut writer = std::io::BufWriter::new(file);
-            for sample in &report.samples {
-                serde_json::to_writer(&mut writer, sample)?;
-                writeln!(writer)?;
-            }
-            writer.flush()?;
+            let count = report.write_samples_ndjson_gz(samples_path)?;
             tracing::info!(
                 path = %samples_path.display(),
-                count = report.samples.len(),
-                "Wrote samples to NDJSON file"
+                count,
+                "Wrote samples to compressed NDJSON file"
             );
         }
 
@@ -713,7 +797,7 @@ impl Reporter for ClickHouseReporter {
         tracing::info!(
             run_id = %self.config.run_id,
             blocks = report.blocks.len(),
-            samples = report.samples.len(),
+            samples = report.sample_count(),
             "Inserting benchmark results into ClickHouse"
         );
 
@@ -725,20 +809,24 @@ impl Reporter for ClickHouseReporter {
         let block_rows = self.build_block_rows(report);
         self.insert_rows("txgen_blocks", &block_rows)?;
 
-        // Insert metric samples.
-        let sample_rows = self.build_sample_rows(&report.samples);
-        if !sample_rows.is_empty() {
-            for chunk in sample_rows.chunks(self.config.sample_batch_size) {
-                self.insert_rows("txgen_metric_samples", chunk)?;
+        // Insert metric samples in bounded chunks. The report may be backed by
+        // a compressed sample archive, so do not collect all rows at once.
+        let mut inserted_samples = 0usize;
+        report.for_each_sample_chunk(self.config.sample_batch_size, |samples| {
+            let sample_rows = self.build_sample_rows(samples);
+            if !sample_rows.is_empty() {
+                self.insert_rows("txgen_metric_samples", &sample_rows)?;
+                inserted_samples += sample_rows.len();
             }
-        }
+            Ok(())
+        })?;
 
         tracing::info!(
             run_id = %self.config.run_id,
             scenario = %self.config.scenario_name,
             platform = %self.config.platform,
             blocks = block_rows.len(),
-            samples = sample_rows.len(),
+            samples = inserted_samples,
             "ClickHouse insert complete"
         );
 
@@ -802,7 +890,8 @@ fn system_time_to_millis(t: std::time::SystemTime) -> u64 {
 ///
 /// Supported formats:
 /// - `console` - Human-readable output to stderr
-/// - `json:<path>` - JSON output to file (samples written to `<stem>.samples.ndjson` sibling)
+/// - `json:<path>` - JSON output to file (samples written to
+///   `<stem>.samples.ndjson.gz` sibling)
 /// - `clickhouse:<url>` - Push benchmark data to ClickHouse
 /// - `prometheus:<url>` - Push samples via Prometheus remote write protocol (protobuf + snappy on
 ///   `/api/v1/write`). Works with VictoriaMetrics, Prometheus, Cortex, Thanos, etc. Auth and other
@@ -1031,19 +1120,19 @@ mod tests {
     fn test_samples_path_from_report() {
         assert_eq!(
             samples_path_from_report(Path::new("/tmp/results/report-baseline-1.json")),
-            Some(std::path::PathBuf::from("/tmp/results/report-baseline-1.samples.ndjson"))
+            Some(std::path::PathBuf::from("/tmp/results/report-baseline-1.samples.ndjson.gz"))
         );
         assert_eq!(
             samples_path_from_report(Path::new("report-feature-1.json")),
-            Some(std::path::PathBuf::from("report-feature-1.samples.ndjson"))
+            Some(std::path::PathBuf::from("report-feature-1.samples.ndjson.gz"))
         );
         assert_eq!(
             samples_path_from_report(Path::new("report.json")),
-            Some(std::path::PathBuf::from("report.samples.ndjson"))
+            Some(std::path::PathBuf::from("report.samples.ndjson.gz"))
         );
         assert_eq!(
             samples_path_from_report(Path::new("output.json")),
-            Some(std::path::PathBuf::from("output.samples.ndjson"))
+            Some(std::path::PathBuf::from("output.samples.ndjson.gz"))
         );
     }
 
@@ -1107,14 +1196,17 @@ mod tests {
         let report_json: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&report_path).unwrap()).unwrap();
         assert!(
-            report_json.get("samples").is_none() ||
-                report_json["samples"].as_array().unwrap().is_empty()
+            report_json.get("samples").is_none()
+                || report_json["samples"].as_array().unwrap().is_empty()
         );
 
-        // Samples NDJSON should exist with 2 lines.
-        let samples_path = dir.join("report-test.samples.ndjson");
+        // Compressed samples NDJSON should exist with 2 lines.
+        let samples_path = dir.join("report-test.samples.ndjson.gz");
         assert!(samples_path.exists(), "samples NDJSON file should exist");
-        let content = std::fs::read_to_string(&samples_path).unwrap();
+        let file = std::fs::File::open(&samples_path).unwrap();
+        let mut decoder = flate2::read::GzDecoder::new(file);
+        let mut content = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut content).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2);
         let s1: Sample = serde_json::from_str(lines[0]).unwrap();

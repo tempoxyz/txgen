@@ -124,7 +124,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     }
 
     let clock = RunClock::new();
-    let store = SampleStore::new();
+    let store = SampleStore::with_labels(metadata.clone())?;
     let counters = Arc::new(BlockCounters::default());
 
     // Start background scraper if metrics URL is configured.
@@ -214,9 +214,9 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     // Push a final snapshot so counter totals are captured even if the
     // last scraper tick fired before the final block was submitted.
     let final_samples = collector.final_snapshot(&clock);
-    store.push_batch(final_samples).await;
+    store.push_batch(final_samples).await?;
 
-    let samples = store.drain().await;
+    let sample_archive = store.finish().await?;
 
     let blocks = std::mem::take(&mut collector.blocks);
     let run_stats = RunStats::from_blocks_wall_time(&blocks, start.elapsed());
@@ -227,15 +227,13 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         }
     }
 
-    let mut report = FinalReport {
+    let report = FinalReport {
         metadata: metadata.clone(),
-        samples,
+        sample_archive: Some(sample_archive),
         blocks,
         run_stats: Some(run_stats),
         ..Default::default()
     };
-
-    report.apply_labels(&metadata);
 
     for reporter in reporters.iter_mut() {
         reporter.finalize(&report)?;
