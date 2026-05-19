@@ -24,6 +24,7 @@ Use `txgen-ethereum` for standard Ethereum transactions and `txgen-tempo` for Te
 - [Exercise reorg paths](#exercise-reorg-paths)
 - [Use setup transactions and skip them later](#use-setup-transactions-and-skip-them-later)
 - [Generate dependent transaction sequences](#generate-dependent-transaction-sequences)
+- [Generate random fixed-size values](#generate-random-fixed-size-values)
 - [Use Tempo parallel and expiring nonces](#use-tempo-parallel-and-expiring-nonces)
 - [Scrape metrics and write reports](#scrape-metrics-and-write-reports)
 - [Read a report](#read-a-report)
@@ -259,6 +260,61 @@ txgen-tempo generate \
 ```
 
 `--count` counts emitted transactions, not sequence instances. Txgen never emits a partial sequence; if the remaining budget cannot fit the selected sequence, generation stops early.
+
+## Generate random fixed-size values
+
+Use `random` when a template, ABI argument, or sequence binding should generate a fresh fixed-size value from the workload RNG. This is useful for fuzz-style traffic where recipients or identifiers do not need to come from a funded account pool.
+
+```yaml
+templates:
+  random_eth_transfer:
+    type: eip1559
+    from: { pool: users, select: random }
+    to: random
+    value: 1
+    gas_limit: 21000
+
+  random_token_transfer:
+    type: eip1559
+    from: { pool: users, select: random }
+    gas_limit: 65000
+    call:
+      to: "0x20c0000000000000000000000000000000000000"
+      abi: erc20
+      function: transfer
+      args:
+        - random
+        - 1000000
+```
+
+Random sequence bindings are resolved once per sequence instance, then reused by every step that references them:
+
+```yaml
+sequences:
+  transfer_twice_to_random_recipient:
+    bindings:
+      sender:
+        account: { pool: users, select: random }
+      recipient:
+        address: random
+      amount:
+        u256: random
+      salt:
+        bytes32: random
+    steps:
+      - template: random_eth_transfer
+        with:
+          from: { var: sender.ref }
+          to: { var: recipient }
+          value: { var: amount }
+      - template: random_eth_transfer
+        with:
+          from: { var: sender.ref }
+          to: { var: recipient }
+          value: { var: amount }
+```
+
+`random` is supported for fixed-size values such as `address`, `bytes32`, `u64`, `u128`, and `u256`. Use `random_bytes: <len>` for dynamically sized byte payloads.
 
 ## Use Tempo parallel and expiring nonces
 

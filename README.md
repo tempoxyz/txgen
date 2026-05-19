@@ -487,10 +487,23 @@ to:
 # Random address
 to: random
 
+# Random address in an ABI argument
+call:
+  to: "0x..."
+  abi: erc20
+  function: transfer
+  args:
+    - random
+    - 1000000
+
 # Random bytes
 input:
   random_bytes: 32
 ```
+
+`random` generates a value of the target field type. It is supported for fixed-size
+numeric and hash/address-like values (`u64`, `u128`, `u256`, `address`,
+`bytes32`). Use `random_bytes` when you need dynamically sized byte payloads.
 
 ### Contract Calls
 
@@ -640,6 +653,8 @@ bindings:
     account: { pool: users, select: random }
   ephemeral_recipient:
     address: random
+  amount:
+    u256: random
   salt:
     bytes32: { random_bytes: 32 }
   channel_id:
