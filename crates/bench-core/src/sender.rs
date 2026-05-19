@@ -320,43 +320,63 @@ async fn wait_for_receipt(
     }
 }
 
-/// Token-budget rate limiter.
+const RATE_LIMITER_MAX_BURST: Duration = Duration::from_millis(10);
+
+/// Token-bucket rate limiter with a bounded burst budget.
 ///
-/// Instead of sleeping per-token (which breaks at high TPS due to timer
-/// resolution), this tracks how many tokens *should* have been issued by
-/// now based on elapsed time. Tokens are granted instantly while the
-/// budget allows; the caller only sleeps when it gets ahead of schedule.
+/// A pure cumulative scheduler catches up all missed tokens after startup or
+/// source stalls, which can create visible send-rate spikes. This limiter still
+/// batches enough tokens to avoid sub-millisecond sleeps at high TPS, but caps
+/// accumulated credit to a small time window.
 struct RateLimiter {
     rate: f64,
-    start: Instant,
+    burst_capacity: f64,
     state: tokio::sync::Mutex<RateLimiterState>,
 }
 
 struct RateLimiterState {
-    issued: u64,
+    tokens: f64,
+    last_refill: Instant,
 }
 
 impl RateLimiter {
     fn new(tokens_per_sec: u64) -> Self {
+        let rate = tokens_per_sec as f64;
+        let burst_capacity = (rate * RATE_LIMITER_MAX_BURST.as_secs_f64()).max(1.0);
+
         Self {
-            rate: tokens_per_sec as f64,
-            start: Instant::now(),
-            state: tokio::sync::Mutex::new(RateLimiterState { issued: 0 }),
+            rate,
+            burst_capacity,
+            state: tokio::sync::Mutex::new(RateLimiterState {
+                tokens: burst_capacity,
+                last_refill: Instant::now(),
+            }),
         }
     }
 
     async fn acquire(&self) {
         let mut state = self.state.lock().await;
 
-        // The time at which this token *should* be issued.
-        let expected = Duration::from_secs_f64(state.issued as f64 / self.rate);
-        let elapsed = self.start.elapsed();
+        loop {
+            state.refill(self.rate, self.burst_capacity);
 
-        if expected > elapsed {
-            tokio::time::sleep(expected - elapsed).await;
+            if state.tokens >= 1.0 {
+                state.tokens -= 1.0;
+                return;
+            }
+
+            let missing_tokens = 1.0 - state.tokens;
+            tokio::time::sleep(Duration::from_secs_f64(missing_tokens / self.rate)).await;
         }
+    }
+}
 
-        state.issued += 1;
+impl RateLimiterState {
+    fn refill(&mut self, rate: f64, burst_capacity: f64) {
+        let now = Instant::now();
+        let new_tokens = now.duration_since(self.last_refill).as_secs_f64() * rate;
+        self.tokens = (self.tokens + new_tokens).min(burst_capacity);
+        self.last_refill = now;
     }
 }
 
@@ -369,5 +389,11 @@ mod tests {
         let config = SenderConfig::default();
         assert_eq!(config.rate_limit, 0);
         assert_eq!(config.max_concurrent, 100);
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_capacity_is_bounded() {
+        let limiter = RateLimiter::new(10_000);
+        assert_eq!(limiter.burst_capacity, 100.0);
     }
 }
