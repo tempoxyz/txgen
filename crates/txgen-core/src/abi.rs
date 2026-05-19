@@ -284,6 +284,7 @@ fn yaml_to_sol_value(
         if value.get("uniform").is_some() ||
             value.get("choice").is_some() ||
             value.get("pool").is_some() ||
+            value.get("random_address").is_some() ||
             value.get("random_bytes").is_some() ||
             value.get("const").is_some()
         {
@@ -350,6 +351,10 @@ fn resolve_generator_to_sol(
     sol_type: &str,
     resolver: &mut ValueResolver<'_>,
 ) -> Result<DynSolValue> {
+    if value.get("random_address").is_some() && sol_type != "address" {
+        bail!("random_address generator is only supported for Solidity address parameters, got {sol_type}");
+    }
+
     match sol_type {
         "address" => {
             let addr: Address = resolver.resolve(value)?;
@@ -387,6 +392,7 @@ fn parse_int_bits(t: &str) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::{AccountManager, ValueResolver};
+    use rand::{rngs::StdRng, SeedableRng};
 
     #[test]
     fn test_artifact_manager_empty() {
@@ -430,5 +436,61 @@ mod tests {
             .expect_err("fractional uint literals should fail");
 
         assert!(err.to_string().contains("invalid uint256 literal"));
+    }
+
+    #[test]
+    fn test_random_address_in_erc20_transfer_args() {
+        let abi: JsonAbi = serde_json::from_str(
+            r#"[
+                {
+                    "type": "function",
+                    "name": "transfer",
+                    "inputs": [
+                        { "name": "to", "type": "address" },
+                        { "name": "amount", "type": "uint256" }
+                    ],
+                    "outputs": [],
+                    "stateMutability": "nonpayable"
+                }
+            ]"#,
+        )
+        .expect("test ERC20 ABI should parse");
+        let args: Vec<serde_yaml::Value> = serde_yaml::from_str(
+            r#"
+- random_address:
+    prefix: "0x00000000000000000000000000000000dead"
+- 1
+"#,
+        )
+        .expect("test transfer args should parse");
+        let accounts = AccountManager::empty();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+
+        let calldata =
+            encode_function_call(&abi, "transfer(address,uint256)", &args, &mut resolver)
+                .expect("transfer args with random_address should encode");
+
+        assert_eq!(calldata.len(), 4 + 32 + 32);
+        let prefix = hex::decode("00000000000000000000000000000000dead")
+            .expect("test prefix should be valid hex");
+        assert_eq!(&calldata[4 + 12..4 + 12 + prefix.len()], prefix.as_slice());
+        assert_eq!(calldata[4 + 64 - 1], 1);
+    }
+
+    #[test]
+    fn test_random_address_rejected_for_non_address_abi_type() {
+        let accounts = AccountManager::empty();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+        let value = serde_yaml::from_str::<serde_yaml::Value>("random_address: {}")
+            .expect("valid random_address YAML");
+
+        let err = yaml_to_sol_value(&value, "uint256", &mut resolver)
+            .expect_err("random_address should not be accepted for uint256");
+
+        assert!(err.to_string().contains(
+            "random_address generator is only supported for Solidity address parameters"
+        ));
     }
 }

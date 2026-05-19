@@ -20,5 +20,5 @@ pub use spec::{
     AbiEncodePackedDef, AbiHashDef, GasConfig, MixEntry, MixItem, SequenceBinding, SequenceDef,
     SequenceStep, SetupDef, SetupStep, WorkloadSpec,
 };
-pub use value::{FromGenerator, GenValue, Generator, ValueResolver};
+pub use value::{FromGenerator, GenValue, Generator, RandomAddressDef, ValueResolver};
 pub use yaml::merge_yaml;

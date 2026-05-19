@@ -68,7 +68,7 @@ txgen-ethereum generate -s workload.yaml -n 1000 -o transactions.ndjson
 
 #### `addresses`
 
-List all addresses from a workload spec (useful for funding).
+List configured account-pool addresses from a workload spec (useful for funding). Dynamically generated recipients such as `random_address` are intentionally not listed.
 
 ```bash
 txgen-ethereum addresses -s workload.yaml
@@ -479,13 +479,19 @@ to:
     - "0x0000000000000000000000000000000000000001"
     - "0x0000000000000000000000000000000000000002"
 
-# Account address from pool
+# Account address from pool (included in `txgen ... addresses` output)
 to:
   pool: users
   select: random
 
-# Random address
-to: random
+# Random address (not from any account pool; not included in `txgen ... addresses`)
+to:
+  random_address: {}
+
+# Random address with a fixed byte prefix
+args:
+  - random_address:
+      prefix: "0x00000000000000000000000000000000dead"
 
 # Random bytes
 input:
@@ -509,10 +515,12 @@ templates:
       abi: erc20            # Artifact name
       function: transfer    # Function name
       args:
-        - "0x..."           # recipient
+        - random_address: {} # recipient (valid for Solidity address args)
         - 1000000           # amount
       value: 0
 ```
+
+`random_address` is a first-class address generator for Solidity `address` parameters and address-valued fields. It uses the same seeded RNG as other generators, so output is reproducible with `--seed`. Optional `prefix` values are parsed as hex bytes and copied to the start of the 20-byte address; the remaining bytes are randomized.
 
 ### Setup Transactions
 
@@ -639,7 +647,7 @@ bindings:
   payer:
     account: { pool: users, select: random }
   ephemeral_recipient:
-    address: random
+    address: { random_address: {} }
   salt:
     bytes32: { random_bytes: 32 }
   channel_id:

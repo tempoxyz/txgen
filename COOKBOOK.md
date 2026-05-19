@@ -58,7 +58,7 @@ Notes:
 
 ## List and fund workload accounts
 
-List every address referenced by a workload spec:
+List every configured account-pool address in a workload spec. Generated recipients such as `random_address` are not listed or funded by setup flows:
 
 ```bash
 txgen-tempo addresses --spec examples/bench-spec.yaml

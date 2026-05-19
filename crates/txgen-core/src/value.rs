@@ -1,9 +1,11 @@
 use alloy_primitives::{Address, Bytes, B256, U256};
-use eyre::{bail, Result};
+use eyre::{bail, Result, WrapErr};
 use rand::Rng;
 use serde::{de::DeserializeOwned, Deserialize};
 
 use crate::{AccountManager, SelectMode};
+
+const ADDRESS_LEN: usize = 20;
 
 /// A value that can be either a literal or a generator expression.
 #[derive(Debug, Clone, Deserialize)]
@@ -31,12 +33,23 @@ pub enum Generator {
     Choice(Vec<serde_yaml::Value>),
     /// Account address from a pool.
     Pool { pool: String, select: SelectMode },
+    /// Random address, optionally with a fixed byte prefix.
+    RandomAddress(RandomAddressDef),
     /// Random bytes of given length.
     RandomBytes(usize),
     /// Random value.
     Random,
     /// Explicit constant value.
     Const(serde_yaml::Value),
+}
+
+/// Configuration for random address generation.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RandomAddressDef {
+    /// Optional hex byte prefix copied into the start of the address.
+    #[serde(default)]
+    pub prefix: Option<String>,
 }
 
 /// Resolver for generator expressions.
@@ -156,6 +169,7 @@ impl FromGenerator for Address {
                 };
                 Ok(signer.address())
             }
+            Generator::RandomAddress(def) => random_address(def.prefix.as_deref(), resolver.rng),
             Generator::Const(v) => {
                 let s: String = serde_yaml::from_value(v.clone())?;
                 Ok(s.parse()?)
@@ -169,6 +183,22 @@ impl FromGenerator for Address {
             _ => bail!("cannot generate Address from {:?}", generator),
         }
     }
+}
+
+fn random_address(prefix: Option<&str>, rng: &mut dyn rand::RngCore) -> Result<Address> {
+    let prefix = prefix.map(parse_address_prefix).transpose()?.unwrap_or_default();
+    let mut bytes = [0u8; ADDRESS_LEN];
+    bytes[..prefix.len()].copy_from_slice(&prefix);
+    rng.fill(&mut bytes[prefix.len()..]);
+    Ok(Address::from(bytes))
+}
+
+fn parse_address_prefix(prefix: &str) -> Result<Bytes> {
+    let bytes: Bytes = prefix.parse().wrap_err("invalid random_address prefix hex")?;
+    if bytes.len() > ADDRESS_LEN {
+        bail!("random_address prefix is too long: {} bytes (max {ADDRESS_LEN})", bytes.len());
+    }
+    Ok(bytes)
 }
 
 impl FromGenerator for Bytes {
@@ -257,6 +287,69 @@ mod tests {
             addr,
             Address::from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
         );
+    }
+
+    #[test]
+    fn test_random_address() {
+        let accounts = AccountManager::empty();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+        let generator = Generator::RandomAddress(RandomAddressDef::default());
+
+        let addr = Address::from_generator(&generator, &mut resolver)
+            .expect("random_address should generate an address");
+
+        assert_ne!(addr, Address::ZERO);
+    }
+
+    #[test]
+    fn test_random_address_deterministic() {
+        let accounts = AccountManager::empty();
+        let generator = Generator::RandomAddress(RandomAddressDef::default());
+
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut resolver_a = ValueResolver { accounts: &accounts, rng: &mut rng_a };
+        let addr_a = Address::from_generator(&generator, &mut resolver_a)
+            .expect("random_address should generate an address");
+
+        let mut rng_b = StdRng::seed_from_u64(42);
+        let mut resolver_b = ValueResolver { accounts: &accounts, rng: &mut rng_b };
+        let addr_b = Address::from_generator(&generator, &mut resolver_b)
+            .expect("random_address should generate an address");
+
+        assert_eq!(addr_a, addr_b);
+    }
+
+    #[test]
+    fn test_random_address_prefix() {
+        let accounts = AccountManager::empty();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+        let generator = Generator::RandomAddress(RandomAddressDef {
+            prefix: Some("0x00000000000000000000000000000000dead".to_string()),
+        });
+
+        let addr = Address::from_generator(&generator, &mut resolver)
+            .expect("random_address with prefix should generate an address");
+
+        let prefix = hex::decode("00000000000000000000000000000000dead")
+            .expect("test prefix should be valid hex");
+        assert_eq!(&addr.as_slice()[..prefix.len()], prefix.as_slice());
+        assert_ne!(&addr.as_slice()[prefix.len()..], &[0u8; 2]);
+    }
+
+    #[test]
+    fn test_random_address_from_yaml() {
+        let accounts = AccountManager::empty();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+        let value: GenValue<Address> = serde_yaml::from_str("random_address: {}")
+            .expect("random_address generator should parse from YAML");
+
+        let addr =
+            resolver.resolve_gen(&value).expect("random_address YAML should resolve to an address");
+
+        assert_ne!(addr, Address::ZERO);
     }
 
     #[test]
