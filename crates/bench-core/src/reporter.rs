@@ -389,9 +389,9 @@ fn samples_path_from_report(report_path: &Path) -> Option<std::path::PathBuf> {
 
 impl<W: Write + Send> Reporter for JsonReporter<W> {
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
-        let has_data = report.bench_metrics.is_some()
-            || !report.blocks.is_empty()
-            || !report.samples.is_empty();
+        let has_data = report.bench_metrics.is_some() ||
+            !report.blocks.is_empty() ||
+            !report.samples.is_empty();
         if !has_data {
             return Ok(());
         }
@@ -461,9 +461,9 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         writeln!(self.writer)?;
 
         // Stream samples to a separate NDJSON file (one JSON object per line).
-        if write_ndjson
-            && let Some(samples_path) = &self.samples_path
-            && !report.samples.is_empty()
+        if write_ndjson &&
+            let Some(samples_path) = &self.samples_path &&
+            !report.samples.is_empty()
         {
             let file = std::fs::File::create(samples_path).wrap_err_with(|| {
                 format!("failed to create samples file {}", samples_path.display())
@@ -1124,8 +1124,8 @@ mod tests {
         let report_json: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&report_path).unwrap()).unwrap();
         assert!(
-            report_json.get("samples").is_none()
-                || report_json["samples"].as_array().unwrap().is_empty()
+            report_json.get("samples").is_none() ||
+                report_json["samples"].as_array().unwrap().is_empty()
         );
 
         // Samples NDJSON should exist with 2 lines.
