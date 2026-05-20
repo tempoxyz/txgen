@@ -23,7 +23,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         "Starting send"
     );
 
-    let metadata = parse_metadata(&args.metadata)?;
+    let mut metadata = parse_metadata(&args.metadata)?;
     let scraper_configs =
         metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
 
@@ -50,18 +50,18 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     match &args.input {
         Some(path) => {
             let mut source = FileSource::new(path).wrap_err("failed to open input file")?;
-            execute_source(&args, &metadata, providers, &mut source, &scraper_configs).await
+            execute_source(&args, &mut metadata, providers, &mut source, &scraper_configs).await
         }
         None => {
             let mut source = StdinSource::new();
-            execute_source(&args, &metadata, providers, &mut source, &scraper_configs).await
+            execute_source(&args, &mut metadata, providers, &mut source, &scraper_configs).await
         }
     }
 }
 
 async fn execute_source<S: TxSource>(
     args: &SendArgs,
-    metadata: &HashMap<String, String>,
+    metadata: &mut HashMap<String, String>,
     providers: Vec<DynProvider<AnyNetwork>>,
     source: &mut S,
     scraper_configs: &[ScraperConfig],

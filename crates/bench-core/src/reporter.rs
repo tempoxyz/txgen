@@ -510,6 +510,7 @@ pub struct ClickHouseConfig {
 /// Required metadata keys for the ClickHouse reporter.
 const REQUIRED_METADATA: &[&str] = &["scenario", "platform", "git-sha", "git-ref"];
 const DEFAULT_CLICKHOUSE_SAMPLE_BATCH_SIZE: usize = 50_000;
+const CLICKHOUSE_RUN_ID_METADATA_KEY: &str = "clickhouse_run_id";
 
 impl ClickHouseConfig {
     /// Create a ClickHouse config from the reporter URL and user metadata.
@@ -541,6 +542,12 @@ impl ClickHouseConfig {
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(DEFAULT_CLICKHOUSE_SAMPLE_BATCH_SIZE);
+        let run_id = match metadata.get(CLICKHOUSE_RUN_ID_METADATA_KEY) {
+            Some(value) => value.parse::<uuid::Uuid>().wrap_err_with(|| {
+                format!("invalid {CLICKHOUSE_RUN_ID_METADATA_KEY} metadata value: {value}")
+            })?,
+            None => uuid::Uuid::new_v4(),
+        };
 
         // Separate config-like keys from remaining metadata.
         let config_keys = ["tps", "max_concurrent", "chain_id", "scrape_interval_ms"];
@@ -560,7 +567,7 @@ impl ClickHouseConfig {
             database,
             user,
             password,
-            run_id: uuid::Uuid::new_v4(),
+            run_id,
             started_at: std::time::SystemTime::now(),
             scenario_name: metadata["scenario"].clone(),
             platform: metadata["platform"].clone(),
@@ -815,7 +822,7 @@ fn system_time_to_millis(t: std::time::SystemTime) -> u64 {
 pub fn parse_reporters(
     specs: &[String],
     mode: &str,
-    metadata: &HashMap<String, String>,
+    metadata: &mut HashMap<String, String>,
 ) -> Result<Vec<Box<dyn Reporter>>> {
     let mut reporters: Vec<Box<dyn Reporter>> = Vec::new();
 
@@ -833,6 +840,9 @@ pub fn parse_reporters(
             ));
         } else if let Some(url) = spec.strip_prefix("clickhouse:") {
             let config = ClickHouseConfig::from_metadata(url, mode, metadata)?;
+            metadata
+                .entry(CLICKHOUSE_RUN_ID_METADATA_KEY.to_string())
+                .or_insert_with(|| config.run_id.to_string());
             reporters.push(Box::new(
                 ClickHouseReporter::new(config).wrap_err("failed to create ClickHouse reporter")?,
             ));
@@ -878,6 +888,63 @@ mod tests {
 
     fn sample_report() -> FinalReport {
         FinalReport { bench_metrics: Some(sample_metrics()), ..Default::default() }
+    }
+
+    fn clickhouse_metadata() -> HashMap<String, String> {
+        HashMap::from([
+            ("scenario".to_string(), "tip20-10k".to_string()),
+            ("platform".to_string(), "tempo".to_string()),
+            ("git-sha".to_string(), "abc123".to_string()),
+            ("git-ref".to_string(), "main".to_string()),
+        ])
+    }
+
+    #[test]
+    fn test_clickhouse_config_uses_provided_run_id() {
+        let run_id = uuid::Uuid::parse_str("5fdfaa5a-c66e-4048-9637-1f906d05cf1e").unwrap();
+        let mut metadata = clickhouse_metadata();
+        metadata.insert(CLICKHOUSE_RUN_ID_METADATA_KEY.to_string(), run_id.to_string());
+
+        let config =
+            ClickHouseConfig::from_metadata("http://localhost:8123", "send", &metadata).unwrap();
+
+        assert_eq!(config.run_id, run_id);
+    }
+
+    #[test]
+    fn test_clickhouse_config_generates_run_id_when_missing() {
+        let metadata = clickhouse_metadata();
+
+        let config =
+            ClickHouseConfig::from_metadata("http://localhost:8123", "send", &metadata).unwrap();
+
+        assert_ne!(config.run_id, uuid::Uuid::nil());
+    }
+
+    #[test]
+    fn test_clickhouse_config_rejects_invalid_run_id() {
+        let mut metadata = clickhouse_metadata();
+        metadata.insert(CLICKHOUSE_RUN_ID_METADATA_KEY.to_string(), "not-a-uuid".to_string());
+
+        let err = ClickHouseConfig::from_metadata("http://localhost:8123", "send", &metadata)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("invalid clickhouse_run_id metadata value"));
+    }
+
+    #[test]
+    fn test_parse_reporters_outputs_generated_clickhouse_run_id_metadata() {
+        let mut metadata = clickhouse_metadata();
+        let reporters = parse_reporters(
+            &["clickhouse:http://localhost:8123".to_string()],
+            "send",
+            &mut metadata,
+        )
+        .unwrap();
+
+        assert_eq!(reporters.len(), 1);
+        let run_id = metadata.get(CLICKHOUSE_RUN_ID_METADATA_KEY).unwrap();
+        assert!(uuid::Uuid::parse_str(run_id).is_ok());
     }
 
     #[test]

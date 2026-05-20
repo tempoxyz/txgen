@@ -82,6 +82,8 @@ bench send -i txs.ndjson \
   -m git-ref=main
 ```
 
+The reporter generates `txgen_runs.run_id` automatically and adds it to report metadata as `clickhouse_run_id`, so JSON reports expose the ClickHouse run id. To choose that UUID before the insert, pass `-m clickhouse_run_id=<uuid>`.
+
 ### Authentication
 
 Credentials and database are configured via environment variables:

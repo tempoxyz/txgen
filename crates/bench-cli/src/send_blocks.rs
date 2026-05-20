@@ -97,7 +97,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let jwt_secret =
         JwtSecret::from_hex(jwt_secret_hex.trim()).wrap_err("invalid JWT secret hex")?;
 
-    let metadata = parse_metadata(&args.metadata)?;
+    let mut metadata = parse_metadata(&args.metadata)?;
     let scraper_configs =
         metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
     let persistence_policy = args.wait_for_persistence;
@@ -118,7 +118,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let testing_provider =
         RootProvider::<Ethereum>::new_http(args.rpc.parse().wrap_err("invalid RPC URL")?);
 
-    let mut reporters = parse_reporters(&args.reports, "send-blocks", &metadata)?;
+    let mut reporters = parse_reporters(&args.reports, "send-blocks", &mut metadata)?;
     if reporters.is_empty() {
         reporters.push(Box::new(ConsoleReporter::stderr(false)));
     }

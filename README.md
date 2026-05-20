@@ -295,6 +295,8 @@ bench send -i txs.ndjson \
 | `git-sha` | Node commit SHA being benchmarked |
 | `git-ref` | Node git branch/ref |
 
+By default, the ClickHouse reporter generates a UUID for `txgen_runs.run_id` and adds it to report metadata as `clickhouse_run_id`, so JSON reports expose the ClickHouse run id. To use a known ID in downstream dashboards, pass `-m clickhouse_run_id=<uuid>`.
+
 Authentication and insert batching are configured via environment variables: `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE`, and `CLICKHOUSE_SAMPLE_BATCH_SIZE` (default: `50000`). See [`scripts/clickhouse/README.md`](scripts/clickhouse/README.md) for schema setup and example queries.
 
 The JSON report includes:
