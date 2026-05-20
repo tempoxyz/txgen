@@ -494,8 +494,8 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         writeln!(self.writer)?;
 
         // Stream samples to a separate gzip-compressed NDJSON file.
-        if let Some(samples_path) = &self.samples_path
-            && report.has_samples()
+        if let Some(samples_path) = &self.samples_path &&
+            report.has_samples()
         {
             let count = write_samples_ndjson_gz(report, samples_path)?;
             tracing::info!(
@@ -865,8 +865,7 @@ fn system_time_to_millis(t: std::time::SystemTime) -> u64 {
 ///
 /// Supported formats:
 /// - `console` - Human-readable output to stderr
-/// - `json:<path>` - JSON output to file (samples written to
-///   `<stem>.samples.ndjson.gz` sibling)
+/// - `json:<path>` - JSON output to file (samples written to `<stem>.samples.ndjson.gz` sibling)
 /// - `clickhouse:<url>` - Push benchmark data to ClickHouse
 /// - `prometheus:<url>` - Push samples via Prometheus remote write protocol (protobuf + snappy on
 ///   `/api/v1/write`). Works with VictoriaMetrics, Prometheus, Cortex, Thanos, etc. Auth and other
@@ -923,8 +922,7 @@ pub fn parse_reporters(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::LatencyStats;
-    use crate::sample::SampleStore;
+    use crate::{metrics::LatencyStats, sample::SampleStore};
     use std::{collections::BTreeMap, time::Duration};
 
     fn sample_metrics() -> BenchMetrics {
@@ -1129,8 +1127,8 @@ mod tests {
         let report_json: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&report_path).unwrap()).unwrap();
         assert!(
-            report_json.get("samples").is_none()
-                || report_json["samples"].as_array().unwrap().is_empty()
+            report_json.get("samples").is_none() ||
+                report_json["samples"].as_array().unwrap().is_empty()
         );
 
         // Compressed samples NDJSON should exist with 2 lines.

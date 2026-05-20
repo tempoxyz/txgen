@@ -167,8 +167,8 @@ async fn scraper_loop(
         // Collect extra samples (e.g. internal metrics) at the same offset.
         if let Some(ref cb) = extra_samples {
             let extra = cb();
-            if !extra.is_empty()
-                && let Err(err) = store.push_batch(extra).await
+            if !extra.is_empty() &&
+                let Err(err) = store.push_batch(extra).await
             {
                 tracing::warn!(%err, "failed to write internal metric samples");
             }
@@ -179,8 +179,8 @@ async fn scraper_loop(
                 Ok(text) => {
                     let mut samples = parse_prometheus_text(&text, offset_ms, unix_ms);
                     apply_node_label(&mut samples, config.node_label.as_deref());
-                    if !samples.is_empty()
-                        && let Err(err) = store.push_batch(samples).await
+                    if !samples.is_empty() &&
+                        let Err(err) = store.push_batch(samples).await
                     {
                         tracing::warn!(%err, url = %config.url, "failed to write scraped metric samples");
                     }
