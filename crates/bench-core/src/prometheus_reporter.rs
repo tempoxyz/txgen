@@ -197,11 +197,11 @@ impl Reporter for PrometheusReporter {
         );
 
         let mut pushed = 0usize;
-        report.for_each_sample_chunk(self.config.batch_size, |chunk| {
-            self.send_batch(chunk)?;
+        for chunk in report.sample_chunks(self.config.batch_size)? {
+            let chunk = chunk?;
+            self.send_batch(&chunk)?;
             pushed += chunk.len();
-            Ok(())
-        })?;
+        }
 
         tracing::info!(samples = pushed, "remote write push complete");
         Ok(())

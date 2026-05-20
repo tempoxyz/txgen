@@ -21,7 +21,7 @@ use std::{
 /// Unified final report passed to reporters at finalization.
 ///
 /// Contains both typed aggregates (for console/JSON reporters) and
-/// the raw unified sample stream (for TSDB reporters).
+/// a disk-backed sample archive (for TSDB reporters and JSON samples output).
 #[derive(Debug, Default)]
 pub struct FinalReport {
     /// User-provided metadata key/value pairs.
@@ -32,8 +32,6 @@ pub struct FinalReport {
     pub time_series: Option<TimeSeriesMetrics>,
     /// Block-level run summary.
     pub run_stats: Option<RunStats>,
-    /// Unified time-series samples (internal + node).
-    pub samples: Vec<Sample>,
     /// Disk-backed compressed sample archive for long benchmark runs.
     pub sample_archive: Option<SampleArchive>,
     /// Per-block statistics.
@@ -41,26 +39,9 @@ pub struct FinalReport {
 }
 
 impl FinalReport {
-    /// Merge run-level labels into in-memory samples.
-    ///
-    /// Labels from `extra` are added to each sample. If a sample already
-    /// has a label with the same key, the existing (node) value wins.
-    /// Disk-backed samples should be written through `SampleStore::with_labels`
-    /// so labels are applied before they enter the archive.
-    pub fn apply_labels(&mut self, extra: &HashMap<String, String>) {
-        if extra.is_empty() {
-            return;
-        }
-        for sample in &mut self.samples {
-            for (k, v) in extra {
-                sample.labels.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-        }
-    }
-
-    /// Total number of in-memory and archived metric samples.
+    /// Total number of archived metric samples.
     pub fn sample_count(&self) -> usize {
-        self.samples.len() + self.sample_archive.as_ref().map_or(0, SampleArchive::len)
+        self.sample_archive.as_ref().map_or(0, SampleArchive::len)
     }
 
     /// Whether the report has metric samples.
@@ -68,73 +49,38 @@ impl FinalReport {
         self.sample_count() > 0
     }
 
-    /// Iterate over samples in bounded chunks.
-    pub fn for_each_sample_chunk<F>(&self, chunk_size: usize, mut f: F) -> Result<()>
-    where
-        F: FnMut(&[Sample]) -> Result<()>,
-    {
+    /// Iterate over archived samples.
+    pub fn iter_samples(&self) -> Result<impl Iterator<Item = Result<Sample>> + '_> {
+        let iter = self.sample_archive.as_ref().map(SampleArchive::iter).transpose()?;
+        Ok(iter.into_iter().flatten())
+    }
+
+    /// Iterate over archived samples in bounded chunks.
+    pub fn sample_chunks(
+        &self,
+        chunk_size: usize,
+    ) -> Result<impl Iterator<Item = Result<Vec<Sample>>> + '_> {
+        let mut samples = self.iter_samples()?;
         let chunk_size = chunk_size.max(1);
-        let mut chunk = Vec::with_capacity(chunk_size);
-
-        for sample in &self.samples {
-            chunk.push(sample.clone());
-            if chunk.len() >= chunk_size {
-                f(&chunk)?;
-                chunk.clear();
-            }
-        }
-
-        if let Some(archive) = &self.sample_archive {
-            for sample in archive.iter()? {
-                chunk.push(sample?);
-                if chunk.len() >= chunk_size {
-                    f(&chunk)?;
-                    chunk.clear();
+        Ok(std::iter::from_fn(move || {
+            let mut chunk = Vec::with_capacity(chunk_size);
+            for _ in 0..chunk_size {
+                match samples.next() {
+                    Some(Ok(sample)) => chunk.push(sample),
+                    Some(Err(err)) => return Some(Err(err)),
+                    None => break,
                 }
             }
-        }
-
-        if !chunk.is_empty() {
-            f(&chunk)?;
-        }
-
-        Ok(())
-    }
-
-    /// Collect all samples into memory. Intended only for stdout JSON reports
-    /// and tests; file/remote reporters should stream chunks instead.
-    pub fn collect_samples(&self) -> Result<Vec<Sample>> {
-        let mut samples = Vec::with_capacity(self.sample_count());
-        self.for_each_sample_chunk(10_000, |chunk| {
-            samples.extend_from_slice(chunk);
-            Ok(())
-        })?;
-        Ok(samples)
-    }
-
-    /// Write all samples to a gzip-compressed NDJSON file.
-    pub fn write_samples_ndjson_gz(&self, path: &Path) -> Result<usize> {
-        let file = File::create(path)
-            .wrap_err_with(|| format!("failed to create samples file {}", path.display()))?;
-        let mut writer = GzEncoder::new(BufWriter::new(file), Compression::default());
-        let mut count = 0usize;
-
-        self.for_each_sample_chunk(10_000, |chunk| {
-            for sample in chunk {
-                serde_json::to_writer(&mut writer, sample)?;
-                writeln!(writer)?;
-                count += 1;
+            if chunk.is_empty() {
+                None
+            } else {
+                Some(Ok(chunk))
             }
-            Ok(())
-        })?;
-
-        writer.finish()?.flush()?;
-        Ok(count)
+        }))
     }
 
     /// Retain only samples at or before the given Unix millisecond timestamp.
     pub fn retain_samples_until(&mut self, cutoff_ms: u64) -> Result<()> {
-        self.samples.retain(|sample| sample.unix_ms <= cutoff_ms);
         if let Some(archive) = self.sample_archive.as_mut() {
             archive.retain(|sample| sample.unix_ms <= cutoff_ms)?;
         }
@@ -518,11 +464,6 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         let metadata =
             if report.metadata.is_empty() { None } else { Some(report.metadata.clone()) };
 
-        let (embed_samples, write_ndjson) = match &self.samples_path {
-            Some(_) => (false, true),
-            None => (true, false),
-        };
-
         let json_report = JsonReport {
             sent,
             success,
@@ -535,18 +476,17 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             blocks,
             run_stats: report.run_stats.clone(),
             metadata,
-            samples: if embed_samples { report.collect_samples()? } else { Vec::new() },
+            samples: Vec::new(),
         };
 
         serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
         writeln!(self.writer)?;
 
         // Stream samples to a separate gzip-compressed NDJSON file.
-        if write_ndjson
-            && let Some(samples_path) = &self.samples_path
+        if let Some(samples_path) = &self.samples_path
             && report.has_samples()
         {
-            let count = report.write_samples_ndjson_gz(samples_path)?;
+            let count = write_samples_ndjson_gz(report, samples_path)?;
             tracing::info!(
                 path = %samples_path.display(),
                 count,
@@ -556,6 +496,22 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
 
         Ok(())
     }
+}
+
+fn write_samples_ndjson_gz(report: &FinalReport, path: &Path) -> Result<usize> {
+    let file = File::create(path)
+        .wrap_err_with(|| format!("failed to create samples file {}", path.display()))?;
+    let mut writer = GzEncoder::new(BufWriter::new(file), Compression::default());
+    let mut count = 0usize;
+
+    for sample in report.iter_samples()? {
+        serde_json::to_writer(&mut writer, &sample?)?;
+        writeln!(writer)?;
+        count += 1;
+    }
+
+    writer.finish()?.flush()?;
+    Ok(count)
 }
 
 /// ClickHouse reporter configuration.
@@ -788,6 +744,18 @@ impl ClickHouseReporter {
             })
             .collect()
     }
+
+    /// Insert one metric sample batch.
+    fn insert_sample_batch(&self, samples: &[Sample]) -> Result<usize> {
+        let sample_rows = self.build_sample_rows(samples);
+        if sample_rows.is_empty() {
+            return Ok(0);
+        }
+
+        let count = sample_rows.len();
+        self.insert_rows("txgen_metric_samples", &sample_rows)?;
+        Ok(count)
+    }
 }
 
 impl Reporter for ClickHouseReporter {
@@ -809,17 +777,12 @@ impl Reporter for ClickHouseReporter {
         let block_rows = self.build_block_rows(report);
         self.insert_rows("txgen_blocks", &block_rows)?;
 
-        // Insert metric samples in bounded chunks. The report may be backed by
-        // a compressed sample archive, so do not collect all rows at once.
+        // Insert metric samples in bounded chunks. The report is backed by a
+        // compressed sample archive, so do not collect all rows at once.
         let mut inserted_samples = 0usize;
-        report.for_each_sample_chunk(self.config.sample_batch_size, |samples| {
-            let sample_rows = self.build_sample_rows(samples);
-            if !sample_rows.is_empty() {
-                self.insert_rows("txgen_metric_samples", &sample_rows)?;
-                inserted_samples += sample_rows.len();
-            }
-            Ok(())
-        })?;
+        for chunk in report.sample_chunks(self.config.sample_batch_size)? {
+            inserted_samples += self.insert_sample_batch(&chunk?)?;
+        }
 
         tracing::info!(
             run_id = %self.config.run_id,
@@ -946,7 +909,8 @@ pub fn parse_reporters(
 mod tests {
     use super::*;
     use crate::metrics::LatencyStats;
-    use std::time::Duration;
+    use crate::sample::SampleStore;
+    use std::{collections::BTreeMap, time::Duration};
 
     fn sample_metrics() -> BenchMetrics {
         BenchMetrics {
@@ -967,6 +931,27 @@ mod tests {
 
     fn sample_report() -> FinalReport {
         FinalReport { bench_metrics: Some(sample_metrics()), ..Default::default() }
+    }
+
+    fn sample(name: &str, value: f64, offset_ms: u64) -> Sample {
+        Sample {
+            name: name.to_string(),
+            labels: BTreeMap::new(),
+            value,
+            offset_ms,
+            unix_ms: 1000 + offset_ms,
+        }
+    }
+
+    async fn sample_report_with_samples(samples: Vec<Sample>) -> FinalReport {
+        let store = SampleStore::new().unwrap();
+        store.push_batch(samples).await.unwrap();
+        let sample_archive = store.finish().await.unwrap();
+        FinalReport {
+            bench_metrics: Some(sample_metrics()),
+            sample_archive: Some(sample_archive),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1075,48 +1060,6 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_labels() {
-        use crate::sample::Sample;
-        use std::collections::BTreeMap;
-
-        let mut report = FinalReport {
-            samples: vec![
-                Sample {
-                    name: "txgen_sent_total".to_string(),
-                    labels: BTreeMap::new(),
-                    value: 100.0,
-                    offset_ms: 0,
-                    unix_ms: 0,
-                },
-                Sample {
-                    name: "reth_metric".to_string(),
-                    labels: BTreeMap::from([("host".to_string(), "node-1".to_string())]),
-                    value: 42.0,
-                    offset_ms: 0,
-                    unix_ms: 0,
-                },
-            ],
-            ..Default::default()
-        };
-
-        let labels = HashMap::from([
-            ("run_id".to_string(), "abc123".to_string()),
-            ("host".to_string(), "override-me".to_string()),
-        ]);
-        report.apply_labels(&labels);
-
-        // run_id added to both.
-        assert_eq!(report.samples[0].labels["run_id"], "abc123");
-        assert_eq!(report.samples[1].labels["run_id"], "abc123");
-
-        // Node label "host" preserved (not overwritten).
-        assert_eq!(report.samples[1].labels["host"], "node-1");
-
-        // No prior "host" label → gets the new value.
-        assert_eq!(report.samples[0].labels["host"], "override-me");
-    }
-
-    #[test]
     fn test_samples_path_from_report() {
         assert_eq!(
             samples_path_from_report(Path::new("/tmp/results/report-baseline-1.json")),
@@ -1136,35 +1079,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_json_reporter_stdout_embeds_samples() {
-        use crate::sample::Sample;
-        use std::collections::BTreeMap;
-
+    #[tokio::test]
+    async fn test_json_reporter_omits_embedded_samples() {
         let mut output = Vec::new();
         {
             let mut reporter = JsonReporter::new(&mut output);
-            let mut report = sample_report();
-            report.samples = vec![Sample {
-                name: "test_metric".to_string(),
-                labels: BTreeMap::new(),
-                value: 1.0,
-                offset_ms: 0,
-                unix_ms: 1000,
-            }];
+            let report = sample_report_with_samples(vec![sample("test_metric", 1.0, 0)]).await;
             reporter.finalize(&report).unwrap();
         }
 
         let output_str = String::from_utf8(output).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&output_str).unwrap();
-        assert_eq!(parsed["samples"].as_array().unwrap().len(), 1);
+        assert!(parsed.get("samples").is_none());
     }
 
-    #[test]
-    fn test_json_reporter_file_splits_samples() {
-        use crate::sample::Sample;
-        use std::collections::BTreeMap;
-
+    #[tokio::test]
+    async fn test_json_reporter_file_splits_samples() {
         let dir = std::env::temp_dir().join("txgen-test-split-samples");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1172,23 +1102,9 @@ mod tests {
         let report_path = dir.join("report-test.json");
         {
             let mut reporter = JsonReporter::file(&report_path).unwrap();
-            let mut report = sample_report();
-            report.samples = vec![
-                Sample {
-                    name: "m1".to_string(),
-                    labels: BTreeMap::new(),
-                    value: 1.0,
-                    offset_ms: 0,
-                    unix_ms: 1000,
-                },
-                Sample {
-                    name: "m2".to_string(),
-                    labels: BTreeMap::new(),
-                    value: 2.0,
-                    offset_ms: 100,
-                    unix_ms: 1100,
-                },
-            ];
+            let report =
+                sample_report_with_samples(vec![sample("m1", 1.0, 0), sample("m2", 2.0, 100)])
+                    .await;
             reporter.finalize(&report).unwrap();
         }
 
