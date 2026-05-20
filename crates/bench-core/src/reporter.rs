@@ -251,6 +251,9 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
 /// JSON output format.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct JsonReport {
+    /// Benchmark identifier shared with external reporters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub benchmark_id: Option<uuid::Uuid>,
     /// Total transactions sent (send mode).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sent: Option<u64>,
@@ -335,6 +338,7 @@ pub struct JsonLatencySample {
 /// `report-baseline-1.json` → `report-baseline-1.samples.ndjson`.
 pub struct JsonReporter<W: Write + Send = Box<dyn Write + Send>> {
     writer: W,
+    benchmark_id: Option<uuid::Uuid>,
     /// Path to the NDJSON samples file (only set for file-based reporters).
     samples_path: Option<std::path::PathBuf>,
 }
@@ -342,7 +346,7 @@ pub struct JsonReporter<W: Write + Send = Box<dyn Write + Send>> {
 impl JsonReporter {
     /// Create a JSON reporter writing to stdout.
     pub fn stdout() -> Self {
-        Self { writer: Box::new(std::io::stdout()), samples_path: None }
+        Self { writer: Box::new(std::io::stdout()), benchmark_id: None, samples_path: None }
     }
 
     /// Create a JSON reporter writing to a file.
@@ -352,14 +356,20 @@ impl JsonReporter {
     pub fn file(path: &Path) -> Result<JsonReporter<std::io::BufWriter<std::fs::File>>> {
         let file = std::fs::File::create(path).context("failed to create output file")?;
         let samples_path = samples_path_from_report(path);
-        Ok(JsonReporter { writer: std::io::BufWriter::new(file), samples_path })
+        Ok(JsonReporter { writer: std::io::BufWriter::new(file), benchmark_id: None, samples_path })
     }
 }
 
 impl<W: Write + Send> JsonReporter<W> {
     /// Create a new JSON reporter with a custom writer.
     pub fn new(writer: W) -> Self {
-        Self { writer, samples_path: None }
+        Self { writer, benchmark_id: None, samples_path: None }
+    }
+
+    /// Set the benchmark identifier written to the JSON report.
+    pub fn with_benchmark_id(mut self, benchmark_id: uuid::Uuid) -> Self {
+        self.benchmark_id = Some(benchmark_id);
+        self
     }
 }
 
@@ -379,9 +389,9 @@ fn samples_path_from_report(report_path: &Path) -> Option<std::path::PathBuf> {
 
 impl<W: Write + Send> Reporter for JsonReporter<W> {
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
-        let has_data = report.bench_metrics.is_some() ||
-            !report.blocks.is_empty() ||
-            !report.samples.is_empty();
+        let has_data = report.bench_metrics.is_some()
+            || !report.blocks.is_empty()
+            || !report.samples.is_empty();
         if !has_data {
             return Ok(());
         }
@@ -432,6 +442,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         };
 
         let json_report = JsonReport {
+            benchmark_id: self.benchmark_id,
             sent,
             success,
             failed,
@@ -450,9 +461,9 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         writeln!(self.writer)?;
 
         // Stream samples to a separate NDJSON file (one JSON object per line).
-        if write_ndjson &&
-            let Some(samples_path) = &self.samples_path &&
-            !report.samples.is_empty()
+        if write_ndjson
+            && let Some(samples_path) = &self.samples_path
+            && !report.samples.is_empty()
         {
             let file = std::fs::File::create(samples_path).wrap_err_with(|| {
                 format!("failed to create samples file {}", samples_path.display())
@@ -521,6 +532,7 @@ impl ClickHouseConfig {
     pub fn from_metadata(
         url: &str,
         mode: &str,
+        run_id: uuid::Uuid,
         metadata: &HashMap<String, String>,
     ) -> Result<Self> {
         let missing: Vec<&str> =
@@ -560,7 +572,7 @@ impl ClickHouseConfig {
             database,
             user,
             password,
-            run_id: uuid::Uuid::new_v4(),
+            run_id,
             started_at: std::time::SystemTime::now(),
             scenario_name: metadata["scenario"].clone(),
             platform: metadata["platform"].clone(),
@@ -818,6 +830,7 @@ pub fn parse_reporters(
     metadata: &HashMap<String, String>,
 ) -> Result<Vec<Box<dyn Reporter>>> {
     let mut reporters: Vec<Box<dyn Reporter>> = Vec::new();
+    let benchmark_id = uuid::Uuid::new_v4();
 
     if specs.is_empty() {
         return Ok(reporters);
@@ -829,10 +842,12 @@ pub fn parse_reporters(
         } else if let Some(path) = spec.strip_prefix("json:") {
             let path = Path::new(path);
             reporters.push(Box::new(
-                JsonReporter::file(path).wrap_err("failed to create JSON reporter")?,
+                JsonReporter::file(path)
+                    .wrap_err("failed to create JSON reporter")?
+                    .with_benchmark_id(benchmark_id),
             ));
         } else if let Some(url) = spec.strip_prefix("clickhouse:") {
-            let config = ClickHouseConfig::from_metadata(url, mode, metadata)?;
+            let config = ClickHouseConfig::from_metadata(url, mode, benchmark_id, metadata)?;
             reporters.push(Box::new(
                 ClickHouseReporter::new(config).wrap_err("failed to create ClickHouse reporter")?,
             ));
@@ -897,13 +912,15 @@ mod tests {
     #[test]
     fn test_json_reporter() {
         let mut output = Vec::new();
+        let benchmark_id = uuid::Uuid::new_v4();
         {
-            let mut reporter = JsonReporter::new(&mut output);
+            let mut reporter = JsonReporter::new(&mut output).with_benchmark_id(benchmark_id);
             reporter.finalize(&sample_report()).unwrap();
         }
 
         let output_str = String::from_utf8(output).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&output_str).unwrap();
+        assert_eq!(parsed["benchmark_id"], benchmark_id.to_string());
         assert_eq!(parsed["sent"], 1000);
         assert_eq!(parsed["success"], 950);
     }
@@ -1107,8 +1124,8 @@ mod tests {
         let report_json: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&report_path).unwrap()).unwrap();
         assert!(
-            report_json.get("samples").is_none() ||
-                report_json["samples"].as_array().unwrap().is_empty()
+            report_json.get("samples").is_none()
+                || report_json["samples"].as_array().unwrap().is_empty()
         );
 
         // Samples NDJSON should exist with 2 lines.
