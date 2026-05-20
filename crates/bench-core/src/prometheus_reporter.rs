@@ -5,12 +5,11 @@
 //! Cortex, Thanos, etc.) via `/api/v1/write` using the
 //! standard remote write protocol (protobuf + snappy compression).
 //!
-//! User-provided metadata (`-m key=value`) are already applied to samples by
-//! [`FinalReport`] before reporters run, so the remote-write request carries
-//! run labels in the protobuf payload. The reporter intentionally does not
-//! also send them as VictoriaMetrics `extra_label` query parameters, since
-//! duplicating labels can make VictoriaMetrics accept the request but drop the
-//! affected series.
+//! User-provided metadata (`-m key=value`) are already applied to samples before
+//! reporters run, so the remote-write request carries run labels in the protobuf
+//! payload. The reporter intentionally does not also send them as
+//! VictoriaMetrics `extra_label` query parameters, since duplicating labels can
+//! make VictoriaMetrics accept the request but drop the affected series.
 //!
 //! Connection knobs (auth, tenant, batching) are read from environment
 //! variables so secrets never end up on the command line:
@@ -186,20 +185,21 @@ impl PrometheusReporter {
 
 impl Reporter for PrometheusReporter {
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
-        if report.samples.is_empty() {
+        if !report.has_samples() {
             tracing::info!("remote write: no samples to push");
             return Ok(());
         }
 
         tracing::info!(
-            samples = report.samples.len(),
+            samples = report.sample_count(),
             url = %self.config.base_url,
             "Pushing samples via Prometheus remote write"
         );
 
         let mut pushed = 0usize;
-        for chunk in report.samples.chunks(self.config.batch_size) {
-            self.send_batch(chunk)?;
+        for chunk in report.sample_chunks(self.config.batch_size)? {
+            let chunk = chunk?;
+            self.send_batch(&chunk)?;
             pushed += chunk.len();
         }
 
