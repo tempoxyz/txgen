@@ -42,6 +42,12 @@ pub struct SendArgs {
     #[arg(long, default_value = "100")]
     pub max_concurrent: usize,
 
+    /// Number of times to retry failed transaction submissions.
+    ///
+    /// Set to 0 to never retry. If omitted, retries forever.
+    #[arg(long, value_name = "N")]
+    pub retries: Option<u32>,
+
     /// Request timeout
     #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
     pub timeout: Duration,
@@ -315,6 +321,28 @@ mod tests {
         assert_eq!(parse_reorg_depth("8"), Ok(8));
         assert!(parse_reorg_depth("0").is_err());
         assert!(parse_reorg_depth("abc").is_err());
+    }
+
+    #[test]
+    fn test_send_retries_default_is_forever() {
+        let cli = Cli::try_parse_from(["bench", "send"]).unwrap();
+
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+
+        assert_eq!(args.retries, None);
+    }
+
+    #[test]
+    fn test_send_retries_zero_disables_retries() {
+        let cli = Cli::try_parse_from(["bench", "send", "--retries", "0"]).unwrap();
+
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+
+        assert_eq!(args.retries, Some(0));
     }
 
     #[test]

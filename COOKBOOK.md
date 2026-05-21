@@ -154,6 +154,8 @@ Use `--tps 0` for unlimited send rate:
 bench send --input txs.ndjson --rpc-url http://localhost:8545 --tps 0
 ```
 
+By default, failed transaction submissions are retried forever. Use `--retries N` to cap retries, or `--retries 0` to disable retries entirely.
+
 ## Run a timed stress test
 
 Generate workload transactions for a wall-clock duration instead of a count:
