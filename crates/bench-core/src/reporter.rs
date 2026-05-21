@@ -10,7 +10,13 @@ use crate::{
     sample::{Sample, SampleArchive},
 };
 use eyre::{bail, Context, Result};
-use std::{collections::HashMap, io::Write, path::Path};
+use flate2::{write::GzEncoder, Compression};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{BufWriter, Write},
+    path::Path,
+};
 
 /// Unified final report passed to reporters at finalization.
 ///
@@ -26,7 +32,7 @@ pub struct FinalReport {
     pub time_series: Option<TimeSeriesMetrics>,
     /// Block-level run summary.
     pub run_stats: Option<RunStats>,
-    /// Disk-backed compressed sample archive for long benchmark runs.
+    /// Disk-backed sample archive for long benchmark runs.
     pub sample_archive: Option<SampleArchive>,
     /// Per-block statistics.
     pub blocks: Vec<BlockStats>,
@@ -76,7 +82,7 @@ impl FinalReport {
     /// Retain only samples at or before the given Unix millisecond timestamp.
     pub fn retain_samples_until(&mut self, cutoff_ms: u64) -> Result<()> {
         if let Some(archive) = self.sample_archive.as_mut() {
-            archive.retain(|sample| sample.unix_ms <= cutoff_ms)?;
+            archive.retain_until(cutoff_ms);
         }
         Ok(())
     }
@@ -364,7 +370,8 @@ pub struct JsonLatencySample {
 ///
 /// When writing to a file, samples are written to a separate gzip-compressed
 /// NDJSON (newline-delimited JSON) sibling file instead of being embedded in
-/// the report.
+/// the report. The benchmark writes samples to a temporary uncompressed NDJSON
+/// archive, then this reporter stream-compresses that archive to the sidecar.
 ///
 /// The samples file path is derived from the report path by replacing the
 /// extension with `.samples.ndjson.gz`:
@@ -487,11 +494,11 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
         writeln!(self.writer)?;
 
-        // Copy the finalized gzip-compressed NDJSON archive to the report sidecar.
+        // Stream-compress the finalized NDJSON archive to the report sidecar.
         if let Some(samples_path) = &self.samples_path &&
             report.has_samples()
         {
-            let count = copy_samples_ndjson_gz(report, samples_path)?;
+            let count = copy_and_gzip_samples_ndjson(report, samples_path)?;
             tracing::info!(
                 path = %samples_path.display(),
                 count,
@@ -503,19 +510,26 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
     }
 }
 
-fn copy_samples_ndjson_gz(report: &FinalReport, path: &Path) -> Result<usize> {
+fn copy_and_gzip_samples_ndjson(report: &FinalReport, path: &Path) -> Result<usize> {
     let Some(archive) = report.sample_archive.as_ref() else {
         return Ok(0);
     };
 
-    std::fs::copy(archive.path(), path).wrap_err_with(|| {
+    let output = File::create(path)
+        .wrap_err_with(|| format!("failed to create samples file {}", path.display()))?;
+
+    let writer = BufWriter::new(output);
+    let mut encoder = GzEncoder::new(writer, Compression::default());
+
+    let count = archive.write_ndjson_to(&mut encoder).wrap_err_with(|| {
         format!(
-            "failed to copy samples file from {} to {}",
+            "failed to gzip samples file from {} to {}",
             archive.path().display(),
             path.display()
         )
     })?;
-    Ok(archive.len())
+    encoder.finish()?.flush()?;
+    Ok(count)
 }
 
 /// ClickHouse reporter configuration.
@@ -783,7 +797,7 @@ impl Reporter for ClickHouseReporter {
         self.insert_rows("txgen_blocks", &block_rows)?;
 
         // Insert metric samples in bounded chunks. The report is backed by a
-        // compressed sample archive, so do not collect all rows at once.
+        // disk archive, so do not collect all rows at once.
         let mut inserted_samples = 0usize;
         for chunk in report.sample_chunks(self.config.sample_batch_size)? {
             inserted_samples += self.insert_sample_batch(&chunk?)?;
@@ -1117,10 +1131,12 @@ mod tests {
             reporter.finalize(&report).unwrap();
 
             let samples_path = dir.join("report-test.samples.ndjson.gz");
-            assert_eq!(
-                std::fs::read(&samples_path).unwrap(),
-                std::fs::read(&source_samples_path).unwrap()
-            );
+            let source_content = std::fs::read_to_string(&source_samples_path).unwrap();
+            let file = std::fs::File::open(&samples_path).unwrap();
+            let mut decoder = flate2::read::GzDecoder::new(file);
+            let mut content = String::new();
+            std::io::Read::read_to_string(&mut decoder, &mut content).unwrap();
+            assert_eq!(content, source_content);
         }
 
         // Report JSON should not contain samples.
@@ -1144,6 +1160,41 @@ mod tests {
         assert_eq!(s1.name, "m1");
         let s2: Sample = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(s2.name, "m2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_json_reporter_file_applies_lazy_sample_cutoff() {
+        let dir = std::env::temp_dir().join("txgen-test-cutoff-samples");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let report_path = dir.join("report-test.json");
+        {
+            let mut reporter = JsonReporter::file(&report_path).unwrap();
+            let mut report =
+                sample_report_with_samples(vec![sample("m1", 1.0, 0), sample("m2", 2.0, 100)])
+                    .await;
+            let source_samples_path = report.sample_archive.as_ref().unwrap().path().to_path_buf();
+            let source_content = std::fs::read_to_string(&source_samples_path).unwrap();
+            assert_eq!(source_content.lines().count(), 2);
+
+            report.retain_samples_until(1000).unwrap();
+            assert_eq!(std::fs::read_to_string(&source_samples_path).unwrap(), source_content);
+
+            reporter.finalize(&report).unwrap();
+        }
+
+        let samples_path = dir.join("report-test.samples.ndjson.gz");
+        let file = std::fs::File::open(&samples_path).unwrap();
+        let mut decoder = flate2::read::GzDecoder::new(file);
+        let mut content = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut content).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let sample: Sample = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(sample.name, "m1");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

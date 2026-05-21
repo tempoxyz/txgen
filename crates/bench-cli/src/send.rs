@@ -133,7 +133,7 @@ async fn execute_source<S: TxSource>(
     let final_metrics = metrics.finalize().await;
     let time_series = metrics.time_series().await;
 
-    // Finalize the compressed sample archive before reporters read it.
+    // Finalize the sample archive before reporters read it.
     let sample_archive = store.finish().await?;
 
     // Collect per-block stats from the chain. The range starts one block after
