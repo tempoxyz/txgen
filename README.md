@@ -161,12 +161,13 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
 | `--block-access-list-output <PATH>` | Append gzip-compressed NDJSON with one line per new block and its block access list, starting from the tip observed before setup/workload sending |
+| `--trie-witness-output <PATH>` | Append gzip-compressed NDJSON with one line per new block and its trie witness, starting from the tip observed before setup/workload sending |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 300, 0 to disable) |
 
-**Required RPC methods:** `eth_sendRawTransaction`, `eth_getTransactionReceipt` (setup and inclusion waits), `eth_getBlockByNumber`, `txpool_status` (for `--drain-timeout`), `eth_getBlockAccessListByBlockNumber` (for `--block-access-list-output`)
+**Required RPC methods:** `eth_sendRawTransaction`, `eth_getTransactionReceipt` (setup and inclusion waits), `eth_getBlockByNumber`, `txpool_status` (for `--drain-timeout`), `eth_getBlockAccessListByBlockNumber` (for `--block-access-list-output`), `debug_executionWitness` (for `--trie-witness-output`)
 
-When `--block-access-list-output` is enabled, the output should normally use a `.ndjson.gz` suffix. Each decompressed line contains `number` and `block_access_list` fields. `--bal-output` is accepted as a short alias.
+When `--block-access-list-output` or `--trie-witness-output` is enabled, the output should normally use a `.ndjson.gz` suffix. Each decompressed line contains `number` plus either `block_access_list` or `trie_witness`. `--bal-output` and `--witness-output` are accepted as short aliases.
 
 #### `bench send-blocks`
 
@@ -761,6 +762,7 @@ Summary of which RPC methods are required by each feature:
 | `eth_sendRawTransaction` | `bench send` |
 | `eth_getTransactionReceipt` | `bench send` (setup and inclusion waits) |
 | `eth_getBlockByNumber` | `bench send` (per-block stats collection) |
+| `debug_executionWitness` | `bench send --trie-witness-output` |
 | `debug_getRawBlock` | `txgen extract`, `txgen-ethereum extract-big-blocks` |
 | `eth_getBlockAccessListByBlockNumber` | `bench send --block-access-list-output`, `txgen extract --bal`, `txgen-ethereum extract-big-blocks --bal` |
 | `reth_newPayload` | `bench send-blocks` |

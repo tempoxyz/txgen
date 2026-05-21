@@ -1,7 +1,7 @@
 //! `bench send` - Send transactions from file or stdin
 
 use crate::{metrics_url::metrics_scraper_configs, SendArgs};
-use alloy_eips::{eip7928::BlockAccessList, BlockNumberOrTag};
+use alloy_eips::BlockNumberOrTag;
 use alloy_network::AnyNetwork;
 use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
@@ -14,7 +14,7 @@ use bench_core::{
 };
 use eyre::{bail, Context, Result};
 use flate2::{write::GzEncoder, Compression};
-use serde::Serialize;
+use serde_json::{Map, Value};
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
@@ -79,18 +79,46 @@ async fn execute_source<S: TxSource>(
     let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
     let query_provider = &providers[0];
 
-    let bal_recorder = if let Some(path) = &args.block_access_list_output {
-        let original_tip = query_provider
-            .get_block_number()
-            .await
-            .wrap_err("failed to get original block number")?;
-        Some(
-            BlockAccessListRecorder::start(providers[0].clone(), original_tip, path.clone())
+    let original_tip =
+        if args.block_access_list_output.is_some() || args.trie_witness_output.is_some() {
+            Some(
+                query_provider
+                    .get_block_number()
+                    .await
+                    .wrap_err("failed to get original block number")?,
+            )
+        } else {
+            None
+        };
+
+    let bal_recorder =
+        if let (Some(path), Some(original_tip)) = (&args.block_access_list_output, original_tip) {
+            Some(
+                BlockArtifactRecorder::start(
+                    providers[0].clone(),
+                    original_tip,
+                    path.clone(),
+                    BlockArtifactKind::BlockAccessList,
+                )
                 .await?,
-        )
-    } else {
-        None
-    };
+            )
+        } else {
+            None
+        };
+    let trie_witness_recorder =
+        if let (Some(path), Some(original_tip)) = (&args.trie_witness_output, original_tip) {
+            Some(
+                BlockArtifactRecorder::start(
+                    providers[0].clone(),
+                    original_tip,
+                    path.clone(),
+                    BlockArtifactKind::TrieWitness,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
 
     let first_workload = run_setup_phase(args, source, &providers, &config, query_provider).await?;
 
@@ -144,11 +172,24 @@ async fn execute_source<S: TxSource>(
         query_provider.get_block_number().await.wrap_err("failed to get ending block number")?;
     if let Some(recorder) = bal_recorder {
         let stats = recorder.stop_at(end_block).await?;
+        let label = BlockArtifactKind::BlockAccessList.label();
         tracing::info!(
+            artifact = label,
             blocks = stats.blocks_written,
             start = ?stats.first_block,
             end = ?stats.last_block,
-            "Block access list recorder stopped"
+            "Block artifact recorder stopped"
+        );
+    }
+    if let Some(recorder) = trie_witness_recorder {
+        let stats = recorder.stop_at(end_block).await?;
+        let label = BlockArtifactKind::TrieWitness.label();
+        tracing::info!(
+            artifact = label,
+            blocks = stats.blocks_written,
+            start = ?stats.first_block,
+            end = ?stats.last_block,
+            "Block artifact recorder stopped"
         );
     }
 
@@ -220,51 +261,70 @@ async fn execute_source<S: TxSource>(
     Ok(())
 }
 
-struct BlockAccessListRecorder {
+struct BlockArtifactRecorder {
+    kind: BlockArtifactKind,
     stop_tx: Option<oneshot::Sender<u64>>,
-    handle: Option<JoinHandle<Result<BlockAccessListRecorderStats>>>,
+    handle: Option<JoinHandle<Result<BlockArtifactRecorderStats>>>,
 }
 
 #[derive(Debug)]
-struct BlockAccessListRecorderStats {
+struct BlockArtifactRecorderStats {
     blocks_written: u64,
     first_block: Option<u64>,
     last_block: Option<u64>,
 }
 
-#[derive(Serialize)]
-struct BlockAccessListOutputLine<'a> {
-    number: u64,
-    block_access_list: &'a BlockAccessList,
+#[derive(Clone, Copy)]
+enum BlockArtifactKind {
+    BlockAccessList,
+    TrieWitness,
 }
 
-type BlockAccessListWriter = GzEncoder<BufWriter<File>>;
+impl BlockArtifactKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::BlockAccessList => "block_access_list",
+            Self::TrieWitness => "trie_witness",
+        }
+    }
 
-impl BlockAccessListRecorder {
+    const fn field_name(self) -> &'static str {
+        match self {
+            Self::BlockAccessList => "block_access_list",
+            Self::TrieWitness => "trie_witness",
+        }
+    }
+}
+
+type BlockArtifactWriter = GzEncoder<BufWriter<File>>;
+
+impl BlockArtifactRecorder {
     async fn start(
         provider: DynProvider<AnyNetwork>,
         start_block: u64,
         path: PathBuf,
+        kind: BlockArtifactKind,
     ) -> Result<Self> {
         let file =
             OpenOptions::new().create(true).append(true).open(&path).wrap_err_with(|| {
-                format!("failed to open block access list output file {}", path.display())
+                format!("failed to open {} output file {}", kind.label(), path.display())
             })?;
         let writer = GzEncoder::new(BufWriter::new(file), Compression::default());
         let (stop_tx, stop_rx) = oneshot::channel();
         let handle =
-            tokio::spawn(record_block_access_lists(provider, writer, start_block, stop_rx));
+            tokio::spawn(record_block_artifacts(provider, writer, start_block, stop_rx, kind));
 
         tracing::info!(
+            artifact = kind.label(),
             path = %path.display(),
             start_block,
-            "Started block access list recorder"
+            "Started block artifact recorder"
         );
 
-        Ok(Self { stop_tx: Some(stop_tx), handle: Some(handle) })
+        Ok(Self { kind, stop_tx: Some(stop_tx), handle: Some(handle) })
     }
 
-    async fn stop_at(mut self, end_block: u64) -> Result<BlockAccessListRecorderStats> {
+    async fn stop_at(mut self, end_block: u64) -> Result<BlockArtifactRecorderStats> {
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(end_block);
         }
@@ -272,16 +332,16 @@ impl BlockAccessListRecorder {
         let handle = self
             .handle
             .take()
-            .ok_or_else(|| eyre::eyre!("block access list recorder task missing"))?;
+            .ok_or_else(|| eyre::eyre!("{} recorder task missing", self.kind.label()))?;
 
         handle
             .await
-            .wrap_err("block access list recorder task failed to join")?
-            .wrap_err("block access list recorder failed")
+            .wrap_err_with(|| format!("{} recorder task failed to join", self.kind.label()))?
+            .wrap_err_with(|| format!("{} recorder failed", self.kind.label()))
     }
 }
 
-impl Drop for BlockAccessListRecorder {
+impl Drop for BlockArtifactRecorder {
     fn drop(&mut self) {
         if let Some(handle) = &self.handle {
             handle.abort();
@@ -289,22 +349,23 @@ impl Drop for BlockAccessListRecorder {
     }
 }
 
-async fn record_block_access_lists(
+async fn record_block_artifacts(
     provider: DynProvider<AnyNetwork>,
-    mut writer: BlockAccessListWriter,
+    mut writer: BlockArtifactWriter,
     start_block: u64,
     mut stop_rx: oneshot::Receiver<u64>,
-) -> Result<BlockAccessListRecorderStats> {
+    kind: BlockArtifactKind,
+) -> Result<BlockArtifactRecorderStats> {
     let mut next_block = start_block.saturating_add(1);
     let mut stop_at = None;
     let mut stats =
-        BlockAccessListRecorderStats { blocks_written: 0, first_block: None, last_block: None };
+        BlockArtifactRecorderStats { blocks_written: 0, first_block: None, last_block: None };
 
     loop {
         if let Some(target_block) = stop_at
             && next_block > target_block
         {
-            finish_block_access_list_output(&mut writer)?;
+            finish_block_artifact_output(&mut writer, kind)?;
             return Ok(stats);
         }
 
@@ -314,19 +375,19 @@ async fn record_block_access_lists(
         let fetch_through = latest_block.min(target_block);
 
         while next_block <= fetch_through {
-            let block_access_list = fetch_block_access_list(&provider, next_block).await?;
-            write_block_access_list(&mut writer, next_block, &block_access_list)?;
+            let artifact = fetch_block_artifact(&provider, next_block, kind).await?;
+            write_block_artifact(&mut writer, next_block, kind.field_name(), artifact)?;
             stats.blocks_written += 1;
             stats.first_block.get_or_insert(next_block);
             stats.last_block = Some(next_block);
-            tracing::debug!(block = next_block, "Recorded block access list");
+            tracing::debug!(artifact = kind.label(), block = next_block, "Recorded block artifact");
             next_block += 1;
         }
 
         if let Some(target_block) = stop_at
             && next_block > target_block
         {
-            finish_block_access_list_output(&mut writer)?;
+            finish_block_artifact_output(&mut writer, kind)?;
             return Ok(stats);
         }
 
@@ -339,39 +400,65 @@ async fn record_block_access_lists(
     }
 }
 
-fn finish_block_access_list_output(writer: &mut BlockAccessListWriter) -> Result<()> {
-    writer.try_finish().wrap_err("failed to finish block access list gzip output")?;
-    writer.get_mut().flush().wrap_err("failed to flush block access list output")?;
+fn finish_block_artifact_output(
+    writer: &mut BlockArtifactWriter,
+    kind: BlockArtifactKind,
+) -> Result<()> {
+    writer
+        .try_finish()
+        .wrap_err_with(|| format!("failed to finish {} gzip output", kind.label()))?;
+    writer
+        .get_mut()
+        .flush()
+        .wrap_err_with(|| format!("failed to flush {} output", kind.label()))?;
     Ok(())
 }
 
-async fn fetch_block_access_list(
+async fn fetch_block_artifact(
     provider: &DynProvider<AnyNetwork>,
     block_number: u64,
-) -> Result<BlockAccessList> {
-    provider
-        .get_block_access_list_by_number(BlockNumberOrTag::Number(block_number))
-        .await
-        .wrap_err_with(|| format!("failed to fetch block access list {block_number}"))?
-        .ok_or_else(|| eyre::eyre!("block access list not found for block {block_number}"))
+    kind: BlockArtifactKind,
+) -> Result<Value> {
+    match kind {
+        BlockArtifactKind::BlockAccessList => {
+            let block_access_list = provider
+                .get_block_access_list_by_number(BlockNumberOrTag::Number(block_number))
+                .await
+                .wrap_err_with(|| format!("failed to fetch block access list {block_number}"))?
+                .ok_or_else(|| {
+                    eyre::eyre!("block access list not found for block {block_number}")
+                })?;
+            serde_json::to_value(block_access_list)
+                .wrap_err_with(|| format!("failed to serialize block access list {block_number}"))
+        }
+        BlockArtifactKind::TrieWitness => provider
+            .client()
+            .request("debug_executionWitness", (BlockNumberOrTag::Number(block_number),))
+            .await
+            .wrap_err_with(|| format!("failed to fetch trie witness {block_number}")),
+    }
 }
 
-fn write_block_access_list(
-    writer: &mut BlockAccessListWriter,
+fn write_block_artifact(
+    writer: &mut BlockArtifactWriter,
     block_number: u64,
-    block_access_list: &BlockAccessList,
+    field_name: &str,
+    artifact: Value,
 ) -> Result<()> {
-    let line = BlockAccessListOutputLine { number: block_number, block_access_list };
+    let mut line = Map::with_capacity(2);
+    line.insert("number".to_string(), Value::from(block_number));
+    line.insert(field_name.to_string(), artifact);
+
     let mut buffer = Vec::new();
     serde_json::to_writer(&mut buffer, &line)
-        .wrap_err_with(|| format!("failed to serialize block access list {block_number}"))?;
+        .wrap_err_with(|| format!("failed to serialize {field_name} {block_number}"))?;
     buffer.push(b'\n');
-    writer.write_all(&buffer).wrap_err_with(|| {
-        format!("failed to write block access list {block_number} to gzip output")
-    })?;
-    writer.flush().wrap_err_with(|| {
-        format!("failed to flush block access list {block_number} to gzip output")
-    })?;
+    writer
+        .write_all(&buffer)
+        .wrap_err_with(|| format!("failed to write {field_name} {block_number} to gzip output"))?;
+    writer
+        .flush()
+        .wrap_err_with(|| format!("failed to flush {field_name} {block_number} to gzip output"))?;
     Ok(())
 }
 
