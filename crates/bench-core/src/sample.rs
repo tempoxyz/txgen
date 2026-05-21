@@ -88,17 +88,13 @@ impl SampleArchive {
         }
 
         let mut written = 0usize;
-        for line in self.filtered_lines()? {
-            let line = line?;
-            writer.write_all(line.as_bytes())?;
+        for sample in self.iter()? {
+            let sample = sample?;
+            serde_json::to_writer(&mut *writer, &sample)?;
             writer.write_all(b"\n")?;
             written += 1;
         }
         Ok(written)
-    }
-
-    fn filtered_lines(&self) -> Result<SampleArchiveLineIter> {
-        SampleArchiveLineIter::open(&self.path, self.retain_until_unix_ms)
     }
 }
 
@@ -140,46 +136,6 @@ impl Iterator for SampleArchiveIter {
             };
             if self.retain_until_unix_ms.is_none_or(|cutoff_ms| sample.unix_ms <= cutoff_ms) {
                 return Some(Ok(sample));
-            }
-        }
-    }
-}
-
-struct SampleArchiveLineIter {
-    lines: Lines<BufReader<File>>,
-    retain_until_unix_ms: Option<u64>,
-}
-
-impl SampleArchiveLineIter {
-    fn open(path: &Path, retain_until_unix_ms: Option<u64>) -> Result<Self> {
-        let file = File::open(path)
-            .wrap_err_with(|| format!("failed to open sample archive {}", path.display()))?;
-        Ok(Self { lines: BufReader::new(file).lines(), retain_until_unix_ms })
-    }
-}
-
-impl Iterator for SampleArchiveLineIter {
-    type Item = Result<String>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let line = match self.lines.next()? {
-                Ok(line) => line,
-                Err(err) => return Some(Err(err).context("failed to read sample archive line")),
-            };
-
-            let Some(cutoff_ms) = self.retain_until_unix_ms else {
-                return Some(Ok(line));
-            };
-
-            let sample = match serde_json::from_str::<Sample>(&line) {
-                Ok(sample) => sample,
-                Err(err) => {
-                    return Some(Err(err).context("failed to parse sample archive line"));
-                }
-            };
-            if sample.unix_ms <= cutoff_ms {
-                return Some(Ok(line));
             }
         }
     }
