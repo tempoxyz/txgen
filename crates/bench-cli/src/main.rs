@@ -84,14 +84,14 @@ pub struct SendArgs {
     ///
     /// Starts from the chain tip observed before setup/workload sending and
     /// writes one line per block in block-number order while the run is active.
-    #[arg(long = "block-access-list-output", alias = "bal-output", value_name = "PATH")]
+    #[arg(long = "block-access-list-output", value_name = "PATH")]
     pub block_access_list_output: Option<PathBuf>,
 
     /// Append trie witnesses produced during the run to a gzip-compressed NDJSON file.
     ///
     /// Starts from the chain tip observed before setup/workload sending and
     /// writes one line per block in block-number order while the run is active.
-    #[arg(long = "trie-witness-output", alias = "witness-output", value_name = "PATH")]
+    #[arg(long = "trie-witness-output", value_name = "PATH")]
     pub trie_witness_output: Option<PathBuf>,
 
     /// Skip setup-phase transactions in the input stream.
@@ -372,48 +372,11 @@ mod tests {
     }
 
     #[test]
-    fn test_block_access_list_output_alias() {
-        let cli = Cli::try_parse_from([
-            "bench",
-            "send",
-            "--bal-output",
-            "/tmp/block-access-lists.ndjson.gz",
-        ])
-        .unwrap();
-
-        let Command::Send(args) = cli.command else {
-            panic!("expected send command");
-        };
-
-        assert_eq!(
-            args.block_access_list_output,
-            Some(PathBuf::from("/tmp/block-access-lists.ndjson.gz"))
-        );
-    }
-
-    #[test]
     fn test_trie_witness_output_arg() {
         let cli = Cli::try_parse_from([
             "bench",
             "send",
             "--trie-witness-output",
-            "/tmp/trie-witnesses.ndjson.gz",
-        ])
-        .unwrap();
-
-        let Command::Send(args) = cli.command else {
-            panic!("expected send command");
-        };
-
-        assert_eq!(args.trie_witness_output, Some(PathBuf::from("/tmp/trie-witnesses.ndjson.gz")));
-    }
-
-    #[test]
-    fn test_trie_witness_output_alias() {
-        let cli = Cli::try_parse_from([
-            "bench",
-            "send",
-            "--witness-output",
             "/tmp/trie-witnesses.ndjson.gz",
         ])
         .unwrap();

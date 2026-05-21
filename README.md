@@ -167,7 +167,7 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 
 **Required RPC methods:** `eth_sendRawTransaction`, `eth_getTransactionReceipt` (setup and inclusion waits), `eth_getBlockByNumber`, `txpool_status` (for `--drain-timeout`), `eth_getBlockAccessListByBlockNumber` (for `--block-access-list-output`), `debug_executionWitness` (for `--trie-witness-output`)
 
-When `--block-access-list-output` or `--trie-witness-output` is enabled, the output should normally use a `.ndjson.gz` suffix. Each decompressed line contains `number` plus either `block_access_list` or `trie_witness`. `--bal-output` and `--witness-output` are accepted as short aliases.
+When `--block-access-list-output` or `--trie-witness-output` is enabled, the output should normally use a `.ndjson.gz` suffix. Each decompressed line contains `number` plus either `block_access_list` or `trie_witness`.
 
 #### `bench send-blocks`
 
