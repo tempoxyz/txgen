@@ -1,8 +1,12 @@
 use alloy_primitives::{Address, TxKind};
 use eyre::Result;
 use rand::rngs::StdRng;
+use std::sync::OnceLock;
 
-use crate::{AccountManager, AccountRef, ArtifactManager, GasConfig, NonceTracker, SelectMode};
+use crate::{
+    AccountManager, AccountRef, AddressPoolManager, ArtifactManager, GasConfig, NonceTracker,
+    SelectMode,
+};
 
 /// Result of selecting a signer from a pool.
 pub struct SelectedSigner {
@@ -25,6 +29,9 @@ pub struct BuildContext<'a> {
     /// Account manager for signer access.
     pub accounts: &'a AccountManager,
 
+    /// Destination-only address pool manager.
+    pub address_pools: &'a AddressPoolManager,
+
     /// Artifact manager for ABI access.
     pub artifacts: &'a ArtifactManager,
 
@@ -35,8 +42,13 @@ pub struct BuildContext<'a> {
     pub rng: &'a mut StdRng,
 }
 
+fn empty_address_pools() -> &'static AddressPoolManager {
+    static EMPTY_ADDRESS_POOLS: OnceLock<AddressPoolManager> = OnceLock::new();
+    EMPTY_ADDRESS_POOLS.get_or_init(AddressPoolManager::empty)
+}
+
 impl<'a> BuildContext<'a> {
-    /// Create a new build context.
+    /// Create a new build context with no destination-only address pools.
     pub fn new(
         chain_id: u64,
         gas: &'a GasConfig,
@@ -45,7 +57,28 @@ impl<'a> BuildContext<'a> {
         nonces: &'a mut NonceTracker,
         rng: &'a mut StdRng,
     ) -> Self {
-        Self { chain_id, gas, accounts, artifacts, nonces, rng }
+        Self::new_with_address_pools(
+            chain_id,
+            gas,
+            accounts,
+            empty_address_pools(),
+            artifacts,
+            nonces,
+            rng,
+        )
+    }
+
+    /// Create a new build context with destination-only address pools.
+    pub fn new_with_address_pools(
+        chain_id: u64,
+        gas: &'a GasConfig,
+        accounts: &'a AccountManager,
+        address_pools: &'a AddressPoolManager,
+        artifacts: &'a ArtifactManager,
+        nonces: &'a mut NonceTracker,
+        rng: &'a mut StdRng,
+    ) -> Self {
+        Self { chain_id, gas, accounts, address_pools, artifacts, nonces, rng }
     }
 
     /// Get the next nonce for a scheduling key.
@@ -55,7 +88,11 @@ impl<'a> BuildContext<'a> {
 
     /// Create a value resolver for this context.
     pub fn resolver(&mut self) -> crate::ValueResolver<'_> {
-        crate::ValueResolver { accounts: self.accounts, rng: self.rng }
+        crate::ValueResolver {
+            accounts: self.accounts,
+            address_pools: self.address_pools,
+            rng: self.rng,
+        }
     }
 
     /// Select a signer from a pool based on the account reference.

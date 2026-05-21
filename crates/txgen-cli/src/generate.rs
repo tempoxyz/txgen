@@ -15,8 +15,8 @@ use std::{
 };
 use txgen_core::{
     dedup_scheduling_keys, merge_yaml, AbiEncodePackedDef, AbiHashDef, AccountManager,
-    ArtifactManager, BuildContext, GeneratedTx, MixItem, NdjsonWriter, NonceTracker, SchedulingKey,
-    SequenceBinding, SetupStep, TxPhase, WorkloadSpec,
+    AddressPoolManager, ArtifactManager, BuildContext, GeneratedTx, MixItem, NdjsonWriter,
+    NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase, WorkloadSpec,
 };
 
 #[derive(Args)]
@@ -63,6 +63,7 @@ pub struct GenerateArgs {
 pub struct GenerateContext {
     spec: WorkloadSpec,
     accounts: AccountManager,
+    address_pools: AddressPoolManager,
     artifacts: ArtifactManager,
     nonces: NonceTracker,
     rng: StdRng,
@@ -75,6 +76,7 @@ impl GenerateContext {
             .wrap_err_with(|| format!("failed to load spec: {}", args.spec.display()))?;
         let base_path = args.spec.parent().unwrap_or_else(|| std::path::Path::new("."));
         let accounts = AccountManager::from_spec(&spec.accounts)?;
+        let address_pools = AddressPoolManager::from_spec(&spec.address_pools)?;
         let artifacts = ArtifactManager::load(&spec.artifacts, base_path)?;
         let nonces = NonceTracker::new();
         let rng = match args.seed {
@@ -82,7 +84,7 @@ impl GenerateContext {
             None => StdRng::from_os_rng(),
         };
         let limit = GenerationLimit { count: args.count, duration: args.duration };
-        Ok(Self { spec, accounts, artifacts, nonces, rng, limit })
+        Ok(Self { spec, accounts, address_pools, artifacts, nonces, rng, limit })
     }
 
     /// Borrow accounts and nonces simultaneously for prefetching.
@@ -225,10 +227,11 @@ where
         bail!("no workload entries in mix (total weight is 0)");
     }
 
-    let mut build_ctx = BuildContext::new(
+    let mut build_ctx = BuildContext::new_with_address_pools(
         ctx.spec.chain_id,
         &ctx.spec.gas,
         &ctx.accounts,
+        &ctx.address_pools,
         &ctx.artifacts,
         &mut ctx.nonces,
         &mut ctx.rng,

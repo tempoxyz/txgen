@@ -5,15 +5,39 @@ use eyre::{bail, Result, WrapErr};
 use k256::ecdsa::SigningKey;
 use rand::Rng;
 use serde::{Deserialize, Deserializer};
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Mutex};
 
 /// Type alias for our signer type.
 pub type EcdsaSigner = LocalSigner<SigningKey>;
 
-/// Manages account pools derived from mnemonics.
+/// Manages signer account pools derived from mnemonics.
 #[derive(Debug)]
 pub struct AccountManager {
     pools: HashMap<String, Vec<EcdsaSigner>>,
+}
+
+/// Manages destination-only address pools.
+#[derive(Debug)]
+pub struct AddressPoolManager {
+    pools: HashMap<String, AddressPool>,
+}
+
+/// A destination-only address pool.
+#[derive(Debug)]
+enum AddressPool {
+    /// Eager literal address list.
+    Literal(Vec<Address>),
+    /// Lazily-derived mnemonic address range.
+    Mnemonic(MnemonicAddressPool),
+}
+
+/// A lazily-derived mnemonic address range with an on-demand cache.
+#[derive(Debug)]
+struct MnemonicAddressPool {
+    mnemonic: String,
+    start: u32,
+    len: usize,
+    cache: Mutex<HashMap<u32, Address>>,
 }
 
 impl AccountManager {
@@ -71,6 +95,107 @@ impl AccountManager {
     }
 }
 
+impl AddressPoolManager {
+    /// Create an empty address pool manager (for testing and specs without destination pools).
+    pub fn empty() -> Self {
+        Self { pools: HashMap::new() }
+    }
+
+    /// Create an address pool manager from spec definitions.
+    ///
+    /// Mnemonic-backed pools are kept lazy: addresses are derived and cached on first use.
+    pub fn from_spec(address_pools: &HashMap<String, AddressPoolDef>) -> Result<Self> {
+        let mut pools = HashMap::new();
+
+        for (name, def) in address_pools {
+            let pool = def
+                .to_pool()
+                .wrap_err_with(|| format!("failed to create address pool '{name}'"))?;
+            pools.insert(name.clone(), pool);
+        }
+
+        Ok(Self { pools })
+    }
+
+    /// Get a random address from a destination-only pool.
+    pub fn get_random(&self, pool: &str, rng: &mut dyn rand::RngCore) -> Result<Address> {
+        let address_pool = self.get_pool(pool)?;
+        if address_pool.is_empty() {
+            bail!("address pool '{}' is empty", pool);
+        }
+        let idx = rng.random_range(0..address_pool.len());
+        address_pool
+            .get_by_index(idx)
+            .wrap_err_with(|| format!("failed to get random address from address pool '{pool}'"))
+    }
+
+    /// Get an address by index from a destination-only pool.
+    pub fn get_by_index(&self, pool: &str, index: usize) -> Result<Address> {
+        let address_pool = self.get_pool(pool)?;
+        if index >= address_pool.len() {
+            bail!("index {} out of range for address pool '{}'", index, pool);
+        }
+        address_pool
+            .get_by_index(index)
+            .wrap_err_with(|| format!("failed to get address pool '{pool}' index {index}"))
+    }
+
+    fn get_pool(&self, name: &str) -> Result<&AddressPool> {
+        self.pools.get(name).ok_or_else(|| eyre::eyre!("address pool '{}' not found", name))
+    }
+}
+
+impl AddressPool {
+    fn len(&self) -> usize {
+        match self {
+            Self::Literal(addresses) => addresses.len(),
+            Self::Mnemonic(pool) => pool.len,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn get_by_index(&self, index: usize) -> Result<Address> {
+        match self {
+            Self::Literal(addresses) => addresses
+                .get(index)
+                .copied()
+                .ok_or_else(|| eyre::eyre!("index {index} out of range for literal address pool")),
+            Self::Mnemonic(pool) => pool.get_by_index(index),
+        }
+    }
+}
+
+impl MnemonicAddressPool {
+    fn new(mnemonic: String, start: u32, len: usize) -> Self {
+        Self { mnemonic, start, len, cache: Mutex::new(HashMap::new()) }
+    }
+
+    fn get_by_index(&self, index: usize) -> Result<Address> {
+        let derivation_offset = u32::try_from(index)
+            .map_err(|_| eyre::eyre!("address pool index {index} exceeds u32 derivation limit"))?;
+        let derivation_index = self
+            .start
+            .checked_add(derivation_offset)
+            .ok_or_else(|| eyre::eyre!("address pool index {index} overflows derivation path"))?;
+
+        {
+            let cache =
+                self.cache.lock().map_err(|_| eyre::eyre!("address pool cache lock poisoned"))?;
+            if let Some(address) = cache.get(&derivation_index) {
+                return Ok(*address);
+            }
+        }
+
+        let address = derive_address(&self.mnemonic, derivation_index)?;
+        let mut cache =
+            self.cache.lock().map_err(|_| eyre::eyre!("address pool cache lock poisoned"))?;
+        Ok(*cache.entry(derivation_index).or_insert(address))
+    }
+}
+
 /// Definition of an account pool in the workload spec.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountPoolDef {
@@ -87,13 +212,7 @@ pub struct AccountPoolDef {
 impl AccountPoolDef {
     /// Derive signers from this pool definition.
     pub fn derive_signers(&self) -> Result<Vec<EcdsaSigner>> {
-        let indices: Vec<u32> = if let Some(idx) = self.index {
-            vec![idx]
-        } else if let Some([start, end]) = self.range {
-            (start..end).collect()
-        } else {
-            bail!("account pool must have either 'index' or 'range'");
-        };
+        let indices = selected_indices(self.index, self.range, "account pool")?;
 
         indices
             .into_iter()
@@ -107,6 +226,93 @@ impl AccountPoolDef {
             })
             .collect()
     }
+}
+
+/// Definition of a destination-only address pool in the workload spec.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddressPoolDef {
+    /// Literal destination addresses.
+    #[serde(default)]
+    pub addresses: Vec<Address>,
+
+    /// BIP-39 mnemonic phrase (supports `${ENV_VAR}` expansion).
+    #[serde(default)]
+    pub mnemonic: Option<String>,
+
+    /// Single address index when deriving from a mnemonic (mutually exclusive with `range`).
+    pub index: Option<u32>,
+
+    /// Range of address indices `[start, end)` when deriving from a mnemonic.
+    pub range: Option<[u32; 2]>,
+}
+
+impl AddressPoolDef {
+    /// Derive destination-only addresses from this pool definition eagerly.
+    pub fn derive_addresses(&self) -> Result<Vec<Address>> {
+        let pool = self.to_pool()?;
+        (0..pool.len()).map(|idx| pool.get_by_index(idx)).collect()
+    }
+
+    fn to_pool(&self) -> Result<AddressPool> {
+        let has_addresses = !self.addresses.is_empty();
+        let has_mnemonic = self.mnemonic.is_some();
+
+        match (has_addresses, has_mnemonic) {
+            (true, false) => Ok(AddressPool::Literal(self.addresses.clone())),
+            (false, true) => self.to_mnemonic_pool(),
+            (true, true) => {
+                bail!("address pool must set either 'addresses' or 'mnemonic', not both")
+            }
+            (false, false) => bail!("address pool must have either 'addresses' or 'mnemonic'"),
+        }
+    }
+
+    fn to_mnemonic_pool(&self) -> Result<AddressPool> {
+        let mnemonic = self
+            .mnemonic
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("address pool must have a mnemonic"))?;
+        let (start, len) = selected_range(self.index, self.range, "address pool")?;
+        Ok(AddressPool::Mnemonic(MnemonicAddressPool::new(mnemonic.clone(), start, len)))
+    }
+}
+
+fn selected_indices(
+    index: Option<u32>,
+    range: Option<[u32; 2]>,
+    context: &str,
+) -> Result<Vec<u32>> {
+    let (start, len) = selected_range(index, range, context)?;
+    let end = start
+        .checked_add(u32::try_from(len).map_err(|_| {
+            eyre::eyre!("{context} range length {len} exceeds u32 derivation limit")
+        })?)
+        .ok_or_else(|| eyre::eyre!("{context} range overflows u32 derivation limit"))?;
+    Ok((start..end).collect())
+}
+
+fn selected_range(
+    index: Option<u32>,
+    range: Option<[u32; 2]>,
+    context: &str,
+) -> Result<(u32, usize)> {
+    if let Some(idx) = index {
+        Ok((idx, 1))
+    } else if let Some([start, end]) = range {
+        Ok((start, end.saturating_sub(start) as usize))
+    } else {
+        bail!("{context} must have either 'index' or 'range'");
+    }
+}
+
+fn derive_address(mnemonic: &str, idx: u32) -> Result<Address> {
+    MnemonicBuilder::<English>::default()
+        .phrase(mnemonic)
+        .index(idx)
+        .map_err(|e| eyre::eyre!("failed to set mnemonic: {e}"))?
+        .build()
+        .map(|signer: EcdsaSigner| signer.address())
+        .map_err(|e| eyre::eyre!("failed to derive address at index {idx}: {e}"))
 }
 
 /// Reference to an account in a pool.
@@ -207,5 +413,75 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let signer = manager.get_random("users", &mut rng).unwrap();
         assert!(!signer.address().is_zero());
+    }
+
+    #[test]
+    fn test_derive_mnemonic_address_pool() -> Result<()> {
+        let def = AddressPoolDef {
+            addresses: Vec::new(),
+            mnemonic: Some(TEST_MNEMONIC.to_string()),
+            index: None,
+            range: Some([0, 3]),
+        };
+
+        let addresses = def.derive_addresses()?;
+        assert_eq!(addresses.len(), 3);
+        assert_eq!(
+            addresses[0],
+            AccountPoolDef { mnemonic: TEST_MNEMONIC.to_string(), index: Some(0), range: None }
+                .derive_signers()?[0]
+                .address()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_address_pool_manager_literal_addresses() -> Result<()> {
+        let first = Address::from([1u8; 20]);
+        let second = Address::from([2u8; 20]);
+        let mut defs = HashMap::new();
+        defs.insert(
+            "recipients".to_string(),
+            AddressPoolDef {
+                addresses: vec![first, second],
+                mnemonic: None,
+                index: None,
+                range: None,
+            },
+        );
+
+        let manager = AddressPoolManager::from_spec(&defs)?;
+        assert_eq!(manager.get_by_index("recipients", 0)?, first);
+        assert_eq!(manager.get_by_index("recipients", 1)?, second);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_mnemonic_address_pool_derives_large_range_lazily() -> Result<()> {
+        let mut defs = HashMap::new();
+        defs.insert(
+            "recipients".to_string(),
+            AddressPoolDef {
+                addresses: Vec::new(),
+                mnemonic: Some(TEST_MNEMONIC.to_string()),
+                index: None,
+                range: Some([0, 1_000_000]),
+            },
+        );
+
+        let manager = AddressPoolManager::from_spec(&defs)?;
+        let address = manager.get_by_index("recipients", 999_999)?;
+        let expected = AccountPoolDef {
+            mnemonic: TEST_MNEMONIC.to_string(),
+            index: Some(999_999),
+            range: None,
+        }
+        .derive_signers()?[0]
+            .address();
+
+        assert_eq!(address, expected);
+        Ok(())
     }
 }
