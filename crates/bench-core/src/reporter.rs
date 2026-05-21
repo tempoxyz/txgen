@@ -10,13 +10,7 @@ use crate::{
     sample::{Sample, SampleArchive},
 };
 use eyre::{bail, Context, Result};
-use flate2::{write::GzEncoder, Compression};
-use std::{
-    collections::HashMap,
-    fs::File,
-    io::{BufWriter, Write},
-    path::Path,
-};
+use std::{collections::HashMap, io::Write, path::Path};
 
 /// Unified final report passed to reporters at finalization.
 ///
@@ -493,11 +487,11 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
         writeln!(self.writer)?;
 
-        // Stream samples to a separate gzip-compressed NDJSON file.
+        // Copy the finalized gzip-compressed NDJSON archive to the report sidecar.
         if let Some(samples_path) = &self.samples_path &&
             report.has_samples()
         {
-            let count = write_samples_ndjson_gz(report, samples_path)?;
+            let count = copy_samples_ndjson_gz(report, samples_path)?;
             tracing::info!(
                 path = %samples_path.display(),
                 count,
@@ -509,20 +503,19 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
     }
 }
 
-fn write_samples_ndjson_gz(report: &FinalReport, path: &Path) -> Result<usize> {
-    let file = File::create(path)
-        .wrap_err_with(|| format!("failed to create samples file {}", path.display()))?;
-    let mut writer = GzEncoder::new(BufWriter::new(file), Compression::default());
-    let mut count = 0usize;
+fn copy_samples_ndjson_gz(report: &FinalReport, path: &Path) -> Result<usize> {
+    let Some(archive) = report.sample_archive.as_ref() else {
+        return Ok(0);
+    };
 
-    for sample in report.iter_samples()? {
-        serde_json::to_writer(&mut writer, &sample?)?;
-        writeln!(writer)?;
-        count += 1;
-    }
-
-    writer.finish()?.flush()?;
-    Ok(count)
+    std::fs::copy(archive.path(), path).wrap_err_with(|| {
+        format!(
+            "failed to copy samples file from {} to {}",
+            archive.path().display(),
+            path.display()
+        )
+    })?;
+    Ok(archive.len())
 }
 
 /// ClickHouse reporter configuration.
@@ -1120,7 +1113,14 @@ mod tests {
             let report =
                 sample_report_with_samples(vec![sample("m1", 1.0, 0), sample("m2", 2.0, 100)])
                     .await;
+            let source_samples_path = report.sample_archive.as_ref().unwrap().path().to_path_buf();
             reporter.finalize(&report).unwrap();
+
+            let samples_path = dir.join("report-test.samples.ndjson.gz");
+            assert_eq!(
+                std::fs::read(&samples_path).unwrap(),
+                std::fs::read(&source_samples_path).unwrap()
+            );
         }
 
         // Report JSON should not contain samples.
