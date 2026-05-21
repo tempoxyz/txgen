@@ -80,6 +80,13 @@ pub struct SendArgs {
     #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
     pub metrics_align: Option<u64>,
 
+    /// Append block access lists for blocks produced during the run as NDJSON.
+    ///
+    /// Starts from the chain tip observed before setup/workload sending and
+    /// writes one line per block in block-number order while the run is active.
+    #[arg(long = "block-access-list-output", alias = "bal-output", value_name = "PATH")]
+    pub block_access_list_output: Option<PathBuf>,
+
     /// Skip setup-phase transactions in the input stream.
     #[arg(long)]
     pub skip_setup: bool,
@@ -334,6 +341,46 @@ mod tests {
         assert_eq!(
             args.metrics_url,
             vec![MetricsURL::Unlabeled("http://127.0.0.1:9001/metrics".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_block_access_list_output_arg() {
+        let cli = Cli::try_parse_from([
+            "bench",
+            "send",
+            "--block-access-list-output",
+            "/tmp/block-access-lists.ndjson",
+        ])
+        .unwrap();
+
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+
+        assert_eq!(
+            args.block_access_list_output,
+            Some(PathBuf::from("/tmp/block-access-lists.ndjson"))
+        );
+    }
+
+    #[test]
+    fn test_block_access_list_output_alias() {
+        let cli = Cli::try_parse_from([
+            "bench",
+            "send",
+            "--bal-output",
+            "/tmp/block-access-lists.ndjson",
+        ])
+        .unwrap();
+
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+
+        assert_eq!(
+            args.block_access_list_output,
+            Some(PathBuf::from("/tmp/block-access-lists.ndjson"))
         );
     }
 

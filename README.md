@@ -160,10 +160,13 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `--metrics-url <URL or NODE:URL,...>` | Prometheus endpoint(s) to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
+| `--block-access-list-output <PATH>` | Append one NDJSON line per new block with its block access list, starting from the tip observed before setup/workload sending |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 300, 0 to disable) |
 
-**Required RPC methods:** `eth_sendRawTransaction`, `eth_getTransactionReceipt` (setup and inclusion waits), `eth_getBlockByNumber`, `txpool_status` (for `--drain-timeout`)
+**Required RPC methods:** `eth_sendRawTransaction`, `eth_getTransactionReceipt` (setup and inclusion waits), `eth_getBlockByNumber`, `txpool_status` (for `--drain-timeout`), `eth_getBlockAccessListByBlockNumber` (for `--block-access-list-output`)
+
+When `--block-access-list-output` is enabled, each appended NDJSON line contains `number` and `block_access_list` fields. `--bal-output` is accepted as a short alias.
 
 #### `bench send-blocks`
 
@@ -759,7 +762,7 @@ Summary of which RPC methods are required by each feature:
 | `eth_getTransactionReceipt` | `bench send` (setup and inclusion waits) |
 | `eth_getBlockByNumber` | `bench send` (per-block stats collection) |
 | `debug_getRawBlock` | `txgen extract`, `txgen-ethereum extract-big-blocks` |
-| `eth_getBlockAccessListByBlockNumber` | `txgen extract --bal`, `txgen-ethereum extract-big-blocks --bal` |
+| `eth_getBlockAccessListByBlockNumber` | `bench send --block-access-list-output`, `txgen extract --bal`, `txgen-ethereum extract-big-blocks --bal` |
 | `reth_newPayload` | `bench send-blocks` |
 | `reth_forkchoiceUpdated` | `bench send-blocks` |
 | `testing_buildBlockV1` | `bench send-blocks --reorg` |

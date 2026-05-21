@@ -1,6 +1,7 @@
 //! `bench send` - Send transactions from file or stdin
 
 use crate::{metrics_url::metrics_scraper_configs, SendArgs};
+use alloy_eips::{eip7928::BlockAccessList, BlockNumberOrTag};
 use alloy_network::AnyNetwork;
 use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
@@ -12,7 +13,14 @@ use bench_core::{
     TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
-use std::{collections::HashMap, time::Duration};
+use serde::Serialize;
+use std::{collections::HashMap, path::PathBuf, time::Duration};
+use tokio::{
+    fs::{File, OpenOptions},
+    io::{AsyncWriteExt, BufWriter},
+    sync::oneshot,
+    task::JoinHandle,
+};
 
 pub async fn execute(args: SendArgs) -> Result<()> {
     tracing::info!(
@@ -69,6 +77,19 @@ async fn execute_source<S: TxSource>(
     let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
     let query_provider = &providers[0];
 
+    let bal_recorder = if let Some(path) = &args.block_access_list_output {
+        let original_tip = query_provider
+            .get_block_number()
+            .await
+            .wrap_err("failed to get original block number")?;
+        Some(
+            BlockAccessListRecorder::start(providers[0].clone(), original_tip, path.clone())
+                .await?,
+        )
+    } else {
+        None
+    };
+
     let first_workload = run_setup_phase(args, source, &providers, &config, query_provider).await?;
 
     let clock = if let Some(start) = args.metrics_align {
@@ -117,6 +138,18 @@ async fn execute_source<S: TxSource>(
         wait_for_pool_drain(query_provider, args.drain_timeout).await?;
     }
 
+    let end_block =
+        query_provider.get_block_number().await.wrap_err("failed to get ending block number")?;
+    if let Some(recorder) = bal_recorder {
+        let stats = recorder.stop_at(end_block).await?;
+        tracing::info!(
+            blocks = stats.blocks_written,
+            start = ?stats.first_block,
+            end = ?stats.last_block,
+            "Block access list recorder stopped"
+        );
+    }
+
     // Stop the scraper before finalizing.
     if !scraper_handles.is_empty() {
         tracing::info!(
@@ -140,9 +173,6 @@ async fn execute_source<S: TxSource>(
     // the block that was current before sending (start_block is the last
     // existing block at that point, so start_block+1 is the first block that
     // could contain our transactions) and ends at the current latest block.
-    let end_block =
-        query_provider.get_block_number().await.wrap_err("failed to get ending block number")?;
-
     let mut report = FinalReport {
         metadata: metadata.clone(),
         bench_metrics: Some(final_metrics),
@@ -185,6 +215,155 @@ async fn execute_source<S: TxSource>(
         reporter.finalize(&report)?;
     }
 
+    Ok(())
+}
+
+struct BlockAccessListRecorder {
+    stop_tx: Option<oneshot::Sender<u64>>,
+    handle: Option<JoinHandle<Result<BlockAccessListRecorderStats>>>,
+}
+
+#[derive(Debug)]
+struct BlockAccessListRecorderStats {
+    blocks_written: u64,
+    first_block: Option<u64>,
+    last_block: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct BlockAccessListOutputLine<'a> {
+    number: u64,
+    block_access_list: &'a BlockAccessList,
+}
+
+impl BlockAccessListRecorder {
+    async fn start(
+        provider: DynProvider<AnyNetwork>,
+        start_block: u64,
+        path: PathBuf,
+    ) -> Result<Self> {
+        let file =
+            OpenOptions::new().create(true).append(true).open(&path).await.wrap_err_with(|| {
+                format!("failed to open block access list output file {}", path.display())
+            })?;
+        let writer = BufWriter::new(file);
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let handle =
+            tokio::spawn(record_block_access_lists(provider, writer, start_block, stop_rx));
+
+        tracing::info!(
+            path = %path.display(),
+            start_block,
+            "Started block access list recorder"
+        );
+
+        Ok(Self { stop_tx: Some(stop_tx), handle: Some(handle) })
+    }
+
+    async fn stop_at(mut self, end_block: u64) -> Result<BlockAccessListRecorderStats> {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(end_block);
+        }
+
+        let handle = self
+            .handle
+            .take()
+            .ok_or_else(|| eyre::eyre!("block access list recorder task missing"))?;
+
+        handle
+            .await
+            .wrap_err("block access list recorder task failed to join")?
+            .wrap_err("block access list recorder failed")
+    }
+}
+
+impl Drop for BlockAccessListRecorder {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
+async fn record_block_access_lists(
+    provider: DynProvider<AnyNetwork>,
+    mut writer: BufWriter<File>,
+    start_block: u64,
+    mut stop_rx: oneshot::Receiver<u64>,
+) -> Result<BlockAccessListRecorderStats> {
+    let mut next_block = start_block.saturating_add(1);
+    let mut stop_at = None;
+    let mut stats =
+        BlockAccessListRecorderStats { blocks_written: 0, first_block: None, last_block: None };
+
+    loop {
+        if let Some(target_block) = stop_at
+            && next_block > target_block
+        {
+            writer.flush().await.wrap_err("failed to flush block access list output")?;
+            return Ok(stats);
+        }
+
+        let latest_block =
+            provider.get_block_number().await.wrap_err("failed to get latest block number")?;
+        let target_block = stop_at.unwrap_or(latest_block);
+        let fetch_through = latest_block.min(target_block);
+
+        while next_block <= fetch_through {
+            let block_access_list = fetch_block_access_list(&provider, next_block).await?;
+            write_block_access_list(&mut writer, next_block, &block_access_list).await?;
+            stats.blocks_written += 1;
+            stats.first_block.get_or_insert(next_block);
+            stats.last_block = Some(next_block);
+            tracing::debug!(block = next_block, "Recorded block access list");
+            next_block += 1;
+        }
+
+        if let Some(target_block) = stop_at
+            && next_block > target_block
+        {
+            writer.flush().await.wrap_err("failed to flush block access list output")?;
+            return Ok(stats);
+        }
+
+        tokio::select! {
+            result = &mut stop_rx, if stop_at.is_none() => {
+                stop_at = Some(result.unwrap_or_else(|_| next_block.saturating_sub(1)));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+        }
+    }
+}
+
+async fn fetch_block_access_list(
+    provider: &DynProvider<AnyNetwork>,
+    block_number: u64,
+) -> Result<BlockAccessList> {
+    provider
+        .get_block_access_list_by_number(BlockNumberOrTag::Number(block_number))
+        .await
+        .wrap_err_with(|| format!("failed to fetch block access list {block_number}"))?
+        .ok_or_else(|| eyre::eyre!("block access list not found for block {block_number}"))
+}
+
+async fn write_block_access_list(
+    writer: &mut BufWriter<File>,
+    block_number: u64,
+    block_access_list: &BlockAccessList,
+) -> Result<()> {
+    let line = BlockAccessListOutputLine { number: block_number, block_access_list };
+    let mut buffer = Vec::new();
+    serde_json::to_writer(&mut buffer, &line)
+        .wrap_err_with(|| format!("failed to serialize block access list {block_number}"))?;
+    buffer.push(b'\n');
+    writer
+        .write_all(&buffer)
+        .await
+        .wrap_err_with(|| format!("failed to write block access list {block_number}"))?;
+    writer
+        .flush()
+        .await
+        .wrap_err_with(|| format!("failed to flush block access list {block_number}"))?;
     Ok(())
 }
 

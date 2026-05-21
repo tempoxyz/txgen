@@ -21,6 +21,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 # alloy
+alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-network.workspace = true
 alloy-provider = { version = "2", features = ["hyper", "txpool-api"] }
@@ -39,4 +40,3 @@ humantime = "2"
 reqwest = { version = "0.13", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
