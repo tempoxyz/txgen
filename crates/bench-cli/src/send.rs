@@ -362,8 +362,8 @@ async fn record_block_artifacts(
         BlockArtifactRecorderStats { blocks_written: 0, first_block: None, last_block: None };
 
     loop {
-        if let Some(target_block) = stop_at
-            && next_block > target_block
+        if let Some(target_block) = stop_at &&
+            next_block > target_block
         {
             finish_block_artifact_output(&mut writer, kind)?;
             return Ok(stats);
@@ -384,8 +384,8 @@ async fn record_block_artifacts(
             next_block += 1;
         }
 
-        if let Some(target_block) = stop_at
-            && next_block > target_block
+        if let Some(target_block) = stop_at &&
+            next_block > target_block
         {
             finish_block_artifact_output(&mut writer, kind)?;
             return Ok(stats);
