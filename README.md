@@ -154,6 +154,7 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `--rpc-url <URL>` | RPC endpoint URLs, comma-separated or repeated (default: `http://localhost:8545`) |
 | `--tps <N>` | Target transactions per second (0 = unlimited) |
 | `--max-concurrent <N>` | Maximum concurrent requests (default: 100) |
+| `--retries <N>` | Retry failed transaction submissions N times (0 = never retry, omitted = retry forever) |
 | `--timeout <DUR>` | Request timeout (default: 30s) |
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
 | `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |

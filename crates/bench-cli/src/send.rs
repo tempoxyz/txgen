@@ -20,6 +20,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         rpc_urls = ?args.rpc_urls,
         tps = args.tps,
         skip_setup = args.skip_setup,
+        retries = args.retries.map_or("forever".to_string(), |retries| retries.to_string()),
         "Starting send"
     );
 
@@ -30,7 +31,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     // CU/s set to u64::MAX to disable the layer's built-in rate limiting
     // while keeping retry-on-429 behavior. The benchmarking tool has its own
     // rate limiter and typically targets local nodes that don't rate-limit.
-    let retry_layer = RetryBackoffLayer::new(10, 100, u64::MAX);
+    let retry_layer = RetryBackoffLayer::new(args.retries.unwrap_or(u32::MAX), 100, u64::MAX);
     let http_client = reqwest::Client::builder()
         .timeout(args.timeout)
         .build()
