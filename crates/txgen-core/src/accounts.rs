@@ -1,4 +1,4 @@
-use alloy_primitives::Address;
+use alloy_primitives::{keccak256, Address, B256};
 use alloy_signer::Signer;
 use alloy_signer_local::{coins_bip39::English, LocalSigner, MnemonicBuilder};
 use eyre::{bail, Result, WrapErr};
@@ -29,6 +29,8 @@ enum AddressPool {
     Literal(Vec<Address>),
     /// Lazily-derived mnemonic address range.
     Mnemonic(MnemonicAddressPool),
+    /// Fast deterministic address range.
+    Fast(FastAddressPool),
 }
 
 /// A lazily-derived mnemonic address range with an on-demand cache.
@@ -38,6 +40,14 @@ struct MnemonicAddressPool {
     start: u32,
     len: usize,
     cache: Mutex<HashMap<u32, Address>>,
+}
+
+/// A fast deterministic address range matching Tempo state bloat generation.
+#[derive(Debug)]
+struct FastAddressPool {
+    seed: B256,
+    start: u64,
+    len: usize,
 }
 
 impl AccountManager {
@@ -150,6 +160,7 @@ impl AddressPool {
         match self {
             Self::Literal(addresses) => addresses.len(),
             Self::Mnemonic(pool) => pool.len,
+            Self::Fast(pool) => pool.len,
         }
     }
 
@@ -164,6 +175,7 @@ impl AddressPool {
                 .copied()
                 .ok_or_else(|| eyre::eyre!("index {index} out of range for literal address pool")),
             Self::Mnemonic(pool) => pool.get_by_index(index),
+            Self::Fast(pool) => pool.get_by_index(index),
         }
     }
 }
@@ -193,6 +205,22 @@ impl MnemonicAddressPool {
         let mut cache =
             self.cache.lock().map_err(|_| eyre::eyre!("address pool cache lock poisoned"))?;
         Ok(*cache.entry(derivation_index).or_insert(address))
+    }
+}
+
+impl FastAddressPool {
+    fn new(seed: &str, start: u64, len: usize) -> Self {
+        Self { seed: keccak256(seed.as_bytes()), start, len }
+    }
+
+    fn get_by_index(&self, index: usize) -> Result<Address> {
+        let offset = u64::try_from(index)
+            .map_err(|_| eyre::eyre!("address pool index {index} exceeds u64 derivation limit"))?;
+        let derivation_index = self
+            .start
+            .checked_add(offset)
+            .ok_or_else(|| eyre::eyre!("address pool index {index} overflows derivation path"))?;
+        Ok(derive_fast_address(self.seed, derivation_index))
     }
 }
 
@@ -244,6 +272,23 @@ pub struct AddressPoolDef {
 
     /// Range of address indices `[start, end)` when deriving from a mnemonic.
     pub range: Option<[u32; 2]>,
+
+    /// Fast deterministic address pool.
+    #[serde(default)]
+    pub fast: Option<FastAddressPoolDef>,
+}
+
+/// Definition of a fast deterministic destination-only address pool.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FastAddressPoolDef {
+    /// Seed string hashed before deriving addresses.
+    pub seed: String,
+
+    /// Single fast address index (mutually exclusive with `range`).
+    pub index: Option<u64>,
+
+    /// Range of fast address indices `[start, end)`.
+    pub range: Option<[u64; 2]>,
 }
 
 impl AddressPoolDef {
@@ -256,14 +301,20 @@ impl AddressPoolDef {
     fn to_pool(&self) -> Result<AddressPool> {
         let has_addresses = !self.addresses.is_empty();
         let has_mnemonic = self.mnemonic.is_some();
+        let has_fast = self.fast.is_some();
+        let fields_set =
+            usize::from(has_addresses) + usize::from(has_mnemonic) + usize::from(has_fast);
 
-        match (has_addresses, has_mnemonic) {
-            (true, false) => Ok(AddressPool::Literal(self.addresses.clone())),
-            (false, true) => self.to_mnemonic_pool(),
-            (true, true) => {
-                bail!("address pool must set either 'addresses' or 'mnemonic', not both")
-            }
-            (false, false) => bail!("address pool must have either 'addresses' or 'mnemonic'"),
+        if fields_set != 1 {
+            bail!("address pool must set exactly one of 'addresses', 'mnemonic', or 'fast'");
+        }
+
+        if has_addresses {
+            Ok(AddressPool::Literal(self.addresses.clone()))
+        } else if has_mnemonic {
+            self.to_mnemonic_pool()
+        } else {
+            self.to_fast_pool()
         }
     }
 
@@ -274,6 +325,15 @@ impl AddressPoolDef {
             .ok_or_else(|| eyre::eyre!("address pool must have a mnemonic"))?;
         let (start, len) = selected_range(self.index, self.range, "address pool")?;
         Ok(AddressPool::Mnemonic(MnemonicAddressPool::new(mnemonic.clone(), start, len)))
+    }
+
+    fn to_fast_pool(&self) -> Result<AddressPool> {
+        let fast = self
+            .fast
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("address pool must have a fast definition"))?;
+        let (start, len) = selected_fast_range(fast.index, fast.range, "fast address pool")?;
+        Ok(AddressPool::Fast(FastAddressPool::new(&fast.seed, start, len)))
     }
 }
 
@@ -305,6 +365,25 @@ fn selected_range(
     }
 }
 
+fn selected_fast_range(
+    index: Option<u64>,
+    range: Option<[u64; 2]>,
+    context: &str,
+) -> Result<(u64, usize)> {
+    if let Some(idx) = index {
+        Ok((idx, 1))
+    } else if let Some([start, end]) = range {
+        if end < start {
+            bail!("{context} range end must be greater than or equal to start");
+        }
+        let len = usize::try_from(end - start)
+            .map_err(|_| eyre::eyre!("{context} range length exceeds usize"))?;
+        Ok((start, len))
+    } else {
+        bail!("{context} must have either 'index' or 'range'");
+    }
+}
+
 fn derive_address(mnemonic: &str, idx: u32) -> Result<Address> {
     MnemonicBuilder::<English>::default()
         .phrase(mnemonic)
@@ -313,6 +392,14 @@ fn derive_address(mnemonic: &str, idx: u32) -> Result<Address> {
         .build()
         .map(|signer: EcdsaSigner| signer.address())
         .map_err(|e| eyre::eyre!("failed to derive address at index {idx}: {e}"))
+}
+
+fn derive_fast_address(seed: B256, index: u64) -> Address {
+    let mut buf = [0u8; 40];
+    buf[..32].copy_from_slice(seed.as_slice());
+    buf[32..].copy_from_slice(&index.to_be_bytes());
+    let hash = keccak256(buf);
+    Address::from_slice(&hash.as_slice()[12..])
 }
 
 /// Reference to an account in a pool.
@@ -422,6 +509,7 @@ mod tests {
             mnemonic: Some(TEST_MNEMONIC.to_string()),
             index: None,
             range: Some([0, 3]),
+            fast: None,
         };
 
         let addresses = def.derive_addresses()?;
@@ -448,6 +536,7 @@ mod tests {
                 mnemonic: None,
                 index: None,
                 range: None,
+                fast: None,
             },
         );
 
@@ -468,6 +557,7 @@ mod tests {
                 mnemonic: Some(TEST_MNEMONIC.to_string()),
                 index: None,
                 range: Some([0, 1_000_000]),
+                fast: None,
             },
         );
 
@@ -480,6 +570,32 @@ mod tests {
         }
         .derive_signers()?[0]
             .address();
+
+        assert_eq!(address, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fast_address_pool_matches_state_bloat_derivation() -> Result<()> {
+        let mut defs = HashMap::new();
+        defs.insert(
+            "recipients".to_string(),
+            AddressPoolDef {
+                addresses: Vec::new(),
+                mnemonic: None,
+                index: None,
+                range: None,
+                fast: Some(FastAddressPoolDef {
+                    seed: TEST_MNEMONIC.to_string(),
+                    index: None,
+                    range: Some([10_000, 1_000_000]),
+                }),
+            },
+        );
+
+        let manager = AddressPoolManager::from_spec(&defs)?;
+        let address = manager.get_by_index("recipients", 0)?;
+        let expected: Address = "0x8dd07b58a16a2f0fcb5e5814c3bd115870785683".parse()?;
 
         assert_eq!(address, expected);
         Ok(())

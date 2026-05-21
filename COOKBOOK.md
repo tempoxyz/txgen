@@ -79,7 +79,7 @@ txgen-tempo addresses --spec examples/bench-spec.yaml --format shell \
 
 ## Send to destination-only address pools
 
-Use `address_pools` when you want workload transactions to target known existing users without making those users available as signers. Pools can be derived from a recipient mnemonic or provided as literal addresses. Mnemonic-backed pools are derived lazily and cached on first use, so very large ranges do not add startup cost:
+Use `address_pools` when you want workload transactions to target known existing users without making those users available as signers. Pools can be derived from a recipient mnemonic, fast deterministic state-bloat-style addresses, or literal addresses. Mnemonic-backed pools are derived lazily and cached on first use, so very large ranges do not add startup cost:
 
 ```yaml
 accounts:
@@ -91,6 +91,10 @@ address_pools:
   existing_users:
     mnemonic: "${RECIPIENT_MNEMONIC}"
     range: [0, 10000]
+  state_bloat_users:
+    fast:
+      seed: "${STATE_BLOAT_SEED}"
+      range: [10000, 1000000]
   known_recipients:
     addresses:
       - "0x0000000000000000000000000000000000000001"

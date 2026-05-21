@@ -450,6 +450,7 @@ mod tests {
                 mnemonic: None,
                 index: None,
                 range: None,
+                fast: None,
             },
         )]))?;
         let mut rng = rand::rng();

@@ -11,7 +11,7 @@ mod yaml;
 pub use abi::{ArtifactDef, ArtifactManager, CallDef, EncodedCall};
 pub use accounts::{
     AccountManager, AccountPoolDef, AccountRef, AddressPoolDef, AddressPoolManager, EcdsaSigner,
-    SelectMode, SignerExt,
+    FastAddressPoolDef, SelectMode, SignerExt,
 };
 pub use nonce::NonceTracker;
 pub use output::{GeneratedTx, NdjsonWriter, TxPhase};

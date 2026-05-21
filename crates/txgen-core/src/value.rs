@@ -303,6 +303,7 @@ mod tests {
                 mnemonic: None,
                 index: None,
                 range: None,
+                fast: None,
             },
         )]))?;
         let mut rng = StdRng::seed_from_u64(42);
