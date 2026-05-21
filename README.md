@@ -396,6 +396,10 @@ address_pools:
   existing_users:
     mnemonic: "${RECIPIENT_MNEMONIC}"
     range: [0, 10000]
+  bloated_state_users:
+    fast:
+      seed: "${STATE_BLOAT_SEED}"
+      range: [10000, 1000000]
   known_contracts:
     addresses:
       - "0x0000000000000000000000000000000000000001"
@@ -482,7 +486,7 @@ from:
 
 ### Destination-only Address Pools
 
-Use `address_pools` when you want to send to known users without making those users available for signing. Mnemonic-backed pools are lazy: txgen derives and caches an address only when it is selected, so large ranges such as `[0, 1000000]` do not add startup cost.
+Use `address_pools` when you want to send to known users without making those users available for signing. Mnemonic-backed pools are lazy: txgen derives and caches an address only when it is selected, so large ranges such as `[0, 1000000]` do not add startup cost. Fast pools derive deterministic non-signable addresses as `last20(keccak256(keccak256(seed) || index_be_u64))`, matching Tempo state-bloat addresses beyond the signable range.
 
 ```yaml
 accounts:
@@ -494,6 +498,10 @@ address_pools:
   existing_users:
     mnemonic: "${RECIPIENT_MNEMONIC}"
     range: [0, 1000000]
+  state_bloat_users:
+    fast:
+      seed: "${STATE_BLOAT_SEED}"
+      range: [10000, 1000000]
   fixed_recipients:
     addresses:
       - "0x0000000000000000000000000000000000000001"
