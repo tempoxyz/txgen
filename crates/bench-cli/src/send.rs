@@ -13,14 +13,16 @@ use bench_core::{
     TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
+use flate2::{write::GzEncoder, Compression};
 use serde::Serialize;
-use std::{collections::HashMap, path::PathBuf, time::Duration};
-use tokio::{
+use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
-    io::{AsyncWriteExt, BufWriter},
-    sync::oneshot,
-    task::JoinHandle,
+    io::{BufWriter, Write},
+    path::PathBuf,
+    time::Duration,
 };
+use tokio::{sync::oneshot, task::JoinHandle};
 
 pub async fn execute(args: SendArgs) -> Result<()> {
     tracing::info!(
@@ -236,6 +238,8 @@ struct BlockAccessListOutputLine<'a> {
     block_access_list: &'a BlockAccessList,
 }
 
+type BlockAccessListWriter = GzEncoder<BufWriter<File>>;
+
 impl BlockAccessListRecorder {
     async fn start(
         provider: DynProvider<AnyNetwork>,
@@ -243,10 +247,10 @@ impl BlockAccessListRecorder {
         path: PathBuf,
     ) -> Result<Self> {
         let file =
-            OpenOptions::new().create(true).append(true).open(&path).await.wrap_err_with(|| {
+            OpenOptions::new().create(true).append(true).open(&path).wrap_err_with(|| {
                 format!("failed to open block access list output file {}", path.display())
             })?;
-        let writer = BufWriter::new(file);
+        let writer = GzEncoder::new(BufWriter::new(file), Compression::default());
         let (stop_tx, stop_rx) = oneshot::channel();
         let handle =
             tokio::spawn(record_block_access_lists(provider, writer, start_block, stop_rx));
@@ -287,7 +291,7 @@ impl Drop for BlockAccessListRecorder {
 
 async fn record_block_access_lists(
     provider: DynProvider<AnyNetwork>,
-    mut writer: BufWriter<File>,
+    mut writer: BlockAccessListWriter,
     start_block: u64,
     mut stop_rx: oneshot::Receiver<u64>,
 ) -> Result<BlockAccessListRecorderStats> {
@@ -300,7 +304,7 @@ async fn record_block_access_lists(
         if let Some(target_block) = stop_at
             && next_block > target_block
         {
-            writer.flush().await.wrap_err("failed to flush block access list output")?;
+            finish_block_access_list_output(&mut writer)?;
             return Ok(stats);
         }
 
@@ -311,7 +315,7 @@ async fn record_block_access_lists(
 
         while next_block <= fetch_through {
             let block_access_list = fetch_block_access_list(&provider, next_block).await?;
-            write_block_access_list(&mut writer, next_block, &block_access_list).await?;
+            write_block_access_list(&mut writer, next_block, &block_access_list)?;
             stats.blocks_written += 1;
             stats.first_block.get_or_insert(next_block);
             stats.last_block = Some(next_block);
@@ -322,7 +326,7 @@ async fn record_block_access_lists(
         if let Some(target_block) = stop_at
             && next_block > target_block
         {
-            writer.flush().await.wrap_err("failed to flush block access list output")?;
+            finish_block_access_list_output(&mut writer)?;
             return Ok(stats);
         }
 
@@ -333,6 +337,12 @@ async fn record_block_access_lists(
             _ = tokio::time::sleep(Duration::from_millis(500)) => {}
         }
     }
+}
+
+fn finish_block_access_list_output(writer: &mut BlockAccessListWriter) -> Result<()> {
+    writer.try_finish().wrap_err("failed to finish block access list gzip output")?;
+    writer.get_mut().flush().wrap_err("failed to flush block access list output")?;
+    Ok(())
 }
 
 async fn fetch_block_access_list(
@@ -346,8 +356,8 @@ async fn fetch_block_access_list(
         .ok_or_else(|| eyre::eyre!("block access list not found for block {block_number}"))
 }
 
-async fn write_block_access_list(
-    writer: &mut BufWriter<File>,
+fn write_block_access_list(
+    writer: &mut BlockAccessListWriter,
     block_number: u64,
     block_access_list: &BlockAccessList,
 ) -> Result<()> {
@@ -356,14 +366,12 @@ async fn write_block_access_list(
     serde_json::to_writer(&mut buffer, &line)
         .wrap_err_with(|| format!("failed to serialize block access list {block_number}"))?;
     buffer.push(b'\n');
-    writer
-        .write_all(&buffer)
-        .await
-        .wrap_err_with(|| format!("failed to write block access list {block_number}"))?;
-    writer
-        .flush()
-        .await
-        .wrap_err_with(|| format!("failed to flush block access list {block_number}"))?;
+    writer.write_all(&buffer).wrap_err_with(|| {
+        format!("failed to write block access list {block_number} to gzip output")
+    })?;
+    writer.flush().wrap_err_with(|| {
+        format!("failed to flush block access list {block_number} to gzip output")
+    })?;
     Ok(())
 }
 

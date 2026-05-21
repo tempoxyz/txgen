@@ -1250,6 +1250,7 @@ dependencies = [
  "bench-core",
  "clap",
  "eyre",
+ "flate2",
  "humantime",
  "reqwest 0.13.2",
  "serde",

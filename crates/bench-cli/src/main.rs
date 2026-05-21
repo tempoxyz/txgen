@@ -80,7 +80,7 @@ pub struct SendArgs {
     #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
     pub metrics_align: Option<u64>,
 
-    /// Append block access lists for blocks produced during the run as NDJSON.
+    /// Append block access lists produced during the run to a gzip-compressed NDJSON file.
     ///
     /// Starts from the chain tip observed before setup/workload sending and
     /// writes one line per block in block-number order while the run is active.
@@ -350,7 +350,7 @@ mod tests {
             "bench",
             "send",
             "--block-access-list-output",
-            "/tmp/block-access-lists.ndjson",
+            "/tmp/block-access-lists.ndjson.gz",
         ])
         .unwrap();
 
@@ -360,7 +360,7 @@ mod tests {
 
         assert_eq!(
             args.block_access_list_output,
-            Some(PathBuf::from("/tmp/block-access-lists.ndjson"))
+            Some(PathBuf::from("/tmp/block-access-lists.ndjson.gz"))
         );
     }
 
@@ -370,7 +370,7 @@ mod tests {
             "bench",
             "send",
             "--bal-output",
-            "/tmp/block-access-lists.ndjson",
+            "/tmp/block-access-lists.ndjson.gz",
         ])
         .unwrap();
 
@@ -380,7 +380,7 @@ mod tests {
 
         assert_eq!(
             args.block_access_list_output,
-            Some(PathBuf::from("/tmp/block-access-lists.ndjson"))
+            Some(PathBuf::from("/tmp/block-access-lists.ndjson.gz"))
         );
     }
 
