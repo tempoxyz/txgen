@@ -161,6 +161,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                     persistence_policy: &persistence_policy,
                 },
                 args.wait_time,
+                args.retries,
                 start,
                 &mut reporters,
             )
@@ -191,6 +192,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                     persistence_policy: &persistence_policy,
                 },
                 args.wait_time,
+                args.retries,
                 start,
                 &mut reporters,
             )
@@ -270,22 +272,35 @@ async fn process_input_and_wait(
     provider: &(impl Provider + RethApi<Ethereum>),
     testing_provider: &(impl Provider + TestingApi<Ethereum>),
     input: &InputLine,
-    state: ProcessingState<'_>,
+    mut state: ProcessingState<'_>,
     wait_time: Option<Duration>,
+    retries: Option<u64>,
     start: Instant,
     reporters: &mut [Box<dyn Reporter>],
 ) -> Result<()> {
     let block_start = Instant::now();
 
-    process_input(
-        provider,
-        testing_provider,
-        input,
-        state.collector,
-        state.reorg_state,
-        state.persistence_policy,
-    )
-    .await?;
+    let mut attempt = 0;
+    loop {
+        match process_input(
+            provider,
+            testing_provider,
+            input,
+            state.collector,
+            state.reorg_state.as_deref_mut(),
+            state.persistence_policy,
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(err) if should_retry(attempt, retries) => {
+                attempt += 1;
+                tracing::warn!(%err, attempt, "Failed to submit block input, retrying");
+                tokio::time::sleep(retry_delay(attempt)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
     report_progress(state.collector, start, reporters)?;
 
     if let Some(wait_time) = wait_time {
@@ -296,6 +311,15 @@ async fn process_input_and_wait(
     }
 
     Ok(())
+}
+
+fn should_retry(attempt: u64, retries: Option<u64>) -> bool {
+    retries.is_none_or(|retries| attempt < retries)
+}
+
+fn retry_delay(attempt: u64) -> Duration {
+    let millis = 100_u64.saturating_mul(2_u64.saturating_pow(attempt.min(5) as u32));
+    Duration::from_millis(millis.min(1_000))
 }
 
 async fn process_input(

@@ -34,11 +34,15 @@ pub struct SenderConfig {
     /// Controls parallelism via a semaphore. Limits how many connections are
     /// open at once, independently of the rate limit.
     pub max_concurrent: usize,
+    /// Maximum number of retries after the initial submit attempt.
+    ///
+    /// `None` retries forever. `Some(0)` submits once without retrying.
+    pub retries: Option<u64>,
 }
 
 impl Default for SenderConfig {
     fn default() -> Self {
-        Self { rate_limit: 0, max_concurrent: 100 }
+        Self { rate_limit: 0, max_concurrent: 100, retries: None }
     }
 }
 
@@ -83,6 +87,8 @@ pub struct Sender {
     /// Maximum number of transactions buffered internally before applying
     /// backpressure to the transaction source.
     max_buffered: usize,
+    /// Maximum number of retries after the initial submit attempt.
+    retries: Option<u64>,
 }
 
 impl Sender {
@@ -114,6 +120,7 @@ impl Sender {
             worker_tasks: JoinSet::new(),
             rate_limiter,
             max_buffered,
+            retries: config.retries,
         }
     }
 
@@ -202,8 +209,8 @@ impl Sender {
                 break;
             };
 
-            if let Some(limiter) = &self.rate_limiter &&
-                let Some(delay) = limiter.try_acquire_or_delay().await
+            if let Some(limiter) = &self.rate_limiter
+                && let Some(delay) = limiter.try_acquire_or_delay().await
             {
                 drop(permit);
                 tokio::time::sleep(delay).await;
@@ -244,9 +251,10 @@ impl Sender {
         let providers = self.providers.clone();
         let metrics = self.metrics.clone();
         let completion_tx = self.completion_tx.clone();
+        let retries = self.retries;
 
         self.worker_tasks.spawn(async move {
-            submit_tx(pending, providers, metrics, permit, completion_tx).await;
+            submit_tx(pending, providers, metrics, permit, completion_tx, retries).await;
         });
     }
 }
@@ -281,6 +289,7 @@ async fn submit_tx(
     metrics: Arc<MetricsCollector>,
     permit: OwnedSemaphorePermit,
     completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
+    retries: Option<u64>,
 ) {
     let release_all_keys = || {
         let mut keys = pending.submission_keys.clone();
@@ -288,24 +297,31 @@ async fn submit_tx(
         keys
     };
 
-    metrics.record_sent();
-
     // Pick a random provider for this request.
     // SAFETY: `providers` is guaranteed to be non-empty by construction.
     let provider = providers.choose(&mut rand::rng()).unwrap();
 
     let start = Instant::now();
-    let tx_hash = match provider.send_raw_transaction(&pending.raw).await {
-        Ok(pending_tx) => {
-            metrics.record_success(start.elapsed());
-            *pending_tx.tx_hash()
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to send transaction");
-            metrics.record_failure();
-            drop(permit);
-            release_keys(&completion_tx, release_all_keys());
-            return;
+    let mut attempt = 0;
+    let tx_hash = loop {
+        metrics.record_sent();
+        match provider.send_raw_transaction(&pending.raw).await {
+            Ok(pending_tx) => {
+                metrics.record_success(start.elapsed());
+                break *pending_tx.tx_hash();
+            }
+            Err(e) if should_retry(attempt, retries) => {
+                attempt += 1;
+                tracing::warn!(error = %e, attempt, "Failed to send transaction, retrying");
+                tokio::time::sleep(retry_delay(attempt)).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, attempt, "Failed to send transaction");
+                metrics.record_failure();
+                drop(permit);
+                release_keys(&completion_tx, release_all_keys());
+                return;
+            }
         }
     };
 
@@ -330,6 +346,15 @@ async fn submit_tx(
     }
 
     release_keys(&completion_tx, pending.inclusion_keys);
+}
+
+fn should_retry(attempt: u64, retries: Option<u64>) -> bool {
+    retries.is_none_or(|retries| attempt < retries)
+}
+
+fn retry_delay(attempt: u64) -> Duration {
+    let millis = 100_u64.saturating_mul(2_u64.saturating_pow(attempt.min(5) as u32));
+    Duration::from_millis(millis.min(1_000))
 }
 
 fn release_keys(completion_tx: &mpsc::UnboundedSender<SchedulingKeys>, keys: SchedulingKeys) {
@@ -451,11 +476,11 @@ mod tests {
 
     #[test]
     fn test_max_buffered_transactions_uses_existing_sender_knobs() {
-        let config = SenderConfig { rate_limit: 10_000, max_concurrent: 100 };
+        let config = SenderConfig { rate_limit: 10_000, max_concurrent: 100, retries: None };
         let limiter = RateLimiter::new(config.rate_limit);
         assert_eq!(max_buffered_transactions(&config, Some(&limiter)), 400);
 
-        let config = SenderConfig { rate_limit: 100_000, max_concurrent: 100 };
+        let config = SenderConfig { rate_limit: 100_000, max_concurrent: 100, retries: None };
         let limiter = RateLimiter::new(config.rate_limit);
         assert_eq!(max_buffered_transactions(&config, Some(&limiter)), 2_000);
     }

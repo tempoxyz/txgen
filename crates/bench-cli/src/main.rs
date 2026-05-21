@@ -46,6 +46,12 @@ pub struct SendArgs {
     #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
     pub timeout: Duration,
 
+    /// Maximum submit retries after the first attempt.
+    ///
+    /// Defaults to retrying forever. Set to 0 to submit once without retrying.
+    #[arg(long)]
+    pub retries: Option<u64>,
+
     /// Report output destinations
     #[arg(long = "report", value_name = "FORMAT")]
     pub reports: Vec<String>,
@@ -123,6 +129,12 @@ pub struct SendBlocksArgs {
     /// integers are treated as milliseconds.
     #[arg(long, value_name = "WAIT_TIME", value_parser = parse_duration_millis_fallback)]
     pub wait_time: Option<Duration>,
+
+    /// Maximum submit retries after the first attempt.
+    ///
+    /// Defaults to retrying forever. Set to 0 to submit once without retrying.
+    #[arg(long)]
+    pub retries: Option<u64>,
 
     /// Report output destinations
     #[arg(long = "report", value_name = "FORMAT")]

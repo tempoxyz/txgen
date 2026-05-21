@@ -4,7 +4,6 @@ use crate::{metrics_url::metrics_scraper_configs, SendArgs};
 use alloy_network::AnyNetwork;
 use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
-use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     collect_block_stats, parse_reporters, start_scrapers, trim_trailing_empty_blocks,
     ConsoleReporter, FileSource, FinalReport, GeneratedTx, MetricsCollector, ProgressState,
@@ -27,10 +26,6 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     let scraper_configs =
         metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
 
-    // CU/s set to u64::MAX to disable the layer's built-in rate limiting
-    // while keeping retry-on-429 behavior. The benchmarking tool has its own
-    // rate limiter and typically targets local nodes that don't rate-limit.
-    let retry_layer = RetryBackoffLayer::new(10, 100, u64::MAX);
     let http_client = reqwest::Client::builder()
         .timeout(args.timeout)
         .build()
@@ -40,9 +35,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         .iter()
         .map(|url| {
             let url = url.parse().context("failed to parse RPC URL")?;
-            let client = RpcClient::builder()
-                .layer(retry_layer.clone())
-                .http_with_client(http_client.clone(), url);
+            let client = RpcClient::builder().http_with_client(http_client.clone(), url);
             Ok(ProviderBuilder::new_with_network::<AnyNetwork>().connect_client(client).erased())
         })
         .collect::<Result<Vec<_>>>()?;
@@ -66,7 +59,11 @@ async fn execute_source<S: TxSource>(
     source: &mut S,
     scraper_configs: &[ScraperConfig],
 ) -> Result<()> {
-    let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
+    let config = SenderConfig {
+        rate_limit: args.tps,
+        max_concurrent: args.max_concurrent,
+        retries: args.retries,
+    };
     let query_provider = &providers[0];
 
     let first_workload = run_setup_phase(args, source, &providers, &config, query_provider).await?;
