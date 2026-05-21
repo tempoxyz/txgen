@@ -45,6 +45,7 @@ pub struct Sample {
 pub struct SampleArchive {
     path: PathBuf,
     len: usize,
+    retain_until_unix_ms: Option<u64>,
 }
 
 impl SampleArchive {
@@ -63,34 +64,41 @@ impl SampleArchive {
         self.len == 0
     }
 
-    /// Iterate over samples in the archive.
-    pub fn iter(&self) -> Result<SampleArchiveIter> {
-        SampleArchiveIter::open(&self.path)
+    /// Set a lazy cutoff so reads skip samples after `cutoff_ms`.
+    pub fn retain_until(&mut self, cutoff_ms: u64) {
+        self.retain_until_unix_ms =
+            Some(self.retain_until_unix_ms.map_or(cutoff_ms, |current| current.min(cutoff_ms)));
     }
 
-    /// Rewrite the archive, retaining only samples matching `keep`.
-    pub fn retain<F>(&mut self, mut keep: F) -> Result<()>
-    where
-        F: FnMut(&Sample) -> bool,
-    {
-        let filtered_path = temporary_sample_path();
-        let mut writer = sample_writer(&filtered_path)?;
-        let mut retained = 0usize;
+    /// Iterate over samples in the archive.
+    pub fn iter(&self) -> Result<SampleArchiveIter> {
+        SampleArchiveIter::open(&self.path, self.retain_until_unix_ms)
+    }
 
-        for sample in self.iter()? {
-            let sample = sample?;
-            if keep(&sample) {
-                serde_json::to_writer(&mut writer, &sample)?;
-                writeln!(writer)?;
-                retained += 1;
-            }
+    /// Write NDJSON samples to `writer`, applying any lazy cutoff.
+    pub fn write_ndjson_to<W: Write>(&self, writer: &mut W) -> Result<usize> {
+        if self.retain_until_unix_ms.is_none() {
+            let mut reader = BufReader::new(File::open(&self.path).wrap_err_with(|| {
+                format!("failed to open sample archive {}", self.path.display())
+            })?);
+            std::io::copy(&mut reader, writer).wrap_err_with(|| {
+                format!("failed to copy sample archive {}", self.path.display())
+            })?;
+            return Ok(self.len);
         }
 
-        writer.flush()?;
-        std::fs::remove_file(&self.path).ok();
-        self.path = filtered_path;
-        self.len = retained;
-        Ok(())
+        let mut written = 0usize;
+        for line in self.filtered_lines()? {
+            let line = line?;
+            writer.write_all(line.as_bytes())?;
+            writer.write_all(b"\n")?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    fn filtered_lines(&self) -> Result<SampleArchiveLineIter> {
+        SampleArchiveLineIter::open(&self.path, self.retain_until_unix_ms)
     }
 }
 
@@ -103,13 +111,14 @@ impl Drop for SampleArchive {
 /// Iterator over an NDJSON sample archive.
 pub struct SampleArchiveIter {
     lines: Lines<BufReader<File>>,
+    retain_until_unix_ms: Option<u64>,
 }
 
 impl SampleArchiveIter {
-    fn open(path: &Path) -> Result<Self> {
+    fn open(path: &Path, retain_until_unix_ms: Option<u64>) -> Result<Self> {
         let file = File::open(path)
             .wrap_err_with(|| format!("failed to open sample archive {}", path.display()))?;
-        Ok(Self { lines: BufReader::new(file).lines() })
+        Ok(Self { lines: BufReader::new(file).lines(), retain_until_unix_ms })
     }
 }
 
@@ -117,12 +126,62 @@ impl Iterator for SampleArchiveIter {
     type Item = Result<Sample>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let line = match self.lines.next()? {
-            Ok(line) => line,
-            Err(err) => return Some(Err(err).context("failed to read sample archive line")),
-        };
+        loop {
+            let line = match self.lines.next()? {
+                Ok(line) => line,
+                Err(err) => return Some(Err(err).context("failed to read sample archive line")),
+            };
 
-        Some(serde_json::from_str(&line).context("failed to parse sample archive line"))
+            let sample: Sample = match serde_json::from_str(&line) {
+                Ok(sample) => sample,
+                Err(err) => {
+                    return Some(Err(err).context("failed to parse sample archive line"));
+                }
+            };
+            if self.retain_until_unix_ms.is_none_or(|cutoff_ms| sample.unix_ms <= cutoff_ms) {
+                return Some(Ok(sample));
+            }
+        }
+    }
+}
+
+struct SampleArchiveLineIter {
+    lines: Lines<BufReader<File>>,
+    retain_until_unix_ms: Option<u64>,
+}
+
+impl SampleArchiveLineIter {
+    fn open(path: &Path, retain_until_unix_ms: Option<u64>) -> Result<Self> {
+        let file = File::open(path)
+            .wrap_err_with(|| format!("failed to open sample archive {}", path.display()))?;
+        Ok(Self { lines: BufReader::new(file).lines(), retain_until_unix_ms })
+    }
+}
+
+impl Iterator for SampleArchiveLineIter {
+    type Item = Result<String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let line = match self.lines.next()? {
+                Ok(line) => line,
+                Err(err) => return Some(Err(err).context("failed to read sample archive line")),
+            };
+
+            let Some(cutoff_ms) = self.retain_until_unix_ms else {
+                return Some(Ok(line));
+            };
+
+            let sample = match serde_json::from_str::<Sample>(&line) {
+                Ok(sample) => sample,
+                Err(err) => {
+                    return Some(Err(err).context("failed to parse sample archive line"));
+                }
+            };
+            if sample.unix_ms <= cutoff_ms {
+                return Some(Ok(line));
+            }
+        }
     }
 }
 
@@ -211,7 +270,7 @@ impl SampleStore {
             writer.flush()?;
         }
 
-        Ok(SampleArchive { path: inner.path.clone(), len: inner.len })
+        Ok(SampleArchive { path: inner.path.clone(), len: inner.len, retain_until_unix_ms: None })
     }
 
     /// Number of samples currently stored.
@@ -321,7 +380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retain_rewrites_archive() {
+    async fn retain_until_filters_reads_without_rewriting_archive() {
         let store = SampleStore::new().unwrap();
         store
             .push_batch(vec![make_sample("old", 1.0, 0), make_sample("new", 2.0, 100)])
@@ -329,11 +388,22 @@ mod tests {
             .unwrap();
 
         let mut archive = store.finish().await.unwrap();
-        archive.retain(|sample| sample.offset_ms >= 100).unwrap();
+        let original_path = archive.path().to_path_buf();
+        let original_content = std::fs::read_to_string(&original_path).unwrap();
+
+        archive.retain_until(1_700_000_000_000);
+
+        assert_eq!(archive.path(), original_path);
+        assert_eq!(std::fs::read_to_string(&original_path).unwrap(), original_content);
 
         let samples = archive.iter().unwrap().collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].name, "new");
+        assert_eq!(samples[0].name, "old");
+
+        let mut ndjson = Vec::new();
+        let count = archive.write_ndjson_to(&mut ndjson).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(String::from_utf8(ndjson).unwrap().lines().count(), 1);
     }
 
     #[test]

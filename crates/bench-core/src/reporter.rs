@@ -14,7 +14,7 @@ use flate2::{write::GzEncoder, Compression};
 use std::{
     collections::HashMap,
     fs::File,
-    io::{BufReader, BufWriter, Write},
+    io::{BufWriter, Write},
     path::Path,
 };
 
@@ -82,7 +82,7 @@ impl FinalReport {
     /// Retain only samples at or before the given Unix millisecond timestamp.
     pub fn retain_samples_until(&mut self, cutoff_ms: u64) -> Result<()> {
         if let Some(archive) = self.sample_archive.as_mut() {
-            archive.retain(|sample| sample.unix_ms <= cutoff_ms)?;
+            archive.retain_until(cutoff_ms);
         }
         Ok(())
     }
@@ -515,16 +515,13 @@ fn copy_and_gzip_samples_ndjson(report: &FinalReport, path: &Path) -> Result<usi
         return Ok(0);
     };
 
-    let input = File::open(archive.path())
-        .wrap_err_with(|| format!("failed to open samples file {}", archive.path().display()))?;
     let output = File::create(path)
         .wrap_err_with(|| format!("failed to create samples file {}", path.display()))?;
 
-    let mut reader = BufReader::new(input);
     let writer = BufWriter::new(output);
     let mut encoder = GzEncoder::new(writer, Compression::default());
 
-    std::io::copy(&mut reader, &mut encoder).wrap_err_with(|| {
+    let count = archive.write_ndjson_to(&mut encoder).wrap_err_with(|| {
         format!(
             "failed to gzip samples file from {} to {}",
             archive.path().display(),
@@ -532,7 +529,7 @@ fn copy_and_gzip_samples_ndjson(report: &FinalReport, path: &Path) -> Result<usi
         )
     })?;
     encoder.finish()?.flush()?;
-    Ok(archive.len())
+    Ok(count)
 }
 
 /// ClickHouse reporter configuration.
@@ -1163,6 +1160,41 @@ mod tests {
         assert_eq!(s1.name, "m1");
         let s2: Sample = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(s2.name, "m2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_json_reporter_file_applies_lazy_sample_cutoff() {
+        let dir = std::env::temp_dir().join("txgen-test-cutoff-samples");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let report_path = dir.join("report-test.json");
+        {
+            let mut reporter = JsonReporter::file(&report_path).unwrap();
+            let mut report =
+                sample_report_with_samples(vec![sample("m1", 1.0, 0), sample("m2", 2.0, 100)])
+                    .await;
+            let source_samples_path = report.sample_archive.as_ref().unwrap().path().to_path_buf();
+            let source_content = std::fs::read_to_string(&source_samples_path).unwrap();
+            assert_eq!(source_content.lines().count(), 2);
+
+            report.retain_samples_until(1000).unwrap();
+            assert_eq!(std::fs::read_to_string(&source_samples_path).unwrap(), source_content);
+
+            reporter.finalize(&report).unwrap();
+        }
+
+        let samples_path = dir.join("report-test.samples.ndjson.gz");
+        let file = std::fs::File::open(&samples_path).unwrap();
+        let mut decoder = flate2::read::GzDecoder::new(file);
+        let mut content = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut content).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let sample: Sample = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(sample.name, "m1");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
