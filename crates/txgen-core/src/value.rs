@@ -3,7 +3,7 @@ use eyre::{bail, Result};
 use rand::Rng;
 use serde::{de::DeserializeOwned, Deserialize};
 
-use crate::{AccountManager, SelectMode};
+use crate::{AccountManager, AddressPoolManager, SelectMode};
 
 /// A value that can be either a literal or a generator expression.
 #[derive(Debug, Clone, Deserialize)]
@@ -29,8 +29,10 @@ pub enum Generator {
     Uniform([u64; 2]),
     /// Random choice from a list of values.
     Choice(Vec<serde_yaml::Value>),
-    /// Account address from a pool.
+    /// Account address from a signer pool.
     Pool { pool: String, select: SelectMode },
+    /// Destination address from an address-only pool.
+    AddressPool { pool: String, select: SelectMode },
     /// Random bytes of given length.
     RandomBytes(usize),
     /// Random value.
@@ -42,6 +44,7 @@ pub enum Generator {
 /// Resolver for generator expressions.
 pub struct ValueResolver<'a> {
     pub accounts: &'a AccountManager,
+    pub address_pools: &'a AddressPoolManager,
     pub rng: &'a mut dyn rand::RngCore,
 }
 
@@ -156,6 +159,10 @@ impl FromGenerator for Address {
                 };
                 Ok(signer.address())
             }
+            Generator::AddressPool { pool, select } => match select {
+                SelectMode::Random => resolver.address_pools.get_random(pool, resolver.rng),
+                SelectMode::Index(idx) => resolver.address_pools.get_by_index(pool, *idx),
+            },
             Generator::Const(v) => {
                 let s: String = serde_yaml::from_value(v.clone())?;
                 Ok(s.parse()?)
@@ -235,8 +242,10 @@ mod tests {
     #[test]
     fn test_uniform_u64() {
         let accounts = AccountManager::empty();
+        let address_pools = AddressPoolManager::empty();
         let mut rng = StdRng::seed_from_u64(42);
-        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+        let mut resolver =
+            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
 
         let generator = Generator::Uniform([1, 100]);
         let val: u64 = u64::from_generator(&generator, &mut resolver).unwrap();
@@ -246,8 +255,10 @@ mod tests {
     #[test]
     fn test_const_address() {
         let accounts = AccountManager::empty();
+        let address_pools = AddressPoolManager::empty();
         let mut rng = StdRng::seed_from_u64(42);
-        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+        let mut resolver =
+            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
 
         let generator = Generator::Const(serde_yaml::Value::String(
             "0x0000000000000000000000000000000000000001".to_string(),
@@ -262,8 +273,10 @@ mod tests {
     #[test]
     fn test_random() {
         let accounts = AccountManager::empty();
+        let address_pools = AddressPoolManager::empty();
         let mut rng = StdRng::seed_from_u64(42);
-        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+        let mut resolver =
+            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
 
         let generator = Generator::Random;
 
@@ -277,5 +290,30 @@ mod tests {
         // Unsupported types: should fail.
         assert!(Bytes::from_generator(&generator, &mut resolver).is_err());
         assert!(String::from_generator(&generator, &mut resolver).is_err());
+    }
+
+    #[test]
+    fn test_address_pool_generator() -> Result<()> {
+        let accounts = AccountManager::empty();
+        let expected = Address::from([7u8; 20]);
+        let address_pools = AddressPoolManager::from_spec(&std::collections::HashMap::from([(
+            "recipients".to_string(),
+            crate::AddressPoolDef {
+                addresses: vec![expected],
+                mnemonic: None,
+                index: None,
+                range: None,
+            },
+        )]))?;
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut resolver =
+            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+
+        let generator =
+            Generator::AddressPool { pool: "recipients".to_string(), select: SelectMode::Index(0) };
+        let address = Address::from_generator(&generator, &mut resolver)?;
+
+        assert_eq!(address, expected);
+        Ok(())
     }
 }

@@ -15,6 +15,7 @@ Use `txgen-ethereum` for standard Ethereum transactions and `txgen-tempo` for Te
 
 - [Generate synthetic transactions offline](#generate-synthetic-transactions-offline)
 - [List and fund workload accounts](#list-and-fund-workload-accounts)
+- [Send to destination-only address pools](#send-to-destination-only-address-pools)
 - [Send a fixed number of synthetic transactions](#send-a-fixed-number-of-synthetic-transactions)
 - [Run a timed stress test](#run-a-timed-stress-test)
 - [Replay historical blocks through Engine API](#replay-historical-blocks-through-engine-api)
@@ -59,7 +60,7 @@ Notes:
 
 ## List and fund workload accounts
 
-List every address referenced by a workload spec:
+List every signer account address referenced by a workload spec. Destination-only `address_pools` are omitted:
 
 ```bash
 txgen-tempo addresses --spec examples/bench-spec.yaml
@@ -75,6 +76,58 @@ txgen-tempo addresses --spec examples/bench-spec.yaml --format shell \
       -d '{"jsonrpc":"2.0","method":"tempo_fundAddress","params":["{}"],"id":1}' \
       http://localhost:8545 -o /dev/null
 ```
+
+## Send to destination-only address pools
+
+Use `address_pools` when you want workload transactions to target known existing users without making those users available as signers. Pools can be derived from a recipient mnemonic or provided as literal addresses. Mnemonic-backed pools are derived lazily and cached on first use, so very large ranges do not add startup cost:
+
+```yaml
+accounts:
+  senders:
+    mnemonic: "${SENDER_MNEMONIC}"
+    range: [0, 100]
+
+address_pools:
+  existing_users:
+    mnemonic: "${RECIPIENT_MNEMONIC}"
+    range: [0, 10000]
+  known_recipients:
+    addresses:
+      - "0x0000000000000000000000000000000000000001"
+      - "0x0000000000000000000000000000000000000002"
+
+templates:
+  transfer_to_existing_user:
+    type: eip1559
+    from: { pool: senders, select: random }
+    to:
+      address_pool:
+        pool: existing_users
+        select: random
+    value: 1
+    gas_limit: 21000
+```
+
+For ERC20-style calls, use the same generator in the ABI `address` argument:
+
+```yaml
+templates:
+  erc20_transfer_to_existing_user:
+    type: eip1559
+    from: { pool: senders, select: random }
+    gas_limit: 65000
+    call:
+      to: "0xToken..."
+      abi: erc20
+      function: transfer
+      args:
+        - address_pool:
+            pool: existing_users
+            select: random
+        - 1000000
+```
+
+`address_pools` are only valid in address-valued positions like `to`, sequence `address` bindings, and ABI `address` arguments. They cannot be used for `from` or `sponsor`, and `txgen addresses` will not print them.
 
 ## Send a fixed number of synthetic transactions
 

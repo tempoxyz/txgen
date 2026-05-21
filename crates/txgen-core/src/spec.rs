@@ -1,4 +1,4 @@
-use crate::{AccountPoolDef, AccountRef, ArtifactDef, GenValue};
+use crate::{AccountPoolDef, AccountRef, AddressPoolDef, ArtifactDef, GenValue};
 use alloy_primitives::{Address, B256, U256};
 use eyre::{bail, Result, WrapErr};
 use serde::{Deserialize, Deserializer};
@@ -14,9 +14,13 @@ pub struct WorkloadSpec {
     #[serde(default)]
     pub gas: GasConfig,
 
-    /// Account pools keyed by name.
+    /// Signer account pools keyed by name.
     #[serde(default)]
     pub accounts: HashMap<String, AccountPoolDef>,
+
+    /// Destination-only address pools keyed by name.
+    #[serde(default)]
+    pub address_pools: HashMap<String, AddressPoolDef>,
 
     /// ABI/deployment artifact definitions keyed by name.
     #[serde(default)]
@@ -334,6 +338,7 @@ chain_id: 1
         let spec = WorkloadSpec::parse(yaml).unwrap();
         assert_eq!(spec.chain_id, 1);
         assert!(spec.accounts.is_empty());
+        assert!(spec.address_pools.is_empty());
         assert!(spec.templates.is_empty());
     }
 
@@ -349,9 +354,14 @@ accounts:
   users:
     mnemonic: "${TEST_MNEMONIC}"
     range: [0, 10]
+address_pools:
+  recipients:
+    mnemonic: "${TEST_MNEMONIC}"
+    range: [10, 20]
 "#;
         let spec = WorkloadSpec::parse(yaml).unwrap();
         assert_eq!(spec.accounts["users"].mnemonic, "test test test");
+        assert_eq!(spec.address_pools["recipients"].mnemonic.as_deref(), Some("test test test"));
         // SAFETY: Test cleanup
         unsafe {
             env::remove_var("TEST_MNEMONIC");
@@ -414,6 +424,11 @@ sequences:
         u256: { uniform: [1, 10] }
       random_recipient:
         address: random
+      pooled_recipient:
+        address:
+          address_pool:
+            pool: recipients
+            select: random
       salt:
         bytes32: { random_bytes: 32 }
       channel_id:
@@ -439,6 +454,7 @@ mix:
         assert_eq!(sequence.steps.len(), 2);
         assert!(matches!(sequence.bindings["amount"], SequenceBinding::U256(_)));
         assert!(matches!(sequence.bindings["random_recipient"], SequenceBinding::Address(_)));
+        assert!(matches!(sequence.bindings["pooled_recipient"], SequenceBinding::Address(_)));
         assert!(matches!(sequence.bindings["salt"], SequenceBinding::Bytes32(_)));
         assert!(matches!(sequence.bindings["channel_id"], SequenceBinding::AbiHash(_)));
         assert_eq!(spec.mix[0].item, MixItem::Sequence("pair".to_string()));
