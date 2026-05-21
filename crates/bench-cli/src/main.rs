@@ -11,6 +11,7 @@ use std::{path::PathBuf, time::Duration};
 
 use crate::metrics_url::{parse_metrics_url, MetricsURL};
 
+mod block_artifact_recorder;
 mod metrics_url;
 mod send;
 mod send_blocks;
