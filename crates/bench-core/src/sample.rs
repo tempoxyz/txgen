@@ -1,12 +1,12 @@
 //! Unified metric sample type and disk-backed store.
 //!
 //! Both internal benchmark metrics and scraped node Prometheus metrics are
-//! streamed into a gzip-compressed NDJSON file. Reporters read the file back in
+//! streamed into an uncompressed NDJSON file. Reporters read the file back in
 //! batches at finalization time, which avoids retaining all metric samples in
-//! memory for long benchmark runs.
+//! memory for long benchmark runs. File JSON reports compress the archive only
+//! when writing the final sidecar.
 
 use eyre::{Context, Result};
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -40,7 +40,7 @@ pub struct Sample {
     pub unix_ms: u64,
 }
 
-/// A finalized gzip-compressed NDJSON sample archive.
+/// A finalized NDJSON sample archive.
 #[derive(Debug)]
 pub struct SampleArchive {
     path: PathBuf,
@@ -48,7 +48,7 @@ pub struct SampleArchive {
 }
 
 impl SampleArchive {
-    /// Path to the compressed NDJSON sample file.
+    /// Path to the NDJSON sample file.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -63,7 +63,7 @@ impl SampleArchive {
         self.len == 0
     }
 
-    /// Iterate over samples by decompressing the archive.
+    /// Iterate over samples in the archive.
     pub fn iter(&self) -> Result<SampleArchiveIter> {
         SampleArchiveIter::open(&self.path)
     }
@@ -74,7 +74,7 @@ impl SampleArchive {
         F: FnMut(&Sample) -> bool,
     {
         let filtered_path = temporary_sample_path();
-        let mut writer = gzip_writer(&filtered_path)?;
+        let mut writer = sample_writer(&filtered_path)?;
         let mut retained = 0usize;
 
         for sample in self.iter()? {
@@ -86,7 +86,7 @@ impl SampleArchive {
             }
         }
 
-        writer.finish()?.flush()?;
+        writer.flush()?;
         std::fs::remove_file(&self.path).ok();
         self.path = filtered_path;
         self.len = retained;
@@ -100,17 +100,16 @@ impl Drop for SampleArchive {
     }
 }
 
-/// Iterator over a compressed NDJSON sample archive.
+/// Iterator over an NDJSON sample archive.
 pub struct SampleArchiveIter {
-    lines: Lines<BufReader<GzDecoder<File>>>,
+    lines: Lines<BufReader<File>>,
 }
 
 impl SampleArchiveIter {
     fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)
             .wrap_err_with(|| format!("failed to open sample archive {}", path.display()))?;
-        let decoder = GzDecoder::new(file);
-        Ok(Self { lines: BufReader::new(decoder).lines() })
+        Ok(Self { lines: BufReader::new(file).lines() })
     }
 }
 
@@ -127,7 +126,7 @@ impl Iterator for SampleArchiveIter {
     }
 }
 
-type SampleWriter = GzEncoder<BufWriter<File>>;
+type SampleWriter = BufWriter<File>;
 
 #[derive(Debug)]
 struct SampleStoreInner {
@@ -140,7 +139,7 @@ struct SampleStoreInner {
 /// Append-only sample store.
 ///
 /// Shared between the internal metrics snapshotter and Prometheus scrapers via
-/// `Arc`. Batches are serialized to a gzip-compressed NDJSON file immediately
+/// `Arc`. Batches are serialized to an uncompressed NDJSON file immediately
 /// instead of being retained in memory.
 #[derive(Debug, Clone)]
 pub struct SampleStore {
@@ -157,7 +156,7 @@ impl SampleStore {
     /// are written. Existing sample labels win on key collisions.
     pub fn with_labels(labels: HashMap<String, String>) -> Result<Self> {
         let path = temporary_sample_path();
-        let writer = gzip_writer(&path)?;
+        let writer = sample_writer(&path)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(SampleStoreInner {
                 path,
@@ -205,11 +204,11 @@ impl SampleStore {
         Ok(())
     }
 
-    /// Finalize the compressed sample archive.
+    /// Finalize the sample archive.
     pub async fn finish(&self) -> Result<SampleArchive> {
         let mut inner = self.inner.lock().await;
-        if let Some(writer) = inner.writer.take() {
-            writer.finish()?.flush()?;
+        if let Some(mut writer) = inner.writer.take() {
+            writer.flush()?;
         }
 
         Ok(SampleArchive { path: inner.path.clone(), len: inner.len })
@@ -232,10 +231,10 @@ fn apply_labels(sample: &mut Sample, labels: &HashMap<String, String>) {
     }
 }
 
-fn gzip_writer(path: &Path) -> Result<SampleWriter> {
+fn sample_writer(path: &Path) -> Result<SampleWriter> {
     let file = File::create(path)
         .wrap_err_with(|| format!("failed to create sample archive {}", path.display()))?;
-    Ok(GzEncoder::new(BufWriter::new(file), Compression::default()))
+    Ok(BufWriter::new(file))
 }
 
 fn temporary_sample_path() -> PathBuf {
@@ -248,7 +247,7 @@ fn temporary_sample_path() -> PathBuf {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
     std::env::temp_dir()
-        .join(format!("txgen-samples-{}-{nanos}-{id}.samples.ndjson.gz", std::process::id()))
+        .join(format!("txgen-samples-{}-{nanos}-{id}.samples.ndjson", std::process::id()))
 }
 
 #[cfg(test)]
