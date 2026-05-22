@@ -5,12 +5,11 @@
 //! Cortex, Thanos, etc.) via `/api/v1/write` using the
 //! standard remote write protocol (protobuf + snappy compression).
 //!
-//! User-provided metadata (`-m key=value`) are already applied to samples by
-//! [`FinalReport`] before reporters run, so the remote-write request carries
-//! run labels in the protobuf payload. The reporter intentionally does not
-//! also send them as VictoriaMetrics `extra_label` query parameters, since
-//! duplicating labels can make VictoriaMetrics accept the request but drop the
-//! affected series.
+//! User-provided metadata (`-m key=value`) are already applied to samples before
+//! reporters run, so the remote-write request carries run labels in the protobuf
+//! payload. The reporter intentionally does not also send them as
+//! VictoriaMetrics `extra_label` query parameters, since duplicating labels can
+//! make VictoriaMetrics accept the request but drop the affected series.
 //!
 //! Connection knobs (auth, tenant, batching) are read from environment
 //! variables so secrets never end up on the command line:
@@ -155,13 +154,24 @@ impl PrometheusReporter {
     }
 
     /// Send a single batch of samples as a snappy-compressed protobuf WriteRequest.
-    fn send_batch(&self, batch: &[Sample]) -> Result<()> {
+    fn send_batch(&self, batch: &[Sample], batch_idx: usize) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
 
         let write_req = build_write_request(batch);
+        let timeseries_count = write_req.timeseries.len();
         let body = write_req.encode_compressed().context("snappy compression failed")?;
+        let body_len = body.len();
+
+        tracing::info!(
+            batch = batch_idx,
+            samples = batch.len(),
+            timeseries = timeseries_count,
+            body_bytes = body_len,
+            url = %self.import_url,
+            "Sending remote write batch"
+        );
 
         let headers = self.headers()?;
         let rt = tokio::runtime::Handle::current();
@@ -175,31 +185,51 @@ impl PrometheusReporter {
             .wrap_err("failed to POST remote write")?;
 
         let status = resp.status();
+        let resp_body = tokio::task::block_in_place(|| rt.block_on(resp.text()))
+            .unwrap_or_else(|_| "<no body>".to_string());
+
         if !status.is_success() {
-            let body = tokio::task::block_in_place(|| rt.block_on(resp.text()))
-                .unwrap_or_else(|_| "<no body>".to_string());
-            bail!("remote write failed (HTTP {status}): {body}");
+            tracing::error!(
+                batch = batch_idx,
+                %status,
+                body = %resp_body,
+                url = %self.import_url,
+                "Remote write batch failed"
+            );
+            bail!("remote write failed (HTTP {status}): {resp_body}");
         }
+
+        tracing::info!(
+            batch = batch_idx,
+            %status,
+            body = %resp_body,
+            "Remote write batch accepted"
+        );
         Ok(())
     }
 }
 
 impl Reporter for PrometheusReporter {
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
-        if report.samples.is_empty() {
+        if !report.has_samples() {
             tracing::info!("remote write: no samples to push");
             return Ok(());
         }
 
+        let total_batches = report.sample_count().div_ceil(self.config.batch_size);
+
         tracing::info!(
-            samples = report.samples.len(),
-            url = %self.config.base_url,
+            samples = report.sample_count(),
+            batches = total_batches,
+            batch_size = self.config.batch_size,
+            url = %self.import_url,
             "Pushing samples via Prometheus remote write"
         );
 
         let mut pushed = 0usize;
-        for chunk in report.samples.chunks(self.config.batch_size) {
-            self.send_batch(chunk)?;
+        for (idx, chunk) in report.sample_chunks(self.config.batch_size)?.enumerate() {
+            let chunk = chunk?;
+            self.send_batch(&chunk, idx)?;
             pushed += chunk.len();
         }
 

@@ -68,7 +68,7 @@ txgen-ethereum generate -s workload.yaml -n 1000 -o transactions.ndjson
 
 #### `addresses`
 
-List all addresses from a workload spec (useful for funding).
+List signer account addresses from a workload spec (useful for funding). Destination-only `address_pools` are intentionally omitted.
 
 ```bash
 txgen-ethereum addresses -s workload.yaml
@@ -154,6 +154,7 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `--rpc-url <URL>` | RPC endpoint URLs, comma-separated or repeated (default: `http://localhost:8545`) |
 | `--tps <N>` | Target transactions per second (0 = unlimited) |
 | `--max-concurrent <N>` | Maximum concurrent requests (default: 100) |
+| `--retries <N>` | Retry failed transaction submissions N times (0 = never retry, omitted = retry forever) |
 | `--timeout <DUR>` | Request timeout (default: 30s) |
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
 | `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
@@ -378,7 +379,7 @@ gas:
   max_fee_per_gas: 1000000000      # 1 gwei
   max_priority_fee_per_gas: 1000000000
 
-# Account pools derived from mnemonics
+# Signer account pools derived from mnemonics
 accounts:
   users:
     mnemonic: "${MNEMONIC}"  # Supports environment variable expansion
@@ -387,6 +388,22 @@ accounts:
   deployer:
     mnemonic: "${MNEMONIC}"
     index: 0                 # Single account
+
+# Destination-only address pools. These are usable as recipients/arguments,
+# but cannot be used for `from`/`sponsor` signing and are omitted by `addresses`.
+# Mnemonic-backed address pools are derived lazily and cached on first use.
+address_pools:
+  existing_users:
+    mnemonic: "${RECIPIENT_MNEMONIC}"
+    range: [0, 10000]
+  bloated_state_users:
+    fast:
+      seed: "${STATE_BLOAT_SEED}"
+      range: [10000, 1000000]
+  known_contracts:
+    addresses:
+      - "0x0000000000000000000000000000000000000001"
+      - "0x0000000000000000000000000000000000000002"
 
 # ABI/deployment artifacts for contract calls and setup deploys
 artifacts:
@@ -415,7 +432,10 @@ templates:
     from:
       pool: users
       select: random
-    to: "0x..."
+    to:
+      address_pool:
+        pool: existing_users
+        select: random
     value: 1000
     gas_limit: 21000
 
@@ -456,13 +476,57 @@ mix:
 
 ### Account Selection
 
-Accounts are selected from pools using `select`:
+Accounts are selected from signer pools using `select`. Only `accounts` pools can be used in signing positions such as `from` and `sponsor`; `address_pools` are destination-only values.
 
 ```yaml
 from:
   pool: users
-  select: random    # Random account from pool
+  select: random    # Random signer account from pool
 ```
+
+### Destination-only Address Pools
+
+Use `address_pools` when you want to send to known users without making those users available for signing. Mnemonic-backed pools are lazy: txgen derives and caches an address only when it is selected, so large ranges such as `[0, 1000000]` do not add startup cost. Fast pools derive deterministic non-signable addresses as `last20(keccak256(keccak256(seed) || index_be_u64))`, matching Tempo state-bloat addresses beyond the signable range.
+
+```yaml
+accounts:
+  senders:
+    mnemonic: "${SENDER_MNEMONIC}"
+    range: [0, 100]
+
+address_pools:
+  existing_users:
+    mnemonic: "${RECIPIENT_MNEMONIC}"
+    range: [0, 1000000]
+  state_bloat_users:
+    fast:
+      seed: "${STATE_BLOAT_SEED}"
+      range: [10000, 1000000]
+  fixed_recipients:
+    addresses:
+      - "0x0000000000000000000000000000000000000001"
+      - "0x0000000000000000000000000000000000000002"
+```
+
+Reference an address pool from any address-valued field:
+
+```yaml
+to:
+  address_pool:
+    pool: existing_users
+    select: random
+```
+
+or select a specific derivation/list index:
+
+```yaml
+to:
+  address_pool:
+    pool: existing_users
+    select: { index: 12345 }
+```
+
+`txgen addresses` intentionally omits `address_pools`; it only lists signer account addresses for funding.
 
 ### Value Generators
 
@@ -479,10 +543,16 @@ to:
     - "0x0000000000000000000000000000000000000001"
     - "0x0000000000000000000000000000000000000002"
 
-# Account address from pool
+# Account address from signer pool
 to:
   pool: users
   select: random
+
+# Destination-only address from address pool
+to:
+  address_pool:
+    pool: existing_users
+    select: random
 
 # Random address
 to: random
@@ -494,6 +564,17 @@ call:
   function: transfer
   args:
     - random
+    - 1000000
+
+# Destination-only address in an ABI argument
+call:
+  to: "0x..."
+  abi: erc20
+  function: transfer
+  args:
+    - address_pool:
+        pool: existing_users
+        select: random
     - 1000000
 
 # Random bytes
@@ -522,7 +603,9 @@ templates:
       abi: erc20            # Artifact name
       function: transfer    # Function name
       args:
-        - "0x..."           # recipient
+        - address_pool:
+            pool: existing_users
+            select: random  # recipient from destination-only pool
         - 1000000           # amount
       value: 0
 ```

@@ -284,6 +284,7 @@ fn yaml_to_sol_value(
         if value.get("uniform").is_some() ||
             value.get("choice").is_some() ||
             value.get("pool").is_some() ||
+            value.get("address_pool").is_some() ||
             value.get("random_bytes").is_some() ||
             value.get("const").is_some()
         {
@@ -386,7 +387,7 @@ fn parse_int_bits(t: &str) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AccountManager, ValueResolver};
+    use crate::{AccountManager, AddressPoolManager, ValueResolver};
 
     #[test]
     fn test_artifact_manager_empty() {
@@ -397,8 +398,10 @@ mod tests {
     #[test]
     fn test_negative_uint_literal_fails() {
         let accounts = AccountManager::empty();
+        let address_pools = AddressPoolManager::empty();
         let mut rng = rand::rng();
-        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+        let mut resolver =
+            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
         let value = serde_yaml::from_str::<serde_yaml::Value>("-1").expect("valid YAML");
 
         let err = yaml_to_sol_value(&value, "uint256", &mut resolver)
@@ -410,8 +413,10 @@ mod tests {
     #[test]
     fn test_hex_uint_literal() {
         let accounts = AccountManager::empty();
+        let address_pools = AddressPoolManager::empty();
         let mut rng = rand::rng();
-        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+        let mut resolver =
+            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
         let value = serde_yaml::from_str::<serde_yaml::Value>("\"0x10\"").expect("valid YAML");
 
         let sol_value = yaml_to_sol_value(&value, "uint256", &mut resolver).unwrap();
@@ -422,13 +427,46 @@ mod tests {
     #[test]
     fn test_fractional_uint_literal_fails() {
         let accounts = AccountManager::empty();
+        let address_pools = AddressPoolManager::empty();
         let mut rng = rand::rng();
-        let mut resolver = ValueResolver { accounts: &accounts, rng: &mut rng };
+        let mut resolver =
+            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
         let value = serde_yaml::from_str::<serde_yaml::Value>("1.5").expect("valid YAML");
 
         let err = yaml_to_sol_value(&value, "uint256", &mut resolver)
             .expect_err("fractional uint literals should fail");
 
         assert!(err.to_string().contains("invalid uint256 literal"));
+    }
+
+    #[test]
+    fn test_address_pool_generator_in_abi_arg() -> Result<()> {
+        let accounts = AccountManager::empty();
+        let expected = Address::from([9u8; 20]);
+        let address_pools = AddressPoolManager::from_spec(&std::collections::HashMap::from([(
+            "recipients".to_string(),
+            crate::AddressPoolDef {
+                addresses: vec![expected],
+                mnemonic: None,
+                index: None,
+                range: None,
+                fast: None,
+            },
+        )]))?;
+        let mut rng = rand::rng();
+        let mut resolver =
+            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let value = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+address_pool:
+  pool: recipients
+  select: { index: 0 }
+"#,
+        )?;
+
+        let sol_value = yaml_to_sol_value(&value, "address", &mut resolver)?;
+
+        assert_eq!(sol_value, DynSolValue::Address(expected));
+        Ok(())
     }
 }

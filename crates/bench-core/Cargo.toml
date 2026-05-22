@@ -37,6 +37,7 @@ tracing = "0.1"
 urlencoding = "2"
 uuid.workspace = true
 prometheus_remote_write = { version = "0.2", features = ["compression"] }
+flate2 = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

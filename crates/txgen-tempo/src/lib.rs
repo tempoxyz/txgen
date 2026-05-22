@@ -6,10 +6,11 @@ pub use txgen_cli::fetch_protocol_nonces;
 
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{keccak256, Address, Bytes, TxKind, U256};
+use alloy_provider::{network::Ethereum, DynProvider};
 use alloy_signer::SignerSync;
 use eyre::{bail, Result};
 use rand::RngCore;
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, sync::OnceLock};
 use tempo_alloy::{rpc::TempoTransactionRequest, TempoNetwork};
 use tempo_primitives::transaction::{
     Call, TEMPO_EXPIRING_NONCE_KEY, TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS,
@@ -27,7 +28,51 @@ const EXPIRING_UNIQUENESS_COUNTER_KEY: [u8; 20] = *b"tempo-expiring-seq!!";
 ///
 /// Supports all Ethereum transaction types (legacy, EIP-2930, EIP-1559)
 /// plus Tempo native 0x76 transactions.
-pub struct TempoAdapter;
+///
+/// Holds the RPC [`DynProvider`] populated by [`Self::prefetch_nonces`] so
+/// [`Self::build_request`] can lazy-fetch nonces for `(account, nonce_key)`
+/// pairs that [`prefetch_parallel_nonces`] cannot enumerate up front (any
+/// non-literal `nonce_key`, such as `uniform` or `choice`).
+#[derive(Default)]
+pub struct TempoAdapter {
+    /// Set exactly once by [`Self::prefetch_nonces`], then read lock-free
+    /// on the hot path by [`Self::next_nonce_lazy`].
+    nonce_rpc: OnceLock<DynProvider<Ethereum>>,
+}
+
+impl TempoAdapter {
+    /// Create a new adapter. The nonce RPC is populated by
+    /// [`Self::prefetch_nonces`] when `--rpc` is supplied.
+    pub const fn new() -> Self {
+        Self { nonce_rpc: OnceLock::new() }
+    }
+
+    /// Return the next nonce for `scheduling_key`, fetching the on-chain
+    /// value once if the [`txgen_core::NonceTracker`] hasn't seen this lane
+    /// before.
+    ///
+    /// Bridges from the sync `BuildContext` to the async provider via
+    /// `tokio::task::block_in_place`; the `txgen-tempo` binary uses
+    /// `#[tokio::main]` (multi-threaded), where this is permitted.
+    fn next_nonce_lazy(
+        &self,
+        ctx: &mut BuildContext<'_>,
+        scheduling_key: [u8; 20],
+        address: Address,
+        nonce_key: U256,
+    ) -> Result<u64> {
+        if !ctx.nonces.contains(&scheduling_key) &&
+            let Some(provider) = self.nonce_rpc.get()
+        {
+            let n = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(nonce::fetch_lane_nonce(provider, address, nonce_key))
+            })?;
+            ctx.nonces.reset(scheduling_key, n);
+        }
+        Ok(ctx.next_nonce(scheduling_key))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TempoNonceMode {
@@ -59,8 +104,11 @@ impl NetworkAdapter for TempoAdapter {
         let scheduling_key = compute_scheduling_key(selected.address, nonce_mode, ctx);
         let nonce = match nonce_mode {
             TempoNonceMode::Expiring => 0,
-            TempoNonceMode::Protocol | TempoNonceMode::Parallel(_) => {
-                ctx.next_nonce(scheduling_key)
+            TempoNonceMode::Protocol => {
+                self.next_nonce_lazy(ctx, scheduling_key, selected.address, U256::ZERO)?
+            }
+            TempoNonceMode::Parallel(nonce_key) => {
+                self.next_nonce_lazy(ctx, scheduling_key, selected.address, nonce_key)?
             }
         };
 
@@ -172,17 +220,25 @@ impl NetworkAdapter for TempoAdapter {
     }
 
     async fn prefetch_nonces(&self, ctx: &mut GenerateContext, rpc: &str) -> Result<()> {
-        use alloy_provider::{network::Ethereum, ProviderBuilder};
+        use alloy_provider::{Provider, ProviderBuilder};
         use eyre::WrapErr;
 
         let provider = ProviderBuilder::<_, _, Ethereum>::new()
-            .connect_http(rpc.parse().wrap_err("invalid RPC URL")?);
+            .connect_http(rpc.parse().wrap_err("invalid RPC URL")?)
+            .erased();
 
         let (accounts, nonces) = ctx.accounts_and_nonces();
         txgen_cli::fetch_protocol_nonces(accounts, nonces, rpc).await?;
 
         let (spec, accounts, nonces) = ctx.prefetch_state();
         prefetch_parallel_nonces(&provider, accounts, spec, nonces).await?;
+
+        // Keep the provider so build_request can lazy-fetch nonces for any
+        // (account, nonce_key) pair not enumerated by prefetch_parallel_nonces
+        // (any non-literal `nonce_key` such as `uniform` or `choice`). `set`
+        // only ever fails if called twice; the second call is a no-op we
+        // accept silently because prefetch is only invoked once per run.
+        let _ = self.nonce_rpc.set(provider);
 
         Ok(())
     }
@@ -477,7 +533,8 @@ mod tests {
 
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
 
-        let raw = sign_and_encode(&TempoAdapter, base_template(TempoTxType::Tempo), &mut ctx);
+        let raw =
+            sign_and_encode(&TempoAdapter::new(), base_template(TempoTxType::Tempo), &mut ctx);
 
         assert!(!raw.is_empty());
         assert_eq!(raw[0], TEMPO_TX_TYPE_ID);
@@ -496,10 +553,31 @@ mod tests {
         let mut template = base_template(TempoTxType::Tempo);
         template.nonce_key = Some(GenValue::Literal(U256::from(42)));
 
-        let raw = sign_and_encode(&TempoAdapter, template, &mut ctx);
+        let raw = sign_and_encode(&TempoAdapter::new(), template, &mut ctx);
 
         assert!(!raw.is_empty());
         assert_eq!(raw[0], TEMPO_TX_TYPE_ID);
+    }
+
+    #[test]
+    fn test_lazy_fetch_no_provider_falls_back_to_tracker_default() {
+        // Without a provider configured, build_request must keep the legacy
+        // behaviour: assume `nonce=0` for any unseen scheduling key. This
+        // protects callers that build txs without `--rpc` (e.g. unit tests).
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let mut template = base_template(TempoTxType::Tempo);
+        template.nonce_key = Some(GenValue::Literal(U256::from(42)));
+
+        let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
+
+        assert_eq!(tx_req.request.nonce(), Some(0));
     }
 
     #[test]
@@ -512,7 +590,8 @@ mod tests {
 
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
 
-        let raw = sign_and_encode(&TempoAdapter, base_template(TempoTxType::Eip1559), &mut ctx);
+        let raw =
+            sign_and_encode(&TempoAdapter::new(), base_template(TempoTxType::Eip1559), &mut ctx);
 
         assert!(!raw.is_empty());
         assert_eq!(raw[0], 0x02);
@@ -533,7 +612,7 @@ mod tests {
         template.expiring_nonce = true;
         template.valid_before = Some(1_700_000_000);
 
-        let tx_req = TempoAdapter.build_request(template, &mut ctx).unwrap();
+        let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
 
         assert_eq!(tx_req.request.nonce(), Some(0));
         assert_eq!(tx_req.request.nonce_key, Some(TEMPO_EXPIRING_NONCE_KEY));
@@ -555,8 +634,8 @@ mod tests {
         template.expiring_nonce = true;
         template.valid_before = Some(1_700_000_000);
 
-        let first = TempoAdapter.build_request(template.clone(), &mut ctx).unwrap();
-        let second = TempoAdapter.build_request(template, &mut ctx).unwrap();
+        let first = TempoAdapter::new().build_request(template.clone(), &mut ctx).unwrap();
+        let second = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
 
         assert_eq!(first.request.nonce(), Some(0));
         assert_eq!(second.request.nonce(), Some(0));
@@ -577,8 +656,8 @@ mod tests {
         template.expiring_nonce = true;
         template.valid_before = Some(1_700_000_000);
 
-        let first = sign_and_encode(&TempoAdapter, template.clone(), &mut ctx);
-        let second = sign_and_encode(&TempoAdapter, template, &mut ctx);
+        let first = sign_and_encode(&TempoAdapter::new(), template.clone(), &mut ctx);
+        let second = sign_and_encode(&TempoAdapter::new(), template, &mut ctx);
 
         assert_ne!(first, second);
     }
@@ -597,8 +676,8 @@ mod tests {
         template.expiring_nonce = true;
         template.valid_before = Some(1_700_000_000);
 
-        let first = TempoAdapter.build_request(template.clone(), &mut ctx).unwrap().request;
-        let second = TempoAdapter.build_request(template, &mut ctx).unwrap().request;
+        let first = TempoAdapter::new().build_request(template.clone(), &mut ctx).unwrap().request;
+        let second = TempoAdapter::new().build_request(template, &mut ctx).unwrap().request;
 
         assert_eq!(first.max_priority_fee_per_gas(), Some(1_000_000_001));
         assert_eq!(first.max_fee_per_gas(), Some(1_000_000_001));
@@ -621,7 +700,7 @@ mod tests {
         template.valid_for_secs = Some(25);
 
         let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let tx_req = TempoAdapter.build_request(template, &mut ctx).unwrap();
+        let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
         let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
         let valid_before = tx_req.request.valid_before.unwrap();
@@ -639,10 +718,14 @@ mod tests {
 
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
 
-        let first =
-            TempoAdapter.build_request(sponsored_expiring_template(), &mut ctx).unwrap().request;
-        let second =
-            TempoAdapter.build_request(sponsored_expiring_template(), &mut ctx).unwrap().request;
+        let first = TempoAdapter::new()
+            .build_request(sponsored_expiring_template(), &mut ctx)
+            .unwrap()
+            .request;
+        let second = TempoAdapter::new()
+            .build_request(sponsored_expiring_template(), &mut ctx)
+            .unwrap()
+            .request;
 
         assert_ne!(first.max_fee_per_gas(), second.max_fee_per_gas());
         assert_ne!(
@@ -664,7 +747,7 @@ mod tests {
         let mut template = base_template(TempoTxType::Tempo);
         template.expiring_nonce = true;
 
-        let err = TempoAdapter
+        let err = TempoAdapter::new()
             .build_request(template, &mut ctx)
             .err()
             .expect("expiring nonce without expiry should fail");
