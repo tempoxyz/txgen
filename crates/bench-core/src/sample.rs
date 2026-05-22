@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     fs::File,
-    io::{BufRead, BufReader, BufWriter, Lines, Write},
+    io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -77,7 +77,7 @@ impl SampleArchive {
 
     /// Write NDJSON samples to `writer`, applying any lazy cutoff.
     pub fn write_ndjson_to<W: Write>(&self, writer: &mut W) -> Result<usize> {
-        if self.retain_until_unix_ms.is_none() {
+        let Some(cutoff_ms) = self.retain_until_unix_ms else {
             let mut reader = BufReader::new(File::open(&self.path).wrap_err_with(|| {
                 format!("failed to open sample archive {}", self.path.display())
             })?);
@@ -85,14 +85,30 @@ impl SampleArchive {
                 format!("failed to copy sample archive {}", self.path.display())
             })?;
             return Ok(self.len);
-        }
+        };
 
+        let mut reader =
+            BufReader::new(File::open(&self.path).wrap_err_with(|| {
+                format!("failed to open sample archive {}", self.path.display())
+            })?);
+        let mut line = Vec::with_capacity(1024);
         let mut written = 0usize;
-        for sample in self.iter()? {
-            let sample = sample?;
-            serde_json::to_writer(&mut *writer, &sample)?;
-            writer.write_all(b"\n")?;
-            written += 1;
+        loop {
+            line.clear();
+            let bytes = reader.read_until(b'\n', &mut line).wrap_err_with(|| {
+                format!("failed to read sample archive {}", self.path.display())
+            })?;
+            if bytes == 0 {
+                break;
+            }
+
+            if sample_line_unix_ms(&line)
+                .wrap_err("failed to scan sample archive line timestamp")? <=
+                cutoff_ms
+            {
+                writer.write_all(&line)?;
+                written += 1;
+            }
         }
         Ok(written)
     }
@@ -106,7 +122,8 @@ impl Drop for SampleArchive {
 
 /// Iterator over an NDJSON sample archive.
 pub struct SampleArchiveIter {
-    lines: Lines<BufReader<File>>,
+    reader: BufReader<File>,
+    line: Vec<u8>,
     retain_until_unix_ms: Option<u64>,
 }
 
@@ -114,7 +131,11 @@ impl SampleArchiveIter {
     fn open(path: &Path, retain_until_unix_ms: Option<u64>) -> Result<Self> {
         let file = File::open(path)
             .wrap_err_with(|| format!("failed to open sample archive {}", path.display()))?;
-        Ok(Self { lines: BufReader::new(file).lines(), retain_until_unix_ms })
+        Ok(Self {
+            reader: BufReader::new(file),
+            line: Vec::with_capacity(1024),
+            retain_until_unix_ms,
+        })
     }
 }
 
@@ -123,22 +144,81 @@ impl Iterator for SampleArchiveIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let line = match self.lines.next()? {
-                Ok(line) => line,
+            self.line.clear();
+            match self.reader.read_until(b'\n', &mut self.line) {
+                Ok(0) => return None,
+                Ok(_) => {}
                 Err(err) => return Some(Err(err).context("failed to read sample archive line")),
-            };
+            }
 
-            let sample: Sample = match serde_json::from_str(&line) {
+            if let Some(cutoff_ms) = self.retain_until_unix_ms {
+                let unix_ms = match sample_line_unix_ms(&self.line)
+                    .wrap_err("failed to scan sample archive line timestamp")
+                {
+                    Ok(unix_ms) => unix_ms,
+                    Err(err) => return Some(Err(err)),
+                };
+                if unix_ms > cutoff_ms {
+                    continue;
+                }
+            }
+
+            let sample: Sample = match serde_json::from_slice(&self.line) {
                 Ok(sample) => sample,
                 Err(err) => {
                     return Some(Err(err).context("failed to parse sample archive line"));
                 }
             };
-            if self.retain_until_unix_ms.is_none_or(|cutoff_ms| sample.unix_ms <= cutoff_ms) {
-                return Some(Ok(sample));
-            }
+            return Some(Ok(sample));
         }
     }
+}
+
+const UNIX_MS_JSON_KEY: &[u8] = b"\"unix_ms\"";
+
+fn sample_line_unix_ms(line: &[u8]) -> Result<u64> {
+    let Some(key_start) =
+        line.windows(UNIX_MS_JSON_KEY.len()).rposition(|window| window == UNIX_MS_JSON_KEY)
+    else {
+        eyre::bail!("sample archive line is missing unix_ms");
+    };
+
+    let mut index = key_start + UNIX_MS_JSON_KEY.len();
+    index = skip_json_whitespace(line, index);
+    if line.get(index).copied() != Some(b':') {
+        eyre::bail!("sample archive line has invalid unix_ms field");
+    }
+
+    index = skip_json_whitespace(line, index + 1);
+    let mut value = 0u64;
+    let mut has_digits = false;
+    while let Some(byte @ b'0'..=b'9') = line.get(index).copied() {
+        has_digits = true;
+        let digit = u64::from(byte - b'0');
+        value = value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(digit))
+            .ok_or_else(|| eyre::eyre!("sample archive line unix_ms overflows u64"))?;
+        index += 1;
+    }
+
+    if !has_digits {
+        eyre::bail!("sample archive line has invalid unix_ms value");
+    }
+    if let Some(byte) = line.get(index).copied() &&
+        !matches!(byte, b',' | b'}' | b' ' | b'\n' | b'\r' | b'\t')
+    {
+        eyre::bail!("sample archive line has invalid unix_ms delimiter");
+    }
+
+    Ok(value)
+}
+
+fn skip_json_whitespace(line: &[u8], mut index: usize) -> usize {
+    while matches!(line.get(index).copied(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+        index += 1;
+    }
+    index
 }
 
 type SampleWriter = BufWriter<File>;
@@ -333,6 +413,23 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].name, "finite");
         assert_eq!(samples[0].value, 1.0);
+    }
+
+    #[test]
+    fn sample_line_unix_ms_scans_top_level_timestamp_from_end() {
+        let line =
+            br#"{"name":"x","labels":{"unix_ms":"label"},"value":1.0,"offset_ms":7,"unix_ms":42}
+"#;
+
+        assert_eq!(sample_line_unix_ms(line).expect("valid sample line"), 42);
+    }
+
+    #[test]
+    fn sample_line_unix_ms_rejects_invalid_timestamp() {
+        let line = br#"{"name":"x","labels":{},"value":1.0,"offset_ms":7,"unix_ms":42.0}
+"#;
+
+        assert!(sample_line_unix_ms(line).is_err());
     }
 
     #[tokio::test]
