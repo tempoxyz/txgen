@@ -30,6 +30,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 # misc
 async-trait = "0.1"
+futures.workspace = true
 rand.workspace = true
 eyre.workspace = true
 tracing = "0.1"

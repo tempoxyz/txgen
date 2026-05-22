@@ -12,6 +12,7 @@ use alloy_network::{primitives::BlockResponse, Network};
 use alloy_provider::Provider;
 
 use eyre::{Context, Result};
+use futures::{stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -25,6 +26,8 @@ use tokio::{
     sync::{mpsc, oneshot, Mutex},
     task::JoinHandle,
 };
+
+const BLOCK_STATS_FETCH_CONCURRENCY: usize = 32;
 
 /// Metrics collected during a benchmark run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,28 +322,42 @@ pub async fn collect_block_stats<N: Network, P: Provider<N>>(
     start_block: u64,
     end_block: u64,
 ) -> Result<Vec<BlockStats>> {
-    let mut stats = Vec::with_capacity((end_block - start_block + 1) as usize);
+    let blocks = stream::iter(start_block..=end_block)
+        .map(|number| async move {
+            let block = provider
+                .get_block(BlockNumberOrTag::Number(number).into())
+                .await
+                .wrap_err_with(|| format!("failed to fetch block {number}"))?
+                .ok_or_else(|| eyre::eyre!("block {number} not found"))?;
+
+            let timestamp_secs = block.header().timestamp();
+            let timestamp_ms = extract_timestamp_ms(&block, timestamp_secs);
+
+            Ok::<_, eyre::Report>((
+                number,
+                timestamp_ms,
+                block.transactions().len(),
+                block.header().gas_used(),
+                block.header().gas_limit(),
+            ))
+        })
+        .buffered(BLOCK_STATS_FETCH_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let mut stats = Vec::with_capacity(blocks.len());
     let mut prev_timestamp_ms: Option<u64> = None;
 
-    for number in start_block..=end_block {
-        let block = provider
-            .get_block(BlockNumberOrTag::Number(number).into())
-            .await
-            .wrap_err_with(|| format!("failed to fetch block {number}"))?
-            .ok_or_else(|| eyre::eyre!("block {number} not found"))?;
-
-        let timestamp_secs = block.header().timestamp();
-        let timestamp_ms = extract_timestamp_ms(&block, timestamp_secs);
-
+    for (number, timestamp_ms, tx_count, gas_used, gas_limit) in blocks {
         let block_time_ms = prev_timestamp_ms.map(|prev| timestamp_ms.saturating_sub(prev));
         prev_timestamp_ms = Some(timestamp_ms);
 
         stats.push(BlockStats {
             number,
             timestamp_ms,
-            tx_count: block.transactions().len(),
-            gas_used: block.header().gas_used(),
-            gas_limit: block.header().gas_limit(),
+            tx_count,
+            gas_used,
+            gas_limit,
             block_time_ms,
             new_payload_ms: None,
             forkchoice_updated_ms: None,

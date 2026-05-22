@@ -1272,6 +1272,7 @@ dependencies = [
  "async-trait",
  "eyre",
  "flate2",
+ "futures",
  "prometheus_remote_write",
  "rand 0.9.2",
  "reqwest 0.12.28",
