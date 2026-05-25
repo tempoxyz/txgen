@@ -122,11 +122,15 @@ async fn execute_source<S: TxSource>(
     // Wait for the txpool to drain so all transactions are included in blocks
     // before we collect block stats. The scraper and block poller keep running.
     if args.drain_timeout > 0 {
-        log_post_process_state_started("txpool_drain");
+        tracing::info!(state = "txpool_drain", "Post-processing state started");
         wait_for_pool_drain(query_provider, args.drain_timeout).await?;
-        log_post_process_state_completed("txpool_drain");
+        tracing::info!(state = "txpool_drain", "Post-processing state completed");
     } else {
-        log_post_process_state_skipped("txpool_drain", "--drain-timeout=0");
+        tracing::info!(
+            state = "txpool_drain",
+            reason = "--drain-timeout=0",
+            "Post-processing state skipped"
+        );
     }
 
     // Stop the scraper before finalizing.
@@ -141,32 +145,36 @@ async fn execute_source<S: TxSource>(
         for handle in scraper_handles {
             handle.stop().await;
         }
-        log_post_process_state_completed("metrics_scraper_stop");
+        tracing::info!(state = "metrics_scraper_stop", "Post-processing state completed");
     } else {
-        log_post_process_state_skipped("metrics_scraper_stop", "no metrics scrapers");
+        tracing::info!(
+            state = "metrics_scraper_stop",
+            reason = "no metrics scrapers",
+            "Post-processing state skipped"
+        );
     }
 
-    log_post_process_state_started("metrics_finalize");
+    tracing::info!(state = "metrics_finalize", "Post-processing state started");
     let final_metrics = metrics.finalize().await;
-    log_post_process_state_completed("metrics_finalize");
+    tracing::info!(state = "metrics_finalize", "Post-processing state completed");
 
-    log_post_process_state_started("time_series_build");
+    tracing::info!(state = "time_series_build", "Post-processing state started");
     let time_series = metrics.time_series().await;
-    log_post_process_state_completed("time_series_build");
+    tracing::info!(state = "time_series_build", "Post-processing state completed");
 
     // Finalize the sample archive before reporters read it.
-    log_post_process_state_started("sample_archive_finalize");
+    tracing::info!(state = "sample_archive_finalize", "Post-processing state started");
     let sample_archive = store.finish().await?;
-    log_post_process_state_completed("sample_archive_finalize");
+    tracing::info!(state = "sample_archive_finalize", "Post-processing state completed");
 
     // Collect per-block stats from the chain. The range starts one block after
     // the block that was current before sending (start_block is the last
     // existing block at that point, so start_block+1 is the first block that
     // could contain our transactions) and ends at the current latest block.
-    log_post_process_state_started("ending_block_fetch");
+    tracing::info!(state = "ending_block_fetch", "Post-processing state started");
     let end_block =
         query_provider.get_block_number().await.wrap_err("failed to get ending block number")?;
-    log_post_process_state_completed("ending_block_fetch");
+    tracing::info!(state = "ending_block_fetch", "Post-processing state completed");
 
     let mut report = FinalReport {
         metadata: metadata.clone(),
@@ -195,7 +203,7 @@ async fn execute_source<S: TxSource>(
         // Trim trailing empty blocks (system-only, gas_used == 0) that
         // accumulated during the txpool drain wait. Also trim metric
         // samples captured after the last real block.
-        log_post_process_state_started("report_trim");
+        tracing::info!(state = "report_trim", "Post-processing state started");
         let cutoff_ms = trim_trailing_empty_blocks(&mut block_stats);
         if let Some(cutoff_ms) = cutoff_ms {
             report.retain_samples_until(cutoff_ms)?;
@@ -212,46 +220,50 @@ async fn execute_source<S: TxSource>(
             "Post-processing state completed"
         );
 
-        log_post_process_state_started("block_reporter_events");
+        tracing::info!(state = "block_reporter_events", "Post-processing state started");
         for block in &block_stats {
             for reporter in reporters.iter_mut() {
                 reporter.on_block(block)?;
             }
         }
-        log_post_process_state_completed("block_reporter_events");
+        tracing::info!(state = "block_reporter_events", "Post-processing state completed");
 
-        log_post_process_state_started("run_stats_build");
+        tracing::info!(state = "run_stats_build", "Post-processing state started");
         report.run_stats = Some(RunStats::from_blocks_chain_time(&block_stats));
-        log_post_process_state_completed("run_stats_build");
+        tracing::info!(state = "run_stats_build", "Post-processing state completed");
         report.blocks = block_stats;
     } else {
-        log_post_process_state_skipped("block_stats_collect", "no new blocks");
-        log_post_process_state_skipped("report_trim", "no block stats");
-        log_post_process_state_skipped("block_reporter_events", "no block stats");
-        log_post_process_state_skipped("run_stats_build", "no block stats");
+        tracing::info!(
+            state = "block_stats_collect",
+            reason = "no new blocks",
+            "Post-processing state skipped"
+        );
+        tracing::info!(
+            state = "report_trim",
+            reason = "no block stats",
+            "Post-processing state skipped"
+        );
+        tracing::info!(
+            state = "block_reporter_events",
+            reason = "no block stats",
+            "Post-processing state skipped"
+        );
+        tracing::info!(
+            state = "run_stats_build",
+            reason = "no block stats",
+            "Post-processing state skipped"
+        );
     }
 
-    log_post_process_state_started("reporter_finalize");
+    tracing::info!(state = "reporter_finalize", "Post-processing state started");
     for reporter in &mut reporters {
         reporter.finalize(&report)?;
     }
-    log_post_process_state_completed("reporter_finalize");
+    tracing::info!(state = "reporter_finalize", "Post-processing state completed");
 
     tracing::info!("Post-processing completed");
 
     Ok(())
-}
-
-fn log_post_process_state_started(state: &'static str) {
-    tracing::info!(state, "Post-processing state started");
-}
-
-fn log_post_process_state_completed(state: &'static str) {
-    tracing::info!(state, "Post-processing state completed");
-}
-
-fn log_post_process_state_skipped(state: &'static str, reason: &'static str) {
-    tracing::info!(state, reason, "Post-processing state skipped");
 }
 
 async fn run_setup_phase<S: TxSource, P: TxPoolApi<AnyNetwork>>(
