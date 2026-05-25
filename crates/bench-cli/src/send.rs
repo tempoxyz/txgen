@@ -24,7 +24,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         rpc_urls = ?args.rpc_urls,
         tps = args.tps,
         skip_setup = args.skip_setup,
-        timeseries_latencies = args.timeseries_latencies,
+        collect_timeseries_latencies = args.collect_timeseries_latencies,
         retries = args.retries.map_or("forever".to_string(), |retries| retries.to_string()),
         "Starting send"
     );
@@ -83,8 +83,10 @@ async fn execute_source<S: TxSource>(
         RunClock::new()
     };
     let store = SampleStore::with_labels(metadata.clone())?;
-    let metrics =
-        MetricsCollector::new_with_time_series_latencies(clock.clone(), args.timeseries_latencies);
+    let metrics = MetricsCollector::new_with_time_series_latencies(
+        clock.clone(),
+        args.collect_timeseries_latencies,
+    );
 
     // Start background scraper + internal snapshotter after setup so setup is
     // excluded from benchmark metrics.

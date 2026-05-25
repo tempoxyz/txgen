@@ -91,7 +91,7 @@ pub struct SendArgs {
     /// Disabled by default to avoid retaining one timestamped latency sample
     /// per successful transaction.
     #[arg(long)]
-    pub timeseries_latencies: bool,
+    pub collect_timeseries_latencies: bool,
 
     /// Skip setup-phase transactions in the input stream.
     #[arg(long)]
@@ -353,25 +353,25 @@ mod tests {
     }
 
     #[test]
-    fn test_send_timeseries_latencies_default_disabled() {
+    fn test_send_collect_timeseries_latencies_default_disabled() {
         let cli = Cli::try_parse_from(["bench", "send"]).unwrap();
 
         let Command::Send(args) = cli.command else {
             panic!("expected send command");
         };
 
-        assert!(!args.timeseries_latencies);
+        assert!(!args.collect_timeseries_latencies);
     }
 
     #[test]
-    fn test_send_timeseries_latencies_enabled() {
-        let cli = Cli::try_parse_from(["bench", "send", "--timeseries-latencies"]).unwrap();
+    fn test_send_collect_timeseries_latencies_enabled() {
+        let cli = Cli::try_parse_from(["bench", "send", "--collect-timeseries-latencies"]).unwrap();
 
         let Command::Send(args) = cli.command else {
             panic!("expected send command");
         };
 
-        assert!(args.timeseries_latencies);
+        assert!(args.collect_timeseries_latencies);
     }
 
     #[test]
