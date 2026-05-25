@@ -20,7 +20,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         rpc_urls = ?args.rpc_urls,
         tps = args.tps,
         skip_setup = args.skip_setup,
-        collect_timeseries_latencies = args.collect_timeseries_latencies,
+        collect_latencies = args.collect_latencies,
         retries = args.retries.map_or("forever".to_string(), |retries| retries.to_string()),
         "Starting send"
     );
@@ -79,10 +79,7 @@ async fn execute_source<S: TxSource>(
         RunClock::new()
     };
     let store = SampleStore::with_labels(metadata.clone())?;
-    let metrics = MetricsCollector::new_with_time_series_latencies(
-        clock.clone(),
-        args.collect_timeseries_latencies,
-    );
+    let metrics = MetricsCollector::new_with_latencies(clock.clone(), args.collect_latencies);
 
     // Start background scraper + internal snapshotter after setup so setup is
     // excluded from benchmark metrics.
@@ -274,7 +271,7 @@ async fn run_setup_phase<S: TxSource, P: TxPoolApi<AnyNetwork>>(
     query_provider: &P,
 ) -> Result<Option<GeneratedTx>> {
     let setup_clock = RunClock::new();
-    let setup_metrics = MetricsCollector::new_with_time_series_latencies(setup_clock, false);
+    let setup_metrics = MetricsCollector::new_with_latencies(setup_clock, false);
     let mut setup_sender = Sender::new(providers.to_vec(), config.clone(), setup_metrics.clone());
     let mut setup_seen = 0u64;
 

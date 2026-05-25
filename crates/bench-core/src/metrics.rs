@@ -41,8 +41,9 @@ pub struct BenchMetrics {
     /// Total elapsed time.
     #[serde(with = "duration_serde")]
     pub elapsed: Duration,
-    /// Latency statistics.
-    pub latency: LatencyStats,
+    /// Latency statistics, when latency collection is enabled.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub latency: Option<LatencyStats>,
 }
 
 impl BenchMetrics {
@@ -442,33 +443,26 @@ struct ThroughputCounts {
 /// Options controlling metrics collection behavior.
 #[derive(Debug, Clone, Copy)]
 pub struct MetricsCollectorOptions {
-    /// Whether to retain per-transaction timestamped latency samples for
-    /// `time_series.latencies` reporting.
-    pub collect_time_series_latencies: bool,
+    /// Whether to retain per-transaction latency samples for aggregate latency
+    /// stats and `time_series.latencies` reporting.
+    pub collect_latencies: bool,
 }
 
 impl Default for MetricsCollectorOptions {
     fn default() -> Self {
-        Self { collect_time_series_latencies: true }
+        Self { collect_latencies: true }
     }
 }
 
 #[derive(Debug)]
 struct MetricsAggregation {
     throughput: BTreeMap<u64, ThroughputCounts>,
-    latencies: Vec<Duration>,
-    time_series_latencies: Vec<TimestampedLatency>,
-    collect_time_series_latencies: bool,
+    latencies: Vec<TimestampedLatency>,
 }
 
 impl MetricsAggregation {
-    fn new(collect_time_series_latencies: bool) -> Self {
-        Self {
-            throughput: BTreeMap::new(),
-            latencies: Vec::new(),
-            time_series_latencies: Vec::new(),
-            collect_time_series_latencies,
-        }
+    fn new() -> Self {
+        Self { throughput: BTreeMap::new(), latencies: Vec::new() }
     }
 
     fn record_event(&mut self, event: TimestampedEvent) {
@@ -481,10 +475,7 @@ impl MetricsAggregation {
     }
 
     fn record_latency(&mut self, latency: TimestampedLatency) {
-        self.latencies.push(latency.latency);
-        if self.collect_time_series_latencies {
-            self.time_series_latencies.push(latency);
-        }
+        self.latencies.push(latency);
     }
 }
 
@@ -539,6 +530,7 @@ pub struct MetricsCollector {
     success: AtomicU64,
     failed: AtomicU64,
     clock: RunClock,
+    collect_latencies: bool,
     latency_tx: mpsc::UnboundedSender<TimestampedLatency>,
     event_tx: mpsc::UnboundedSender<TimestampedEvent>,
     aggregation: Arc<Mutex<MetricsAggregation>>,
@@ -562,12 +554,9 @@ impl MetricsCollector {
         Self::new_with_options(clock, MetricsCollectorOptions::default())
     }
 
-    /// Create a new metrics collector with explicit latency time-series behavior.
-    pub fn new_with_time_series_latencies(
-        clock: RunClock,
-        collect_time_series_latencies: bool,
-    ) -> Arc<Self> {
-        Self::new_with_options(clock, MetricsCollectorOptions { collect_time_series_latencies })
+    /// Create a new metrics collector with explicit latency collection behavior.
+    pub fn new_with_latencies(clock: RunClock, collect_latencies: bool) -> Arc<Self> {
+        Self::new_with_options(clock, MetricsCollectorOptions { collect_latencies })
     }
 
     /// Create a new metrics collector with explicit options.
@@ -575,8 +564,7 @@ impl MetricsCollector {
         let (latency_tx, latency_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (aggregation_shutdown_tx, aggregation_shutdown_rx) = oneshot::channel();
-        let aggregation =
-            Arc::new(Mutex::new(MetricsAggregation::new(options.collect_time_series_latencies)));
+        let aggregation = Arc::new(Mutex::new(MetricsAggregation::new()));
         let aggregation_handle = tokio::spawn(metrics_aggregation_loop(
             aggregation.clone(),
             latency_rx,
@@ -589,6 +577,7 @@ impl MetricsCollector {
             success: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             clock,
+            collect_latencies: options.collect_latencies,
             latency_tx,
             event_tx,
             aggregation,
@@ -623,7 +612,9 @@ impl MetricsCollector {
     pub fn record_success(&self, latency: Duration) {
         self.success.fetch_add(1, Ordering::Relaxed);
         let offset = self.elapsed();
-        let _ = self.latency_tx.send(TimestampedLatency { offset, latency });
+        if self.collect_latencies {
+            let _ = self.latency_tx.send(TimestampedLatency { offset, latency });
+        }
         let _ = self.event_tx.send(TimestampedEvent { offset, event: TxEvent::Success });
     }
 
@@ -705,11 +696,14 @@ impl MetricsCollector {
         let elapsed = self.clock.elapsed();
         self.finish_aggregation().await;
 
-        let latency = {
+        let latency = if self.collect_latencies {
             let aggregation = self.aggregation.lock().await;
-            let mut durations = aggregation.latencies.clone();
+            let mut durations: Vec<Duration> =
+                aggregation.latencies.iter().map(|l| l.latency).collect();
             durations.sort();
-            LatencyStats::from_sorted(&durations)
+            Some(LatencyStats::from_sorted(&durations))
+        } else {
+            None
         };
 
         BenchMetrics {
@@ -740,7 +734,7 @@ impl MetricsCollector {
         }
 
         let latency_samples: Vec<LatencySample> = aggregation
-            .time_series_latencies
+            .latencies
             .iter()
             .map(|l| LatencySample { offset_ms: l.offset.as_millis() as u64, latency: l.latency })
             .collect();
@@ -843,7 +837,7 @@ mod tests {
             success: 90,
             failed: 10,
             elapsed: Duration::from_secs(10),
-            latency: LatencyStats::default(),
+            latency: None,
         };
 
         assert!((metrics.tps() - 10.0).abs() < 0.001);
@@ -970,14 +964,14 @@ mod tests {
             success: 90,
             failed: 10,
             elapsed: Duration::from_millis(1500),
-            latency: LatencyStats {
+            latency: Some(LatencyStats {
                 min: Duration::from_millis(5),
                 max: Duration::from_millis(200),
                 mean: Duration::from_millis(50),
                 p50: Duration::from_millis(40),
                 p95: Duration::from_millis(150),
                 p99: Duration::from_millis(180),
-            },
+            }),
         };
 
         let json = serde_json::to_string(&metrics).unwrap();
@@ -985,7 +979,7 @@ mod tests {
 
         assert_eq!(parsed.sent, 100);
         assert_eq!(parsed.elapsed, Duration::from_millis(1500));
-        assert_eq!(parsed.latency.p50, Duration::from_millis(40));
+        assert_eq!(parsed.latency.unwrap().p50, Duration::from_millis(40));
     }
 
     #[tokio::test]
@@ -1025,8 +1019,9 @@ mod tests {
         assert_eq!(metrics.sent, 2);
         assert_eq!(metrics.success, 2);
         assert_eq!(metrics.failed, 0);
-        assert_eq!(metrics.latency.min, Duration::from_millis(10));
-        assert_eq!(metrics.latency.max, Duration::from_millis(20));
+        let latency = metrics.latency.unwrap();
+        assert_eq!(latency.min, Duration::from_millis(10));
+        assert_eq!(latency.max, Duration::from_millis(20));
         assert_eq!(ts.latencies.len(), 2);
         assert_eq!(ts.latencies[0].latency, Duration::from_millis(20));
         assert_eq!(ts.latencies[1].latency, Duration::from_millis(10));
@@ -1036,8 +1031,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn time_series_latencies_can_be_disabled_without_losing_latency_stats() {
-        let collector = MetricsCollector::new_with_time_series_latencies(RunClock::new(), false);
+    async fn latencies_can_be_disabled() {
+        let collector = MetricsCollector::new_with_latencies(RunClock::new(), false);
 
         collector.record_sent();
         collector.record_success(Duration::from_millis(20));
@@ -1047,9 +1042,7 @@ mod tests {
         let metrics = collector.finalize().await;
         let ts = collector.time_series().await;
 
-        assert_eq!(metrics.latency.min, Duration::from_millis(10));
-        assert_eq!(metrics.latency.max, Duration::from_millis(20));
-        assert_eq!(metrics.latency.p50, Duration::from_millis(20));
+        assert!(metrics.latency.is_none());
         assert!(ts.latencies.is_empty());
         assert_eq!(ts.throughput.iter().map(|sample| sample.sent).sum::<u64>(), 2);
         assert_eq!(ts.throughput.iter().map(|sample| sample.success).sum::<u64>(), 2);

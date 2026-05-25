@@ -228,38 +228,40 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
             writeln!(self.writer, "  Duration:        {:>10.2}s", metrics.elapsed.as_secs_f64())?;
             writeln!(self.writer, "  Throughput:      {:>10.2} tx/s", metrics.tps())?;
             writeln!(self.writer, "  Success Rate:    {:>10.1}%", metrics.success_rate())?;
-            writeln!(self.writer)?;
-            writeln!(self.writer, "  Latency:")?;
-            writeln!(
-                self.writer,
-                "    Min:           {:>10.2}ms",
-                metrics.latency.min.as_secs_f64() * 1000.0
-            )?;
-            writeln!(
-                self.writer,
-                "    Max:           {:>10.2}ms",
-                metrics.latency.max.as_secs_f64() * 1000.0
-            )?;
-            writeln!(
-                self.writer,
-                "    Mean:          {:>10.2}ms",
-                metrics.latency.mean.as_secs_f64() * 1000.0
-            )?;
-            writeln!(
-                self.writer,
-                "    P50:           {:>10.2}ms",
-                metrics.latency.p50.as_secs_f64() * 1000.0
-            )?;
-            writeln!(
-                self.writer,
-                "    P95:           {:>10.2}ms",
-                metrics.latency.p95.as_secs_f64() * 1000.0
-            )?;
-            writeln!(
-                self.writer,
-                "    P99:           {:>10.2}ms",
-                metrics.latency.p99.as_secs_f64() * 1000.0
-            )?;
+            if let Some(latency) = &metrics.latency {
+                writeln!(self.writer)?;
+                writeln!(self.writer, "  Latency:")?;
+                writeln!(
+                    self.writer,
+                    "    Min:           {:>10.2}ms",
+                    latency.min.as_secs_f64() * 1000.0
+                )?;
+                writeln!(
+                    self.writer,
+                    "    Max:           {:>10.2}ms",
+                    latency.max.as_secs_f64() * 1000.0
+                )?;
+                writeln!(
+                    self.writer,
+                    "    Mean:          {:>10.2}ms",
+                    latency.mean.as_secs_f64() * 1000.0
+                )?;
+                writeln!(
+                    self.writer,
+                    "    P50:           {:>10.2}ms",
+                    latency.p50.as_secs_f64() * 1000.0
+                )?;
+                writeln!(
+                    self.writer,
+                    "    P95:           {:>10.2}ms",
+                    latency.p95.as_secs_f64() * 1000.0
+                )?;
+                writeln!(
+                    self.writer,
+                    "    P99:           {:>10.2}ms",
+                    latency.p99.as_secs_f64() * 1000.0
+                )?;
+            }
         }
 
         if let Some(run) = &report.run_stats {
@@ -457,13 +459,13 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
                     Some(metrics.elapsed.as_secs_f64()),
                     Some(metrics.tps()),
                     Some(metrics.success_rate()),
-                    Some(JsonLatency {
-                        min_ms: metrics.latency.min.as_secs_f64() * 1000.0,
-                        max_ms: metrics.latency.max.as_secs_f64() * 1000.0,
-                        mean_ms: metrics.latency.mean.as_secs_f64() * 1000.0,
-                        p50_ms: metrics.latency.p50.as_secs_f64() * 1000.0,
-                        p95_ms: metrics.latency.p95.as_secs_f64() * 1000.0,
-                        p99_ms: metrics.latency.p99.as_secs_f64() * 1000.0,
+                    metrics.latency.as_ref().map(|latency| JsonLatency {
+                        min_ms: latency.min.as_secs_f64() * 1000.0,
+                        max_ms: latency.max.as_secs_f64() * 1000.0,
+                        mean_ms: latency.mean.as_secs_f64() * 1000.0,
+                        p50_ms: latency.p50.as_secs_f64() * 1000.0,
+                        p95_ms: latency.p95.as_secs_f64() * 1000.0,
+                        p99_ms: latency.p99.as_secs_f64() * 1000.0,
                     }),
                     ts,
                 )
@@ -939,19 +941,25 @@ mod tests {
             success: 950,
             failed: 50,
             elapsed: Duration::from_secs(10),
-            latency: LatencyStats {
+            latency: Some(LatencyStats {
                 min: Duration::from_millis(1),
                 max: Duration::from_millis(100),
                 mean: Duration::from_millis(15),
                 p50: Duration::from_millis(10),
                 p95: Duration::from_millis(50),
                 p99: Duration::from_millis(80),
-            },
+            }),
         }
     }
 
     fn sample_report() -> FinalReport {
         FinalReport { bench_metrics: Some(sample_metrics()), ..Default::default() }
+    }
+
+    fn sample_report_without_latency() -> FinalReport {
+        let mut metrics = sample_metrics();
+        metrics.latency = None;
+        FinalReport { bench_metrics: Some(metrics), ..Default::default() }
     }
 
     fn sample(name: &str, value: f64, offset_ms: u64) -> Sample {
@@ -1022,6 +1030,20 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&output_str).unwrap();
         assert!(parsed["time_series"]["throughput"].is_array());
         assert!(parsed["time_series"].get("latencies").is_none());
+    }
+
+    #[test]
+    fn test_json_reporter_omits_disabled_latency_stats() {
+        let mut output = Vec::new();
+        {
+            let mut reporter = JsonReporter::new(&mut output);
+            reporter.finalize(&sample_report_without_latency()).unwrap();
+        }
+
+        let output_str = String::from_utf8(output).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output_str).unwrap();
+        assert!(parsed.get("latency").is_none());
+        assert_eq!(parsed["sent"], 1000);
     }
 
     #[test]
