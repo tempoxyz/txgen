@@ -119,59 +119,42 @@ async fn execute_source<S: TxSource>(
     // Wait for the txpool to drain so all transactions are included in blocks
     // before we collect block stats. The scraper and block poller keep running.
     if args.drain_timeout > 0 {
-        tracing::info!(state = "txpool_drain", "Post-processing state started");
         wait_for_pool_drain(query_provider, args.drain_timeout).await?;
-        tracing::info!(state = "txpool_drain", "Post-processing state completed");
+        tracing::info!("Txpool drain completed");
     } else {
-        tracing::info!(
-            state = "txpool_drain",
-            reason = "--drain-timeout=0",
-            "Post-processing state skipped"
-        );
+        tracing::info!(reason = "--drain-timeout=0", "Skipped txpool drain");
     }
 
     // Stop the scraper before finalizing.
     if !scraper_handles.is_empty() {
-        tracing::info!(
-            state = "metrics_scraper_stop",
-            scrapers = scraper_handles.len(),
-            scrapes = scraper_handles.iter().map(|h| h.scrape_count()).sum::<u64>(),
-            errors = scraper_handles.iter().map(|h| h.error_count()).sum::<u64>(),
-            "Post-processing state started"
-        );
+        let scrapers = scraper_handles.len();
+        let scrapes = scraper_handles.iter().map(|h| h.scrape_count()).sum::<u64>();
+        let errors = scraper_handles.iter().map(|h| h.error_count()).sum::<u64>();
         for handle in scraper_handles {
             handle.stop().await;
         }
-        tracing::info!(state = "metrics_scraper_stop", "Post-processing state completed");
+        tracing::info!(scrapers, scrapes, errors, "Metrics scrapers stopped");
     } else {
-        tracing::info!(
-            state = "metrics_scraper_stop",
-            reason = "no metrics scrapers",
-            "Post-processing state skipped"
-        );
+        tracing::info!(reason = "no metrics scrapers", "Skipped metrics scraper stop");
     }
 
-    tracing::info!(state = "metrics_finalize", "Post-processing state started");
     let final_metrics = metrics.finalize().await;
-    tracing::info!(state = "metrics_finalize", "Post-processing state completed");
+    tracing::info!("Metrics finalized");
 
-    tracing::info!(state = "time_series_build", "Post-processing state started");
     let time_series = metrics.time_series().await;
-    tracing::info!(state = "time_series_build", "Post-processing state completed");
+    tracing::info!("Time series built");
 
     // Finalize the sample archive before reporters read it.
-    tracing::info!(state = "sample_archive_finalize", "Post-processing state started");
     let sample_archive = store.finish().await?;
-    tracing::info!(state = "sample_archive_finalize", "Post-processing state completed");
+    tracing::info!("Sample archive finalized");
 
     // Collect per-block stats from the chain. The range starts one block after
     // the block that was current before sending (start_block is the last
     // existing block at that point, so start_block+1 is the first block that
     // could contain our transactions) and ends at the current latest block.
-    tracing::info!(state = "ending_block_fetch", "Post-processing state started");
     let end_block =
         query_provider.get_block_number().await.wrap_err("failed to get ending block number")?;
-    tracing::info!(state = "ending_block_fetch", "Post-processing state completed");
+    tracing::info!(end_block, "Ending block fetched");
 
     let mut report = FinalReport {
         metadata: metadata.clone(),
@@ -183,24 +166,18 @@ async fn execute_source<S: TxSource>(
 
     if end_block > start_block {
         let block_range_start = start_block + 1;
-        tracing::info!(
-            state = "block_stats_collect",
-            start = block_range_start,
-            end = end_block,
-            "Post-processing state started"
-        );
         let mut block_stats =
             collect_block_stats(query_provider, block_range_start, end_block).await?;
         tracing::info!(
-            state = "block_stats_collect",
+            start = block_range_start,
+            end = end_block,
             blocks = block_stats.len(),
-            "Post-processing state completed"
+            "Block stats collected"
         );
 
         // Trim trailing empty blocks (system-only, gas_used == 0) that
         // accumulated during the txpool drain wait. Also trim metric
         // samples captured after the last real block.
-        tracing::info!(state = "report_trim", "Post-processing state started");
         let cutoff_ms = trim_trailing_empty_blocks(&mut block_stats);
         if let Some(cutoff_ms) = cutoff_ms {
             report.retain_samples_until(cutoff_ms)?;
@@ -211,52 +188,29 @@ async fn execute_source<S: TxSource>(
                     .retain(|t| t.second * 1000 <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
             }
         }
-        tracing::info!(
-            state = "report_trim",
-            cutoff_ms = ?cutoff_ms,
-            "Post-processing state completed"
-        );
+        tracing::info!(cutoff_ms = ?cutoff_ms, "Report trimmed");
 
-        tracing::info!(state = "block_reporter_events", "Post-processing state started");
         for block in &block_stats {
             for reporter in reporters.iter_mut() {
                 reporter.on_block(block)?;
             }
         }
-        tracing::info!(state = "block_reporter_events", "Post-processing state completed");
+        tracing::info!(blocks = block_stats.len(), "Block reporter events emitted");
 
-        tracing::info!(state = "run_stats_build", "Post-processing state started");
         report.run_stats = Some(RunStats::from_blocks_chain_time(&block_stats));
-        tracing::info!(state = "run_stats_build", "Post-processing state completed");
+        tracing::info!("Run stats built");
         report.blocks = block_stats;
     } else {
-        tracing::info!(
-            state = "block_stats_collect",
-            reason = "no new blocks",
-            "Post-processing state skipped"
-        );
-        tracing::info!(
-            state = "report_trim",
-            reason = "no block stats",
-            "Post-processing state skipped"
-        );
-        tracing::info!(
-            state = "block_reporter_events",
-            reason = "no block stats",
-            "Post-processing state skipped"
-        );
-        tracing::info!(
-            state = "run_stats_build",
-            reason = "no block stats",
-            "Post-processing state skipped"
-        );
+        tracing::info!(reason = "no new blocks", "Skipped block stats collection");
+        tracing::info!(reason = "no block stats", "Skipped report trim");
+        tracing::info!(reason = "no block stats", "Skipped block reporter events");
+        tracing::info!(reason = "no block stats", "Skipped run stats build");
     }
 
-    tracing::info!(state = "reporter_finalize", "Post-processing state started");
     for reporter in &mut reporters {
         reporter.finalize(&report)?;
     }
-    tracing::info!(state = "reporter_finalize", "Post-processing state completed");
+    tracing::info!("Reporters finalized");
 
     tracing::info!("Post-processing completed");
 
