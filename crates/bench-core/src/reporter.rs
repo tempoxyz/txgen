@@ -354,6 +354,7 @@ pub struct JsonTimeSeries {
     /// Per-second throughput samples.
     pub throughput: Vec<ThroughputSample>,
     /// Individual latency samples.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub latencies: Vec<JsonLatencySample>,
 }
 
@@ -495,8 +496,8 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         writeln!(self.writer)?;
 
         // Stream-compress the finalized NDJSON archive to the report sidecar.
-        if let Some(samples_path) = &self.samples_path &&
-            report.has_samples()
+        if let Some(samples_path) = &self.samples_path
+            && report.has_samples()
         {
             let count = copy_and_gzip_samples_ndjson(report, samples_path)?;
             tracing::info!(
@@ -1005,6 +1006,25 @@ mod tests {
     }
 
     #[test]
+    fn test_json_reporter_omits_empty_time_series_latencies() {
+        let mut output = Vec::new();
+        {
+            let mut reporter = JsonReporter::new(&mut output);
+            let mut report = sample_report();
+            report.time_series = Some(TimeSeriesMetrics {
+                throughput: vec![ThroughputSample { second: 0, sent: 10, success: 9, failed: 1 }],
+                latencies: Vec::new(),
+            });
+            reporter.finalize(&report).unwrap();
+        }
+
+        let output_str = String::from_utf8(output).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output_str).unwrap();
+        assert!(parsed["time_series"]["throughput"].is_array());
+        assert!(parsed["time_series"].get("latencies").is_none());
+    }
+
+    #[test]
     fn test_json_reporter_with_blocks() {
         let mut output = Vec::new();
         {
@@ -1143,8 +1163,8 @@ mod tests {
         let report_json: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&report_path).unwrap()).unwrap();
         assert!(
-            report_json.get("samples").is_none() ||
-                report_json["samples"].as_array().unwrap().is_empty()
+            report_json.get("samples").is_none()
+                || report_json["samples"].as_array().unwrap().is_empty()
         );
 
         // Compressed samples NDJSON should exist with 2 lines.

@@ -160,7 +160,7 @@ pub struct ThroughputSample {
 pub struct TimeSeriesMetrics {
     /// Per-second throughput samples.
     pub throughput: Vec<ThroughputSample>,
-    /// Individual latency samples with timestamps.
+    /// Individual latency samples with timestamps, when collection is enabled.
     pub latencies: Vec<LatencySample>,
 }
 
@@ -401,8 +401,8 @@ pub fn trim_trailing_empty_blocks(blocks: &mut Vec<BlockStats>) -> Option<u64> {
 /// combines it with the second-precision timestamp. Falls back to
 /// `timestamp_secs * 1000` for standard Ethereum blocks.
 fn extract_timestamp_ms<B: BlockResponse>(block: &B, timestamp_secs: u64) -> u64 {
-    if let Some(other) = block.other_fields() &&
-        let Some(Ok(ms_part)) =
+    if let Some(other) = block.other_fields()
+        && let Some(Ok(ms_part)) =
             other.get_deserialized::<alloy_primitives::U64>("timestampMillisPart")
     {
         return timestamp_secs.saturating_mul(1000).saturating_add(ms_part.to());
@@ -439,13 +439,38 @@ struct ThroughputCounts {
     failed: u64,
 }
 
-#[derive(Debug, Default)]
+/// Options controlling metrics collection behavior.
+#[derive(Debug, Clone, Copy)]
+pub struct MetricsCollectorOptions {
+    /// Whether to retain per-transaction timestamped latency samples for
+    /// `time_series.latencies` reporting.
+    pub collect_time_series_latencies: bool,
+}
+
+impl Default for MetricsCollectorOptions {
+    fn default() -> Self {
+        Self { collect_time_series_latencies: true }
+    }
+}
+
+#[derive(Debug)]
 struct MetricsAggregation {
     throughput: BTreeMap<u64, ThroughputCounts>,
-    latencies: Vec<TimestampedLatency>,
+    latencies: Vec<Duration>,
+    time_series_latencies: Vec<TimestampedLatency>,
+    collect_time_series_latencies: bool,
 }
 
 impl MetricsAggregation {
+    fn new(collect_time_series_latencies: bool) -> Self {
+        Self {
+            throughput: BTreeMap::new(),
+            latencies: Vec::new(),
+            time_series_latencies: Vec::new(),
+            collect_time_series_latencies,
+        }
+    }
+
     fn record_event(&mut self, event: TimestampedEvent) {
         let bucket = self.throughput.entry(event.offset.as_secs()).or_default();
         match event.event {
@@ -456,7 +481,10 @@ impl MetricsAggregation {
     }
 
     fn record_latency(&mut self, latency: TimestampedLatency) {
-        self.latencies.push(latency);
+        self.latencies.push(latency.latency);
+        if self.collect_time_series_latencies {
+            self.time_series_latencies.push(latency);
+        }
     }
 }
 
@@ -531,10 +559,24 @@ impl std::fmt::Debug for MetricsCollector {
 impl MetricsCollector {
     /// Create a new metrics collector with a shared [`RunClock`].
     pub fn new(clock: RunClock) -> Arc<Self> {
+        Self::new_with_options(clock, MetricsCollectorOptions::default())
+    }
+
+    /// Create a new metrics collector with explicit latency time-series behavior.
+    pub fn new_with_time_series_latencies(
+        clock: RunClock,
+        collect_time_series_latencies: bool,
+    ) -> Arc<Self> {
+        Self::new_with_options(clock, MetricsCollectorOptions { collect_time_series_latencies })
+    }
+
+    /// Create a new metrics collector with explicit options.
+    pub fn new_with_options(clock: RunClock, options: MetricsCollectorOptions) -> Arc<Self> {
         let (latency_tx, latency_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (aggregation_shutdown_tx, aggregation_shutdown_rx) = oneshot::channel();
-        let aggregation = Arc::new(Mutex::new(MetricsAggregation::default()));
+        let aggregation =
+            Arc::new(Mutex::new(MetricsAggregation::new(options.collect_time_series_latencies)));
         let aggregation_handle = tokio::spawn(metrics_aggregation_loop(
             aggregation.clone(),
             latency_rx,
@@ -651,8 +693,8 @@ impl MetricsCollector {
             let _ = shutdown.send(());
         }
 
-        if let Some(handle) = self.aggregation_handle.lock().await.take() &&
-            let Err(err) = handle.await
+        if let Some(handle) = self.aggregation_handle.lock().await.take()
+            && let Err(err) = handle.await
         {
             tracing::warn!(%err, "metrics aggregation task failed");
         }
@@ -665,8 +707,7 @@ impl MetricsCollector {
 
         let latency = {
             let aggregation = self.aggregation.lock().await;
-            let mut durations: Vec<Duration> =
-                aggregation.latencies.iter().map(|l| l.latency).collect();
+            let mut durations = aggregation.latencies.clone();
             durations.sort();
             LatencyStats::from_sorted(&durations)
         };
@@ -699,7 +740,7 @@ impl MetricsCollector {
         }
 
         let latency_samples: Vec<LatencySample> = aggregation
-            .latencies
+            .time_series_latencies
             .iter()
             .map(|l| LatencySample { offset_ms: l.offset.as_millis() as u64, latency: l.latency })
             .collect();
@@ -992,6 +1033,26 @@ mod tests {
         assert_eq!(ts.throughput.iter().map(|sample| sample.sent).sum::<u64>(), 2);
         assert_eq!(ts.throughput.iter().map(|sample| sample.success).sum::<u64>(), 2);
         assert_eq!(ts.throughput.iter().map(|sample| sample.failed).sum::<u64>(), 0);
+    }
+
+    #[tokio::test]
+    async fn time_series_latencies_can_be_disabled_without_losing_latency_stats() {
+        let collector = MetricsCollector::new_with_time_series_latencies(RunClock::new(), false);
+
+        collector.record_sent();
+        collector.record_success(Duration::from_millis(20));
+        collector.record_sent();
+        collector.record_success(Duration::from_millis(10));
+
+        let metrics = collector.finalize().await;
+        let ts = collector.time_series().await;
+
+        assert_eq!(metrics.latency.min, Duration::from_millis(10));
+        assert_eq!(metrics.latency.max, Duration::from_millis(20));
+        assert_eq!(metrics.latency.p50, Duration::from_millis(20));
+        assert!(ts.latencies.is_empty());
+        assert_eq!(ts.throughput.iter().map(|sample| sample.sent).sum::<u64>(), 2);
+        assert_eq!(ts.throughput.iter().map(|sample| sample.success).sum::<u64>(), 2);
     }
 
     #[test]

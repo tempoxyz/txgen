@@ -86,6 +86,13 @@ pub struct SendArgs {
     #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
     pub metrics_align: Option<u64>,
 
+    /// Collect and report individual latency samples under time_series.latencies.
+    ///
+    /// Disabled by default to avoid retaining one timestamped latency sample
+    /// per successful transaction.
+    #[arg(long)]
+    pub timeseries_latencies: bool,
+
     /// Skip setup-phase transactions in the input stream.
     #[arg(long)]
     pub skip_setup: bool,
@@ -343,6 +350,28 @@ mod tests {
         };
 
         assert_eq!(args.retries, Some(0));
+    }
+
+    #[test]
+    fn test_send_timeseries_latencies_default_disabled() {
+        let cli = Cli::try_parse_from(["bench", "send"]).unwrap();
+
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+
+        assert!(!args.timeseries_latencies);
+    }
+
+    #[test]
+    fn test_send_timeseries_latencies_enabled() {
+        let cli = Cli::try_parse_from(["bench", "send", "--timeseries-latencies"]).unwrap();
+
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+
+        assert!(args.timeseries_latencies);
     }
 
     #[test]
