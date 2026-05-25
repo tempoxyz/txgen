@@ -12,11 +12,7 @@ use bench_core::{
     TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
-use std::{
-    collections::HashMap,
-    future::Future,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, time::Duration};
 
 pub async fn execute(args: SendArgs) -> Result<()> {
     tracing::info!(
@@ -121,60 +117,56 @@ async fn execute_source<S: TxSource>(
     sender.flush().await;
 
     let (sent, success, failed) = metrics.counts();
-    tracing::info!(
-        sent,
-        success,
-        failed,
-        elapsed_ms = duration_ms(metrics.elapsed_since_start()),
-        "Bench send completed; starting post-processing"
-    );
-    let post_processing_start = Instant::now();
+    tracing::info!(sent, success, failed, "Bench send completed; starting post-processing");
 
     // Wait for the txpool to drain so all transactions are included in blocks
     // before we collect block stats. The scraper and block poller keep running.
     if args.drain_timeout > 0 {
-        time_post_process_result(
-            "txpool_drain",
-            wait_for_pool_drain(query_provider, args.drain_timeout),
-        )
-        .await?;
+        log_post_process_state_started("txpool_drain");
+        wait_for_pool_drain(query_provider, args.drain_timeout).await?;
+        log_post_process_state_completed("txpool_drain");
     } else {
         log_post_process_state_skipped("txpool_drain", "--drain-timeout=0");
     }
 
     // Stop the scraper before finalizing.
     if !scraper_handles.is_empty() {
-        time_post_process("metrics_scraper_stop", async move {
-            tracing::info!(
-                scrapers = scraper_handles.len(),
-                scrapes = scraper_handles.iter().map(|h| h.scrape_count()).sum::<u64>(),
-                errors = scraper_handles.iter().map(|h| h.error_count()).sum::<u64>(),
-                "Stopping metrics scrapers"
-            );
-            for handle in scraper_handles {
-                handle.stop().await;
-            }
-        })
-        .await;
+        tracing::info!(
+            state = "metrics_scraper_stop",
+            scrapers = scraper_handles.len(),
+            scrapes = scraper_handles.iter().map(|h| h.scrape_count()).sum::<u64>(),
+            errors = scraper_handles.iter().map(|h| h.error_count()).sum::<u64>(),
+            "Post-processing state started"
+        );
+        for handle in scraper_handles {
+            handle.stop().await;
+        }
+        log_post_process_state_completed("metrics_scraper_stop");
     } else {
         log_post_process_state_skipped("metrics_scraper_stop", "no metrics scrapers");
     }
 
-    let final_metrics = time_post_process("metrics_finalize", metrics.finalize()).await;
-    let time_series = time_post_process("time_series_build", metrics.time_series()).await;
+    log_post_process_state_started("metrics_finalize");
+    let final_metrics = metrics.finalize().await;
+    log_post_process_state_completed("metrics_finalize");
+
+    log_post_process_state_started("time_series_build");
+    let time_series = metrics.time_series().await;
+    log_post_process_state_completed("time_series_build");
 
     // Finalize the sample archive before reporters read it.
-    let sample_archive =
-        time_post_process_result("sample_archive_finalize", store.finish()).await?;
+    log_post_process_state_started("sample_archive_finalize");
+    let sample_archive = store.finish().await?;
+    log_post_process_state_completed("sample_archive_finalize");
 
     // Collect per-block stats from the chain. The range starts one block after
     // the block that was current before sending (start_block is the last
     // existing block at that point, so start_block+1 is the first block that
     // could contain our transactions) and ends at the current latest block.
-    let end_block = time_post_process_result("ending_block_fetch", async {
-        query_provider.get_block_number().await.wrap_err("failed to get ending block number")
-    })
-    .await?;
+    log_post_process_state_started("ending_block_fetch");
+    let end_block =
+        query_provider.get_block_number().await.wrap_err("failed to get ending block number")?;
+    log_post_process_state_completed("ending_block_fetch");
 
     let mut report = FinalReport {
         metadata: metadata.clone(),
@@ -186,48 +178,51 @@ async fn execute_source<S: TxSource>(
 
     if end_block > start_block {
         let block_range_start = start_block + 1;
-        tracing::info!(start = block_range_start, end = end_block, "Collecting per-block stats");
-
-        let mut block_stats = time_post_process_result(
-            "block_stats_collect",
-            collect_block_stats(query_provider, block_range_start, end_block),
-        )
-        .await?;
+        tracing::info!(
+            state = "block_stats_collect",
+            start = block_range_start,
+            end = end_block,
+            "Post-processing state started"
+        );
+        let mut block_stats =
+            collect_block_stats(query_provider, block_range_start, end_block).await?;
+        tracing::info!(
+            state = "block_stats_collect",
+            blocks = block_stats.len(),
+            "Post-processing state completed"
+        );
 
         // Trim trailing empty blocks (system-only, gas_used == 0) that
         // accumulated during the txpool drain wait. Also trim metric
         // samples captured after the last real block.
-        time_post_process_result("report_trim", async {
-            if let Some(cutoff_ms) = trim_trailing_empty_blocks(&mut block_stats) {
-                report.retain_samples_until(cutoff_ms)?;
-                if let Some(ts) = report.time_series.as_mut() {
-                    ts.latencies
-                        .retain(|l| l.offset_ms <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
-                    ts.throughput.retain(|t| {
-                        t.second * 1000 <= cutoff_ms.saturating_sub(clock.start_unix_ms())
-                    });
-                }
+        log_post_process_state_started("report_trim");
+        let cutoff_ms = trim_trailing_empty_blocks(&mut block_stats);
+        if let Some(cutoff_ms) = cutoff_ms {
+            report.retain_samples_until(cutoff_ms)?;
+            if let Some(ts) = report.time_series.as_mut() {
+                ts.latencies
+                    .retain(|l| l.offset_ms <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
+                ts.throughput
+                    .retain(|t| t.second * 1000 <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
             }
-            Ok(())
-        })
-        .await?;
-
-        time_post_process_result("block_reporter_events", async {
-            for block in &block_stats {
-                for reporter in reporters.iter_mut() {
-                    reporter.on_block(block)?;
-                }
-            }
-            Ok(())
-        })
-        .await?;
-
-        report.run_stats = Some(
-            time_post_process("run_stats_build", async {
-                RunStats::from_blocks_chain_time(&block_stats)
-            })
-            .await,
+        }
+        tracing::info!(
+            state = "report_trim",
+            cutoff_ms = ?cutoff_ms,
+            "Post-processing state completed"
         );
+
+        log_post_process_state_started("block_reporter_events");
+        for block in &block_stats {
+            for reporter in reporters.iter_mut() {
+                reporter.on_block(block)?;
+            }
+        }
+        log_post_process_state_completed("block_reporter_events");
+
+        log_post_process_state_started("run_stats_build");
+        report.run_stats = Some(RunStats::from_blocks_chain_time(&block_stats));
+        log_post_process_state_completed("run_stats_build");
         report.blocks = block_stats;
     } else {
         log_post_process_state_skipped("block_stats_collect", "no new blocks");
@@ -236,58 +231,27 @@ async fn execute_source<S: TxSource>(
         log_post_process_state_skipped("run_stats_build", "no block stats");
     }
 
-    time_post_process_result("reporter_finalize", async {
-        for reporter in &mut reporters {
-            reporter.finalize(&report)?;
-        }
-        Ok(())
-    })
-    .await?;
+    log_post_process_state_started("reporter_finalize");
+    for reporter in &mut reporters {
+        reporter.finalize(&report)?;
+    }
+    log_post_process_state_completed("reporter_finalize");
 
-    tracing::info!(
-        elapsed_ms = duration_ms(post_processing_start.elapsed()),
-        "Post-processing completed"
-    );
+    tracing::info!("Post-processing completed");
 
     Ok(())
 }
 
-async fn time_post_process<T, F>(state: &'static str, future: F) -> T
-where
-    F: Future<Output = T>,
-{
-    let start = Instant::now();
-    let output = future.await;
-    tracing::info!(
-        state,
-        elapsed_ms = duration_ms(start.elapsed()),
-        "Post-processing state completed"
-    );
-    output
+fn log_post_process_state_started(state: &'static str) {
+    tracing::info!(state, "Post-processing state started");
 }
 
-async fn time_post_process_result<T, F>(state: &'static str, future: F) -> Result<T>
-where
-    F: Future<Output = Result<T>>,
-{
-    let start = Instant::now();
-    let result = future.await;
-    let elapsed_ms = duration_ms(start.elapsed());
-    match &result {
-        Ok(_) => tracing::info!(state, elapsed_ms, "Post-processing state completed"),
-        Err(err) => {
-            tracing::warn!(state, elapsed_ms, error = %err, "Post-processing state failed");
-        }
-    }
-    result
+fn log_post_process_state_completed(state: &'static str) {
+    tracing::info!(state, "Post-processing state completed");
 }
 
 fn log_post_process_state_skipped(state: &'static str, reason: &'static str) {
     tracing::info!(state, reason, "Post-processing state skipped");
-}
-
-fn duration_ms(duration: Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 async fn run_setup_phase<S: TxSource, P: TxPoolApi<AnyNetwork>>(
