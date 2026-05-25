@@ -20,6 +20,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         rpc_urls = ?args.rpc_urls,
         tps = args.tps,
         skip_setup = args.skip_setup,
+        collect_latencies = args.collect_latencies,
         retries = args.retries.map_or("forever".to_string(), |retries| retries.to_string()),
         "Starting send"
     );
@@ -78,7 +79,7 @@ async fn execute_source<S: TxSource>(
         RunClock::new()
     };
     let store = SampleStore::with_labels(metadata.clone())?;
-    let metrics = MetricsCollector::new(clock.clone());
+    let metrics = MetricsCollector::new_with_latencies(clock.clone(), args.collect_latencies);
 
     // Start background scraper + internal snapshotter after setup so setup is
     // excluded from benchmark metrics.
@@ -112,30 +113,40 @@ async fn execute_source<S: TxSource>(
 
     sender.flush().await;
 
+    let (sent, success, failed) = metrics.counts();
+    tracing::info!(sent, success, failed, "Bench send completed; starting post-processing");
+
     // Wait for the txpool to drain so all transactions are included in blocks
     // before we collect block stats. The scraper and block poller keep running.
     if args.drain_timeout > 0 {
         wait_for_pool_drain(query_provider, args.drain_timeout).await?;
+        tracing::info!("Txpool drain completed");
+    } else {
+        tracing::info!(reason = "--drain-timeout=0", "Skipped txpool drain");
     }
 
     // Stop the scraper before finalizing.
     if !scraper_handles.is_empty() {
-        tracing::info!(
-            scrapers = scraper_handles.len(),
-            scrapes = scraper_handles.iter().map(|h| h.scrape_count()).sum::<u64>(),
-            errors = scraper_handles.iter().map(|h| h.error_count()).sum::<u64>(),
-            "Stopping metrics scrapers"
-        );
+        let scrapers = scraper_handles.len();
+        let scrapes = scraper_handles.iter().map(|h| h.scrape_count()).sum::<u64>();
+        let errors = scraper_handles.iter().map(|h| h.error_count()).sum::<u64>();
         for handle in scraper_handles {
             handle.stop().await;
         }
+        tracing::info!(scrapers, scrapes, errors, "Metrics scrapers stopped");
+    } else {
+        tracing::info!(reason = "no metrics scrapers", "Skipped metrics scraper stop");
     }
 
     let final_metrics = metrics.finalize().await;
+    tracing::info!("Metrics finalized");
+
     let time_series = metrics.time_series().await;
+    tracing::info!("Time series built");
 
     // Finalize the sample archive before reporters read it.
     let sample_archive = store.finish().await?;
+    tracing::info!("Sample archive finalized");
 
     // Collect per-block stats from the chain. The range starts one block after
     // the block that was current before sending (start_block is the last
@@ -143,6 +154,7 @@ async fn execute_source<S: TxSource>(
     // could contain our transactions) and ends at the current latest block.
     let end_block =
         query_provider.get_block_number().await.wrap_err("failed to get ending block number")?;
+    tracing::info!(end_block, "Ending block fetched");
 
     let mut report = FinalReport {
         metadata: metadata.clone(),
@@ -154,15 +166,20 @@ async fn execute_source<S: TxSource>(
 
     if end_block > start_block {
         let block_range_start = start_block + 1;
-        tracing::info!(start = block_range_start, end = end_block, "Collecting per-block stats");
-
         let mut block_stats =
             collect_block_stats(query_provider, block_range_start, end_block).await?;
+        tracing::info!(
+            start = block_range_start,
+            end = end_block,
+            blocks = block_stats.len(),
+            "Block stats collected"
+        );
 
         // Trim trailing empty blocks (system-only, gas_used == 0) that
         // accumulated during the txpool drain wait. Also trim metric
         // samples captured after the last real block.
-        if let Some(cutoff_ms) = trim_trailing_empty_blocks(&mut block_stats) {
+        let cutoff_ms = trim_trailing_empty_blocks(&mut block_stats);
+        if let Some(cutoff_ms) = cutoff_ms {
             report.retain_samples_until(cutoff_ms)?;
             if let Some(ts) = report.time_series.as_mut() {
                 ts.latencies
@@ -171,20 +188,31 @@ async fn execute_source<S: TxSource>(
                     .retain(|t| t.second * 1000 <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
             }
         }
+        tracing::info!(cutoff_ms = ?cutoff_ms, "Report trimmed");
 
         for block in &block_stats {
             for reporter in reporters.iter_mut() {
                 reporter.on_block(block)?;
             }
         }
+        tracing::info!(blocks = block_stats.len(), "Block reporter events emitted");
 
         report.run_stats = Some(RunStats::from_blocks_chain_time(&block_stats));
+        tracing::info!("Run stats built");
         report.blocks = block_stats;
+    } else {
+        tracing::info!(reason = "no new blocks", "Skipped block stats collection");
+        tracing::info!(reason = "no block stats", "Skipped report trim");
+        tracing::info!(reason = "no block stats", "Skipped block reporter events");
+        tracing::info!(reason = "no block stats", "Skipped run stats build");
     }
 
     for reporter in &mut reporters {
         reporter.finalize(&report)?;
     }
+    tracing::info!("Reporters finalized");
+
+    tracing::info!("Post-processing completed");
 
     Ok(())
 }
@@ -197,7 +225,7 @@ async fn run_setup_phase<S: TxSource, P: TxPoolApi<AnyNetwork>>(
     query_provider: &P,
 ) -> Result<Option<GeneratedTx>> {
     let setup_clock = RunClock::new();
-    let setup_metrics = MetricsCollector::new(setup_clock);
+    let setup_metrics = MetricsCollector::new_with_latencies(setup_clock, false);
     let mut setup_sender = Sender::new(providers.to_vec(), config.clone(), setup_metrics.clone());
     let mut setup_seen = 0u64;
 
