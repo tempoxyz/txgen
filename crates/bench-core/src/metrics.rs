@@ -402,8 +402,8 @@ pub fn trim_trailing_empty_blocks(blocks: &mut Vec<BlockStats>) -> Option<u64> {
 /// combines it with the second-precision timestamp. Falls back to
 /// `timestamp_secs * 1000` for standard Ethereum blocks.
 fn extract_timestamp_ms<B: BlockResponse>(block: &B, timestamp_secs: u64) -> u64 {
-    if let Some(other) = block.other_fields()
-        && let Some(Ok(ms_part)) =
+    if let Some(other) = block.other_fields() &&
+        let Some(Ok(ms_part)) =
             other.get_deserialized::<alloy_primitives::U64>("timestampMillisPart")
     {
         return timestamp_secs.saturating_mul(1000).saturating_add(ms_part.to());
@@ -684,8 +684,8 @@ impl MetricsCollector {
             let _ = shutdown.send(());
         }
 
-        if let Some(handle) = self.aggregation_handle.lock().await.take()
-            && let Err(err) = handle.await
+        if let Some(handle) = self.aggregation_handle.lock().await.take() &&
+            let Err(err) = handle.await
         {
             tracing::warn!(%err, "metrics aggregation task failed");
         }
