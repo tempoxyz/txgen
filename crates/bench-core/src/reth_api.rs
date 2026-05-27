@@ -17,14 +17,13 @@ use alloy_primitives::{Bytes, B256};
 use alloy_provider::Provider;
 use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, ForkchoiceUpdated, PayloadStatus};
 use alloy_transport::TransportResult;
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer};
 
 /// Input for `reth_newPayload`.
 ///
 /// Accepts standard execution data, reth-bb big-block data, or raw RLP-encoded block bytes.
 /// Uses `#[serde(untagged)]` to try deserialization in order.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum RethNewPayloadInput {
     /// Standard execution data (payload + sidecar).
@@ -36,9 +35,54 @@ pub enum RethNewPayloadInput {
         /// Raw RLP-encoded block bytes.
         block: Bytes,
         /// RLP-encoded block access list bytes.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         bal: Option<Bytes>,
     },
+}
+
+impl Serialize for RethNewPayloadInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::ExecutionData(data) => data.serialize(serializer),
+            Self::BigBlockData(data) => data.serialize(serializer),
+            Self::BlockRlp { block, bal: None } => block.serialize(serializer),
+            Self::BlockRlp { block, bal: Some(bal) } => {
+                let mut state = serializer.serialize_struct("BlockRlp", 2)?;
+                state.serialize_field("block", block)?;
+                state.serialize_field("bal", bal)?;
+                state.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RethNewPayloadInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RethNewPayloadInputSerde {
+            ExecutionData(Box<ExecutionData>),
+            BigBlockData(Box<BigBlockData<ExecutionData>>),
+            BlockRlp {
+                block: Bytes,
+                #[serde(default)]
+                bal: Option<Bytes>,
+            },
+            LegacyBlockRlp(Bytes),
+        }
+
+        Ok(match RethNewPayloadInputSerde::deserialize(deserializer)? {
+            RethNewPayloadInputSerde::ExecutionData(data) => Self::ExecutionData(data),
+            RethNewPayloadInputSerde::BigBlockData(data) => Self::BigBlockData(data),
+            RethNewPayloadInputSerde::BlockRlp { block, bal } => Self::BlockRlp { block, bal },
+            RethNewPayloadInputSerde::LegacyBlockRlp(block) => Self::BlockRlp { block, bal: None },
+        })
+    }
 }
 
 /// Big-block payload data for reth-bb.
@@ -193,6 +237,46 @@ mod tests {
             RethNewPayloadInput::BlockRlp { block, bal } => {
                 assert_eq!(block.as_ref(), &[0xf8, 0x70, 0x01]);
                 assert_eq!(bal.as_ref().map(Bytes::as_ref), Some(&[0xc0][..]));
+            }
+            RethNewPayloadInput::ExecutionData(_) | RethNewPayloadInput::BigBlockData(_) => {
+                panic!("expected BlockRlp variant")
+            }
+        }
+    }
+
+    #[test]
+    fn test_block_rlp_without_bal_serializes_legacy_bytes() {
+        let input =
+            RethNewPayloadInput::BlockRlp { block: Bytes::from(vec![0xf8, 0x70, 0x01]), bal: None };
+
+        let json = serde_json::to_string(&input)
+            .expect("block RLP without BAL should serialize as legacy bytes");
+        assert_eq!(json, r#""0xf87001""#);
+
+        let deserialized: RethNewPayloadInput =
+            serde_json::from_str(&json).expect("legacy block RLP should deserialize");
+
+        match deserialized {
+            RethNewPayloadInput::BlockRlp { block, bal } => {
+                assert_eq!(block.as_ref(), &[0xf8, 0x70, 0x01]);
+                assert_eq!(bal, None);
+            }
+            RethNewPayloadInput::ExecutionData(_) | RethNewPayloadInput::BigBlockData(_) => {
+                panic!("expected BlockRlp variant")
+            }
+        }
+    }
+
+    #[test]
+    fn test_block_rlp_deserializes_object_without_bal() {
+        let json = r#"{"block":"0xf87001"}"#;
+        let input: RethNewPayloadInput =
+            serde_json::from_str(json).expect("block RLP object without BAL should deserialize");
+
+        match input {
+            RethNewPayloadInput::BlockRlp { block, bal } => {
+                assert_eq!(block.as_ref(), &[0xf8, 0x70, 0x01]);
+                assert_eq!(bal, None);
             }
             RethNewPayloadInput::ExecutionData(_) | RethNewPayloadInput::BigBlockData(_) => {
                 panic!("expected BlockRlp variant")
