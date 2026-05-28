@@ -6,7 +6,12 @@
 //! (as `BlockRlp`) and `reth_forkchoiceUpdated`,
 //! collecting per-block timing and engine status from [`RethPayloadStatus`].
 
-use crate::{metrics_url::metrics_scraper_configs, send::parse_metadata, SendBlocksArgs};
+use crate::{
+    metrics_forwarder::{build_metrics_forwarder, finish_metrics_forwarder, push_samples},
+    metrics_url::metrics_scraper_configs,
+    send::parse_metadata,
+    SendBlocksArgs,
+};
 use alloy_network::Ethereum;
 use alloy_primitives::{Address, Bytes, B256};
 use alloy_provider::{ext::TestingApi, Provider, RootProvider};
@@ -126,6 +131,8 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let clock = RunClock::new();
     let store = SampleStore::with_labels(metadata.clone())?;
     let counters = Arc::new(BlockCounters::default());
+    let metrics_forwarder =
+        build_metrics_forwarder(args.metrics_forward.as_deref(), &metadata, &scraper_configs)?;
 
     // Start background scraper if metrics URL is configured.
     let scraper_handles = if !scraper_configs.is_empty() {
@@ -133,8 +140,9 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         let snap_clock = clock.clone();
         let callback: bench_core::SampleCallback =
             Arc::new(move || snap_counters.snapshot_samples(&snap_clock));
+        let forwarder_handle = metrics_forwarder.as_ref().map(|f| f.handle());
 
-        start_scrapers(&scraper_configs, clock.clone(), store.clone(), callback)
+        start_scrapers(&scraper_configs, clock.clone(), store.clone(), callback, forwarder_handle)
     } else {
         Vec::new()
     };
@@ -214,7 +222,8 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     // Push a final snapshot so counter totals are captured even if the
     // last scraper tick fired before the final block was submitted.
     let final_samples = collector.final_snapshot(&clock);
-    store.push_batch(final_samples).await?;
+    let forwarder_handle = metrics_forwarder.as_ref().map(|f| f.handle());
+    push_samples(&store, forwarder_handle.as_ref(), final_samples).await?;
 
     let sample_archive = store.finish().await?;
 
@@ -235,10 +244,18 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         ..Default::default()
     };
 
+    let mut finalize_result = Ok(());
     for reporter in reporters.iter_mut() {
-        reporter.finalize(&report)?;
+        if let Err(err) = reporter.finalize(&report) {
+            finalize_result = Err(err);
+            break;
+        }
     }
 
+    let forwarder_result = finish_metrics_forwarder(metrics_forwarder).await;
+
+    finalize_result?;
+    forwarder_result?;
     Ok(())
 }
 

@@ -1,6 +1,10 @@
 //! `bench send` - Send transactions from file or stdin
 
-use crate::{metrics_url::metrics_scraper_configs, SendArgs};
+use crate::{
+    metrics_forwarder::{build_metrics_forwarder, finish_metrics_forwarder},
+    metrics_url::metrics_scraper_configs,
+    SendArgs,
+};
 use alloy_network::AnyNetwork;
 use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
@@ -80,6 +84,8 @@ async fn execute_source<S: TxSource>(
     };
     let store = SampleStore::with_labels(metadata.clone())?;
     let metrics = MetricsCollector::new_with_latencies(clock.clone(), args.collect_latencies);
+    let metrics_forwarder =
+        build_metrics_forwarder(args.metrics_forward.as_deref(), metadata, scraper_configs)?;
 
     // Start background scraper + internal snapshotter after setup so setup is
     // excluded from benchmark metrics.
@@ -87,8 +93,9 @@ async fn execute_source<S: TxSource>(
         let snap_metrics = metrics.clone();
         let callback: bench_core::SampleCallback =
             std::sync::Arc::new(move || snap_metrics.snapshot_samples());
+        let forwarder_handle = metrics_forwarder.as_ref().map(|f| f.handle());
 
-        start_scrapers(scraper_configs, clock.clone(), store.clone(), callback)
+        start_scrapers(scraper_configs, clock.clone(), store.clone(), callback, forwarder_handle)
     } else {
         Vec::new()
     };
@@ -207,13 +214,21 @@ async fn execute_source<S: TxSource>(
         tracing::info!(reason = "no block stats", "Skipped run stats build");
     }
 
+    let mut finalize_result = Ok(());
     for reporter in &mut reporters {
-        reporter.finalize(&report)?;
+        if let Err(err) = reporter.finalize(&report) {
+            finalize_result = Err(err);
+            break;
+        }
     }
     tracing::info!("Reporters finalized");
 
     tracing::info!("Post-processing completed");
 
+    let forwarder_result = finish_metrics_forwarder(metrics_forwarder).await;
+
+    finalize_result?;
+    forwarder_result?;
     Ok(())
 }
 

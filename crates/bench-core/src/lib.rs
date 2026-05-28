@@ -25,7 +25,10 @@ pub use metrics::{
     ThroughputSample, TimeSeriesMetrics,
 };
 pub use prometheus::parse_prometheus_text;
-pub use prometheus_reporter::{PrometheusConfig, PrometheusReporter};
+pub use prometheus_reporter::{
+    PrometheusConfig, PrometheusForwarder, PrometheusForwarderHandle, PrometheusForwarderSummary,
+    PrometheusReporter,
+};
 pub use reporter::{
     parse_reporters, ClickHouseConfig, ClickHouseReporter, ConsoleReporter, FinalReport,
     JsonLatency, JsonLatencySample, JsonReport, JsonReporter, JsonTimeSeries, ProgressState,

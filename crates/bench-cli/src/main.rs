@@ -11,6 +11,7 @@ use std::{path::PathBuf, time::Duration};
 
 use crate::metrics_url::{parse_metrics_url, MetricsURL};
 
+mod metrics_forwarder;
 mod metrics_url;
 mod send;
 mod send_blocks;
@@ -85,6 +86,13 @@ pub struct SendArgs {
     /// original offset within the run.
     #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
     pub metrics_align: Option<u64>,
+
+    /// Forward scraped samples in real time via Prometheus remote write.
+    ///
+    /// Uses `/api/v1/write` and the same PROMETHEUS_* environment variables
+    /// as `--report prometheus:<url>`. Requires `--metrics-url`.
+    #[arg(long = "metrics-forward", value_name = "URL")]
+    pub metrics_forward: Option<String>,
 
     /// Collect and report latency metrics.
     ///
@@ -168,6 +176,13 @@ pub struct SendBlocksArgs {
     /// original offset within the run.
     #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
     pub metrics_align: Option<u64>,
+
+    /// Forward scraped samples in real time via Prometheus remote write.
+    ///
+    /// Uses `/api/v1/write` and the same PROMETHEUS_* environment variables
+    /// as `--report prometheus:<url>`. Requires `--metrics-url`.
+    #[arg(long = "metrics-forward", value_name = "URL")]
+    pub metrics_forward: Option<String>,
 
     /// Build a synthetic side fork and alternate forkchoice updates.
     #[arg(
@@ -393,6 +408,48 @@ mod tests {
             args.metrics_url,
             vec![MetricsURL::Unlabeled("http://127.0.0.1:9001/metrics".to_string())]
         );
+    }
+
+    #[test]
+    fn test_send_metrics_forward() {
+        let cli = Cli::try_parse_from([
+            "bench",
+            "send",
+            "--metrics-url",
+            "http://127.0.0.1:9001/metrics",
+            "--metrics-forward",
+            "http://victoriametrics:8428",
+        ])
+        .unwrap();
+
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+
+        assert_eq!(args.metrics_forward, Some("http://victoriametrics:8428".to_string()));
+    }
+
+    #[test]
+    fn test_send_blocks_metrics_forward() {
+        let cli = Cli::try_parse_from([
+            "bench",
+            "send-blocks",
+            "--engine",
+            "http://localhost:8551",
+            "--jwt-secret",
+            "/tmp/jwt.hex",
+            "--metrics-url",
+            "http://127.0.0.1:9001/metrics",
+            "--metrics-forward",
+            "http://prometheus:9090",
+        ])
+        .unwrap();
+
+        let Command::SendBlocks(args) = cli.command else {
+            panic!("expected send-blocks command");
+        };
+
+        assert_eq!(args.metrics_forward, Some("http://prometheus:9090".to_string()));
     }
 
     #[test]

@@ -161,6 +161,7 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `--metrics-url <URL or NODE:URL,...>` | Prometheus endpoint(s) to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
+| `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url` |
 | `--collect-latencies` | Collect and report aggregate latency stats plus individual request samples under `time_series.latencies` (default: disabled) |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 300, 0 to disable) |
@@ -200,6 +201,7 @@ bench send-blocks \
 | `--metrics-url <URL or NODE:URL,...>` | Prometheus endpoint(s) to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
+| `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url` |
 
 For `send-blocks`, aggregate run rates use benchmark wall-clock duration. Per-block timestamps remain the original chain timestamps from the input. With `--reorg`, canonical block stats remain canonical-only, but the wall-clock duration includes synthetic fork block build/submission work.
 
@@ -252,6 +254,7 @@ Report destinations are specified with `--report` and can be repeated:
 | `json:<path>` | Write JSON report to file |
 | `clickhouse:<url>` | Push benchmark data to ClickHouse |
 | `prometheus:<url>` | Push samples via Prometheus remote write (`/api/v1/write`) |
+| `victoriametrics:<url>` | Alias for Prometheus remote write, intended for VictoriaMetrics |
 
 ### Metrics Scraping
 
@@ -275,6 +278,19 @@ Internal txgen metrics are snapshotted on the same interval and included alongsi
 Metadata key=value pairs (`-m key=value`) are applied as labels to all samples, useful for tagging runs with build SHAs, profiles, or experiment IDs.
 
 Use `--metrics-align <TIMESTAMP>` to shift exported sample timestamps while preserving each sample's offset within the run. The timestamp is treated as benchmark start time and may be Unix seconds or milliseconds; after conversion to milliseconds, exported sample `unix_ms` values become `TIMESTAMP + offset_ms`.
+
+`bench send` and `bench send-blocks` can also forward the scrape stream to a
+Prometheus-compatible remote write endpoint while the run is still active:
+
+```bash
+bench send -i txs.ndjson \
+  --metrics-url http://127.0.0.1:9001/metrics \
+  --report json:report.json \
+  --metrics-forward http://victoriametrics:8428 \
+  -m scenario=tip20-10k -m run_id=$(uuidgen)
+```
+
+This uses the same Prometheus remote write payload and `PROMETHEUS_*` environment variables as the Prometheus reporter, but uploads each scrape batch as it is archived. The JSON reporter still writes the compressed `.samples.ndjson.gz` sidecar at finalization.
 
 ### ClickHouse Reporting
 
@@ -328,6 +344,7 @@ Connection knobs are read from environment variables to keep secrets off the com
 | `PROMETHEUS_TENANT_ID` | Cluster VM `accountID` query parameter |
 | `PROMETHEUS_BATCH_SIZE` | Samples per HTTP request (default: `10000`) |
 | `PROMETHEUS_TIMEOUT_SECS` | Per-request HTTP timeout in seconds (default: `60`) |
+| `PROMETHEUS_QUEUE_SIZE` | Real-time forwarder queue size in scrape batches (default: `16`) |
 
 Example with auth:
 
