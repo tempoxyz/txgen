@@ -91,12 +91,7 @@ pub struct SendArgs {
     ///
     /// Uses `/api/v1/write` and the same PROMETHEUS_* environment variables
     /// as `--report prometheus:<url>`. Requires `--metrics-url`.
-    #[arg(
-        long = "metrics-forward",
-        alias = "victoriametrics-forward",
-        alias = "vm-forward",
-        value_name = "URL"
-    )]
+    #[arg(long = "metrics-forward", value_name = "URL")]
     pub metrics_forward: Option<String>,
 
     /// Skip setup-phase transactions in the input stream.
@@ -178,12 +173,7 @@ pub struct SendBlocksArgs {
     ///
     /// Uses `/api/v1/write` and the same PROMETHEUS_* environment variables
     /// as `--report prometheus:<url>`. Requires `--metrics-url`.
-    #[arg(
-        long = "metrics-forward",
-        alias = "victoriametrics-forward",
-        alias = "vm-forward",
-        value_name = "URL"
-    )]
+    #[arg(long = "metrics-forward", value_name = "URL")]
     pub metrics_forward: Option<String>,
 
     /// Build a synthetic side fork and alternate forkchoice updates.
@@ -391,13 +381,13 @@ mod tests {
     }
 
     #[test]
-    fn test_send_metrics_forward_aliases() {
+    fn test_send_metrics_forward() {
         let cli = Cli::try_parse_from([
             "bench",
             "send",
             "--metrics-url",
             "http://127.0.0.1:9001/metrics",
-            "--vm-forward",
+            "--metrics-forward",
             "http://victoriametrics:8428",
         ])
         .unwrap();

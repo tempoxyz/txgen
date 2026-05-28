@@ -161,7 +161,7 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `--metrics-url <URL or NODE:URL,...>` | Prometheus endpoint(s) to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
-| `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url`. `--victoriametrics-forward` and `--vm-forward` are accepted as aliases |
+| `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url` |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 300, 0 to disable) |
 
@@ -200,7 +200,7 @@ bench send-blocks \
 | `--metrics-url <URL or NODE:URL,...>` | Prometheus endpoint(s) to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
-| `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url`. `--victoriametrics-forward` and `--vm-forward` are accepted as aliases |
+| `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url` |
 
 For `send-blocks`, aggregate run rates use benchmark wall-clock duration. Per-block timestamps remain the original chain timestamps from the input. With `--reorg`, canonical block stats remain canonical-only, but the wall-clock duration includes synthetic fork block build/submission work.
 
@@ -289,7 +289,7 @@ bench send -i txs.ndjson \
   -m scenario=tip20-10k -m run_id=$(uuidgen)
 ```
 
-This uses the same Prometheus remote write payload and `PROMETHEUS_*` environment variables as the Prometheus reporter, but uploads each scrape batch as it is archived. The JSON reporter still writes the compressed `.samples.ndjson.gz` sidecar at finalization. For backwards compatibility, `--victoriametrics-forward` and `--vm-forward` are aliases for `--metrics-forward`.
+This uses the same Prometheus remote write payload and `PROMETHEUS_*` environment variables as the Prometheus reporter, but uploads each scrape batch as it is archived. The JSON reporter still writes the compressed `.samples.ndjson.gz` sidecar at finalization.
 
 ### ClickHouse Reporting
 
