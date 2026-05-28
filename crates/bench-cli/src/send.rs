@@ -100,24 +100,33 @@ async fn execute_source<S: TxSource>(
         reporters.push(Box::new(ConsoleReporter::stderr(true)));
     }
 
+    let mut send_result = SendResult::default();
+
     // Record the block number after setup and before workload sending so per-block
     // stats exclude setup blocks.
     let start_block =
         query_provider.get_block_number().await.wrap_err("failed to get starting block number")?;
 
     if let Some(tx) = first_workload {
-        send_workload_tx(tx, &mut sender, &metrics, &config, &mut reporters).await?;
+        let result = send_workload_tx(tx, &mut sender, &metrics, &config, &mut reporters).await?;
+        send_result = send_result.combine(result);
     }
 
-    send_workload_from_source(source, &mut sender, &metrics, &config, &mut reporters).await?;
+    send_result = send_result.combine(
+        send_workload_from_source(source, &mut sender, &metrics, &config, &mut reporters).await?,
+    );
 
     sender.flush().await;
+    let end_block =
+        query_provider.get_block_number().await.wrap_err("failed to get ending block number")?;
+    tracing::info!(end_block, "Ending block fetched after workload sending completed");
 
     let (sent, success, failed) = metrics.counts();
     tracing::info!(sent, success, failed, "Bench send completed; starting post-processing");
 
-    // Wait for the txpool to drain so all transactions are included in blocks
-    // before we collect block stats. The scraper and block poller keep running.
+    // Wait for the txpool to drain before finalizing reports. `end_block` was
+    // captured immediately after sending completed, so block stats exclude
+    // blocks produced only while the pool drains.
     if args.drain_timeout > 0 {
         wait_for_pool_drain(query_provider, args.drain_timeout).await?;
         tracing::info!("Txpool drain completed");
@@ -149,12 +158,10 @@ async fn execute_source<S: TxSource>(
     tracing::info!("Sample archive finalized");
 
     // Collect per-block stats from the chain. The range starts one block after
-    // the block that was current before sending (start_block is the last
-    // existing block at that point, so start_block+1 is the first block that
-    // could contain our transactions) and ends at the current latest block.
-    let end_block =
-        query_provider.get_block_number().await.wrap_err("failed to get ending block number")?;
-    tracing::info!(end_block, "Ending block fetched");
+    // the block that was current before sending. Ramp-up blocks before the
+    // first submitted target-TPS batch are removed by timestamp below.
+    // The range ends at the block that was current immediately after workload
+    // sending completed.
 
     let mut report = FinalReport {
         metadata: metadata.clone(),
@@ -189,6 +196,25 @@ async fn execute_source<S: TxSource>(
             }
         }
         tracing::info!(cutoff_ms = ?cutoff_ms, "Report trimmed");
+
+        if let Some(cutoff_ms) = send_result.target_tps_reached_unix_ms {
+            let trim_count = block_stats
+                .iter()
+                .position(|block| block.timestamp_ms > cutoff_ms)
+                .unwrap_or(block_stats.len());
+            if trim_count > 0 {
+                block_stats.drain(..trim_count);
+                if let Some(first) = block_stats.first_mut() {
+                    first.block_time_ms = None;
+                }
+                tracing::info!(
+                    trimmed_blocks = trim_count,
+                    target_tps = config.rate_limit,
+                    cutoff_ms,
+                    "Trimmed ramp-up blocks before submitted target TPS"
+                );
+            }
+        }
 
         for block in &block_stats {
             for reporter in reporters.iter_mut() {
@@ -304,20 +330,37 @@ pub(crate) fn parse_metadata(args: &[String]) -> Result<HashMap<String, String>>
     Ok(map)
 }
 
+#[derive(Default)]
+struct SendResult {
+    target_tps_reached_unix_ms: Option<u64>,
+}
+
+impl SendResult {
+    fn combine(mut self, other: Self) -> Self {
+        self.target_tps_reached_unix_ms =
+            self.target_tps_reached_unix_ms.or(other.target_tps_reached_unix_ms);
+        self
+    }
+}
+
 async fn send_workload_from_source<S: TxSource>(
     source: &mut S,
     sender: &mut Sender,
     metrics: &MetricsCollector,
     config: &SenderConfig,
     reporters: &mut [Box<dyn Reporter>],
-) -> Result<()> {
+) -> Result<SendResult> {
+    let mut send_result = SendResult::default();
+
     while let Some(tx) = source.next_tx().await? {
         if tx.phase == TxPhase::Setup {
             bail!("setup transaction appeared after workload started");
         }
-        send_workload_tx(tx, sender, metrics, config, reporters).await?;
+        send_result =
+            send_result.combine(send_workload_tx(tx, sender, metrics, config, reporters).await?);
     }
-    Ok(())
+
+    Ok(send_result)
 }
 
 async fn send_workload_tx(
@@ -326,7 +369,8 @@ async fn send_workload_tx(
     metrics: &MetricsCollector,
     config: &SenderConfig,
     reporters: &mut [Box<dyn Reporter>],
-) -> Result<()> {
+) -> Result<SendResult> {
+    let sent_before = metrics.counts().0;
     sender.send(tx).await?;
 
     let (sent, success, failed) = metrics.counts();
@@ -345,7 +389,10 @@ async fn send_workload_tx(
         }
     }
 
-    Ok(())
+    let target_tps_reached_unix_ms =
+        (config.rate_limit > 0 && sent_before < config.rate_limit && sent >= config.rate_limit)
+            .then(|| metrics.clock().unix_ms());
+    Ok(SendResult { target_tps_reached_unix_ms })
 }
 
 /// Wait for the transaction pool to drain (pending count reaches zero).
