@@ -161,7 +161,7 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `--metrics-url <URL or NODE:URL,...>` | Prometheus endpoint(s) to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
-| `--victoriametrics-forward <URL>` / `--vm-forward <URL>` | Forward scraped samples to VictoriaMetrics in real time via Prometheus remote write; requires `--metrics-url` |
+| `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url`. `--victoriametrics-forward` and `--vm-forward` are accepted as aliases |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 300, 0 to disable) |
 
@@ -200,6 +200,7 @@ bench send-blocks \
 | `--metrics-url <URL or NODE:URL,...>` | Prometheus endpoint(s) to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
 | `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
+| `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url`. `--victoriametrics-forward` and `--vm-forward` are accepted as aliases |
 
 For `send-blocks`, aggregate run rates use benchmark wall-clock duration. Per-block timestamps remain the original chain timestamps from the input. With `--reorg`, canonical block stats remain canonical-only, but the wall-clock duration includes synthetic fork block build/submission work.
 
@@ -277,17 +278,18 @@ Metadata key=value pairs (`-m key=value`) are applied as labels to all samples, 
 
 Use `--metrics-align <TIMESTAMP>` to shift exported sample timestamps while preserving each sample's offset within the run. The timestamp is treated as benchmark start time and may be Unix seconds or milliseconds; after conversion to milliseconds, exported sample `unix_ms` values become `TIMESTAMP + offset_ms`.
 
-`bench send` can also forward the scrape stream to VictoriaMetrics while the run is still active:
+`bench send` and `bench send-blocks` can also forward the scrape stream to a
+Prometheus-compatible remote write endpoint while the run is still active:
 
 ```bash
 bench send -i txs.ndjson \
   --metrics-url http://127.0.0.1:9001/metrics \
   --report json:report.json \
-  --victoriametrics-forward http://victoriametrics:8428 \
+  --metrics-forward http://victoriametrics:8428 \
   -m scenario=tip20-10k -m run_id=$(uuidgen)
 ```
 
-This uses the same Prometheus remote write payload and `PROMETHEUS_*` environment variables as the Prometheus reporter, but uploads each scrape batch as it is archived. The JSON reporter still writes the compressed `.samples.ndjson.gz` sidecar at finalization.
+This uses the same Prometheus remote write payload and `PROMETHEUS_*` environment variables as the Prometheus reporter, but uploads each scrape batch as it is archived. The JSON reporter still writes the compressed `.samples.ndjson.gz` sidecar at finalization. For backwards compatibility, `--victoriametrics-forward` and `--vm-forward` are aliases for `--metrics-forward`.
 
 ### ClickHouse Reporting
 
