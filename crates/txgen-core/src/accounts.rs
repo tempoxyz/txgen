@@ -1,14 +1,13 @@
 use alloy_primitives::{keccak256, Address, B256};
 use alloy_signer::Signer;
-use alloy_signer_local::{coins_bip39::English, LocalSigner, MnemonicBuilder};
+use alloy_signer_local::{coins_bip39::English, MnemonicBuilder, Secp256k1Signer};
 use eyre::{bail, Result, WrapErr};
-use k256::ecdsa::SigningKey;
 use rand::Rng;
 use serde::{Deserialize, Deserializer};
 use std::{collections::HashMap, sync::Mutex};
 
 /// Type alias for our signer type.
-pub type EcdsaSigner = LocalSigner<SigningKey>;
+pub type EcdsaSigner = Secp256k1Signer;
 
 /// Manages signer account pools derived from mnemonics.
 #[derive(Debug)]
@@ -250,6 +249,7 @@ impl AccountPoolDef {
                     .index(idx)
                     .map_err(|e| eyre::eyre!("failed to set mnemonic: {e}"))?
                     .build()
+                    .map(|signer| signer.to_secp256k1())
                     .map_err(|e| eyre::eyre!("failed to derive signer at index {idx}: {e}"))
             })
             .collect()
@@ -390,6 +390,7 @@ fn derive_address(mnemonic: &str, idx: u32) -> Result<Address> {
         .index(idx)
         .map_err(|e| eyre::eyre!("failed to set mnemonic: {e}"))?
         .build()
+        .map(|signer| signer.to_secp256k1())
         .map(|signer: EcdsaSigner| signer.address())
         .map_err(|e| eyre::eyre!("failed to derive address at index {idx}: {e}"))
 }
@@ -442,7 +443,7 @@ impl<'de> Deserialize<'de> for SelectMode {
     }
 }
 
-/// Extension trait for LocalSigner to get the address.
+/// Extension trait for txgen signers to get the address.
 pub trait SignerExt {
     fn address(&self) -> Address;
 }
