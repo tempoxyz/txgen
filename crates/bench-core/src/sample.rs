@@ -103,8 +103,8 @@ impl SampleArchive {
             }
 
             if sample_line_unix_ms(&line)
-                .wrap_err("failed to scan sample archive line timestamp")? <=
-                cutoff_ms
+                .wrap_err("failed to scan sample archive line timestamp")?
+                <= cutoff_ms
             {
                 writer.write_all(&line)?;
                 written += 1;
@@ -205,8 +205,8 @@ fn sample_line_unix_ms(line: &[u8]) -> Result<u64> {
     if !has_digits {
         eyre::bail!("sample archive line has invalid unix_ms value");
     }
-    if let Some(byte) = line.get(index).copied() &&
-        !matches!(byte, b',' | b'}' | b' ' | b'\n' | b'\r' | b'\t')
+    if let Some(byte) = line.get(index).copied()
+        && !matches!(byte, b',' | b'}' | b' ' | b'\n' | b'\r' | b'\t')
     {
         eyre::bail!("sample archive line has invalid unix_ms delimiter");
     }
@@ -264,8 +264,23 @@ impl SampleStore {
 
     /// Append a batch of samples.
     pub async fn push_batch(&self, samples: Vec<Sample>) -> Result<()> {
+        self.push_batch_inner(samples, false).await.map(|_| ())
+    }
+
+    /// Append a batch of samples and return the samples that were actually written.
+    ///
+    /// Returned samples have store-level labels applied and exclude non-finite values.
+    pub async fn push_batch_and_collect(&self, samples: Vec<Sample>) -> Result<Vec<Sample>> {
+        self.push_batch_inner(samples, true).await
+    }
+
+    async fn push_batch_inner(
+        &self,
+        samples: Vec<Sample>,
+        collect_written: bool,
+    ) -> Result<Vec<Sample>> {
         if samples.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let mut inner = self.inner.lock().await;
@@ -277,6 +292,8 @@ impl SampleStore {
 
         let mut written = 0usize;
         let mut skipped_non_finite = 0usize;
+        let mut written_samples =
+            if collect_written { Vec::with_capacity(samples.len()) } else { Vec::new() };
         for mut sample in samples {
             if !sample.value.is_finite() {
                 skipped_non_finite += 1;
@@ -286,6 +303,9 @@ impl SampleStore {
             apply_labels(&mut sample, &labels);
             serde_json::to_writer(&mut *writer, &sample)?;
             writeln!(writer)?;
+            if collect_written {
+                written_samples.push(sample);
+            }
             written += 1;
         }
         if skipped_non_finite > 0 {
@@ -296,7 +316,7 @@ impl SampleStore {
         }
         writer.flush()?;
         inner.len += written;
-        Ok(())
+        Ok(written_samples)
     }
 
     /// Finalize the sample archive.
@@ -391,6 +411,26 @@ mod tests {
         let samples = archive.iter().unwrap().collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(samples[0].labels["run_id"], "abc");
         assert_eq!(samples[0].labels["node"], "a");
+    }
+
+    #[tokio::test]
+    async fn push_batch_and_collect_returns_written_labeled_samples() {
+        let store =
+            SampleStore::with_labels(HashMap::from([("run_id".to_string(), "abc".to_string())]))
+                .unwrap();
+
+        let written = store
+            .push_batch_and_collect(vec![
+                make_sample("finite", 1.0, 0),
+                make_sample("nan", f64::NAN, 100),
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].name, "finite");
+        assert_eq!(written[0].labels["run_id"], "abc");
+        assert_eq!(store.len().await, 1);
     }
 
     #[tokio::test]

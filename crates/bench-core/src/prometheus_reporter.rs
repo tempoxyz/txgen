@@ -22,20 +22,24 @@
 //! | `PROMETHEUS_TENANT_ID`        | Cluster tenant / accountID query param               |
 //! | `PROMETHEUS_BATCH_SIZE`       | Samples per HTTP request (default: 10_000)           |
 //! | `PROMETHEUS_TIMEOUT_SECS`     | Per-request timeout in seconds (default: 60)         |
+//! | `PROMETHEUS_QUEUE_SIZE`       | Real-time forwarder queue size (default: 16 batches) |
 
 use crate::{reporter::FinalReport, sample::Sample, Reporter};
-use eyre::{bail, Context, Result};
+use eyre::{bail, eyre, Context, Result};
 use prometheus_remote_write::{
     Label, Sample as PromSample, TimeSeries, WriteRequest, CONTENT_TYPE,
     HEADER_NAME_REMOTE_WRITE_VERSION, LABEL_NAME, REMOTE_WRITE_VERSION_01,
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 /// Default samples per ingestion request.
 const DEFAULT_BATCH_SIZE: usize = 10_000;
 /// Default per-request HTTP timeout.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
+/// Default number of scrape batches buffered by the real-time forwarder.
+const DEFAULT_QUEUE_SIZE: usize = 16;
 
 /// Configuration for the Prometheus remote write reporter.
 #[derive(Debug, Clone)]
@@ -130,7 +134,7 @@ impl PrometheusReporter {
             url = %config.base_url,
             batch_size = config.batch_size,
             tenant = ?config.tenant_id,
-            "Prometheus remote write reporter initialized"
+            "Prometheus remote write client initialized"
         );
 
         Ok(Self { config, client, import_url: url })
@@ -154,7 +158,7 @@ impl PrometheusReporter {
     }
 
     /// Send a single batch of samples as a snappy-compressed protobuf WriteRequest.
-    fn send_batch(&self, batch: &[Sample], batch_idx: usize) -> Result<()> {
+    async fn send_batch_async(&self, batch: &[Sample], batch_idx: usize) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -174,19 +178,15 @@ impl PrometheusReporter {
         );
 
         let headers = self.headers()?;
-        let rt = tokio::runtime::Handle::current();
-
         let mut req = self.client.post(&self.import_url).headers(headers).body(body);
         if let Some((user, password)) = &self.config.basic_auth {
             req = req.basic_auth(user, Some(password));
         }
 
-        let resp = tokio::task::block_in_place(|| rt.block_on(req.send()))
-            .wrap_err("failed to POST remote write")?;
+        let resp = req.send().await.wrap_err("failed to POST remote write")?;
 
         let status = resp.status();
-        let resp_body = tokio::task::block_in_place(|| rt.block_on(resp.text()))
-            .unwrap_or_else(|_| "<no body>".to_string());
+        let resp_body = resp.text().await.unwrap_or_else(|_| "<no body>".to_string());
 
         if !status.is_success() {
             tracing::error!(
@@ -206,6 +206,12 @@ impl PrometheusReporter {
             "Remote write batch accepted"
         );
         Ok(())
+    }
+
+    /// Send a single batch from the synchronous reporter interface.
+    fn send_batch(&self, batch: &[Sample], batch_idx: usize) -> Result<()> {
+        let rt = tokio::runtime::Handle::current();
+        tokio::task::block_in_place(|| rt.block_on(self.send_batch_async(batch, batch_idx)))
     }
 }
 
@@ -236,6 +242,100 @@ impl Reporter for PrometheusReporter {
         tracing::info!(samples = pushed, "remote write push complete");
         Ok(())
     }
+}
+
+/// Summary returned after a real-time remote-write forwarder drains.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrometheusForwarderSummary {
+    /// Number of HTTP remote-write requests accepted by the endpoint.
+    pub batches: usize,
+    /// Number of samples submitted to those requests.
+    pub samples: usize,
+}
+
+/// Background real-time Prometheus remote-write forwarder.
+///
+/// Scrapers enqueue each archived sample batch as it is collected. The worker
+/// preserves the same remote-write payload format used by [`PrometheusReporter`]
+/// while keeping HTTP uploads out of the scraper task.
+pub struct PrometheusForwarder {
+    tx: mpsc::Sender<Vec<Sample>>,
+    handle: tokio::task::JoinHandle<Result<PrometheusForwarderSummary>>,
+}
+
+/// Cloneable enqueue handle for [`PrometheusForwarder`].
+#[derive(Debug, Clone)]
+pub struct PrometheusForwarderHandle {
+    tx: mpsc::Sender<Vec<Sample>>,
+}
+
+impl PrometheusForwarder {
+    /// Spawn a real-time forwarder task.
+    pub fn spawn(config: PrometheusConfig) -> Result<Self> {
+        let queue_size = prometheus_queue_size();
+        let writer = PrometheusReporter::new(config)?;
+        let (tx, rx) = mpsc::channel(queue_size);
+        let handle = tokio::spawn(run_forwarder(writer, rx));
+
+        tracing::info!(queue_size, "Prometheus remote write forwarder started");
+
+        Ok(Self { tx, handle })
+    }
+
+    /// Return a cloneable handle for scraper tasks.
+    pub fn handle(&self) -> PrometheusForwarderHandle {
+        PrometheusForwarderHandle { tx: self.tx.clone() }
+    }
+
+    /// Close the queue, wait for all enqueued samples to upload, and return upload stats.
+    pub async fn finish(self) -> Result<PrometheusForwarderSummary> {
+        let Self { tx, handle } = self;
+        drop(tx);
+        handle.await.wrap_err("Prometheus remote write forwarder task failed")?
+    }
+}
+
+impl PrometheusForwarderHandle {
+    /// Enqueue a sample batch for real-time remote write.
+    pub async fn push_batch(&self, samples: Vec<Sample>) -> Result<()> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        self.tx.send(samples).await.map_err(|_| eyre!("Prometheus remote write forwarder stopped"))
+    }
+}
+
+async fn run_forwarder(
+    writer: PrometheusReporter,
+    mut rx: mpsc::Receiver<Vec<Sample>>,
+) -> Result<PrometheusForwarderSummary> {
+    let mut summary = PrometheusForwarderSummary::default();
+    let mut batch_idx = 0usize;
+
+    while let Some(samples) = rx.recv().await {
+        for chunk in samples.chunks(writer.config.batch_size) {
+            writer.send_batch_async(chunk, batch_idx).await?;
+            summary.batches += 1;
+            summary.samples += chunk.len();
+            batch_idx += 1;
+        }
+    }
+
+    tracing::info!(
+        batches = summary.batches,
+        samples = summary.samples,
+        "Prometheus remote write forwarder drained"
+    );
+
+    Ok(summary)
+}
+
+fn prometheus_queue_size() -> usize {
+    std::env::var("PROMETHEUS_QUEUE_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(DEFAULT_QUEUE_SIZE)
 }
 
 /// Build a [`WriteRequest`] from a batch of [`Sample`]s.
@@ -335,6 +435,7 @@ fn sanitize_label_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
 
     fn sample(name: &str, value: f64, labels: &[(&str, &str)]) -> Sample {
         Sample {
@@ -432,5 +533,71 @@ mod tests {
 
         assert_eq!(cfg.base_url, "http://prometheus:8428");
         assert_eq!(reporter.import_url, "http://prometheus:8428/api/v1/write");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forwarder_uploads_enqueued_samples_in_batches() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                bodies.push(read_http_request_body(&mut stream));
+                stream
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+            }
+            bodies
+        });
+
+        let mut cfg =
+            PrometheusConfig::from_metadata(&base_url, &std::collections::HashMap::new()).unwrap();
+        cfg.batch_size = 1;
+        cfg.timeout = Duration::from_secs(5);
+
+        let forwarder = PrometheusForwarder::spawn(cfg).unwrap();
+        let handle = forwarder.handle();
+        handle
+            .push_batch(vec![sample("metric_a", 1.0, &[]), sample("metric_b", 2.0, &[])])
+            .await
+            .unwrap();
+        drop(handle);
+
+        let summary = tokio::time::timeout(Duration::from_secs(5), forwarder.finish())
+            .await
+            .unwrap()
+            .unwrap();
+        let bodies = server.join().unwrap();
+
+        assert_eq!(summary, PrometheusForwarderSummary { batches: 2, samples: 2 });
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies.iter().all(|body| !body.is_empty()));
+    }
+
+    fn read_http_request_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        let mut headers = Vec::new();
+        let mut byte = [0u8; 1];
+        while !headers.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            headers.push(byte[0]);
+        }
+
+        let headers = String::from_utf8(headers).unwrap();
+        assert!(headers.starts_with("POST /api/v1/write "));
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+
+        let mut body = vec![0u8; content_length];
+        stream.read_exact(&mut body).unwrap();
+        body
     }
 }

@@ -8,8 +8,8 @@ use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     collect_block_stats, parse_reporters, start_scrapers, trim_trailing_empty_blocks,
     ConsoleReporter, FileSource, FinalReport, GeneratedTx, MetricsCollector, ProgressState,
-    Reporter, RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, StdinSource,
-    TxPhase, TxSource,
+    PrometheusConfig, PrometheusForwarder, Reporter, RunClock, RunStats, SampleStore,
+    ScraperConfig, Sender, SenderConfig, StdinSource, TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, time::Duration};
@@ -79,6 +79,8 @@ async fn execute_source<S: TxSource>(
     };
     let store = SampleStore::with_labels(metadata.clone())?;
     let metrics = MetricsCollector::new(clock.clone());
+    let victoriametrics_forwarder =
+        build_victoriametrics_forwarder(args, metadata, scraper_configs)?;
 
     // Start background scraper + internal snapshotter after setup so setup is
     // excluded from benchmark metrics.
@@ -86,8 +88,9 @@ async fn execute_source<S: TxSource>(
         let snap_metrics = metrics.clone();
         let callback: bench_core::SampleCallback =
             std::sync::Arc::new(move || snap_metrics.snapshot_samples());
+        let forwarder_handle = victoriametrics_forwarder.as_ref().map(|f| f.handle());
 
-        start_scrapers(scraper_configs, clock.clone(), store.clone(), callback)
+        start_scrapers(scraper_configs, clock.clone(), store.clone(), callback, forwarder_handle)
     } else {
         Vec::new()
     };
@@ -182,11 +185,52 @@ async fn execute_source<S: TxSource>(
         report.blocks = block_stats;
     }
 
+    let mut finalize_result = Ok(());
     for reporter in &mut reporters {
-        reporter.finalize(&report)?;
+        if let Err(err) = reporter.finalize(&report) {
+            finalize_result = Err(err);
+            break;
+        }
     }
 
+    let forwarder_result = if let Some(forwarder) = victoriametrics_forwarder {
+        forwarder
+            .finish()
+            .await
+            .map(|summary| {
+                tracing::info!(
+                    batches = summary.batches,
+                    samples = summary.samples,
+                    "VictoriaMetrics forwarding complete"
+                );
+            })
+            .wrap_err("VictoriaMetrics forwarding failed")
+    } else {
+        Ok(())
+    };
+
+    finalize_result?;
+    forwarder_result?;
     Ok(())
+}
+
+fn build_victoriametrics_forwarder(
+    args: &SendArgs,
+    metadata: &HashMap<String, String>,
+    scraper_configs: &[ScraperConfig],
+) -> Result<Option<PrometheusForwarder>> {
+    let Some(url) = args.victoriametrics_forward.as_deref() else {
+        return Ok(None);
+    };
+
+    if scraper_configs.is_empty() {
+        bail!("--victoriametrics-forward requires at least one --metrics-url");
+    }
+
+    let config = PrometheusConfig::from_metadata(url, metadata)?;
+    PrometheusForwarder::spawn(config)
+        .map(Some)
+        .wrap_err("failed to create VictoriaMetrics forwarder")
 }
 
 async fn run_setup_phase<S: TxSource, P: TxPoolApi<AnyNetwork>>(

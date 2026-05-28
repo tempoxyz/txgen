@@ -86,6 +86,14 @@ pub struct SendArgs {
     #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
     pub metrics_align: Option<u64>,
 
+    /// Forward scraped samples to VictoriaMetrics in real time.
+    ///
+    /// Uses Prometheus remote write at `/api/v1/write` and the same
+    /// PROMETHEUS_* environment variables as `--report victoriametrics:<url>`.
+    /// Requires `--metrics-url`.
+    #[arg(long = "victoriametrics-forward", alias = "vm-forward", value_name = "URL")]
+    pub victoriametrics_forward: Option<String>,
+
     /// Skip setup-phase transactions in the input stream.
     #[arg(long)]
     pub skip_setup: bool,
@@ -363,6 +371,25 @@ mod tests {
             args.metrics_url,
             vec![MetricsURL::Unlabeled("http://127.0.0.1:9001/metrics".to_string())]
         );
+    }
+
+    #[test]
+    fn test_send_vm_forward_alias() {
+        let cli = Cli::try_parse_from([
+            "bench",
+            "send",
+            "--metrics-url",
+            "http://127.0.0.1:9001/metrics",
+            "--vm-forward",
+            "http://victoriametrics:8428",
+        ])
+        .unwrap();
+
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+
+        assert_eq!(args.victoriametrics_forward, Some("http://victoriametrics:8428".to_string()));
     }
 
     #[test]

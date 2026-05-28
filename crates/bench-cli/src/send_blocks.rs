@@ -134,7 +134,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         let callback: bench_core::SampleCallback =
             Arc::new(move || snap_counters.snapshot_samples(&snap_clock));
 
-        start_scrapers(&scraper_configs, clock.clone(), store.clone(), callback)
+        start_scrapers(&scraper_configs, clock.clone(), store.clone(), callback, None)
     } else {
         Vec::new()
     };

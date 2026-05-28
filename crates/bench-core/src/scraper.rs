@@ -6,6 +6,7 @@
 use crate::{
     clock::RunClock,
     prometheus::parse_prometheus_text,
+    prometheus_reporter::PrometheusForwarderHandle,
     sample::{Sample, SampleStore},
 };
 use std::{
@@ -106,6 +107,7 @@ pub fn start_scrapers(
     clock: RunClock,
     store: SampleStore,
     callback: SampleCallback,
+    forwarder: Option<PrometheusForwarderHandle>,
 ) -> Vec<ScraperHandle> {
     let (stop_tx, stop_rx) = watch::channel(false);
     let scrape_count = Arc::new(AtomicU64::new(0));
@@ -120,6 +122,7 @@ pub fn start_scrapers(
                 clock.clone(),
                 store.clone(),
                 (idx == 0).then(|| callback.clone()),
+                forwarder.clone(),
                 stop_rx.clone(),
                 scrape_count.clone(),
                 error_count.clone(),
@@ -140,6 +143,7 @@ async fn scraper_loop(
     clock: RunClock,
     store: SampleStore,
     extra_samples: Option<SampleCallback>,
+    forwarder: Option<PrometheusForwarderHandle>,
     mut stop_rx: watch::Receiver<bool>,
     scrape_count: Arc<AtomicU64>,
     error_count: Arc<AtomicU64>,
@@ -167,10 +171,10 @@ async fn scraper_loop(
         // Collect extra samples (e.g. internal metrics) at the same offset.
         if let Some(ref cb) = extra_samples {
             let extra = cb();
-            if !extra.is_empty() &&
-                let Err(err) = store.push_batch(extra).await
+            if !extra.is_empty()
+                && let Err(err) = push_samples(&store, forwarder.as_ref(), extra).await
             {
-                tracing::warn!(%err, "failed to write internal metric samples");
+                tracing::warn!(%err, "failed to write or forward internal metric samples");
             }
         }
 
@@ -179,10 +183,10 @@ async fn scraper_loop(
                 Ok(text) => {
                     let mut samples = parse_prometheus_text(&text, offset_ms, unix_ms);
                     apply_node_label(&mut samples, config.node_label.as_deref());
-                    if !samples.is_empty() &&
-                        let Err(err) = store.push_batch(samples).await
+                    if !samples.is_empty()
+                        && let Err(err) = push_samples(&store, forwarder.as_ref(), samples).await
                     {
-                        tracing::warn!(%err, url = %config.url, "failed to write scraped metric samples");
+                        tracing::warn!(%err, url = %config.url, "failed to write or forward scraped metric samples");
                     }
                     scrape_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -197,6 +201,21 @@ async fn scraper_loop(
             }
         }
     }
+}
+
+async fn push_samples(
+    store: &SampleStore,
+    forwarder: Option<&PrometheusForwarderHandle>,
+    samples: Vec<Sample>,
+) -> eyre::Result<()> {
+    let Some(forwarder) = forwarder else {
+        store.push_batch(samples).await?;
+        return Ok(());
+    };
+
+    let samples = store.push_batch_and_collect(samples).await?;
+    forwarder.push_batch(samples).await?;
+    Ok(())
 }
 
 fn apply_node_label(samples: &mut [Sample], node_label: Option<&str>) {
