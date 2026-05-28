@@ -94,6 +94,14 @@ pub struct SendArgs {
     #[arg(long = "metrics-forward", value_name = "URL")]
     pub metrics_forward: Option<String>,
 
+    /// Collect and report latency metrics.
+    ///
+    /// Disabled by default to avoid retaining one timestamped latency sample per
+    /// successful transaction. When enabled, reports aggregate latency stats
+    /// and individual samples under time_series.latencies.
+    #[arg(long)]
+    pub collect_latencies: bool,
+
     /// Skip setup-phase transactions in the input stream.
     #[arg(long)]
     pub skip_setup: bool,
@@ -358,6 +366,28 @@ mod tests {
         };
 
         assert_eq!(args.retries, Some(0));
+    }
+
+    #[test]
+    fn test_send_collect_latencies_default_disabled() {
+        let cli = Cli::try_parse_from(["bench", "send"]).unwrap();
+
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+
+        assert!(!args.collect_latencies);
+    }
+
+    #[test]
+    fn test_send_collect_latencies_enabled() {
+        let cli = Cli::try_parse_from(["bench", "send", "--collect-latencies"]).unwrap();
+
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+
+        assert!(args.collect_latencies);
     }
 
     #[test]
