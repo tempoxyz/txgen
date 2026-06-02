@@ -100,7 +100,7 @@ impl Sender {
             None
         };
 
-        let max_buffered = max_buffered_transactions(&config, rate_limiter.as_deref());
+        let max_buffered = max_buffered_transactions(&config);
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
 
         Self {
@@ -194,12 +194,24 @@ impl Sender {
         loop {
             self.drain_completions();
 
-            let Some(index) = self.next_ready_index() else {
+            let Some(mut index) = self.next_ready_index() else {
                 break;
             };
 
-            let Ok(permit) = self.semaphore.clone().try_acquire_owned() else {
-                break;
+            let permit = match self.semaphore.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let Ok(permit) = self.semaphore.clone().acquire_owned().await else {
+                        break;
+                    };
+                    self.drain_completions();
+                    let Some(next_index) = self.next_ready_index() else {
+                        drop(permit);
+                        break;
+                    };
+                    index = next_index;
+                    permit
+                }
             };
 
             if let Some(limiter) = &self.rate_limiter &&
@@ -251,11 +263,8 @@ impl Sender {
     }
 }
 
-fn max_buffered_transactions(config: &SenderConfig, limiter: Option<&RateLimiter>) -> usize {
-    let concurrency_buffer = config.max_concurrent.saturating_mul(PENDING_BACKLOG_FACTOR).max(1);
-    let burst_buffer =
-        limiter.map(|l| (l.burst_capacity.ceil() as usize).saturating_mul(2)).unwrap_or(0);
-    concurrency_buffer.max(burst_buffer)
+fn max_buffered_transactions(config: &SenderConfig) -> usize {
+    config.max_concurrent.saturating_mul(PENDING_BACKLOG_FACTOR).max(1)
 }
 
 fn normalize_key_sets(
@@ -303,15 +312,14 @@ async fn submit_tx(
         Err(e) => {
             tracing::warn!(error = %e, "Failed to send transaction");
             metrics.record_failure();
-            drop(permit);
             release_keys(&completion_tx, release_all_keys());
+            drop(permit);
             return;
         }
     };
 
-    drop(permit);
-
     release_keys(&completion_tx, pending.submission_keys);
+    drop(permit);
 
     if pending.inclusion_keys.is_empty() && pending.phase != TxPhase::Setup {
         return;
@@ -357,61 +365,75 @@ async fn wait_for_receipt(
     }
 }
 
-const RATE_LIMITER_MAX_BURST: Duration = Duration::from_millis(10);
+const RATE_LIMITER_TICK: Duration = Duration::from_millis(1);
 
-/// Token-bucket rate limiter with a bounded burst budget.
+/// Millisecond-batched rate limiter.
 ///
-/// A pure cumulative scheduler catches up all missed tokens after startup or
-/// source stalls, which can create visible send-rate spikes. This limiter still
-/// batches enough tokens to avoid sub-millisecond sleeps at high TPS, but caps
-/// accumulated credit to a small time window.
+/// This deliberately does not accumulate catch-up credit. If submissions stall
+/// behind RPC concurrency or source backpressure, only one tick worth of credit
+/// is retained. That keeps high-rate runs from collapsing into large sawtooth
+/// bursts without requiring a sub-millisecond timer wakeup per transaction.
 struct RateLimiter {
-    rate: f64,
-    burst_capacity: f64,
+    tokens_per_tick: f64,
+    max_tokens: f64,
     state: tokio::sync::Mutex<RateLimiterState>,
 }
 
 struct RateLimiterState {
     tokens: f64,
-    last_refill: Instant,
+    next_refill: Instant,
 }
 
 impl RateLimiter {
     fn new(tokens_per_sec: u64) -> Self {
-        let rate = tokens_per_sec as f64;
-        let burst_capacity = (rate * RATE_LIMITER_MAX_BURST.as_secs_f64()).max(1.0);
+        let tokens_per_tick = tokens_per_sec as f64 * RATE_LIMITER_TICK.as_secs_f64();
+        let max_tokens = tokens_per_tick.ceil().max(1.0);
 
         Self {
-            rate,
-            burst_capacity,
+            tokens_per_tick,
+            max_tokens,
             state: tokio::sync::Mutex::new(RateLimiterState {
-                tokens: burst_capacity,
-                last_refill: Instant::now(),
+                tokens: max_tokens,
+                next_refill: Instant::now() + RATE_LIMITER_TICK,
             }),
         }
     }
 
     async fn try_acquire_or_delay(&self) -> Option<Duration> {
         let mut state = self.state.lock().await;
-        state.refill(self.rate, self.burst_capacity);
+        state.refill(self.tokens_per_tick, self.max_tokens);
 
         if state.tokens >= 1.0 {
             state.tokens -= 1.0;
             None
         } else {
-            let missing_tokens = 1.0 - state.tokens;
-            Some(Duration::from_secs_f64(missing_tokens / self.rate))
+            Some(state.next_refill.saturating_duration_since(Instant::now()))
         }
     }
 }
 
 impl RateLimiterState {
-    fn refill(&mut self, rate: f64, burst_capacity: f64) {
+    fn refill(&mut self, tokens_per_tick: f64, max_tokens: f64) {
         let now = Instant::now();
-        let new_tokens = now.duration_since(self.last_refill).as_secs_f64() * rate;
-        self.tokens = (self.tokens + new_tokens).min(burst_capacity);
-        self.last_refill = now;
+        if now < self.next_refill {
+            return;
+        }
+
+        let ticks = elapsed_ticks(now, self.next_refill, RATE_LIMITER_TICK);
+        self.tokens = (self.tokens + tokens_per_tick * ticks as f64).min(max_tokens);
+        self.next_refill += multiply_duration(RATE_LIMITER_TICK, ticks);
     }
+}
+
+fn elapsed_ticks(now: Instant, next_refill: Instant, tick: Duration) -> u64 {
+    let tick_nanos = tick.as_nanos().max(1);
+    let ticks = now.duration_since(next_refill).as_nanos() / tick_nanos + 1;
+    ticks.min(u64::MAX as u128) as u64
+}
+
+fn multiply_duration(duration: Duration, multiplier: u64) -> Duration {
+    let nanos = duration.as_nanos().saturating_mul(multiplier as u128);
+    Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
 }
 
 #[cfg(test)]
@@ -426,37 +448,50 @@ mod tests {
     }
 
     #[test]
-    fn test_rate_limiter_burst_capacity_is_bounded() {
-        let limiter = RateLimiter::new(10_000);
-        assert_eq!(limiter.burst_capacity, 100.0);
+    fn test_rate_limiter_batches_one_tick_of_tokens() {
+        let limiter = RateLimiter::new(50_000);
+        assert_eq!(limiter.tokens_per_tick, 50.0);
+        assert_eq!(limiter.max_tokens, 50.0);
     }
 
     #[tokio::test]
-    async fn test_rate_limiter_does_not_accumulate_unbounded_catch_up_credit() {
-        let limiter = RateLimiter::new(1_000);
-        assert_eq!(limiter.burst_capacity, 10.0);
+    async fn test_rate_limiter_exhausts_tick_batch_before_waiting() {
+        let limiter = RateLimiter::new(50_000);
+
+        for _ in 0..50 {
+            assert_eq!(limiter.try_acquire_or_delay().await, None);
+        }
+
+        let delay = limiter.try_acquire_or_delay().await.expect("batch should be exhausted");
+        assert!(delay <= Duration::from_millis(1), "delay should be bounded by tick: {delay:?}");
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_does_not_accumulate_large_catch_up_burst() {
+        let limiter = RateLimiter::new(50_000);
 
         {
             let mut state = limiter.state.lock().await;
             state.tokens = 0.0;
-            state.last_refill = Instant::now() - Duration::from_secs(1);
+            state.next_refill = Instant::now() - Duration::from_secs(1);
         }
 
-        assert_eq!(limiter.try_acquire_or_delay().await, None);
+        for _ in 0..50 {
+            assert_eq!(limiter.try_acquire_or_delay().await, None);
+        }
 
-        let state = limiter.state.lock().await;
-        assert!(state.tokens <= 9.0, "tokens: {}", state.tokens);
-        assert!(state.tokens > 8.0, "tokens: {}", state.tokens);
+        assert!(
+            limiter.try_acquire_or_delay().await.is_some(),
+            "stalled limiter should retain at most one tick of credit"
+        );
     }
 
     #[test]
     fn test_max_buffered_transactions_uses_existing_sender_knobs() {
         let config = SenderConfig { rate_limit: 10_000, max_concurrent: 100 };
-        let limiter = RateLimiter::new(config.rate_limit);
-        assert_eq!(max_buffered_transactions(&config, Some(&limiter)), 400);
+        assert_eq!(max_buffered_transactions(&config), 400);
 
         let config = SenderConfig { rate_limit: 100_000, max_concurrent: 100 };
-        let limiter = RateLimiter::new(config.rate_limit);
-        assert_eq!(max_buffered_transactions(&config, Some(&limiter)), 2_000);
+        assert_eq!(max_buffered_transactions(&config), 400);
     }
 }
