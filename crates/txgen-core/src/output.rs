@@ -44,7 +44,7 @@ struct OutputTx<'a> {
     phase: TxPhase,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<&'a str>,
-    raw: &'a str,
+    raw: &'a Bytes,
     submission_keys: &'a [SchedulingKey],
     inclusion_keys: &'a [SchedulingKey],
 }
@@ -53,29 +53,20 @@ struct OutputTx<'a> {
 pub struct NdjsonWriter<W: Write> {
     writer: W,
     count: u64,
-    raw_hex: String,
 }
 
 impl<W: Write> NdjsonWriter<W> {
     /// Create a new NDJSON writer.
     pub fn new(writer: W) -> Self {
-        Self { writer, count: 0, raw_hex: String::new() }
+        Self { writer, count: 0 }
     }
 
     /// Write a generated transaction.
     pub fn write(&mut self, tx: &GeneratedTx) -> Result<()> {
-        // Reuse string buffers to avoid allocations
-        self.raw_hex.clear();
-        self.raw_hex.push_str("0x");
-        for byte in tx.raw.iter() {
-            use std::fmt::Write;
-            write!(self.raw_hex, "{:02x}", byte)?;
-        }
-
         let out = OutputTx {
             phase: tx.phase,
             id: tx.id.as_deref(),
-            raw: &self.raw_hex,
+            raw: &tx.raw,
             submission_keys: &tx.submission_keys,
             inclusion_keys: &tx.inclusion_keys,
         };
@@ -105,8 +96,8 @@ impl<W: Write> NdjsonWriter<W> {
 }
 
 /// Create a writer for stdout.
-pub fn stdout_writer() -> NdjsonWriter<std::io::Stdout> {
-    NdjsonWriter::new(std::io::stdout())
+pub fn stdout_writer() -> NdjsonWriter<std::io::BufWriter<std::io::Stdout>> {
+    NdjsonWriter::new(std::io::BufWriter::new(std::io::stdout()))
 }
 
 /// Create a writer for a file.

@@ -1,3 +1,4 @@
+use alloy_primitives::FixedBytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A 20-byte transaction scheduling key.
@@ -59,13 +60,7 @@ impl Serialize for SchedulingKey {
     where
         S: Serializer,
     {
-        let mut out = String::with_capacity(42);
-        out.push_str("0x");
-        for byte in self.0 {
-            use std::fmt::Write;
-            write!(out, "{byte:02x}").map_err(serde::ser::Error::custom)?;
-        }
-        serializer.serialize_str(&out)
+        FixedBytes::<20>::from(self.0).serialize(serializer)
     }
 }
 
@@ -74,32 +69,7 @@ impl<'de> Deserialize<'de> for SchedulingKey {
     where
         D: Deserializer<'de>,
     {
-        let value = String::deserialize(deserializer)?;
-        parse_hex_key(&value).map(Self::new).map_err(serde::de::Error::custom)
-    }
-}
-
-fn parse_hex_key(value: &str) -> Result<[u8; 20], String> {
-    let hex = value.strip_prefix("0x").unwrap_or(value);
-    if hex.len() != 40 {
-        return Err(format!("scheduling key must be 20 bytes, got {} hex chars", hex.len()));
-    }
-
-    let mut bytes = [0u8; 20];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        let hi = hex_nibble(hex.as_bytes()[index * 2])?;
-        let lo = hex_nibble(hex.as_bytes()[index * 2 + 1])?;
-        *byte = (hi << 4) | lo;
-    }
-    Ok(bytes)
-}
-
-fn hex_nibble(byte: u8) -> Result<u8, String> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(format!("invalid hex character '{}'", byte as char)),
+        FixedBytes::<20>::deserialize(deserializer).map(|bytes| Self::new(bytes.0))
     }
 }
 

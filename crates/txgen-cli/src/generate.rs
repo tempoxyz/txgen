@@ -402,7 +402,8 @@ where
             &[setup_key],
             ctx,
             writer,
-        )?;
+        )?
+        .expect("setup emissions request tx info");
         if info.created_address.is_none() {
             bail!("deploy setup step did not produce a contract creation transaction");
         }
@@ -419,6 +420,7 @@ where
             ctx,
             writer,
         )?
+        .expect("setup emissions request tx info")
     };
 
     setup_bindings.insert(
@@ -571,7 +573,7 @@ fn emit_template_value<A: NetworkAdapter, W: Write>(
     inclusion_keys: &[SchedulingKey],
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
-) -> Result<EmittedTxInfo>
+) -> Result<Option<EmittedTxInfo>>
 where
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
@@ -584,20 +586,25 @@ where
         .build_request(template, ctx)
         .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
 
-    let sender = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?.address();
-    let nonce = tx_req
-        .request
-        .nonce()
-        .ok_or_else(|| eyre::eyre!("template '{name}' did not set a nonce"))?;
-    let created_address =
-        matches!(tx_req.request.kind(), Some(TxKind::Create)).then(|| sender.create(nonce));
+    let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?;
+    let captured = if phase == TxPhase::Setup {
+        let sender = signer.address();
+        let nonce = tx_req
+            .request
+            .nonce()
+            .ok_or_else(|| eyre::eyre!("template '{name}' did not set a nonce"))?;
+        let created_address =
+            matches!(tx_req.request.kind(), Some(TxKind::Create)).then(|| sender.create(nonce));
+        Some((sender, nonce, created_address))
+    } else {
+        None
+    };
 
     let mut unsigned = tx_req
         .request
         .build_unsigned()
         .map_err(|e| eyre::eyre!("failed to build unsigned tx from template '{name}': {e}"))?;
 
-    let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?;
     let sig = signer
         .sign_transaction_sync(&mut unsigned)
         .map_err(|e| eyre::eyre!("failed to sign tx from template '{name}': {e}"))?;
@@ -605,7 +612,12 @@ where
     let signed = unsigned.into_signed(sig);
     let envelope = <A::Network as Network>::TxEnvelope::from(signed);
     let raw = Bytes::from(envelope.encoded_2718());
-    let tx_hash = keccak256(&raw);
+    let info = captured.map(|(sender, nonce, created_address)| EmittedTxInfo {
+        sender,
+        nonce,
+        tx_hash: keccak256(&raw),
+        created_address,
+    });
 
     writer.write(&GeneratedTx {
         phase,
@@ -614,7 +626,7 @@ where
         submission_keys: vec![SchedulingKey::from(tx_req.key)],
         inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),
     })?;
-    Ok(EmittedTxInfo { sender, nonce, tx_hash, created_address })
+    Ok(info)
 }
 
 fn resolve_sequence_bindings(
