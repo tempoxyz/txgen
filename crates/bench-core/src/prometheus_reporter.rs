@@ -20,7 +20,7 @@
 //! | `PROMETHEUS_USER`             | HTTP basic auth username (used with `PROMETHEUS_PASSWORD`)   |
 //! | `PROMETHEUS_PASSWORD`         | HTTP basic auth password                             |
 //! | `PROMETHEUS_TENANT_ID`        | Cluster tenant / accountID query param               |
-//! | `PROMETHEUS_BATCH_SIZE`       | Samples per HTTP request (default: 100_000)          |
+//! | `PROMETHEUS_BATCH_SIZE`       | Samples per HTTP request (default: 50_000)           |
 //! | `PROMETHEUS_ENCODE_WORKERS`   | Parallel final-report encode workers (default: up to 8) |
 //! | `PROMETHEUS_TIMEOUT_SECS`     | Per-request timeout in seconds (default: 60)         |
 //! | `PROMETHEUS_QUEUE_SIZE`       | Real-time forwarder queue size (default: 16 batches) |
@@ -36,7 +36,7 @@ use std::{collections::BTreeMap, time::Duration};
 use tokio::{sync::mpsc, task::JoinSet};
 
 /// Default samples per ingestion request.
-const DEFAULT_BATCH_SIZE: usize = 100_000;
+const DEFAULT_BATCH_SIZE: usize = 50_000;
 /// Maximum default number of CPU workers used to prepare final-report batches.
 const MAX_DEFAULT_ENCODE_WORKERS: usize = 8;
 /// Default per-request HTTP timeout.

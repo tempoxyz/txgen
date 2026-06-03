@@ -342,7 +342,7 @@ Connection knobs are read from environment variables to keep secrets off the com
 | `PROMETHEUS_BEARER_TOKEN` | Sent as `Authorization: Bearer …` (e.g. for VM Cloud / vmauth) |
 | `PROMETHEUS_USER` / `PROMETHEUS_PASSWORD` | HTTP basic auth credentials |
 | `PROMETHEUS_TENANT_ID` | Cluster VM `accountID` query parameter |
-| `PROMETHEUS_BATCH_SIZE` | Samples per HTTP request (default: `100000`) |
+| `PROMETHEUS_BATCH_SIZE` | Samples per HTTP request (default: `50000`) |
 | `PROMETHEUS_ENCODE_WORKERS` | Parallel workers used to build and compress final report requests (default: up to `8`) |
 | `PROMETHEUS_TIMEOUT_SECS` | Per-request HTTP timeout in seconds (default: `60`) |
 | `PROMETHEUS_QUEUE_SIZE` | Real-time forwarder queue size in scrape batches (default: `16`) |
