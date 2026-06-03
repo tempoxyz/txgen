@@ -45,6 +45,7 @@ tempo-primitives = "1"
 futures = "0.3"
 hex = "0.4"
 rand = "0.9"
+rayon = "1"
 eyre = "0.6"
 tokio = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
