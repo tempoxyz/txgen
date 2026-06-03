@@ -26,7 +26,7 @@
 #   --tps <N>              Target TPS (default: 5000)
 #   --max-concurrent <N>   Max concurrent HTTP requests (default: 500)
 #   --rpc-url <URL>        RPC endpoint (default: http://localhost:8545)
-#   --drain-timeout <N>    Seconds to wait for pool drain (default: 300)
+#   --drain-timeout <N>    Seconds to wait for pool drain (default: 0)
 #
 # Replay mode options:
 #   --rpc-source <URL>     Archive node RPC for block extraction (required)
@@ -71,7 +71,7 @@ SEED=99
 TPS=5000
 MAX_CONCURRENT=500
 RPC="http://localhost:8545"
-DRAIN_TIMEOUT=300
+DRAIN_TIMEOUT=0
 
 # Replay mode
 RPC_SOURCE=""

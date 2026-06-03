@@ -111,7 +111,7 @@ pub struct SendArgs {
     /// Polls `txpool_status` and waits until the pending count reaches zero
     /// (3 consecutive readings) before collecting block stats and finalizing.
     /// Set to 0 to disable. Keeps the metrics scraper running during the wait.
-    #[arg(long, default_value = "300")]
+    #[arg(long, default_value = "0")]
     pub drain_timeout: u64,
 }
 
