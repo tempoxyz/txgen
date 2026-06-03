@@ -21,7 +21,7 @@
 //! | `PROMETHEUS_PASSWORD`         | HTTP basic auth password                             |
 //! | `PROMETHEUS_TENANT_ID`        | Cluster tenant / accountID query param               |
 //! | `PROMETHEUS_BATCH_SIZE`       | Samples per HTTP request (default: 50_000)           |
-//! | `PROMETHEUS_ENCODE_WORKERS`   | Parallel final-report encode workers (default: up to 4) |
+//! | `PROMETHEUS_ENCODE_WORKERS`   | Parallel final-report encode workers (default: up to 8) |
 //! | `PROMETHEUS_TIMEOUT_SECS`     | Per-request timeout in seconds (default: 60)         |
 //! | `PROMETHEUS_QUEUE_SIZE`       | Real-time forwarder queue size (default: 16 batches) |
 
@@ -38,7 +38,7 @@ use tokio::{sync::mpsc, task::JoinSet};
 /// Default samples per ingestion request.
 const DEFAULT_BATCH_SIZE: usize = 50_000;
 /// Maximum default number of CPU workers used to prepare final-report batches.
-const MAX_DEFAULT_ENCODE_WORKERS: usize = 4;
+const MAX_DEFAULT_ENCODE_WORKERS: usize = 8;
 /// Default per-request HTTP timeout.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// Default number of scrape batches buffered by the real-time forwarder.
@@ -239,19 +239,27 @@ impl PrometheusReporter {
         let mut input_done = false;
 
         loop {
-            while !input_done && tasks.len() < workers {
-                match chunks.next() {
-                    Some((idx, Ok(chunk))) => {
-                        tasks.spawn_blocking(move || prepare_owned_batch(chunk, idx));
-                    }
-                    Some((_, Err(err))) => return Err(err),
-                    None => input_done = true,
-                }
-            }
+            fill_encode_tasks(&mut chunks, &mut tasks, workers, &mut input_done)?;
 
             if let Some(batch) = prepared.remove(&next_upload) {
                 pushed += batch.samples;
-                self.send_prepared_batch_async(batch).await?;
+                let send = self.send_prepared_batch_async(batch);
+                tokio::pin!(send);
+                loop {
+                    tokio::select! {
+                        result = &mut send => {
+                            result?;
+                            break;
+                        }
+                        result = tasks.join_next(), if !tasks.is_empty() => {
+                            let batch = result
+                                .expect("join_next returned None despite non-empty task set")
+                                .wrap_err("remote write encode worker panicked")??;
+                            prepared.insert(batch.idx, batch);
+                            fill_encode_tasks(&mut chunks, &mut tasks, workers, &mut input_done)?;
+                        }
+                    }
+                }
                 next_upload += 1;
                 continue;
             }
@@ -268,6 +276,28 @@ impl PrometheusReporter {
 
         Ok(pushed)
     }
+}
+
+fn fill_encode_tasks<I>(
+    chunks: &mut I,
+    tasks: &mut JoinSet<Result<PreparedBatch>>,
+    workers: usize,
+    input_done: &mut bool,
+) -> Result<()>
+where
+    I: Iterator<Item = (usize, Result<Vec<Sample>>)>,
+{
+    while !*input_done && tasks.len() < workers {
+        match chunks.next() {
+            Some((idx, Ok(chunk))) => {
+                tasks.spawn_blocking(move || prepare_owned_batch(chunk, idx));
+            }
+            Some((_, Err(err))) => return Err(err),
+            None => *input_done = true,
+        }
+    }
+
+    Ok(())
 }
 
 impl Reporter for PrometheusReporter {
