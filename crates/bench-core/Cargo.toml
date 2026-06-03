@@ -40,4 +40,6 @@ prometheus_remote_write = { version = "0.2", features = ["compression"] }
 flate2 = "1"
 
 [dev-dependencies]
+prost = "0.12"
+snap = "1"
 tokio = { version = "1", features = ["rt", "macros"] }

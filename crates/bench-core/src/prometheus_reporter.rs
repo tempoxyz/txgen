@@ -20,7 +20,8 @@
 //! | `PROMETHEUS_USER`             | HTTP basic auth username (used with `PROMETHEUS_PASSWORD`)   |
 //! | `PROMETHEUS_PASSWORD`         | HTTP basic auth password                             |
 //! | `PROMETHEUS_TENANT_ID`        | Cluster tenant / accountID query param               |
-//! | `PROMETHEUS_BATCH_SIZE`       | Samples per HTTP request (default: 10_000)           |
+//! | `PROMETHEUS_BATCH_SIZE`       | Samples per HTTP request (default: 50_000)           |
+//! | `PROMETHEUS_ENCODE_WORKERS`   | Parallel final-report encode workers (default: up to 4) |
 //! | `PROMETHEUS_TIMEOUT_SECS`     | Per-request timeout in seconds (default: 60)         |
 //! | `PROMETHEUS_QUEUE_SIZE`       | Real-time forwarder queue size (default: 16 batches) |
 
@@ -31,11 +32,13 @@ use prometheus_remote_write::{
     HEADER_NAME_REMOTE_WRITE_VERSION, LABEL_NAME, REMOTE_WRITE_VERSION_01,
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-use std::time::Duration;
-use tokio::sync::mpsc;
+use std::{collections::BTreeMap, time::Duration};
+use tokio::{sync::mpsc, task::JoinSet};
 
 /// Default samples per ingestion request.
-const DEFAULT_BATCH_SIZE: usize = 10_000;
+const DEFAULT_BATCH_SIZE: usize = 50_000;
+/// Maximum default number of CPU workers used to prepare final-report batches.
+const MAX_DEFAULT_ENCODE_WORKERS: usize = 4;
 /// Default per-request HTTP timeout.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// Default number of scrape batches buffered by the real-time forwarder.
@@ -54,6 +57,8 @@ pub struct PrometheusConfig {
     pub tenant_id: Option<String>,
     /// Samples per HTTP request.
     pub batch_size: usize,
+    /// Parallel workers used to build and compress final-report remote-write requests.
+    pub encode_workers: usize,
     /// Per-request HTTP timeout.
     pub timeout: Duration,
 }
@@ -82,6 +87,11 @@ impl PrometheusConfig {
             .and_then(|s| s.parse().ok())
             .filter(|n: &usize| *n > 0)
             .unwrap_or(DEFAULT_BATCH_SIZE);
+        let encode_workers = std::env::var("PROMETHEUS_ENCODE_WORKERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n: &usize| *n > 0)
+            .unwrap_or_else(default_encode_workers);
         let timeout_secs = std::env::var("PROMETHEUS_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -94,6 +104,7 @@ impl PrometheusConfig {
             basic_auth,
             tenant_id,
             batch_size,
+            encode_workers,
             timeout: Duration::from_secs(timeout_secs),
         })
     }
@@ -163,15 +174,19 @@ impl PrometheusReporter {
             return Ok(());
         }
 
-        let write_req = build_write_request(batch);
-        let timeseries_count = write_req.timeseries.len();
-        let body = write_req.encode_compressed().context("snappy compression failed")?;
+        let prepared = prepare_batch(batch, batch_idx)?;
+        self.send_prepared_batch_async(prepared).await
+    }
+
+    /// Send an already encoded remote-write request.
+    async fn send_prepared_batch_async(&self, prepared: PreparedBatch) -> Result<()> {
+        let PreparedBatch { idx, samples, timeseries, body } = prepared;
         let body_len = body.len();
 
         tracing::info!(
-            batch = batch_idx,
-            samples = batch.len(),
-            timeseries = timeseries_count,
+            batch = idx,
+            samples,
+            timeseries,
             body_bytes = body_len,
             url = %self.import_url,
             "Sending remote write batch"
@@ -190,7 +205,7 @@ impl PrometheusReporter {
 
         if !status.is_success() {
             tracing::error!(
-                batch = batch_idx,
+                batch = idx,
                 %status,
                 body = %resp_body,
                 url = %self.import_url,
@@ -200,7 +215,7 @@ impl PrometheusReporter {
         }
 
         tracing::info!(
-            batch = batch_idx,
+            batch = idx,
             %status,
             body = %resp_body,
             "Remote write batch accepted"
@@ -208,10 +223,50 @@ impl PrometheusReporter {
         Ok(())
     }
 
-    /// Send a single batch from the synchronous reporter interface.
-    fn send_batch(&self, batch: &[Sample], batch_idx: usize) -> Result<()> {
+    /// Push final-report samples with parallel encode/compress workers and ordered upload.
+    fn push_report(&self, report: &FinalReport) -> Result<usize> {
         let rt = tokio::runtime::Handle::current();
-        tokio::task::block_in_place(|| rt.block_on(self.send_batch_async(batch, batch_idx)))
+        tokio::task::block_in_place(|| rt.block_on(self.push_report_async(report)))
+    }
+
+    async fn push_report_async(&self, report: &FinalReport) -> Result<usize> {
+        let mut chunks = report.sample_chunks(self.config.batch_size)?.enumerate();
+        let workers = self.config.encode_workers.max(1);
+        let mut tasks = JoinSet::new();
+        let mut prepared: BTreeMap<usize, PreparedBatch> = BTreeMap::new();
+        let mut next_upload = 0usize;
+        let mut pushed = 0usize;
+        let mut input_done = false;
+
+        loop {
+            while !input_done && tasks.len() < workers {
+                match chunks.next() {
+                    Some((idx, Ok(chunk))) => {
+                        tasks.spawn_blocking(move || prepare_owned_batch(chunk, idx));
+                    }
+                    Some((_, Err(err))) => return Err(err),
+                    None => input_done = true,
+                }
+            }
+
+            if let Some(batch) = prepared.remove(&next_upload) {
+                pushed += batch.samples;
+                self.send_prepared_batch_async(batch).await?;
+                next_upload += 1;
+                continue;
+            }
+
+            if input_done && tasks.is_empty() && prepared.is_empty() {
+                break;
+            }
+
+            if let Some(result) = tasks.join_next().await {
+                let batch = result.wrap_err("remote write encode worker panicked")??;
+                prepared.insert(batch.idx, batch);
+            }
+        }
+
+        Ok(pushed)
     }
 }
 
@@ -228,16 +283,12 @@ impl Reporter for PrometheusReporter {
             samples = report.sample_count(),
             batches = total_batches,
             batch_size = self.config.batch_size,
+            encode_workers = self.config.encode_workers,
             url = %self.import_url,
             "Pushing samples via Prometheus remote write"
         );
 
-        let mut pushed = 0usize;
-        for (idx, chunk) in report.sample_chunks(self.config.batch_size)?.enumerate() {
-            let chunk = chunk?;
-            self.send_batch(&chunk, idx)?;
-            pushed += chunk.len();
-        }
+        let pushed = self.push_report(report)?;
 
         tracing::info!(samples = pushed, "remote write push complete");
         Ok(())
@@ -338,6 +389,31 @@ fn prometheus_queue_size() -> usize {
         .unwrap_or(DEFAULT_QUEUE_SIZE)
 }
 
+fn default_encode_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().clamp(1, MAX_DEFAULT_ENCODE_WORKERS))
+        .unwrap_or(1)
+}
+
+struct PreparedBatch {
+    idx: usize,
+    samples: usize,
+    timeseries: usize,
+    body: Vec<u8>,
+}
+
+fn prepare_owned_batch(batch: Vec<Sample>, idx: usize) -> Result<PreparedBatch> {
+    prepare_batch(&batch, idx)
+}
+
+fn prepare_batch(batch: &[Sample], idx: usize) -> Result<PreparedBatch> {
+    let write_req = build_write_request(batch);
+    let timeseries = write_req.timeseries.len();
+    let body = write_req.encode_compressed().context("snappy compression failed")?;
+
+    Ok(PreparedBatch { idx, samples: batch.len(), timeseries, body })
+}
+
 /// Build a [`WriteRequest`] from a batch of [`Sample`]s.
 ///
 /// Each unique combination of (metric name + labels) becomes one `TimeSeries`
@@ -435,6 +511,8 @@ fn sanitize_label_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{FinalReport, SampleStore};
+    use prost::Message as _;
     use std::io::{Read, Write};
 
     fn sample(name: &str, value: f64, labels: &[(&str, &str)]) -> Sample {
@@ -577,6 +655,55 @@ mod tests {
         assert!(bodies.iter().all(|body| !body.is_empty()));
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn final_report_uploads_parallel_prepared_batches_in_order() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut batches = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let body = read_http_request_body(&mut stream);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                batches.push(remote_write_metric_name(&body));
+            }
+            batches
+        });
+
+        let store = SampleStore::new().unwrap();
+        store
+            .push_batch(vec![
+                sample("metric_0", 0.0, &[]),
+                sample("metric_1", 1.0, &[]),
+                sample("metric_2", 2.0, &[]),
+            ])
+            .await
+            .unwrap();
+
+        let mut cfg =
+            PrometheusConfig::from_metadata(&base_url, &std::collections::HashMap::new()).unwrap();
+        cfg.batch_size = 1;
+        cfg.encode_workers = 2;
+        cfg.timeout = Duration::from_secs(5);
+
+        let mut reporter = PrometheusReporter::new(cfg).unwrap();
+        let report = FinalReport {
+            sample_archive: Some(store.finish().await.unwrap()),
+            ..Default::default()
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async move { reporter.finalize(&report) })
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(server.join().unwrap(), ["metric_0", "metric_1", "metric_2"]);
+    }
+
     fn read_http_request_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
         let mut headers = Vec::new();
         let mut byte = [0u8; 1];
@@ -599,5 +726,18 @@ mod tests {
         let mut body = vec![0u8; content_length];
         stream.read_exact(&mut body).unwrap();
         body
+    }
+
+    fn remote_write_metric_name(body: &[u8]) -> String {
+        let decompressed = snap::raw::Decoder::new().decompress_vec(body).unwrap();
+        let request = WriteRequest::decode(decompressed.as_slice()).unwrap();
+        assert_eq!(request.timeseries.len(), 1);
+        request.timeseries[0]
+            .labels
+            .iter()
+            .find(|label| label.name == LABEL_NAME)
+            .unwrap()
+            .value
+            .clone()
     }
 }
