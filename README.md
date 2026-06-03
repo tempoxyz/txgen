@@ -633,7 +633,7 @@ templates:
 
 Use `setup.steps` for deterministic transactions that prepare the chain before the measured workload, such as contract deployments and mint/configuration calls. `txgen` emits all setup transactions first with `phase: "setup"`; workload transactions are emitted afterwards with `phase: "workload"`.
 
-`bench send` treats the first workload transaction as a setup barrier: it waits for all setup transactions to be included, waits for the txpool to drain, resets benchmark timing/metrics, and only then sends workload transactions. Use `bench send --skip-setup` to ignore setup transactions when the target chain is already prepared.
+`bench send` treats the first workload transaction as a setup barrier: it waits for all setup transactions to be included, resets benchmark timing/metrics, and only then sends workload transactions. Use `bench send --skip-setup` to ignore setup transactions when the target chain is already prepared.
 
 ```yaml
 artifacts:
