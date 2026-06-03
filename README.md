@@ -164,7 +164,7 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url` |
 | `--collect-latencies` | Collect and report aggregate latency stats plus individual request samples under `time_series.latencies` (default: disabled) |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
-| `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 300, 0 to disable) |
+| `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 0, set >0 to enable) |
 
 **Required RPC methods:** `eth_sendRawTransaction`, `eth_getTransactionReceipt` (setup and inclusion waits), `eth_getBlockByNumber`, `txpool_status` (for `--drain-timeout`)
 
