@@ -75,7 +75,7 @@ async fn execute_source<S: TxSource>(
     let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
     let query_provider = &providers[0];
 
-    let first_workload = run_setup_phase(args, source, &providers, &config, query_provider).await?;
+    let first_workload = run_setup_phase(args, source, &providers, &config).await?;
 
     let clock = if let Some(start) = args.metrics_align {
         RunClock::new_with_start_unix_ms(start)
@@ -232,12 +232,11 @@ async fn execute_source<S: TxSource>(
     Ok(())
 }
 
-async fn run_setup_phase<S: TxSource, P: TxPoolApi<AnyNetwork>>(
+async fn run_setup_phase<S: TxSource>(
     args: &SendArgs,
     source: &mut S,
     providers: &[DynProvider<AnyNetwork>],
     config: &SenderConfig,
-    query_provider: &P,
 ) -> Result<Option<GeneratedTx>> {
     let setup_clock = RunClock::new();
     let setup_metrics = MetricsCollector::new_with_latencies(setup_clock, false);
@@ -255,29 +254,21 @@ async fn run_setup_phase<S: TxSource, P: TxPoolApi<AnyNetwork>>(
                 setup_sender.send(tx).await?;
             }
             TxPhase::Workload => {
-                finish_setup_phase(
-                    args,
-                    setup_seen,
-                    &mut setup_sender,
-                    &setup_metrics,
-                    query_provider,
-                )
-                .await?;
+                finish_setup_phase(args, setup_seen, &mut setup_sender, &setup_metrics).await?;
                 return Ok(Some(tx));
             }
         }
     }
 
-    finish_setup_phase(args, setup_seen, &mut setup_sender, &setup_metrics, query_provider).await?;
+    finish_setup_phase(args, setup_seen, &mut setup_sender, &setup_metrics).await?;
     Ok(None)
 }
 
-async fn finish_setup_phase<P: TxPoolApi<AnyNetwork>>(
+async fn finish_setup_phase(
     args: &SendArgs,
     setup_seen: u64,
     setup_sender: &mut Sender,
     setup_metrics: &MetricsCollector,
-    query_provider: &P,
 ) -> Result<()> {
     if setup_seen == 0 {
         return Ok(());
@@ -294,12 +285,6 @@ async fn finish_setup_phase<P: TxPoolApi<AnyNetwork>>(
     let (_, _, failed) = setup_metrics.counts();
     if failed > 0 {
         bail!("setup phase failed: {failed} setup transaction(s) failed or reverted");
-    }
-
-    if args.drain_timeout > 0 {
-        wait_for_pool_drain(query_provider, args.drain_timeout).await?;
-    } else {
-        tracing::warn!("Skipping setup txpool drain because --drain-timeout=0");
     }
 
     Ok(())
