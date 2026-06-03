@@ -20,6 +20,7 @@ serde_yaml.workspace = true
 # misc
 futures.workspace = true
 rand.workspace = true
+rayon.workspace = true
 eyre.workspace = true
 humantime = "2"
 

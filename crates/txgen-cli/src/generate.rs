@@ -7,17 +7,23 @@ use alloy_provider::Provider;
 use clap::{ArgGroup, Args};
 use eyre::{bail, Result, WrapErr};
 use rand::{rngs::StdRng, Rng, SeedableRng};
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     io::Write,
     path::PathBuf,
+    sync::mpsc,
     time::{Duration, Instant},
 };
 use txgen_core::{
     dedup_scheduling_keys, merge_yaml, AbiEncodePackedDef, AbiHashDef, AccountManager,
-    AddressPoolManager, ArtifactManager, BuildContext, GeneratedTx, MixItem, NdjsonWriter,
-    NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase, WorkloadSpec,
+    AddressPoolManager, ArtifactManager, BuildContext, EcdsaSigner, GeneratedTx, MixItem,
+    NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase, WorkloadSpec,
 };
+
+fn default_signing_workers() -> usize {
+    2
+}
 
 #[derive(Args)]
 #[command(group(
@@ -54,6 +60,10 @@ pub struct GenerateArgs {
     /// RNG seed for reproducibility
     #[arg(long)]
     pub seed: Option<u64>,
+
+    /// Number of worker threads used to sign and encode workload transactions.
+    #[arg(long, visible_alias = "workers", default_value_t = default_signing_workers())]
+    pub signing_workers: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,10 +78,15 @@ pub struct GenerateContext {
     nonces: NonceTracker,
     rng: StdRng,
     limit: GenerationLimit,
+    signing_workers: usize,
 }
 
 impl GenerateContext {
     pub fn from_args(args: &GenerateArgs) -> Result<Self> {
+        if args.signing_workers == 0 {
+            bail!("--signing-workers must be at least 1");
+        }
+
         let spec = WorkloadSpec::load(&args.spec)
             .wrap_err_with(|| format!("failed to load spec: {}", args.spec.display()))?;
         let base_path = args.spec.parent().unwrap_or_else(|| std::path::Path::new("."));
@@ -84,7 +99,16 @@ impl GenerateContext {
             None => StdRng::from_os_rng(),
         };
         let limit = GenerationLimit { count: args.count, duration: args.duration };
-        Ok(Self { spec, accounts, address_pools, artifacts, nonces, rng, limit })
+        Ok(Self {
+            spec,
+            accounts,
+            address_pools,
+            artifacts,
+            nonces,
+            rng,
+            limit,
+            signing_workers: args.signing_workers,
+        })
     }
 
     /// Borrow accounts and nonces simultaneously for prefetching.
@@ -145,8 +169,10 @@ pub trait NetworkAdapter: Send + Sync {
     }
 }
 
-pub(crate) async fn run_generate<A: NetworkAdapter>(adapter: A, args: GenerateArgs) -> Result<()>
+pub(crate) async fn run_generate<A>(adapter: A, args: GenerateArgs) -> Result<()>
 where
+    A: NetworkAdapter + 'static,
+    <A::Network as Network>::TransactionRequest: Send + 'static,
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
@@ -213,12 +239,10 @@ struct GenerationLimit {
     duration: Option<Duration>,
 }
 
-fn generate_loop<A: NetworkAdapter>(
-    adapter: &A,
-    ctx: &mut GenerateContext,
-    output: Option<PathBuf>,
-) -> Result<()>
+fn generate_loop<A>(adapter: &A, ctx: &mut GenerateContext, output: Option<PathBuf>) -> Result<()>
 where
+    A: NetworkAdapter + 'static,
+    <A::Network as Network>::TransactionRequest: Send + 'static,
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
@@ -245,6 +269,7 @@ where
                 adapter,
                 &ctx.spec,
                 ctx.limit,
+                ctx.signing_workers,
                 &setup_bindings,
                 &mut build_ctx,
                 &mut writer,
@@ -258,6 +283,7 @@ where
                 adapter,
                 &ctx.spec,
                 ctx.limit,
+                ctx.signing_workers,
                 &setup_bindings,
                 &mut build_ctx,
                 &mut writer,
@@ -402,7 +428,8 @@ where
             &[setup_key],
             ctx,
             writer,
-        )?;
+        )?
+        .expect("setup emissions request tx info");
         if info.created_address.is_none() {
             bail!("deploy setup step did not produce a contract creation transaction");
         }
@@ -419,6 +446,7 @@ where
             ctx,
             writer,
         )?
+        .expect("setup emissions request tx info")
     };
 
     setup_bindings.insert(
@@ -471,19 +499,249 @@ fn build_deploy_template_value(
     Ok(serde_yaml::Value::Mapping(mapping))
 }
 
-fn generate_txs<A: NetworkAdapter, W: Write>(
-    adapter: &A,
-    spec: &WorkloadSpec,
-    limit: GenerationLimit,
-    setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
-    ctx: &mut BuildContext<'_>,
-    writer: &mut NdjsonWriter<W>,
-) -> Result<u64>
+type NetworkRequest<A> = <<A as NetworkAdapter>::Network as Network>::TransactionRequest;
+
+struct SigningJob<A: NetworkAdapter> {
+    sequence: u64,
+    name: String,
+    phase: TxPhase,
+    tx_req: TxRequest<NetworkRequest<A>>,
+    signer: EcdsaSigner,
+    inclusion_keys: Vec<SchedulingKey>,
+}
+
+struct SigningResult {
+    sequence: u64,
+    result: Result<GeneratedTx>,
+}
+
+struct SigningPool {
+    pool: ThreadPool,
+    result_tx: mpsc::Sender<SigningResult>,
+    result_rx: mpsc::Receiver<SigningResult>,
+    completed: BTreeMap<u64, GeneratedTx>,
+    next_sequence: u64,
+    next_to_write: u64,
+    in_flight: usize,
+    max_in_flight: usize,
+}
+
+impl SigningPool {
+    fn new(worker_count: usize) -> Result<Self> {
+        if worker_count == 0 {
+            bail!("signing worker count must be at least 1");
+        }
+
+        let (result_tx, result_rx) = mpsc::channel();
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(worker_count)
+            .thread_name(|worker_id| format!("txgen-sign-{worker_id}"))
+            .build()
+            .wrap_err("failed to create signing worker pool")?;
+
+        Ok(Self {
+            pool,
+            result_tx,
+            result_rx,
+            completed: BTreeMap::new(),
+            next_sequence: 0,
+            next_to_write: 0,
+            in_flight: 0,
+            max_in_flight: worker_count.saturating_mul(64).max(1),
+        })
+    }
+
+    fn next_sequence(&mut self) -> Result<u64> {
+        let sequence = self.next_sequence;
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| eyre::eyre!("signing job sequence counter overflowed u64"))?;
+        Ok(sequence)
+    }
+
+    fn submit<A: NetworkAdapter + 'static, W: Write>(
+        &mut self,
+        job: SigningJob<A>,
+        writer: &mut NdjsonWriter<W>,
+    ) -> Result<()>
+    where
+        NetworkRequest<A>: Send + 'static,
+        <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+        <A::Network as Network>::TxEnvelope:
+            From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+    {
+        self.drain_available(writer)?;
+        while self.in_flight >= self.max_in_flight {
+            self.recv_one(writer)?;
+        }
+
+        let result_tx = self.result_tx.clone();
+        self.pool.spawn_fifo(move || submit_signing_job::<A>(job, result_tx));
+        self.in_flight += 1;
+
+        Ok(())
+    }
+
+    fn finish<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
+        while self.in_flight > 0 {
+            self.recv_one(writer)?;
+        }
+        Ok(())
+    }
+
+    fn drain_available<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
+        loop {
+            match self.result_rx.try_recv() {
+                Ok(result) => self.handle_result(result, writer)?,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if self.in_flight > 0 {
+                        bail!("signing worker pool stopped before completing all jobs");
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn recv_one<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
+        let result = self
+            .result_rx
+            .recv()
+            .map_err(|_| eyre::eyre!("signing worker pool stopped before completing all jobs"))?;
+        self.handle_result(result, writer)
+    }
+
+    fn handle_result<W: Write>(
+        &mut self,
+        result: SigningResult,
+        writer: &mut NdjsonWriter<W>,
+    ) -> Result<()> {
+        let tx = result.result?;
+        if self.completed.insert(result.sequence, tx).is_some() {
+            bail!("received duplicate signing result for sequence {}", result.sequence);
+        }
+        self.write_ready(writer)
+    }
+
+    fn write_ready<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
+        while let Some(tx) = self.completed.remove(&self.next_to_write) {
+            if self.in_flight == 0 {
+                bail!("received unexpected signing result");
+            }
+            writer.write(&tx)?;
+            self.in_flight -= 1;
+            self.next_to_write = self
+                .next_to_write
+                .checked_add(1)
+                .ok_or_else(|| eyre::eyre!("written signing result counter overflowed u64"))?;
+        }
+        Ok(())
+    }
+}
+
+fn submit_signing_job<A: NetworkAdapter>(job: SigningJob<A>, result_tx: mpsc::Sender<SigningResult>)
 where
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
+    let sequence = job.sequence;
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sign_workload_job::<A>(job)))
+            .unwrap_or_else(|panic| {
+                Err(eyre::eyre!("signing worker panicked: {}", panic_msg(&panic)))
+            });
+    let _ = result_tx.send(SigningResult { sequence, result });
+}
+
+fn panic_msg(panic: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = panic.downcast_ref::<&'static str>() {
+        message
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "unknown panic payload"
+    }
+}
+
+fn prepare_signing_job<A: NetworkAdapter>(
+    adapter: &A,
+    name: String,
+    value: serde_yaml::Value,
+    phase: TxPhase,
+    inclusion_keys: &[SchedulingKey],
+    sequence: u64,
+    ctx: &mut BuildContext<'_>,
+) -> Result<SigningJob<A>> {
+    let template: A::Template = serde_yaml::from_value(value)
+        .wrap_err_with(|| format!("failed to parse template '{name}'"))?;
+
+    let tx_req = adapter
+        .build_request(template, ctx)
+        .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
+
+    let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?.clone();
+
+    Ok(SigningJob {
+        sequence,
+        name,
+        phase,
+        tx_req,
+        signer,
+        inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),
+    })
+}
+
+fn sign_workload_job<A: NetworkAdapter>(job: SigningJob<A>) -> Result<GeneratedTx>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let SigningJob { sequence: _, name, phase, tx_req, signer, inclusion_keys } = job;
+    let TxRequest { request, signer_pool: _, signer_index: _, key } = tx_req;
+
+    let mut unsigned = request
+        .build_unsigned()
+        .map_err(|e| eyre::eyre!("failed to build unsigned tx from template '{name}': {e}"))?;
+
+    let sig = signer
+        .sign_transaction_sync(&mut unsigned)
+        .map_err(|e| eyre::eyre!("failed to sign tx from template '{name}': {e}"))?;
+
+    let signed = unsigned.into_signed(sig);
+    let envelope = <A::Network as Network>::TxEnvelope::from(signed);
+    let raw = Bytes::from(envelope.encoded_2718());
+
+    Ok(GeneratedTx {
+        phase,
+        id: Some(name),
+        raw,
+        submission_keys: vec![SchedulingKey::from(key)],
+        inclusion_keys,
+    })
+}
+
+fn generate_txs<A, W: Write>(
+    adapter: &A,
+    spec: &WorkloadSpec,
+    limit: GenerationLimit,
+    signing_workers: usize,
+    setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
+    ctx: &mut BuildContext<'_>,
+    writer: &mut NdjsonWriter<W>,
+) -> Result<u64>
+where
+    A: NetworkAdapter + 'static,
+    NetworkRequest<A>: Send + 'static,
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let mut signing_pool = SigningPool::new(signing_workers)?;
     let mut written = 0u64;
     let mut sequence_instances = 0u64;
     let start = Instant::now();
@@ -507,15 +765,17 @@ where
                     .clone();
                 let materialized = substitute_vars(value, setup_bindings)
                     .wrap_err_with(|| format!("failed to materialize template '{name}'"))?;
-                emit_template_value(
+                let sequence = signing_pool.next_sequence()?;
+                let job = prepare_signing_job(
                     adapter,
-                    &name,
+                    name,
                     materialized,
                     TxPhase::Workload,
                     &[],
+                    sequence,
                     ctx,
-                    writer,
                 )?;
+                signing_pool.submit(job, writer)?;
                 written += 1;
             }
             MixItem::Sequence(name) => {
@@ -544,21 +804,24 @@ where
                     let materialized = substitute_vars(merged, &bindings).wrap_err_with(|| {
                         format!("failed to materialize sequence '{name}' step {idx} ('{label}')")
                     })?;
-                    emit_template_value(
+                    let sequence = signing_pool.next_sequence()?;
+                    let job = prepare_signing_job(
                         adapter,
-                        &format!("{name}.{label}"),
+                        format!("{name}.{label}"),
                         materialized,
                         TxPhase::Workload,
                         &[sequence_key],
+                        sequence,
                         ctx,
-                        writer,
                     )?;
+                    signing_pool.submit(job, writer)?;
                     written += 1;
                 }
             }
         }
     }
 
+    signing_pool.finish(writer)?;
     writer.flush()?;
     Ok(written)
 }
@@ -571,7 +834,7 @@ fn emit_template_value<A: NetworkAdapter, W: Write>(
     inclusion_keys: &[SchedulingKey],
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
-) -> Result<EmittedTxInfo>
+) -> Result<Option<EmittedTxInfo>>
 where
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
@@ -584,20 +847,25 @@ where
         .build_request(template, ctx)
         .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
 
-    let sender = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?.address();
-    let nonce = tx_req
-        .request
-        .nonce()
-        .ok_or_else(|| eyre::eyre!("template '{name}' did not set a nonce"))?;
-    let created_address =
-        matches!(tx_req.request.kind(), Some(TxKind::Create)).then(|| sender.create(nonce));
+    let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?;
+    let captured = if phase == TxPhase::Setup {
+        let sender = signer.address();
+        let nonce = tx_req
+            .request
+            .nonce()
+            .ok_or_else(|| eyre::eyre!("template '{name}' did not set a nonce"))?;
+        let created_address =
+            matches!(tx_req.request.kind(), Some(TxKind::Create)).then(|| sender.create(nonce));
+        Some((sender, nonce, created_address))
+    } else {
+        None
+    };
 
     let mut unsigned = tx_req
         .request
         .build_unsigned()
         .map_err(|e| eyre::eyre!("failed to build unsigned tx from template '{name}': {e}"))?;
 
-    let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?;
     let sig = signer
         .sign_transaction_sync(&mut unsigned)
         .map_err(|e| eyre::eyre!("failed to sign tx from template '{name}': {e}"))?;
@@ -605,7 +873,12 @@ where
     let signed = unsigned.into_signed(sig);
     let envelope = <A::Network as Network>::TxEnvelope::from(signed);
     let raw = Bytes::from(envelope.encoded_2718());
-    let tx_hash = keccak256(&raw);
+    let info = captured.map(|(sender, nonce, created_address)| EmittedTxInfo {
+        sender,
+        nonce,
+        tx_hash: keccak256(&raw),
+        created_address,
+    });
 
     writer.write(&GeneratedTx {
         phase,
@@ -614,7 +887,7 @@ where
         submission_keys: vec![SchedulingKey::from(tx_req.key)],
         inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),
     })?;
-    Ok(EmittedTxInfo { sender, nonce, tx_hash, created_address })
+    Ok(info)
 }
 
 fn resolve_sequence_bindings(

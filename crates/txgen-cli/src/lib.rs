@@ -47,8 +47,9 @@ enum Command {
 // Public entrypoint
 // ---------------------------------------------------------------------------
 
-pub async fn run<A: NetworkAdapter>(adapter: A) -> Result<()>
+pub async fn run<A: NetworkAdapter + 'static>(adapter: A) -> Result<()>
 where
+    <A::Network as Network>::TransactionRequest: Send + 'static,
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718 + Decodable + Transaction,
