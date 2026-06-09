@@ -403,6 +403,17 @@ accounts:
   users:
     mnemonic: "${MNEMONIC}"  # Supports environment variable expansion
     range: [0, 100]          # Derive accounts 0-99
+
+  # Tempo native 1-of-1 multisig senders. The owner signers are derived from
+  # the mnemonic, while `txgen addresses` and generated transactions use the
+  # corresponding derived multisig account addresses.
+  multisigs:
+    mnemonic: "${MNEMONIC}"
+    range: [0, 100]
+    native_multisig_1_of_1:
+      auto_setup: true        # Emit one setup transaction per account
+      setup_gas_limit: 300000
+      setup_fee_token: "0x20c0000000000000000000000000000000000000"
   
   deployer:
     mnemonic: "${MNEMONIC}"

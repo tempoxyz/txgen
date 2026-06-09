@@ -4,19 +4,26 @@ mod template;
 pub use nonce::{prefetch_parallel_nonces, NONCE_PRECOMPILE};
 pub use txgen_cli::fetch_protocol_nonces;
 
+use alloy_eips::eip2718::Encodable2718;
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{keccak256, Address, Bytes, TxKind, U256};
 use alloy_provider::{network::Ethereum, DynProvider};
 use alloy_signer::SignerSync;
 use eyre::{bail, Result};
 use rand::RngCore;
-use std::{num::NonZeroU64, sync::OnceLock};
+use std::{io::Write, num::NonZeroU64, sync::OnceLock};
 use tempo_alloy::{rpc::TempoTransactionRequest, TempoNetwork};
-use tempo_primitives::transaction::{
-    Call, TEMPO_EXPIRING_NONCE_KEY, TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS,
+use tempo_primitives::{
+    transaction::{
+        multisig_digest, Call, InitMultisig, MultisigOwner, MultisigSignature, PrimitiveSignature,
+        TempoSignature, TEMPO_EXPIRING_NONCE_KEY, TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS,
+    },
+    TempoTxEnvelope,
 };
-use txgen_cli::{GenerateContext, NetworkAdapter, TxRequest};
-use txgen_core::BuildContext;
+use txgen_cli::{sign_request_default, GenerateContext, NetworkAdapter, TxRequest};
+use txgen_core::{
+    BuildContext, GeneratedTx, NativeMultisig1Of1Account, NdjsonWriter, SchedulingKey, TxPhase,
+};
 
 pub use template::{TempoTemplate, TempoTxType};
 
@@ -61,8 +68,8 @@ impl TempoAdapter {
         address: Address,
         nonce_key: U256,
     ) -> Result<u64> {
-        if !ctx.nonces.contains(&scheduling_key) &&
-            let Some(provider) = self.nonce_rpc.get()
+        if !ctx.nonces.contains(&scheduling_key)
+            && let Some(provider) = self.nonce_rpc.get()
         {
             let n = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
@@ -91,10 +98,17 @@ impl NetworkAdapter for TempoAdapter {
         ctx: &mut BuildContext<'_>,
     ) -> Result<TxRequest<TempoTransactionRequest>> {
         let selected = ctx.select_signer(&template.from)?;
+        let native_multisig =
+            ctx.accounts.native_multisig_1_of_1(&selected.pool, selected.index)?;
         let is_tempo = template.tx_type == TempoTxType::Tempo;
+        if native_multisig.is_some() && !is_tempo {
+            bail!(
+                "native multisig account pools can only be used with Tempo transaction templates"
+            );
+        }
         let nonce_mode = resolve_nonce_mode(&template, is_tempo, ctx)?;
-        if !matches!(nonce_mode, TempoNonceMode::Expiring) &&
-            let Some(valid_for_secs) = template.valid_for_secs
+        if !matches!(nonce_mode, TempoNonceMode::Expiring)
+            && let Some(valid_for_secs) = template.valid_for_secs
         {
             bail!(
                 "`valid_for_secs` is only supported for expiring Tempo transactions (got {valid_for_secs}s on {:?})",
@@ -118,6 +132,7 @@ impl NetworkAdapter for TempoAdapter {
         req.set_chain_id(ctx.chain_id);
         req.set_nonce(nonce);
         req.set_gas_limit(template.gas_limit);
+        req.set_from(selected.address);
 
         match template.tx_type {
             TempoTxType::Tempo => {
@@ -145,6 +160,9 @@ impl NetworkAdapter for TempoAdapter {
 
                 if let Some(fee_token) = template.fee_token {
                     req.set_fee_token(fee_token);
+                }
+                if let Some(native_multisig) = &native_multisig {
+                    req.set_multisig_config_id(native_multisig.config_id);
                 }
                 if let Some(valid_after) = template.valid_after {
                     let valid_after = NonZeroU64::new(valid_after).ok_or_else(|| {
@@ -219,6 +237,28 @@ impl NetworkAdapter for TempoAdapter {
         })
     }
 
+    fn sign_request(
+        name: &str,
+        request: TempoTransactionRequest,
+        signer: &txgen_core::EcdsaSigner,
+    ) -> Result<Bytes> {
+        sign_tempo_request(name, request, signer)
+    }
+
+    fn emit_auto_setup<W: Write>(
+        &self,
+        ctx: &mut BuildContext<'_>,
+        writer: &mut NdjsonWriter<W>,
+    ) -> Result<()> {
+        for account in ctx.accounts.native_multisig_1_of_1_accounts() {
+            if !account.setup.auto_setup {
+                continue;
+            }
+            emit_native_multisig_setup(self, ctx, writer, &account)?;
+        }
+        Ok(())
+    }
+
     async fn prefetch_nonces(&self, ctx: &mut GenerateContext, rpc: &str) -> Result<()> {
         use alloy_provider::{Provider, ProviderBuilder};
         use eyre::WrapErr;
@@ -241,6 +281,101 @@ impl NetworkAdapter for TempoAdapter {
         let _ = self.nonce_rpc.set(provider);
 
         Ok(())
+    }
+}
+
+fn emit_native_multisig_setup<W: Write>(
+    adapter: &TempoAdapter,
+    ctx: &mut BuildContext<'_>,
+    writer: &mut NdjsonWriter<W>,
+    account: &NativeMultisig1Of1Account,
+) -> Result<()> {
+    let scheduling_key = account.account.0 .0;
+    let nonce = adapter.next_nonce_lazy(ctx, scheduling_key, account.account, U256::ZERO)?;
+    let mut req = TempoTransactionRequest::default();
+    req.set_chain_id(ctx.chain_id);
+    req.set_nonce(nonce);
+    req.set_gas_limit(account.setup.setup_gas_limit);
+    req.set_max_fee_per_gas(ctx.gas.max_fee_per_gas);
+    req.set_max_priority_fee_per_gas(ctx.gas.max_priority_fee_per_gas);
+    req.set_from(account.account);
+    req.set_kind(TxKind::Call(account.account));
+    req.set_value(U256::ZERO);
+    if let Some(fee_token) = account.setup.setup_fee_token {
+        req.set_fee_token(fee_token);
+    }
+    req.set_multisig_init(native_multisig_init(account));
+
+    let signer = ctx.accounts.get_by_index(&account.pool, account.index)?;
+    let id = format!("native_multisig_1_of_1_setup.{}.{}", account.pool, account.index);
+    let raw = sign_tempo_request(&id, req, signer)?;
+    writer.write(&GeneratedTx {
+        phase: TxPhase::Setup,
+        id: Some(id),
+        raw,
+        submission_keys: vec![SchedulingKey::from(scheduling_key)],
+        inclusion_keys: Vec::new(),
+    })?;
+    Ok(())
+}
+
+fn sign_tempo_request(
+    name: &str,
+    request: TempoTransactionRequest,
+    signer: &txgen_core::EcdsaSigner,
+) -> Result<Bytes> {
+    if request.multisig_init.is_none() && request.multisig_config_id.is_none() {
+        return sign_request_default::<TempoAdapter>(name, request, signer);
+    }
+
+    let init = request.multisig_init.clone();
+    let (account, config_id) = if let Some(init) = init.as_ref() {
+        let config_id = init
+            .config_id()
+            .map_err(|reason| eyre::eyre!("invalid native multisig init: {reason}"))?;
+        let account = init
+            .account()
+            .map_err(|reason| eyre::eyre!("invalid native multisig account: {reason}"))?;
+        (account, config_id)
+    } else {
+        let config_id = request
+            .multisig_config_id
+            .ok_or_else(|| eyre::eyre!("missing native multisig config id"))?;
+        let account = request
+            .from()
+            .ok_or_else(|| eyre::eyre!("native multisig request must set from account"))?;
+        (account, config_id)
+    };
+
+    if request.from().is_some_and(|from| from != account) {
+        bail!("native multisig request from address does not match derived account");
+    }
+
+    let tx = request
+        .build_aa()
+        .map_err(|e| eyre::eyre!("failed to build AA tx from template '{name}': {e}"))?;
+    let digest = multisig_digest(tx.signature_hash(), account, config_id);
+    let owner_signature = PrimitiveSignature::Secp256k1(
+        signer
+            .sign_hash_sync(&digest)
+            .map_err(|e| eyre::eyre!("failed to sign native multisig owner digest: {e}"))?,
+    )
+    .to_bytes();
+    let signature = TempoSignature::Multisig(MultisigSignature {
+        account,
+        config_id,
+        signatures: vec![owner_signature],
+        init,
+    });
+    let envelope = TempoTxEnvelope::from(tx.into_signed(signature));
+    Ok(Bytes::from(envelope.encoded_2718()))
+}
+
+fn native_multisig_init(account: &NativeMultisig1Of1Account) -> InitMultisig {
+    InitMultisig {
+        salt: account.salt,
+        threshold: 1,
+        owners: vec![MultisigOwner { owner: account.owner, weight: 1 }],
     }
 }
 
@@ -443,7 +578,6 @@ mod tests {
     use super::*;
     use alloy_consensus::SignableTransaction;
     use alloy_eips::eip2718::Encodable2718;
-    use alloy_network::{NetworkTransactionBuilder, TxSignerSync};
     use alloy_primitives::Address;
     use rand::{rngs::StdRng, SeedableRng};
     use std::{
@@ -452,8 +586,8 @@ mod tests {
     };
     use tempo_primitives::TEMPO_TX_TYPE_ID;
     use txgen_core::{
-        AccountManager, AccountPoolDef, AccountRef, ArtifactManager, GasConfig, GenValue,
-        NonceTracker, SelectMode,
+        AccountAddressKind, AccountManager, AccountPoolDef, AccountRef, ArtifactManager, GasConfig,
+        GenValue, NativeMultisig1Of1Def, NonceTracker, SelectMode,
     };
 
     const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -470,12 +604,8 @@ mod tests {
             + Encodable2718,
     {
         let tx_req = adapter.build_request(template, ctx).unwrap();
-        let mut unsigned = tx_req.request.build_unsigned().unwrap();
         let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index).unwrap();
-        let sig = signer.sign_transaction_sync(&mut unsigned).unwrap();
-        let signed = unsigned.into_signed(sig);
-        let envelope = <A::Network as alloy_network::Network>::TxEnvelope::from(signed);
-        Bytes::from(envelope.encoded_2718())
+        A::sign_request("test", tx_req.request, signer).unwrap()
     }
 
     fn test_accounts() -> AccountManager {
@@ -486,6 +616,27 @@ mod tests {
                 mnemonic: TEST_MNEMONIC.to_string(),
                 index: None,
                 range: Some([0, 10]),
+                address_kind: AccountAddressKind::Signer,
+                native_multisig_1_of_1: None,
+            },
+        );
+        AccountManager::from_spec(&accounts_map).unwrap()
+    }
+
+    fn test_native_multisig_accounts() -> AccountManager {
+        let mut accounts_map = HashMap::new();
+        accounts_map.insert(
+            "multisigs".to_string(),
+            AccountPoolDef {
+                mnemonic: TEST_MNEMONIC.to_string(),
+                index: None,
+                range: Some([0, 2]),
+                address_kind: AccountAddressKind::Signer,
+                native_multisig_1_of_1: Some(NativeMultisig1Of1Def {
+                    auto_setup: true,
+                    setup_gas_limit: 300_000,
+                    setup_fee_token: None,
+                }),
             },
         );
         AccountManager::from_spec(&accounts_map).unwrap()
@@ -538,6 +689,76 @@ mod tests {
 
         assert!(!raw.is_empty());
         assert_eq!(raw[0], TEMPO_TX_TYPE_ID);
+    }
+
+    #[test]
+    fn test_build_native_multisig_1_of_1_transfer() {
+        let accounts = test_native_multisig_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        let multisig = accounts.native_multisig_1_of_1("multisigs", 0).unwrap().unwrap();
+
+        let mut template = base_template(TempoTxType::Tempo);
+        template.from = AccountRef { pool: "multisigs".to_string(), select: SelectMode::Index(0) };
+
+        let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
+        assert_eq!(tx_req.request.from(), Some(multisig.account));
+        assert_eq!(tx_req.request.multisig_config_id, Some(multisig.config_id));
+        assert_eq!(tx_req.key, multisig.account.0 .0);
+
+        let signer = accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index).unwrap();
+        let raw = TempoAdapter::sign_request("test", tx_req.request, signer).unwrap();
+
+        assert!(!raw.is_empty());
+        assert_eq!(raw[0], TEMPO_TX_TYPE_ID);
+    }
+
+    #[test]
+    fn test_native_multisig_1_of_1_rejects_non_tempo_templates() {
+        let accounts = test_native_multisig_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        let mut template = base_template(TempoTxType::Eip1559);
+        template.from = AccountRef { pool: "multisigs".to_string(), select: SelectMode::Index(0) };
+
+        let err = match TempoAdapter::new().build_request(template, &mut ctx) {
+            Ok(_) => panic!("native multisig EIP-1559 template should fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("can only be used with Tempo transaction templates"));
+    }
+
+    #[test]
+    fn test_emit_native_multisig_1_of_1_auto_setup() {
+        let accounts = test_native_multisig_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        let mut buf = Vec::new();
+        let count = {
+            let mut writer = NdjsonWriter::new(&mut buf);
+            TempoAdapter::new().emit_auto_setup(&mut ctx, &mut writer).unwrap();
+            writer.count()
+        };
+        let output = String::from_utf8(buf).unwrap();
+        let rows: Vec<&str> = output.lines().collect();
+
+        assert_eq!(count, 2);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].contains("\"phase\":\"setup\""));
+        assert!(rows[0].contains("\"id\":\"native_multisig_1_of_1_setup."));
+        assert!(rows[0].contains("\"raw\":\"0x76"));
     }
 
     #[test]

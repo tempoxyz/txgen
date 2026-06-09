@@ -157,6 +157,36 @@ pub trait NetworkAdapter: Send + Sync {
         ctx: &mut BuildContext<'_>,
     ) -> Result<TxRequest<<Self::Network as Network>::TransactionRequest>>;
 
+    /// Sign and encode a built transaction request.
+    fn sign_request(
+        name: &str,
+        request: <Self::Network as Network>::TransactionRequest,
+        signer: &EcdsaSigner,
+    ) -> Result<Bytes>
+    where
+        Self: Sized,
+        <Self::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+        <Self::Network as Network>::TxEnvelope:
+            From<Signed<<Self::Network as Network>::UnsignedTx>> + Encodable2718,
+    {
+        sign_request_default::<Self>(name, request, signer)
+    }
+
+    /// Emit network-specific setup transactions before the measured workload.
+    fn emit_auto_setup<W: Write>(
+        &self,
+        _ctx: &mut BuildContext<'_>,
+        _writer: &mut NdjsonWriter<W>,
+    ) -> Result<()>
+    where
+        Self: Sized,
+        <Self::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+        <Self::Network as Network>::TxEnvelope:
+            From<Signed<<Self::Network as Network>::UnsignedTx>> + Encodable2718,
+    {
+        Ok(())
+    }
+
     /// Prefetch nonces from the chain before generation.
     ///
     /// Called when `--rpc` is provided. Default is no-op.
@@ -167,6 +197,29 @@ pub trait NetworkAdapter: Send + Sync {
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
         async { Ok(()) }
     }
+}
+
+pub fn sign_request_default<A: NetworkAdapter>(
+    name: &str,
+    request: NetworkRequest<A>,
+    signer: &EcdsaSigner,
+) -> Result<Bytes>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let mut unsigned = request
+        .build_unsigned()
+        .map_err(|e| eyre::eyre!("failed to build unsigned tx from template '{name}': {e}"))?;
+
+    let sig = signer
+        .sign_transaction_sync(&mut unsigned)
+        .map_err(|e| eyre::eyre!("failed to sign tx from template '{name}': {e}"))?;
+
+    let signed = unsigned.into_signed(sig);
+    let envelope = <A::Network as Network>::TxEnvelope::from(signed);
+    Ok(Bytes::from(envelope.encoded_2718()))
 }
 
 pub(crate) async fn run_generate<A>(adapter: A, args: GenerateArgs) -> Result<()>
@@ -265,6 +318,7 @@ where
         Some(path) => {
             let mut writer = txgen_core::output::file_writer(&path)?;
             let setup_bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+            adapter.emit_auto_setup(&mut build_ctx, &mut writer)?;
             let written = generate_txs(
                 adapter,
                 &ctx.spec,
@@ -279,6 +333,7 @@ where
         None => {
             let mut writer = txgen_core::output::stdout_writer();
             let setup_bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+            adapter.emit_auto_setup(&mut build_ctx, &mut writer)?;
             generate_txs(
                 adapter,
                 &ctx.spec,
@@ -703,18 +758,7 @@ where
 {
     let SigningJob { sequence: _, name, phase, tx_req, signer, inclusion_keys } = job;
     let TxRequest { request, signer_pool: _, signer_index: _, key } = tx_req;
-
-    let mut unsigned = request
-        .build_unsigned()
-        .map_err(|e| eyre::eyre!("failed to build unsigned tx from template '{name}': {e}"))?;
-
-    let sig = signer
-        .sign_transaction_sync(&mut unsigned)
-        .map_err(|e| eyre::eyre!("failed to sign tx from template '{name}': {e}"))?;
-
-    let signed = unsigned.into_signed(sig);
-    let envelope = <A::Network as Network>::TxEnvelope::from(signed);
-    let raw = Bytes::from(envelope.encoded_2718());
+    let raw = A::sign_request(&name, request, &signer)?;
 
     Ok(GeneratedTx {
         phase,
@@ -861,18 +905,7 @@ where
         None
     };
 
-    let mut unsigned = tx_req
-        .request
-        .build_unsigned()
-        .map_err(|e| eyre::eyre!("failed to build unsigned tx from template '{name}': {e}"))?;
-
-    let sig = signer
-        .sign_transaction_sync(&mut unsigned)
-        .map_err(|e| eyre::eyre!("failed to sign tx from template '{name}': {e}"))?;
-
-    let signed = unsigned.into_signed(sig);
-    let envelope = <A::Network as Network>::TxEnvelope::from(signed);
-    let raw = Bytes::from(envelope.encoded_2718());
+    let raw = A::sign_request(name, tx_req.request, signer)?;
     let info = captured.map(|(sender, nonce, created_address)| EmittedTxInfo {
         sender,
         nonce,

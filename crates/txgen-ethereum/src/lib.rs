@@ -108,8 +108,8 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
     use std::collections::HashMap;
     use txgen_core::{
-        AccountManager, AccountPoolDef, AccountRef, ArtifactManager, GasConfig, GenValue,
-        NonceTracker, SelectMode,
+        AccountAddressKind, AccountManager, AccountPoolDef, AccountRef, ArtifactManager, GasConfig,
+        GenValue, NonceTracker, SelectMode,
     };
 
     const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -123,6 +123,8 @@ mod tests {
                 mnemonic: TEST_MNEMONIC.to_string(),
                 index: None,
                 range: Some([0, 10]),
+                address_kind: AccountAddressKind::Signer,
+                native_multisig_1_of_1: None,
             },
         );
         let accounts = AccountManager::from_spec(&accounts_map).unwrap();

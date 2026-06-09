@@ -100,16 +100,17 @@ impl<'a> BuildContext<'a> {
         match from.select {
             SelectMode::Random => {
                 let signer = self.accounts.get_random(&from.pool, self.rng)?;
-                let addr = signer.address();
+                let signer_addr = signer.address();
                 let pool = self.accounts.get_pool(&from.pool)?;
                 // SAFETY: the signer came from this pool, so it must be present
-                let idx = pool.iter().position(|s| s.address() == addr).unwrap_or(0);
-                Ok(SelectedSigner { address: addr, pool: from.pool.clone(), index: idx })
+                let idx = pool.iter().position(|s| s.address() == signer_addr).unwrap_or(0);
+                let address = self.accounts.get_address_by_index(&from.pool, idx)?;
+                Ok(SelectedSigner { address, pool: from.pool.clone(), index: idx })
             }
             SelectMode::Index(idx) => {
-                let signer = self.accounts.get_by_index(&from.pool, idx)?;
+                self.accounts.get_by_index(&from.pool, idx)?;
                 Ok(SelectedSigner {
-                    address: signer.address(),
+                    address: self.accounts.get_address_by_index(&from.pool, idx)?,
                     pool: from.pool.clone(),
                     index: idx,
                 })
@@ -149,7 +150,7 @@ impl<'a> BuildContext<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AccountPoolDef;
+    use crate::{AccountAddressKind, AccountPoolDef};
     use rand::SeedableRng;
     use std::collections::HashMap;
 
@@ -159,6 +160,8 @@ mod tests {
             mnemonic: "test test test test test test test test test test test junk".into(),
             index: None,
             range: Some([0, 3]),
+            address_kind: AccountAddressKind::Signer,
+            native_multisig_1_of_1: None,
         };
         let accounts =
             AccountManager::from_spec(&HashMap::from([("default".to_string(), pool_def)])).unwrap();
@@ -184,6 +187,8 @@ mod tests {
             mnemonic: "test test test test test test test test test test test junk".into(),
             index: None,
             range: Some([0, 3]),
+            address_kind: AccountAddressKind::Signer,
+            native_multisig_1_of_1: None,
         };
         let accounts =
             AccountManager::from_spec(&HashMap::from([("default".to_string(), pool_def)])).unwrap();
