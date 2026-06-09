@@ -152,13 +152,10 @@ impl FromGenerator for U256 {
 impl FromGenerator for Address {
     fn from_generator(generator: &Generator, resolver: &mut ValueResolver<'_>) -> Result<Self> {
         match generator {
-            Generator::Pool { pool, select } => {
-                let signer = match select {
-                    SelectMode::Random => resolver.accounts.get_random(pool, resolver.rng)?,
-                    SelectMode::Index(idx) => resolver.accounts.get_by_index(pool, *idx)?,
-                };
-                Ok(signer.address())
-            }
+            Generator::Pool { pool, select } => match select {
+                SelectMode::Random => resolver.accounts.get_random_address(pool, resolver.rng),
+                SelectMode::Index(idx) => resolver.accounts.get_address_by_index(pool, *idx),
+            },
             Generator::AddressPool { pool, select } => match select {
                 SelectMode::Random => resolver.address_pools.get_random(pool, resolver.rng),
                 SelectMode::Index(idx) => resolver.address_pools.get_by_index(pool, *idx),

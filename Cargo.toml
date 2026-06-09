@@ -38,8 +38,8 @@ alloy-eips = "2"
 alloy-rlp = "0.3"
 
 # tempo
-tempo-alloy = "1"
-tempo-primitives = "1"
+tempo-alloy = { git = "https://github.com/tempoxyz/tempo", branch = "tanishk/native-multisig" }
+tempo-primitives = { git = "https://github.com/tempoxyz/tempo", branch = "tanishk/native-multisig" }
 
 # misc
 futures = "0.3"

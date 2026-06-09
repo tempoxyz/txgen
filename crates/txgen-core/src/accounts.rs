@@ -12,7 +12,70 @@ pub type EcdsaSigner = Secp256k1Signer;
 /// Manages signer account pools derived from mnemonics.
 #[derive(Debug)]
 pub struct AccountManager {
-    pools: HashMap<String, Vec<EcdsaSigner>>,
+    pools: HashMap<String, AccountPool>,
+}
+
+/// Signer pool plus its externally funded account-address mode.
+#[derive(Debug)]
+struct AccountPool {
+    signers: Vec<EcdsaSigner>,
+    address_kind: AccountAddressKind,
+    native_multisig_1_of_1: Option<NativeMultisig1Of1Def>,
+}
+
+/// Address mode for a signer pool.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountAddressKind {
+    /// The signer address is also the funded sender account.
+    #[default]
+    Signer,
+    /// The signer is the sole owner of a derived native multisig account.
+    NativeMultisig1Of1,
+}
+
+/// Native multisig setup options for a 1-of-1 account pool.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NativeMultisig1Of1Def {
+    /// Emit one setup transaction per account carrying `multisig_init`.
+    #[serde(default = "default_native_multisig_auto_setup")]
+    pub auto_setup: bool,
+    /// Gas limit used for generated setup transactions.
+    #[serde(default = "default_native_multisig_setup_gas_limit")]
+    pub setup_gas_limit: u64,
+    /// Optional fee token used by generated setup transactions.
+    #[serde(default)]
+    pub setup_fee_token: Option<Address>,
+}
+
+impl Default for NativeMultisig1Of1Def {
+    fn default() -> Self {
+        Self {
+            auto_setup: default_native_multisig_auto_setup(),
+            setup_gas_limit: default_native_multisig_setup_gas_limit(),
+            setup_fee_token: None,
+        }
+    }
+}
+
+fn default_native_multisig_auto_setup() -> bool {
+    true
+}
+
+fn default_native_multisig_setup_gas_limit() -> u64 {
+    300_000
+}
+
+/// Derived 1-of-1 native multisig account metadata.
+#[derive(Debug, Clone)]
+pub struct NativeMultisig1Of1Account {
+    pub pool: String,
+    pub index: usize,
+    pub owner: Address,
+    pub salt: B256,
+    pub config_id: B256,
+    pub account: Address,
+    pub setup: NativeMultisig1Of1Def,
 }
 
 /// Manages destination-only address pools.
@@ -60,10 +123,24 @@ impl AccountManager {
         let mut pools = HashMap::new();
 
         for (name, def) in accounts {
+            if def.address_kind == AccountAddressKind::NativeMultisig1Of1
+                && def.native_multisig_1_of_1.is_none()
+            {
+                bail!(
+                    "account pool '{name}' must set `native_multisig_1_of_1` to use native multisig addresses"
+                );
+            }
             let signers = def
                 .derive_signers()
                 .wrap_err_with(|| format!("failed to derive signers for pool '{name}'"))?;
-            pools.insert(name.clone(), signers);
+            pools.insert(
+                name.clone(),
+                AccountPool {
+                    signers,
+                    address_kind: def.address_kind(),
+                    native_multisig_1_of_1: def.native_multisig_1_of_1.clone(),
+                },
+            );
         }
 
         Ok(Self { pools })
@@ -73,7 +150,7 @@ impl AccountManager {
     pub fn get_pool(&self, name: &str) -> Result<&[EcdsaSigner]> {
         self.pools
             .get(name)
-            .map(|v| v.as_slice())
+            .map(|pool| pool.signers.as_slice())
             .ok_or_else(|| eyre::eyre!("account pool '{}' not found", name))
     }
 
@@ -95,10 +172,69 @@ impl AccountManager {
             .ok_or_else(|| eyre::eyre!("index {} out of range for pool '{}'", index, pool))
     }
 
+    /// Get the externally funded account address for a pool index.
+    pub fn get_address_by_index(&self, pool: &str, index: usize) -> Result<Address> {
+        let pool_data =
+            self.pools.get(pool).ok_or_else(|| eyre::eyre!("account pool '{}' not found", pool))?;
+        let signer = pool_data
+            .signers
+            .get(index)
+            .ok_or_else(|| eyre::eyre!("index {} out of range for pool '{}'", index, pool))?;
+        Ok(account_address(pool_data.address_kind, signer.address(), index))
+    }
+
+    /// Get a random externally funded account address from a pool.
+    pub fn get_random_address(&self, pool: &str, rng: &mut dyn rand::RngCore) -> Result<Address> {
+        let pool_data =
+            self.pools.get(pool).ok_or_else(|| eyre::eyre!("account pool '{}' not found", pool))?;
+        if pool_data.signers.is_empty() {
+            bail!("account pool '{}' is empty", pool);
+        }
+        let idx = rng.random_range(0..pool_data.signers.len());
+        Ok(account_address(pool_data.address_kind, pool_data.signers[idx].address(), idx))
+    }
+
+    /// Return 1-of-1 native multisig metadata for a pool index, if the pool is configured for it.
+    pub fn native_multisig_1_of_1(
+        &self,
+        pool: &str,
+        index: usize,
+    ) -> Result<Option<NativeMultisig1Of1Account>> {
+        let pool_data =
+            self.pools.get(pool).ok_or_else(|| eyre::eyre!("account pool '{}' not found", pool))?;
+        let Some(setup) = pool_data.native_multisig_1_of_1.clone() else {
+            return Ok(None);
+        };
+        let signer = pool_data
+            .signers
+            .get(index)
+            .ok_or_else(|| eyre::eyre!("index {} out of range for pool '{}'", index, pool))?;
+        Ok(Some(native_multisig_1_of_1_account(pool, index, signer.address(), setup)))
+    }
+
+    /// Return all configured 1-of-1 native multisig accounts.
+    pub fn native_multisig_1_of_1_accounts(&self) -> Vec<NativeMultisig1Of1Account> {
+        let mut accounts = Vec::new();
+        for (pool_name, pool) in &self.pools {
+            let Some(setup) = &pool.native_multisig_1_of_1 else {
+                continue;
+            };
+            accounts.extend(pool.signers.iter().enumerate().map(|(index, signer)| {
+                native_multisig_1_of_1_account(pool_name, index, signer.address(), setup.clone())
+            }));
+        }
+        accounts
+    }
+
     /// Get all addresses grouped by pool name.
     pub fn all_addresses(&self) -> impl Iterator<Item = (&str, Vec<Address>)> {
-        self.pools.iter().map(|(name, signers)| {
-            let addresses: Vec<Address> = signers.iter().map(Signer::address).collect();
+        self.pools.iter().map(|(name, pool)| {
+            let addresses: Vec<Address> = pool
+                .signers
+                .iter()
+                .enumerate()
+                .map(|(index, signer)| account_address(pool.address_kind, signer.address(), index))
+                .collect();
             (name.as_str(), addresses)
         })
     }
@@ -234,9 +370,25 @@ pub struct AccountPoolDef {
 
     /// Range of account indices `[start, end)` (mutually exclusive with `index`).
     pub range: Option<[u32; 2]>,
+
+    /// Externally funded address mode for this signer pool.
+    #[serde(default)]
+    pub address_kind: AccountAddressKind,
+
+    /// Treat this pool as 1-of-1 native multisig accounts owned by the signers.
+    #[serde(default)]
+    pub native_multisig_1_of_1: Option<NativeMultisig1Of1Def>,
 }
 
 impl AccountPoolDef {
+    fn address_kind(&self) -> AccountAddressKind {
+        if self.native_multisig_1_of_1.is_some() {
+            AccountAddressKind::NativeMultisig1Of1
+        } else {
+            self.address_kind
+        }
+    }
+
     /// Derive signers from this pool definition.
     pub fn derive_signers(&self) -> Result<Vec<EcdsaSigner>> {
         let indices = selected_indices(self.index, self.range, "account pool")?;
@@ -403,6 +555,64 @@ fn derive_fast_address(seed: B256, index: u64) -> Address {
     Address::from_slice(&hash.as_slice()[12..])
 }
 
+fn account_address(kind: AccountAddressKind, owner: Address, index: usize) -> Address {
+    match kind {
+        AccountAddressKind::Signer => owner,
+        AccountAddressKind::NativeMultisig1Of1 => {
+            let salt = deterministic_native_multisig_salt(index);
+            let config_id = derive_native_multisig_1_of_1_config_id(salt, owner);
+            derive_native_multisig_account(config_id)
+        }
+    }
+}
+
+fn native_multisig_1_of_1_account(
+    pool: &str,
+    index: usize,
+    owner: Address,
+    setup: NativeMultisig1Of1Def,
+) -> NativeMultisig1Of1Account {
+    let salt = deterministic_native_multisig_salt(index);
+    let config_id = derive_native_multisig_1_of_1_config_id(salt, owner);
+    let account = derive_native_multisig_account(config_id);
+    NativeMultisig1Of1Account {
+        pool: pool.to_string(),
+        index,
+        owner,
+        salt,
+        config_id,
+        account,
+        setup,
+    }
+}
+
+fn deterministic_native_multisig_salt(index: usize) -> B256 {
+    let mut salt = [0u8; 32];
+    salt[24..].copy_from_slice(&(index as u64).to_be_bytes());
+    B256::from(salt)
+}
+
+fn derive_native_multisig_1_of_1_config_id(salt: B256, owner: Address) -> B256 {
+    let mut input = Vec::with_capacity(NATIVE_MULTISIG_CONFIG_DOMAIN.len() + 32 + 4 + 4 + 20 + 4);
+    input.extend_from_slice(NATIVE_MULTISIG_CONFIG_DOMAIN);
+    input.extend_from_slice(salt.as_slice());
+    input.extend_from_slice(&1u32.to_be_bytes());
+    input.extend_from_slice(&1u32.to_be_bytes());
+    input.extend_from_slice(owner.as_slice());
+    input.extend_from_slice(&1u32.to_be_bytes());
+    keccak256(input)
+}
+
+fn derive_native_multisig_account(config_id: B256) -> Address {
+    let mut input = [0u8; NATIVE_MULTISIG_ACCOUNT_DOMAIN.len() + 32];
+    input[..NATIVE_MULTISIG_ACCOUNT_DOMAIN.len()].copy_from_slice(NATIVE_MULTISIG_ACCOUNT_DOMAIN);
+    input[NATIVE_MULTISIG_ACCOUNT_DOMAIN.len()..].copy_from_slice(config_id.as_slice());
+    Address::from_slice(&keccak256(input)[12..])
+}
+
+const NATIVE_MULTISIG_CONFIG_DOMAIN: &[u8] = b"tempo:multisig:config";
+const NATIVE_MULTISIG_ACCOUNT_DOMAIN: &[u8] = b"tempo:multisig:account";
+
 /// Reference to an account in a pool.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountRef {
@@ -462,8 +672,13 @@ mod tests {
 
     #[test]
     fn test_derive_single_signer() {
-        let def =
-            AccountPoolDef { mnemonic: TEST_MNEMONIC.to_string(), index: Some(0), range: None };
+        let def = AccountPoolDef {
+            mnemonic: TEST_MNEMONIC.to_string(),
+            index: Some(0),
+            range: None,
+            address_kind: AccountAddressKind::Signer,
+            native_multisig_1_of_1: None,
+        };
         let signers = def.derive_signers().unwrap();
         assert_eq!(signers.len(), 1);
     }
@@ -474,6 +689,8 @@ mod tests {
             mnemonic: TEST_MNEMONIC.to_string(),
             index: None,
             range: Some([0, 10]),
+            address_kind: AccountAddressKind::Signer,
+            native_multisig_1_of_1: None,
         };
         let signers = def.derive_signers().unwrap();
         assert_eq!(signers.len(), 10);
@@ -494,6 +711,8 @@ mod tests {
                 mnemonic: TEST_MNEMONIC.to_string(),
                 index: None,
                 range: Some([0, 5]),
+                address_kind: AccountAddressKind::Signer,
+                native_multisig_1_of_1: None,
             },
         );
         let manager = AccountManager::from_spec(&accounts).unwrap();
@@ -501,6 +720,51 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let signer = manager.get_random("users", &mut rng).unwrap();
         assert!(!signer.address().is_zero());
+    }
+
+    #[test]
+    fn test_native_multisig_1_of_1_pool_uses_derived_addresses() -> Result<()> {
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            "multisigs".to_string(),
+            AccountPoolDef {
+                mnemonic: TEST_MNEMONIC.to_string(),
+                index: None,
+                range: Some([0, 2]),
+                address_kind: AccountAddressKind::Signer,
+                native_multisig_1_of_1: Some(NativeMultisig1Of1Def::default()),
+            },
+        );
+
+        let manager = AccountManager::from_spec(&accounts)?;
+        let owner = manager.get_by_index("multisigs", 0)?.address();
+        let account = manager.get_address_by_index("multisigs", 0)?;
+        let multisig = manager.native_multisig_1_of_1("multisigs", 0)?.unwrap();
+
+        assert_ne!(account, owner);
+        assert_eq!(multisig.owner, owner);
+        assert_eq!(multisig.account, account);
+        assert_eq!(manager.all_addresses().next().unwrap().1[0], account);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_native_multisig_address_kind_requires_setup_config() {
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            "multisigs".to_string(),
+            AccountPoolDef {
+                mnemonic: TEST_MNEMONIC.to_string(),
+                index: Some(0),
+                range: None,
+                address_kind: AccountAddressKind::NativeMultisig1Of1,
+                native_multisig_1_of_1: None,
+            },
+        );
+
+        let err = AccountManager::from_spec(&accounts).unwrap_err();
+        assert!(err.to_string().contains("must set `native_multisig_1_of_1`"));
     }
 
     #[test]
@@ -517,8 +781,14 @@ mod tests {
         assert_eq!(addresses.len(), 3);
         assert_eq!(
             addresses[0],
-            AccountPoolDef { mnemonic: TEST_MNEMONIC.to_string(), index: Some(0), range: None }
-                .derive_signers()?[0]
+            AccountPoolDef {
+                mnemonic: TEST_MNEMONIC.to_string(),
+                index: Some(0),
+                range: None,
+                address_kind: AccountAddressKind::Signer,
+                native_multisig_1_of_1: None,
+            }
+            .derive_signers()?[0]
                 .address()
         );
 
@@ -568,6 +838,8 @@ mod tests {
             mnemonic: TEST_MNEMONIC.to_string(),
             index: Some(999_999),
             range: None,
+            address_kind: AccountAddressKind::Signer,
+            native_multisig_1_of_1: None,
         }
         .derive_signers()?[0]
             .address();
