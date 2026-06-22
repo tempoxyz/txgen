@@ -127,7 +127,7 @@ impl GenerateContext {
 // ---------------------------------------------------------------------------
 
 /// Output from [`NetworkAdapter::into_request`].
-pub struct TxRequest<R> {
+pub struct TxRequest<R, C = ()> {
     /// The network-specific transaction request.
     pub request: R,
     /// Signer pool name.
@@ -136,6 +136,77 @@ pub struct TxRequest<R> {
     pub signer_index: usize,
     /// Scheduling key (e.g. sender address or hash of sender+nonce_key).
     pub key: [u8; 20],
+    /// Adapter-specific signing context.
+    pub sign_context: C,
+}
+
+/// Per-request signing behavior.
+pub trait RequestSignContext<N: Network>: Send + 'static {
+    /// Sign and encode a network request into txgen NDJSON payload data.
+    fn sign_request(
+        self,
+        name: String,
+        phase: TxPhase,
+        request: <N as Network>::TransactionRequest,
+        signer: EcdsaSigner,
+        key: [u8; 20],
+        inclusion_keys: Vec<SchedulingKey>,
+    ) -> Result<GeneratedTx>
+    where
+        <N as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+        <N as Network>::TxEnvelope: From<Signed<<N as Network>::UnsignedTx>> + Encodable2718;
+}
+
+impl<N: Network> RequestSignContext<N> for () {
+    fn sign_request(
+        self,
+        name: String,
+        phase: TxPhase,
+        request: <N as Network>::TransactionRequest,
+        signer: EcdsaSigner,
+        key: [u8; 20],
+        inclusion_keys: Vec<SchedulingKey>,
+    ) -> Result<GeneratedTx>
+    where
+        <N as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+        <N as Network>::TxEnvelope: From<Signed<<N as Network>::UnsignedTx>> + Encodable2718,
+    {
+        sign_standard_request::<N>(name, phase, request, signer, key, inclusion_keys)
+    }
+}
+
+/// Sign and encode a request with the network's standard secp256k1 transaction signature.
+pub fn sign_standard_request<N: Network>(
+    name: String,
+    phase: TxPhase,
+    request: <N as Network>::TransactionRequest,
+    signer: EcdsaSigner,
+    key: [u8; 20],
+    inclusion_keys: Vec<SchedulingKey>,
+) -> Result<GeneratedTx>
+where
+    <N as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <N as Network>::TxEnvelope: From<Signed<<N as Network>::UnsignedTx>> + Encodable2718,
+{
+    let mut unsigned = request
+        .build_unsigned()
+        .map_err(|e| eyre::eyre!("failed to build unsigned tx from template '{name}': {e}"))?;
+
+    let sig = signer
+        .sign_transaction_sync(&mut unsigned)
+        .map_err(|e| eyre::eyre!("failed to sign tx from template '{name}': {e}"))?;
+
+    let signed = unsigned.into_signed(sig);
+    let envelope = <N as Network>::TxEnvelope::from(signed);
+    let raw = Bytes::from(envelope.encoded_2718());
+
+    Ok(GeneratedTx {
+        phase,
+        id: Some(name),
+        raw,
+        submission_keys: vec![SchedulingKey::from(key)],
+        inclusion_keys,
+    })
 }
 
 /// Trait for network-specific transaction generation.
@@ -150,12 +221,28 @@ pub trait NetworkAdapter: Send + Sync {
     /// The alloy [`Network`] whose types are used.
     type Network: Network;
 
+    /// Adapter-specific signing context attached to each request.
+    type SignContext: RequestSignContext<Self::Network>;
+
     /// Map a template to a network-specific transaction request.
     fn build_request(
         &self,
         template: Self::Template,
         ctx: &mut BuildContext<'_>,
-    ) -> Result<TxRequest<<Self::Network as Network>::TransactionRequest>>;
+    ) -> Result<TxRequest<<Self::Network as Network>::TransactionRequest, Self::SignContext>>;
+
+    /// Expand an adapter-specific setup step into ordinary transaction templates.
+    ///
+    /// Returning `Ok(None)` means the adapter does not support the extension.
+    fn expand_setup_extension(
+        &self,
+        _step_id: &str,
+        _extension_name: &str,
+        _value: serde_yaml::Value,
+        _ctx: &mut BuildContext<'_>,
+    ) -> Result<Option<Vec<serde_yaml::Value>>> {
+        Ok(None)
+    }
 
     /// Prefetch nonces from the chain before generation.
     ///
@@ -406,17 +493,45 @@ fn emit_setup_step<A: NetworkAdapter, W: Write>(
     writer: &mut NdjsonWriter<W>,
 ) -> Result<()>
 where
+    A::SignContext: RequestSignContext<A::Network>,
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
     let has_deploy = step.deploy.is_some();
     let has_tx = step.tx.is_some();
-    if has_deploy == has_tx {
-        bail!("setup step must set exactly one of `deploy` or `tx`");
+    let has_keychain_authorize_pool = step.keychain_authorize_pool.is_some();
+    let action_count =
+        usize::from(has_deploy) + usize::from(has_tx) + usize::from(has_keychain_authorize_pool);
+    if action_count != 1 {
+        bail!("setup step must set exactly one of `deploy`, `tx`, or `keychain_authorize_pool`");
     }
 
     let local_bindings = resolve_sequence_bindings(&step.bindings, ctx, setup_bindings)?;
+    if let Some(keychain_authorize_pool) = &step.keychain_authorize_pool {
+        let materialized = substitute_vars(keychain_authorize_pool.clone(), &local_bindings)?;
+        let templates = adapter
+            .expand_setup_extension(&step.id, "keychain_authorize_pool", materialized, ctx)?
+            .ok_or_else(|| {
+                eyre::eyre!("adapter does not support setup step `keychain_authorize_pool`")
+            })?;
+        if templates.is_empty() {
+            bail!("setup step `keychain_authorize_pool` produced no transactions");
+        }
+        for (idx, value) in templates.into_iter().enumerate() {
+            emit_template_value(
+                adapter,
+                &format!("setup.{}[{idx}]", step.id),
+                value,
+                TxPhase::Setup,
+                &[setup_key],
+                ctx,
+                writer,
+            )?;
+        }
+        return Ok(());
+    }
+
     let info = if let Some(deploy) = &step.deploy {
         let materialized = substitute_vars(deploy.clone(), &local_bindings)?;
         let value = build_deploy_template_value(materialized, ctx)?;
@@ -500,12 +615,13 @@ fn build_deploy_template_value(
 }
 
 type NetworkRequest<A> = <<A as NetworkAdapter>::Network as Network>::TransactionRequest;
+type AdapterTxRequest<A> = TxRequest<NetworkRequest<A>, <A as NetworkAdapter>::SignContext>;
 
 struct SigningJob<A: NetworkAdapter> {
     sequence: u64,
     name: String,
     phase: TxPhase,
-    tx_req: TxRequest<NetworkRequest<A>>,
+    tx_req: AdapterTxRequest<A>,
     signer: EcdsaSigner,
     inclusion_keys: Vec<SchedulingKey>,
 }
@@ -702,27 +818,9 @@ where
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
     let SigningJob { sequence: _, name, phase, tx_req, signer, inclusion_keys } = job;
-    let TxRequest { request, signer_pool: _, signer_index: _, key } = tx_req;
+    let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context } = tx_req;
 
-    let mut unsigned = request
-        .build_unsigned()
-        .map_err(|e| eyre::eyre!("failed to build unsigned tx from template '{name}': {e}"))?;
-
-    let sig = signer
-        .sign_transaction_sync(&mut unsigned)
-        .map_err(|e| eyre::eyre!("failed to sign tx from template '{name}': {e}"))?;
-
-    let signed = unsigned.into_signed(sig);
-    let envelope = <A::Network as Network>::TxEnvelope::from(signed);
-    let raw = Bytes::from(envelope.encoded_2718());
-
-    Ok(GeneratedTx {
-        phase,
-        id: Some(name),
-        raw,
-        submission_keys: vec![SchedulingKey::from(key)],
-        inclusion_keys,
-    })
+    sign_context.sign_request(name, phase, request, signer, key, inclusion_keys)
 }
 
 fn generate_txs<A, W: Write>(
@@ -861,18 +959,16 @@ where
         None
     };
 
-    let mut unsigned = tx_req
-        .request
-        .build_unsigned()
-        .map_err(|e| eyre::eyre!("failed to build unsigned tx from template '{name}': {e}"))?;
-
-    let sig = signer
-        .sign_transaction_sync(&mut unsigned)
-        .map_err(|e| eyre::eyre!("failed to sign tx from template '{name}': {e}"))?;
-
-    let signed = unsigned.into_signed(sig);
-    let envelope = <A::Network as Network>::TxEnvelope::from(signed);
-    let raw = Bytes::from(envelope.encoded_2718());
+    let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context } = tx_req;
+    let generated = sign_context.sign_request(
+        name.to_string(),
+        phase,
+        request,
+        signer.clone(),
+        key,
+        dedup_scheduling_keys(inclusion_keys.iter().copied()),
+    )?;
+    let raw = generated.raw.clone();
     let info = captured.map(|(sender, nonce, created_address)| EmittedTxInfo {
         sender,
         nonce,
@@ -880,13 +976,7 @@ where
         created_address,
     });
 
-    writer.write(&GeneratedTx {
-        phase,
-        id: Some(name.to_string()),
-        raw,
-        submission_keys: vec![SchedulingKey::from(tx_req.key)],
-        inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),
-    })?;
+    writer.write(&generated)?;
     Ok(info)
 }
 

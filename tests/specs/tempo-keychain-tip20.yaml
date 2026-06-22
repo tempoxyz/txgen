@@ -1,0 +1,59 @@
+chain_id: 1337
+
+gas:
+  max_fee_per_gas: 100000000000
+  max_priority_fee_per_gas: 100000000000
+
+accounts:
+  users:
+    mnemonic: "test test test test test test test test test test test junk"
+    range: [0, 3]
+
+artifacts:
+  ERC20: ../../examples/erc20.abi.json
+
+setup:
+  steps:
+    - id: authorize_keychain_users
+      keychain_authorize_pool:
+        accounts:
+          pool: users
+        access_keys:
+          mnemonic: "test test test test test test test test test test test junk"
+          range: [100000, 100003]
+        key_type: secp256k1
+        gas_limit: 400000
+        limits:
+          - token: "0x20c0000000000000000000000000000000000000"
+            amount: "1000000000000000000000000"
+            period: 0
+        allowed_calls: unrestricted
+
+templates:
+  keychain_tip20_transfer:
+    type: tempo
+    auth:
+      mode: keychain
+      access_key:
+        from_setup: authorize_keychain_users
+        pair: same_index
+    from:
+      pool: users
+      select: random
+    gas_limit: 400000
+    fee_token: "0x20c0000000000000000000000000000000000000"
+    max_fee_per_gas: 100000000000
+    max_priority_fee_per_gas: 100000000000
+    call:
+      to: "0x20c0000000000000000000000000000000000000"
+      abi: ERC20
+      function: transfer
+      args:
+        - pool:
+            pool: users
+            select: random
+        - 1
+
+mix:
+  - template: keychain_tip20_transfer
+    weight: 100
