@@ -26,7 +26,7 @@ impl<T: Default> Default for GenValue<T> {
 #[serde(rename_all = "snake_case")]
 pub enum Generator {
     /// Uniform random integer in range `[min, max]`.
-    Uniform([u64; 2]),
+    Uniform(UniformRange),
     /// Random choice from a list of values.
     Choice(Vec<serde_yaml::Value>),
     /// Account address from a signer pool.
@@ -39,6 +39,21 @@ pub enum Generator {
     Random,
     /// Explicit constant value.
     Const(serde_yaml::Value),
+}
+
+/// Uniform random integer range.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum UniformRange {
+    /// Inclusive `[min, max]` range.
+    Range([serde_yaml::Value; 2]),
+    /// Inclusive range with optional step.
+    Options {
+        min: serde_yaml::Value,
+        max: serde_yaml::Value,
+        #[serde(default)]
+        step: Option<serde_yaml::Value>,
+    },
 }
 
 /// Resolver for generator expressions.
@@ -66,6 +81,15 @@ impl ValueResolver<'_> {
         Ok(serde_yaml::from_value(value.clone())?)
     }
 
+    /// Resolve a YAML generator expression to a YAML value.
+    pub fn resolve_yaml(&mut self, value: &serde_yaml::Value) -> Result<serde_yaml::Value> {
+        if let Some(generator) = parse_generator(value) {
+            return serde_yaml::Value::from_generator(&generator, self);
+        }
+
+        Ok(value.clone())
+    }
+
     /// Resolve a GenValue to a concrete value.
     pub fn resolve_gen<T: DeserializeOwned + FromGenerator + Clone>(
         &mut self,
@@ -83,10 +107,64 @@ pub trait FromGenerator: Sized {
     fn from_generator(generator: &Generator, resolver: &mut ValueResolver<'_>) -> Result<Self>;
 }
 
+pub(crate) fn parse_generator(value: &serde_yaml::Value) -> Option<Generator> {
+    match serde_yaml::from_value::<GenValue<()>>(value.clone()).ok()? {
+        GenValue::Generator(generator) => Some(generator),
+        GenValue::Literal(_) => None,
+    }
+}
+
+fn choose_yaml_value<'a>(
+    choices: &'a [serde_yaml::Value],
+    resolver: &mut ValueResolver<'_>,
+) -> Result<&'a serde_yaml::Value> {
+    if choices.is_empty() {
+        bail!("choice generator must contain at least one value");
+    }
+
+    let idx = resolver.rng.random_range(0..choices.len());
+    Ok(&choices[idx])
+}
+
+fn yaml_i128(value: &serde_yaml::Value, context: &str) -> Result<i128> {
+    serde_yaml::from_value(value.clone())
+        .map_err(|err| eyre::eyre!("{context} must be an integer: {err}"))
+}
+
+fn sample_uniform_i128(range: &UniformRange, resolver: &mut ValueResolver<'_>) -> Result<i128> {
+    let (min, max, step) = match range {
+        UniformRange::Range([min, max]) => {
+            (yaml_i128(min, "uniform min")?, yaml_i128(max, "uniform max")?, 1)
+        }
+        UniformRange::Options { min, max, step } => (
+            yaml_i128(min, "uniform min")?,
+            yaml_i128(max, "uniform max")?,
+            match step {
+                Some(step) => yaml_i128(step, "uniform step")?,
+                None => 1,
+            },
+        ),
+    };
+
+    if step <= 0 {
+        bail!("uniform step must be greater than zero");
+    }
+    if min > max {
+        bail!("uniform min must be less than or equal to max");
+    }
+
+    let span = max.checked_sub(min).ok_or_else(|| eyre::eyre!("uniform range overflowed"))?;
+    let slots = span / step;
+    let offset = resolver.rng.random_range(0..=slots);
+    let distance =
+        offset.checked_mul(step).ok_or_else(|| eyre::eyre!("uniform selection overflowed"))?;
+    min.checked_add(distance).ok_or_else(|| eyre::eyre!("uniform selection overflowed"))
+}
+
 impl FromGenerator for u64 {
     fn from_generator(generator: &Generator, resolver: &mut ValueResolver<'_>) -> Result<Self> {
         match generator {
-            Generator::Uniform([min, max]) => Ok(resolver.rng.random_range(*min..=*max)),
+            Generator::Uniform(range) => Ok(sample_uniform_i128(range, resolver)?.try_into()?),
             Generator::Const(v) => Ok(serde_yaml::from_value(v.clone())?),
             Generator::Choice(choices) => {
                 let idx = resolver.rng.random_range(0..choices.len());
@@ -101,9 +179,7 @@ impl FromGenerator for u64 {
 impl FromGenerator for u128 {
     fn from_generator(generator: &Generator, resolver: &mut ValueResolver<'_>) -> Result<Self> {
         match generator {
-            Generator::Uniform([min, max]) => {
-                Ok(resolver.rng.random_range(*min as u128..=*max as u128))
-            }
+            Generator::Uniform(range) => Ok(sample_uniform_i128(range, resolver)?.try_into()?),
             Generator::Const(v) => Ok(serde_yaml::from_value(v.clone())?),
             Generator::Choice(choices) => {
                 let idx = resolver.rng.random_range(0..choices.len());
@@ -118,8 +194,8 @@ impl FromGenerator for u128 {
 impl FromGenerator for U256 {
     fn from_generator(generator: &Generator, resolver: &mut ValueResolver<'_>) -> Result<Self> {
         match generator {
-            Generator::Uniform([min, max]) => {
-                let val = resolver.rng.random_range(*min..=*max);
+            Generator::Uniform(range) => {
+                let val: u128 = sample_uniform_i128(range, resolver)?.try_into()?;
                 Ok(U256::from(val))
             }
             Generator::Const(v) => {
@@ -234,6 +310,43 @@ impl FromGenerator for String {
     }
 }
 
+impl FromGenerator for serde_yaml::Value {
+    fn from_generator(generator: &Generator, resolver: &mut ValueResolver<'_>) -> Result<Self> {
+        match generator {
+            Generator::Uniform(range) => {
+                Ok(serde_yaml::to_value(sample_uniform_i128(range, resolver)?)?)
+            }
+            Generator::Choice(choices) => {
+                let value = choose_yaml_value(choices, resolver)?.clone();
+                resolver.resolve_yaml(&value)
+            }
+            Generator::Pool { pool, select } => {
+                let signer = match select {
+                    SelectMode::Random => resolver.accounts.get_random(pool, resolver.rng)?,
+                    SelectMode::Index(idx) => resolver.accounts.get_by_index(pool, *idx)?,
+                };
+                Ok(serde_yaml::Value::String(signer.address().to_string()))
+            }
+            Generator::AddressPool { pool, select } => {
+                let address = match select {
+                    SelectMode::Random => resolver.address_pools.get_random(pool, resolver.rng)?,
+                    SelectMode::Index(idx) => resolver.address_pools.get_by_index(pool, *idx)?,
+                };
+                Ok(serde_yaml::Value::String(address.to_string()))
+            }
+            Generator::RandomBytes(len) => {
+                let mut bytes = vec![0u8; *len];
+                resolver.rng.fill(&mut bytes[..]);
+                Ok(serde_yaml::Value::String(Bytes::from(bytes).to_string()))
+            }
+            Generator::Const(value) => Ok(value.clone()),
+            Generator::Random => {
+                bail!("cannot resolve untyped random generator to a YAML value")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,9 +360,36 @@ mod tests {
         let mut resolver =
             ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
 
-        let generator = Generator::Uniform([1, 100]);
+        let generator = Generator::Uniform(UniformRange::Range([
+            serde_yaml::to_value(1).unwrap(),
+            serde_yaml::to_value(100).unwrap(),
+        ]));
         let val: u64 = u64::from_generator(&generator, &mut resolver).unwrap();
         assert!((1..=100).contains(&val));
+    }
+
+    #[test]
+    fn test_uniform_i64_with_step() {
+        let accounts = AccountManager::empty();
+        let address_pools = AddressPoolManager::empty();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut resolver =
+            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let value = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+uniform:
+  min: -30
+  max: 30
+  step: 10
+"#,
+        )
+        .unwrap();
+
+        for _ in 0..32 {
+            let val: i64 = serde_yaml::from_value(resolver.resolve_yaml(&value).unwrap()).unwrap();
+            assert!((-30..=30).contains(&val));
+            assert_eq!(val % 10, 0);
+        }
     }
 
     #[test]
