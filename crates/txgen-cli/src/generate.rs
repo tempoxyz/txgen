@@ -519,12 +519,13 @@ where
             bail!("setup step `keychain_authorize_pool` produced no transactions");
         }
         for (idx, value) in templates.into_iter().enumerate() {
+            let inclusion_key = compute_setup_extension_key(&step.id, idx);
             emit_template_value(
                 adapter,
                 &format!("setup.{}[{idx}]", step.id),
                 value,
                 TxPhase::Setup,
-                &[setup_key],
+                &[inclusion_key],
                 ctx,
                 writer,
             )?;
@@ -1178,7 +1179,15 @@ fn referenced_local_binding(
 }
 
 fn compute_setup_key() -> SchedulingKey {
-    let hash = keccak256(b"txgen:setup");
+    scheduling_key_from_hash(keccak256(b"txgen:setup"))
+}
+
+fn compute_setup_extension_key(step_id: &str, idx: usize) -> SchedulingKey {
+    let material = format!("txgen:setup:{step_id}:{idx}");
+    scheduling_key_from_hash(keccak256(material.as_bytes()))
+}
+
+fn scheduling_key_from_hash(hash: B256) -> SchedulingKey {
     let mut key = [0u8; 20];
     key.copy_from_slice(&hash[..20]);
     SchedulingKey::from(key)
@@ -1190,10 +1199,7 @@ fn compute_sequence_key(sequence_name: &str, sequence_instance: u64) -> Scheduli
     data.extend_from_slice(sequence_name.as_bytes());
     data.extend_from_slice(&sequence_instance.to_be_bytes());
 
-    let hash = keccak256(data);
-    let mut key = [0u8; 20];
-    key.copy_from_slice(&hash[..20]);
-    SchedulingKey::from(key)
+    scheduling_key_from_hash(keccak256(data))
 }
 
 fn merge_template_overlay(
