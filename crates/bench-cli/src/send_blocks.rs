@@ -75,25 +75,17 @@ struct ReorgState {
     fork_length: usize,
     branch_point_hash: Option<B256>,
     fork_parent_hash: Option<B256>,
-    canonical_forkchoice_state: Option<ForkchoiceState>,
 }
 
 impl ReorgState {
     const fn new(depth: usize) -> Self {
-        Self {
-            depth,
-            fork_length: 0,
-            branch_point_hash: None,
-            fork_parent_hash: None,
-            canonical_forkchoice_state: None,
-        }
+        Self { depth, fork_length: 0, branch_point_hash: None, fork_parent_hash: None }
     }
 
     fn reset(&mut self) {
         self.fork_length = 0;
         self.branch_point_hash = None;
         self.fork_parent_hash = None;
-        self.canonical_forkchoice_state = None;
     }
 }
 
@@ -213,10 +205,6 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             )
             .await?;
         }
-    }
-
-    if let Some(reorg_state) = reorg_state.as_mut() {
-        finish_reorg_cycle(&provider, reorg_state).await?;
     }
 
     // Stop the scraper before finalizing.
@@ -459,7 +447,6 @@ async fn process_block(
     );
 
     if let Some(reorg_state) = reorg_state {
-        reorg_state.canonical_forkchoice_state = Some(canonical_forkchoice_state);
         process_reorg_block(
             provider,
             testing_provider,
@@ -620,40 +607,6 @@ async fn process_reorg_block(
         );
         reorg_state.reset();
     }
-
-    Ok(())
-}
-
-async fn finish_reorg_cycle(
-    provider: &(impl Provider + RethApi<Ethereum>),
-    reorg_state: &mut ReorgState,
-) -> Result<()> {
-    if reorg_state.fork_length == 0 {
-        return Ok(());
-    }
-
-    let canonical_forkchoice_state = reorg_state
-        .canonical_forkchoice_state
-        .ok_or_else(|| eyre::eyre!("reorg state is missing canonical forkchoice state"))?;
-    let fcu_result = provider
-        .reth_forkchoice_updated(canonical_forkchoice_state)
-        .await
-        .wrap_err("reth_forkchoiceUpdated failed while switching back to canonical head")?;
-
-    if !fcu_result.is_valid() {
-        eyre::bail!(
-            "reth_forkchoiceUpdated returned non-VALID status while switching back to canonical head: {:?}",
-            fcu_result.payload_status,
-        );
-    }
-
-    tracing::info!(
-        fork_length = reorg_state.fork_length,
-        reorg_depth = reorg_state.depth,
-        canonical_head = %canonical_forkchoice_state.head_block_hash,
-        "Switched forkchoice back to canonical head at end of input"
-    );
-    reorg_state.reset();
 
     Ok(())
 }
