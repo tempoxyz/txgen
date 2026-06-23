@@ -12,10 +12,11 @@ use crate::{
     send::parse_metadata,
     SendBlocksArgs,
 };
+use alloy_consensus::Header as ConsensusHeader;
 use alloy_network::Ethereum;
 use alloy_primitives::{Address, Bytes, B256};
 use alloy_provider::{ext::TestingApi, Provider, RootProvider};
-use alloy_rlp::Header;
+use alloy_rlp::{Decodable, Header};
 use alloy_rpc_types_engine::{
     ExecutionData, ForkchoiceState, JwtSecret, PayloadAttributes, TestingBuildBlockRequestV1,
 };
@@ -74,17 +75,25 @@ struct ReorgState {
     fork_length: usize,
     branch_point_hash: Option<B256>,
     fork_parent_hash: Option<B256>,
+    canonical_forkchoice_state: Option<ForkchoiceState>,
 }
 
 impl ReorgState {
     const fn new(depth: usize) -> Self {
-        Self { depth, fork_length: 0, branch_point_hash: None, fork_parent_hash: None }
+        Self {
+            depth,
+            fork_length: 0,
+            branch_point_hash: None,
+            fork_parent_hash: None,
+            canonical_forkchoice_state: None,
+        }
     }
 
     fn reset(&mut self) {
         self.fork_length = 0;
         self.branch_point_hash = None;
         self.fork_parent_hash = None;
+        self.canonical_forkchoice_state = None;
     }
 }
 
@@ -204,6 +213,10 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             )
             .await?;
         }
+    }
+
+    if let Some(reorg_state) = reorg_state.as_mut() {
+        finish_reorg_cycle(&provider, reorg_state).await?;
     }
 
     // Stop the scraper before finalizing.
@@ -381,22 +394,33 @@ async fn process_block(
         finalized_block_hash: collector.finalized_hash.unwrap(),
     };
     let canonical_forkchoice_state = forkchoice_state;
+    let delay_canonical_fcu = reorg_state.as_ref().is_some_and(|state| state.fork_length > 0);
 
-    let fcu_start = Instant::now();
-    let fcu_result = provider
-        .reth_forkchoice_updated(forkchoice_state)
-        .await
-        .wrap_err("reth_forkchoiceUpdated failed")?;
-    let fcu_latency = fcu_start.elapsed();
-
-    if !fcu_result.is_valid() {
-        collector.record_failure();
-        eyre::bail!(
-            "reth_forkchoiceUpdated returned non-VALID status for block {}: {:?}",
-            block.number,
-            fcu_result.payload_status,
+    let fcu_latency = if delay_canonical_fcu {
+        tracing::debug!(
+            block = block.number,
+            "Delaying canonical forkchoice update until synthetic fork reaches reorg depth"
         );
-    }
+        Duration::ZERO
+    } else {
+        let fcu_start = Instant::now();
+        let fcu_result = provider
+            .reth_forkchoice_updated(forkchoice_state)
+            .await
+            .wrap_err("reth_forkchoiceUpdated failed")?;
+        let fcu_latency = fcu_start.elapsed();
+
+        if !fcu_result.is_valid() {
+            collector.record_failure();
+            eyre::bail!(
+                "reth_forkchoiceUpdated returned non-VALID status for block {}: {:?}",
+                block.number,
+                fcu_result.payload_status,
+            );
+        }
+
+        fcu_latency
+    };
 
     let total_latency = new_payload_latency + fcu_latency;
     let payload_status_str = payload_status.status.status.to_string();
@@ -435,6 +459,7 @@ async fn process_block(
     );
 
     if let Some(reorg_state) = reorg_state {
+        reorg_state.canonical_forkchoice_state = Some(canonical_forkchoice_state);
         process_reorg_block(
             provider,
             testing_provider,
@@ -487,13 +512,17 @@ async fn process_reorg_block(
     let transactions = extract_tx_bytes_from_block_rlp(block.raw.as_ref()).wrap_err_with(|| {
         format!("failed to extract raw transaction bytes from block {}", block.number)
     })?;
+    let parent_beacon_block_root =
+        extract_parent_beacon_block_root_from_block_rlp(block.raw.as_ref()).wrap_err_with(
+            || format!("failed to extract parent beacon block root from block {}", block.number),
+        )?;
 
     let payload_attributes = PayloadAttributes {
         timestamp: block.timestamp,
         prev_randao: B256::ZERO,
         suggested_fee_recipient: Address::ZERO,
         withdrawals: None,
-        parent_beacon_block_root: None,
+        parent_beacon_block_root,
         slot_number: None,
     };
     let parent_beacon_block_root = payload_attributes.parent_beacon_block_root.unwrap_or_default();
@@ -593,6 +622,54 @@ async fn process_reorg_block(
     }
 
     Ok(())
+}
+
+async fn finish_reorg_cycle(
+    provider: &(impl Provider + RethApi<Ethereum>),
+    reorg_state: &mut ReorgState,
+) -> Result<()> {
+    if reorg_state.fork_length == 0 {
+        return Ok(());
+    }
+
+    let canonical_forkchoice_state = reorg_state
+        .canonical_forkchoice_state
+        .ok_or_else(|| eyre::eyre!("reorg state is missing canonical forkchoice state"))?;
+    let fcu_result = provider
+        .reth_forkchoice_updated(canonical_forkchoice_state)
+        .await
+        .wrap_err("reth_forkchoiceUpdated failed while switching back to canonical head")?;
+
+    if !fcu_result.is_valid() {
+        eyre::bail!(
+            "reth_forkchoiceUpdated returned non-VALID status while switching back to canonical head: {:?}",
+            fcu_result.payload_status,
+        );
+    }
+
+    tracing::info!(
+        fork_length = reorg_state.fork_length,
+        reorg_depth = reorg_state.depth,
+        canonical_head = %canonical_forkchoice_state.head_block_hash,
+        "Switched forkchoice back to canonical head at end of input"
+    );
+    reorg_state.reset();
+
+    Ok(())
+}
+
+fn extract_parent_beacon_block_root_from_block_rlp(raw: &[u8]) -> Result<Option<B256>> {
+    let mut block_buf = raw;
+    let mut block_payload = Header::decode_bytes(&mut block_buf, true)
+        .wrap_err("failed to decode outer block RLP list")?;
+    if !block_buf.is_empty() {
+        eyre::bail!("block RLP has trailing bytes after outer list");
+    }
+
+    let header =
+        ConsensusHeader::decode(&mut block_payload).wrap_err("failed to decode block header")?;
+
+    Ok(header.parent_beacon_block_root)
 }
 
 fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<Vec<Bytes>> {
