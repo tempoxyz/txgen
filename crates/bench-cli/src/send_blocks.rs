@@ -12,6 +12,7 @@ use crate::{
     send::parse_metadata,
     SendBlocksArgs,
 };
+use alloy_eips::BlockId;
 use alloy_network::Ethereum;
 use alloy_primitives::{Address, Bytes, B256};
 use alloy_provider::{ext::TestingApi, Provider, RootProvider};
@@ -89,9 +90,12 @@ impl ReorgState {
 }
 
 struct ProcessingState<'a> {
+    provider: &'a RootProvider<Ethereum>,
+    testing_provider: &'a RootProvider<Ethereum>,
     collector: &'a mut MetricsCollector,
     reorg_state: Option<&'a mut ReorgState>,
     persistence_policy: &'a WaitForPersistence,
+    fetch_bal: bool,
 }
 
 const REORG_NON_BLOB_TX_DROP_INTERVAL: usize = 10;
@@ -113,6 +117,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         wait_for_persistence = ?persistence_policy,
         wait_time_ms = args.wait_time.map(|d| d.as_millis()),
         reorg_depth = args.reorg,
+        bal = args.bal,
         rpc = %args.rpc,
         "Starting block submission"
     );
@@ -160,13 +165,14 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             let input = parse_input_line(&line)?;
 
             process_input_and_wait(
-                &provider,
-                &testing_provider,
                 &input,
                 ProcessingState {
+                    provider: &provider,
+                    testing_provider: &testing_provider,
                     collector: &mut collector,
                     reorg_state: reorg_state.as_mut(),
                     persistence_policy: &persistence_policy,
+                    fetch_bal: args.bal,
                 },
                 args.wait_time,
                 start,
@@ -190,13 +196,14 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             let input = parse_input_line(&line_buf)?;
 
             process_input_and_wait(
-                &provider,
-                &testing_provider,
                 &input,
                 ProcessingState {
+                    provider: &provider,
+                    testing_provider: &testing_provider,
                     collector: &mut collector,
                     reorg_state: reorg_state.as_mut(),
                     persistence_policy: &persistence_policy,
+                    fetch_bal: args.bal,
                 },
                 args.wait_time,
                 start,
@@ -284,25 +291,15 @@ fn report_progress(
 }
 
 async fn process_input_and_wait(
-    provider: &(impl Provider + RethApi<Ethereum>),
-    testing_provider: &(impl Provider + TestingApi<Ethereum>),
     input: &InputLine,
-    state: ProcessingState<'_>,
+    mut state: ProcessingState<'_>,
     wait_time: Option<Duration>,
     start: Instant,
     reporters: &mut [Box<dyn Reporter>],
 ) -> Result<()> {
     let block_start = Instant::now();
 
-    process_input(
-        provider,
-        testing_provider,
-        input,
-        state.collector,
-        state.reorg_state,
-        state.persistence_policy,
-    )
-    .await?;
+    process_input(input, &mut state).await?;
     report_progress(state.collector, start, reporters)?;
 
     if let Some(wait_time) = wait_time {
@@ -315,53 +312,37 @@ async fn process_input_and_wait(
     Ok(())
 }
 
-async fn process_input(
-    provider: &(impl Provider + RethApi<Ethereum>),
-    testing_provider: &(impl Provider + TestingApi<Ethereum>),
-    input: &InputLine,
-    collector: &mut MetricsCollector,
-    reorg_state: Option<&mut ReorgState>,
-    persistence_policy: &WaitForPersistence,
-) -> Result<()> {
+async fn process_input(input: &InputLine, state: &mut ProcessingState<'_>) -> Result<()> {
     match input {
-        InputLine::RawBlock(block) => {
-            process_block(
-                provider,
-                testing_provider,
-                block,
-                collector,
-                reorg_state,
-                persistence_policy,
-            )
-            .await
-        }
+        InputLine::RawBlock(block) => process_block(block, state).await,
         InputLine::BigBlock(big_block) => {
-            if reorg_state.is_some() {
+            if state.reorg_state.is_some() {
                 eyre::bail!("--reorg is only supported for raw RLP block input");
             }
-            process_big_block(provider, big_block, collector, persistence_policy).await
+            process_big_block(state.provider, big_block, state.collector, state.persistence_policy)
+                .await
         }
     }
 }
 
-async fn process_block(
-    provider: &(impl Provider + RethApi<Ethereum>),
-    testing_provider: &(impl Provider + TestingApi<Ethereum>),
-    block: &BlockLine,
-    collector: &mut MetricsCollector,
-    reorg_state: Option<&mut ReorgState>,
-    persistence_policy: &WaitForPersistence,
-) -> Result<()> {
-    let input = RethNewPayloadInput::BlockRlp { block: block.raw.clone(), bal: block.bal.clone() };
-    let wait = persistence_policy.should_wait(collector.blocks_submitted());
+async fn process_block(block: &BlockLine, state: &mut ProcessingState<'_>) -> Result<()> {
+    let bal = if block.bal.is_some() {
+        block.bal.clone()
+    } else if state.fetch_bal {
+        Some(fetch_raw_block_access_list(state.testing_provider, block.number).await?)
+    } else {
+        None
+    };
+    let input = RethNewPayloadInput::BlockRlp { block: block.raw.clone(), bal };
+    let wait = state.persistence_policy.should_wait(state.collector.blocks_submitted());
 
     let new_payload_start = Instant::now();
     let payload_status =
-        provider.reth_new_payload(input, wait).await.wrap_err("reth_newPayload failed")?;
+        state.provider.reth_new_payload(input, wait).await.wrap_err("reth_newPayload failed")?;
     let new_payload_latency = new_payload_start.elapsed();
 
     if !payload_status.status.is_valid() {
-        collector.record_failure();
+        state.collector.record_failure();
         eyre::bail!(
             "reth_newPayload returned non-VALID status for block {}: {:?}",
             block.number,
@@ -369,28 +350,29 @@ async fn process_block(
         );
     }
 
-    let safe_hash = collector.prev_block_hash.unwrap_or(block.key);
-    if collector.finalized_hash.is_none() {
-        collector.finalized_hash = Some(block.key);
+    let safe_hash = state.collector.prev_block_hash.unwrap_or(block.key);
+    if state.collector.finalized_hash.is_none() {
+        state.collector.finalized_hash = Some(block.key);
     }
 
     let forkchoice_state = ForkchoiceState {
         head_block_hash: block.key,
         safe_block_hash: safe_hash,
         // SAFETY: finalized_hash is always Some after the check above
-        finalized_block_hash: collector.finalized_hash.unwrap(),
+        finalized_block_hash: state.collector.finalized_hash.unwrap(),
     };
     let canonical_forkchoice_state = forkchoice_state;
 
     let fcu_start = Instant::now();
-    let fcu_result = provider
+    let fcu_result = state
+        .provider
         .reth_forkchoice_updated(forkchoice_state)
         .await
         .wrap_err("reth_forkchoiceUpdated failed")?;
     let fcu_latency = fcu_start.elapsed();
 
     if !fcu_result.is_valid() {
-        collector.record_failure();
+        state.collector.record_failure();
         eyre::bail!(
             "reth_forkchoiceUpdated returned non-VALID status for block {}: {:?}",
             block.number,
@@ -402,8 +384,9 @@ async fn process_block(
     let payload_status_str = payload_status.status.status.to_string();
 
     let timestamp_ms = block.timestamp * 1000;
-    let block_time_ms = collector.prev_timestamp_ms.map(|prev| timestamp_ms.saturating_sub(prev));
-    collector.prev_timestamp_ms = Some(timestamp_ms);
+    let block_time_ms =
+        state.collector.prev_timestamp_ms.map(|prev| timestamp_ms.saturating_sub(prev));
+    state.collector.prev_timestamp_ms = Some(timestamp_ms);
 
     let block_stats = BlockStats {
         number: block.number,
@@ -420,7 +403,7 @@ async fn process_block(
         sparse_trie_wait_us: payload_status.sparse_trie_wait_us,
     };
 
-    collector.record_success(block_stats);
+    state.collector.record_success(block_stats);
 
     tracing::info!(
         block = block.number,
@@ -434,26 +417,34 @@ async fn process_block(
         "Submitted block"
     );
 
-    if let Some(reorg_state) = reorg_state {
+    if let Some(reorg_state) = state.reorg_state.as_deref_mut() {
         process_reorg_block(
-            provider,
-            testing_provider,
+            state.provider,
+            state.testing_provider,
             block,
-            collector,
+            state.collector,
             reorg_state,
             canonical_forkchoice_state,
-            persistence_policy,
+            state.persistence_policy,
         )
         .await?;
     }
 
-    collector.prev_block_hash = Some(block.key);
+    state.collector.prev_block_hash = Some(block.key);
 
     if block.number.is_multiple_of(32) {
-        collector.finalized_hash = Some(block.key);
+        state.collector.finalized_hash = Some(block.key);
     }
 
     Ok(())
+}
+
+async fn fetch_raw_block_access_list(provider: &impl Provider, block_number: u64) -> Result<Bytes> {
+    provider
+        .get_block_access_list_raw(BlockId::number(block_number))
+        .await
+        .wrap_err_with(|| format!("failed to fetch raw block access list {block_number}"))?
+        .ok_or_else(|| eyre::eyre!("raw block access list not found for block {block_number}"))
 }
 
 async fn process_reorg_block(

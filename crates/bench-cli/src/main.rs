@@ -130,6 +130,10 @@ pub struct SendBlocksArgs {
     #[arg(short, long)]
     pub input: Option<PathBuf>,
 
+    /// Fetch and attach raw block access lists for raw block inputs that do not include BAL bytes.
+    #[arg(long, default_value_t = false)]
+    pub bal: bool,
+
     /// Wait for persistence policy: always, never, or every:N
     ///
     /// Controls whether reth_newPayload blocks until the persistence
@@ -450,6 +454,26 @@ mod tests {
         };
 
         assert_eq!(args.metrics_forward, Some("http://prometheus:9090".to_string()));
+    }
+
+    #[test]
+    fn test_send_blocks_bal() {
+        let cli = Cli::try_parse_from([
+            "bench",
+            "send-blocks",
+            "--engine",
+            "http://localhost:8551",
+            "--jwt-secret",
+            "/tmp/jwt.hex",
+            "--bal",
+        ])
+        .unwrap();
+
+        let Command::SendBlocks(args) = cli.command else {
+            panic!("expected send-blocks command");
+        };
+
+        assert!(args.bal);
     }
 
     #[test]
