@@ -629,6 +629,43 @@ templates:
       value: 0
 ```
 
+For correlated call arguments, `args` can define local variables and then use
+them in `values`. Variables are resolved once per call, so dependent values can
+reuse the same random choices:
+
+```yaml
+call:
+  to: "0x..."
+  abi: dex
+  function: placeFlip
+  args:
+    vars:
+      amount:
+        uniform: { min: 100000000, max: 500000000 }
+      is_bid:
+        choice: [true, false]
+      tick:
+        if:
+          cond: { var: is_bid }
+          then: { uniform: { min: -30, max: 0, step: 10 } }
+          else: { uniform: { min: 0, max: 30, step: 10 } }
+      flip_tick:
+        if:
+          cond: { var: is_bid }
+          then: { uniform: { min: { var: tick }, max: 30, step: 10 } }
+          else: { uniform: { min: -30, max: { var: tick }, step: 10 } }
+    values:
+      - "0x20c0000000000000000000000000000000000001"
+      - { var: amount }
+      - { var: is_bid }
+      - { var: tick }
+      - { var: flip_tick }
+```
+
+Call argument variables reuse normal txgen generators such as `choice` and
+`uniform`. The `var` and `if` expressions are local to the call argument block and let
+arguments depend on earlier resolved variables.
+
 ### Setup Transactions
 
 Use `setup.steps` for deterministic transactions that prepare the chain before the measured workload, such as contract deployments and mint/configuration calls. `txgen` emits all setup transactions first with `phase: "setup"`; workload transactions are emitted afterwards with `phase: "workload"`.

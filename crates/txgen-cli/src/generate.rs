@@ -1122,6 +1122,10 @@ fn substitute_vars(
         serde_yaml::Value::Mapping(mapping) if mapping.len() == 1 => {
             let var_key = serde_yaml::Value::String("var".to_string());
             if let Some(serde_yaml::Value::String(path)) = mapping.get(&var_key) {
+                // If we don't yet have a binding for this variable, leave it for later parsing.
+                if split_binding_path(path, bindings).is_none() {
+                    return Ok(serde_yaml::Value::Mapping(mapping));
+                }
                 return binding_to_value(path, bindings);
             }
             let substituted = mapping
@@ -1228,4 +1232,75 @@ fn account_ref_value(pool: &str, index: usize) -> Result<serde_yaml::Value> {
     );
 
     Ok(serde_yaml::Value::Mapping(account))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn var(path: &str) -> serde_yaml::Value {
+        let mut mapping = serde_yaml::Mapping::new();
+        mapping.insert(
+            serde_yaml::Value::String("var".to_string()),
+            serde_yaml::Value::String(path.to_string()),
+        );
+        serde_yaml::Value::Mapping(mapping)
+    }
+
+    fn yaml_get<'a>(value: &'a serde_yaml::Value, key: &str) -> &'a serde_yaml::Value {
+        value
+            .as_mapping()
+            .and_then(|mapping| mapping.get(serde_yaml::Value::String(key.to_string())))
+            .unwrap_or_else(|| panic!("missing YAML key '{key}'"))
+    }
+
+    #[test]
+    fn substitute_vars_preserves_call_arg_local_vars() -> Result<()> {
+        let token = Address::from([0x20; 20]);
+        let value = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+call:
+  args:
+    vars:
+      is_bid:
+        choice: [true, false]
+      tick:
+        uniform: { min: { var: min_tick }, max: 30, step: 10 }
+    values:
+      - { var: token }
+      - { uniform: { min: { var: global_amount }, max: 500, step: 100 } }
+      - { var: is_bid }
+      - { var: tick }
+      - if:
+          cond: { var: is_bid }
+          then: { uniform: { min: { var: tick }, max: 30, step: 10 } }
+          else: { uniform: { min: -30, max: { var: tick }, step: 10 } }
+"#,
+        )?;
+        let bindings = HashMap::from([
+            ("global_amount".to_string(), ResolvedBinding::U64(123)),
+            ("min_tick".to_string(), ResolvedBinding::U64(0)),
+            ("token".to_string(), ResolvedBinding::Address(token)),
+        ]);
+
+        let materialized = substitute_vars(value, &bindings)?;
+
+        let args = yaml_get(yaml_get(&materialized, "call"), "args");
+        let vars = yaml_get(args, "vars");
+
+        let tick_uniform = yaml_get(yaml_get(vars, "tick"), "uniform");
+        assert_eq!(yaml_get(tick_uniform, "min"), &serde_yaml::to_value(0u64)?);
+
+        let values = yaml_get(args, "values").as_sequence().expect("values sequence");
+        assert_eq!(values[0], serde_yaml::Value::String(token.to_string()));
+        assert_eq!(
+            yaml_get(yaml_get(&values[1], "uniform"), "min"),
+            &serde_yaml::to_value(123u64)?
+        );
+        assert_eq!(values[2], var("is_bid"));
+        assert_eq!(values[3], var("tick"));
+        assert_eq!(yaml_get(yaml_get(&values[4], "if"), "cond"), &var("is_bid"));
+        Ok(())
+    }
 }

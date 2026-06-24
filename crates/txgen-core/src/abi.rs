@@ -3,9 +3,12 @@ use alloy_json_abi::JsonAbi;
 use alloy_primitives::{Address, Bytes, U256};
 use eyre::{bail, Result, WrapErr};
 use serde::Deserialize;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::PathBuf,
+};
 
-use crate::{GenValue, ValueResolver};
+use crate::{value::parse_generator, GenValue, Generator, ValueResolver};
 
 /// Artifact definition in the workload spec.
 #[derive(Debug, Clone, Deserialize)]
@@ -185,11 +188,102 @@ pub struct CallDef {
 
     /// Function arguments.
     #[serde(default)]
-    pub args: Vec<serde_yaml::Value>,
+    pub args: CallArgs,
 
     /// Value to send with the call.
     #[serde(default)]
     pub value: GenValue<U256>,
+}
+
+/// Function arguments for a contract call.
+#[derive(Debug, Clone)]
+pub enum CallArgs {
+    /// A fixed argument list.
+    List(Vec<serde_yaml::Value>),
+    /// Evaluate local variables and use them to materialize an argument list.
+    Vars(CallArgsVars),
+}
+
+/// Local variable definitions and values for a contract call argument list.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CallArgsVars {
+    /// Variables resolved once per call before encoding `values`.
+    ///
+    /// The map keys form the local `{ var: ... }` namespace for this argument block.
+    #[serde(default)]
+    vars: BTreeMap<String, serde_yaml::Value>,
+    /// Argument expressions to encode after variables are resolved.
+    values: Vec<serde_yaml::Value>,
+}
+
+impl Default for CallArgs {
+    fn default() -> Self {
+        Self::List(Vec::new())
+    }
+}
+
+impl CallArgs {
+    fn resolve(&self, resolver: &mut ValueResolver<'_>) -> Result<Vec<serde_yaml::Value>> {
+        match self {
+            Self::List(args) => Ok(args.clone()),
+            Self::Vars(args) => {
+                let mut resolved = HashMap::new();
+                let mut resolving = HashSet::new();
+
+                for name in args.vars.keys() {
+                    resolve_call_arg_var(
+                        name,
+                        &args.vars,
+                        &mut resolved,
+                        &mut resolving,
+                        resolver,
+                    )?;
+                }
+
+                args.values
+                    .iter()
+                    .map(|value| {
+                        eval_call_arg_expr(
+                            value,
+                            &args.vars,
+                            &mut resolved,
+                            &mut resolving,
+                            resolver,
+                        )
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CallArgs {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match value {
+            serde_yaml::Value::Null => Ok(Self::default()),
+            serde_yaml::Value::Sequence(args) => Ok(Self::List(args)),
+            serde_yaml::Value::Mapping(mapping) => {
+                let vars_key = serde_yaml::Value::String("vars".to_string());
+                let values_key = serde_yaml::Value::String("values".to_string());
+                if mapping.contains_key(&vars_key) || mapping.contains_key(&values_key) {
+                    let args = CallArgsVars::deserialize(serde_yaml::Value::Mapping(mapping))
+                        .map_err(serde::de::Error::custom)?;
+                    return Ok(Self::Vars(args));
+                }
+
+                Err(serde::de::Error::custom(
+                    "call args must be a list or `{ vars: {...}, values: [...] }`",
+                ))
+            }
+            _ => Err(serde::de::Error::custom(
+                "call args must be a list or `{ vars: {...}, values: [...] }`",
+            )),
+        }
+    }
 }
 
 /// Result of encoding a call.
@@ -215,7 +309,8 @@ impl CallDef {
 
         let input = if let Some(abi_name) = &self.abi {
             let abi = artifacts.get(abi_name)?;
-            encode_function_call(abi, &self.function, &self.args, resolver)?
+            let args = self.args.resolve(resolver)?;
+            encode_function_call(abi, &self.function, &args, resolver)?
         } else {
             // Raw function selector (4 bytes) - assume function is the hex selector
             self.function.parse()?
@@ -272,6 +367,122 @@ fn encode_function_call(
     Ok(Bytes::from(calldata))
 }
 
+fn resolve_call_arg_var(
+    name: &str,
+    vars: &BTreeMap<String, serde_yaml::Value>,
+    resolved: &mut HashMap<String, serde_yaml::Value>,
+    resolving: &mut HashSet<String>,
+    resolver: &mut ValueResolver<'_>,
+) -> Result<serde_yaml::Value> {
+    if let Some(value) = resolved.get(name) {
+        return Ok(value.clone());
+    }
+
+    let expr = vars.get(name).ok_or_else(|| eyre::eyre!("unknown call args variable '{name}'"))?;
+    if !resolving.insert(name.to_string()) {
+        bail!("circular call args variable dependency involving '{name}'");
+    }
+
+    let value = eval_call_arg_expr(expr, vars, resolved, resolving, resolver)
+        .wrap_err_with(|| format!("failed to resolve call args variable '{name}'"))?;
+    resolving.remove(name);
+    resolved.insert(name.to_string(), value.clone());
+    Ok(value)
+}
+
+fn eval_call_arg_expr(
+    expr: &serde_yaml::Value,
+    vars: &BTreeMap<String, serde_yaml::Value>,
+    resolved: &mut HashMap<String, serde_yaml::Value>,
+    resolving: &mut HashSet<String>,
+    resolver: &mut ValueResolver<'_>,
+) -> Result<serde_yaml::Value> {
+    match expr {
+        serde_yaml::Value::Mapping(mapping) => {
+            if let Some(value) = expression_value(mapping, "var")? {
+                let name: String = serde_yaml::from_value(value.clone())?;
+                return resolve_call_arg_var(&name, vars, resolved, resolving, resolver);
+            }
+
+            if let Some(value) = expression_value(mapping, "if")? {
+                return eval_call_arg_if(value, vars, resolved, resolving, resolver);
+            }
+
+            let mut evaluated = serde_yaml::Mapping::new();
+            for (key, value) in mapping {
+                evaluated.insert(
+                    key.clone(),
+                    eval_call_arg_expr(value, vars, resolved, resolving, resolver)?,
+                );
+            }
+            resolver.resolve_yaml(&serde_yaml::Value::Mapping(evaluated))
+        }
+        serde_yaml::Value::Sequence(values) => values
+            .iter()
+            .map(|value| eval_call_arg_expr(value, vars, resolved, resolving, resolver))
+            .collect::<Result<Vec<_>>>()
+            .map(serde_yaml::Value::Sequence),
+        _ => Ok(expr.clone()),
+    }
+}
+
+fn expression_value<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Result<Option<&'a serde_yaml::Value>> {
+    let key_value = serde_yaml::Value::String(key.to_string());
+    let Some(value) = mapping.get(&key_value) else {
+        return Ok(None);
+    };
+
+    if mapping.len() != 1 {
+        bail!("call args expression '{key}' cannot be combined with other keys");
+    }
+    Ok(Some(value))
+}
+
+fn eval_call_arg_if(
+    value: &serde_yaml::Value,
+    vars: &BTreeMap<String, serde_yaml::Value>,
+    resolved: &mut HashMap<String, serde_yaml::Value>,
+    resolving: &mut HashSet<String>,
+    resolver: &mut ValueResolver<'_>,
+) -> Result<serde_yaml::Value> {
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| eyre::eyre!("call args if expression must be a mapping"))?;
+    let cond = required_mapping_value(mapping, "cond")?;
+    let then_value = required_mapping_value(mapping, "then")?;
+    let else_value = required_mapping_value(mapping, "else")?;
+
+    let cond = eval_call_arg_bool(cond, vars, resolved, resolving, resolver, "if cond")?;
+    if cond {
+        eval_call_arg_expr(then_value, vars, resolved, resolving, resolver)
+    } else {
+        eval_call_arg_expr(else_value, vars, resolved, resolving, resolver)
+    }
+}
+
+fn required_mapping_value<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    key: &str,
+) -> Result<&'a serde_yaml::Value> {
+    let key_value = serde_yaml::Value::String(key.to_string());
+    mapping.get(&key_value).ok_or_else(|| eyre::eyre!("missing call args expression key '{key}'"))
+}
+
+fn eval_call_arg_bool(
+    value: &serde_yaml::Value,
+    vars: &BTreeMap<String, serde_yaml::Value>,
+    resolved: &mut HashMap<String, serde_yaml::Value>,
+    resolving: &mut HashSet<String>,
+    resolver: &mut ValueResolver<'_>,
+    context: &str,
+) -> Result<bool> {
+    let value = eval_call_arg_expr(value, vars, resolved, resolving, resolver)?;
+    serde_yaml::from_value(value).wrap_err_with(|| format!("call args {context} must be a bool"))
+}
+
 /// Convert a YAML value to a DynSolValue based on the expected Solidity type.
 fn yaml_to_sol_value(
     value: &serde_yaml::Value,
@@ -279,18 +490,7 @@ fn yaml_to_sol_value(
     resolver: &mut ValueResolver<'_>,
 ) -> Result<DynSolValue> {
     // Handle generator expressions
-    if value.is_mapping() {
-        // Check if it's a generator
-        if value.get("uniform").is_some() ||
-            value.get("choice").is_some() ||
-            value.get("pool").is_some() ||
-            value.get("address_pool").is_some() ||
-            value.get("random_bytes").is_some() ||
-            value.get("const").is_some()
-        {
-            return resolve_generator_to_sol(value, sol_type, resolver);
-        }
-    } else if matches!(value, serde_yaml::Value::String(s) if s == "random") {
+    if parse_generator(value).is_some() {
         return resolve_generator_to_sol(value, sol_type, resolver);
     }
 
@@ -351,21 +551,19 @@ fn resolve_generator_to_sol(
     sol_type: &str,
     resolver: &mut ValueResolver<'_>,
 ) -> Result<DynSolValue> {
-    match sol_type {
-        "address" => {
-            let addr: Address = resolver.resolve(value)?;
-            Ok(DynSolValue::Address(addr))
-        }
-        t if t.starts_with("uint") => {
-            let val: U256 = resolver.resolve(value)?;
-            Ok(DynSolValue::Uint(val, parse_uint_bits(t)?))
-        }
-        "bytes" => {
-            let bytes: Bytes = resolver.resolve(value)?;
-            Ok(DynSolValue::Bytes(bytes.to_vec()))
-        }
-        _ => bail!("generator not supported for type: {}", sol_type),
+    if matches!(parse_generator(value), Some(Generator::Random)) {
+        let value = match sol_type {
+            "address" => serde_yaml::Value::String(resolver.resolve::<Address>(value)?.to_string()),
+            t if t.starts_with("uint") => {
+                serde_yaml::Value::String(resolver.resolve::<U256>(value)?.to_string())
+            }
+            _ => bail!("generator not supported for type: {}", sol_type),
+        };
+        return yaml_to_sol_value(&value, sol_type, resolver);
     }
+
+    let value = resolver.resolve_yaml(value)?;
+    yaml_to_sol_value(&value, sol_type, resolver)
 }
 
 fn parse_uint_bits(t: &str) -> Result<usize> {
@@ -388,6 +586,7 @@ fn parse_int_bits(t: &str) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::{AccountManager, AddressPoolManager, ValueResolver};
+    use rand::SeedableRng;
 
     #[test]
     fn test_artifact_manager_empty() {
@@ -468,5 +667,144 @@ address_pool:
 
         assert_eq!(sol_value, DynSolValue::Address(expected));
         Ok(())
+    }
+
+    #[test]
+    fn test_random_generator_in_abi_arg() -> Result<()> {
+        let accounts = AccountManager::empty();
+        let address_pools = AddressPoolManager::empty();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut resolver =
+            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let value = serde_yaml::Value::String("random".to_string());
+
+        assert!(matches!(
+            yaml_to_sol_value(&value, "address", &mut resolver)?,
+            DynSolValue::Address(_)
+        ));
+        assert!(matches!(
+            yaml_to_sol_value(&value, "uint256", &mut resolver)?,
+            DynSolValue::Uint(_, 256)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_call_args_vars_resolve_dependent_dex_ticks() -> Result<()> {
+        let args: CallArgs = serde_yaml::from_str(
+            r#"
+vars:
+  is_bid:
+    choice: [true, false]
+  tick:
+    if:
+      cond: { var: is_bid }
+      then: { uniform: { min: -30, max: 0, step: 10 } }
+      else: { uniform: { min: 0, max: 30, step: 10 } }
+values:
+  - "0x20c0000000000000000000000000000000000001"
+  - { uniform: { min: 100000000, max: 500000000, step: 100000000 } }
+  - { var: is_bid }
+  - { var: tick }
+  - if:
+      cond: { var: is_bid }
+      then: { uniform: { min: { var: tick }, max: 30, step: 10 } }
+      else: { uniform: { min: -30, max: { var: tick }, step: 10 } }
+"#,
+        )?;
+        let accounts = AccountManager::empty();
+        let address_pools = AddressPoolManager::empty();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut resolver =
+            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+
+        for _ in 0..128 {
+            let values = args.resolve(&mut resolver)?;
+            assert_eq!(values.len(), 5);
+
+            let amount: i64 = serde_yaml::from_value(values[1].clone())?;
+            let is_bid: bool = serde_yaml::from_value(values[2].clone())?;
+            let tick: i64 = serde_yaml::from_value(values[3].clone())?;
+            let flip_tick: i64 = serde_yaml::from_value(values[4].clone())?;
+
+            assert!((100000000..=500000000).contains(&amount));
+            assert_eq!(amount % 100000000, 0);
+            assert_eq!(tick % 10, 0);
+            assert_eq!(flip_tick % 10, 0);
+
+            if is_bid {
+                assert!((-30..=0).contains(&tick));
+                assert!((tick..=30).contains(&flip_tick));
+            } else {
+                assert!((0..=30).contains(&tick));
+                assert!((-30..=tick).contains(&flip_tick));
+            }
+
+            assert!(matches!(
+                yaml_to_sol_value(&values[1], "uint128", &mut resolver)?,
+                DynSolValue::Uint(_, 128)
+            ));
+            assert_eq!(
+                yaml_to_sol_value(&values[2], "bool", &mut resolver)?,
+                DynSolValue::Bool(is_bid)
+            );
+            assert!(matches!(
+                yaml_to_sol_value(&values[3], "int16", &mut resolver)?,
+                DynSolValue::Int(_, 16)
+            ));
+            assert!(matches!(
+                yaml_to_sol_value(&values[4], "int16", &mut resolver)?,
+                DynSolValue::Int(_, 16)
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_call_args_vars_reject_circular_dependencies() {
+        let args: CallArgs = serde_yaml::from_str(
+            r#"
+vars:
+  a: { var: b }
+  b: { var: a }
+values:
+  - { var: a }
+"#,
+        )
+        .expect("valid call args");
+        let accounts = AccountManager::empty();
+        let address_pools = AddressPoolManager::empty();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut resolver =
+            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+
+        let err = args.resolve(&mut resolver).expect_err("cycle should fail");
+        let err = format!("{err:?}");
+
+        assert!(err.contains("circular call args variable dependency"));
+    }
+
+    #[test]
+    fn test_call_args_vars_reject_empty_choice() {
+        let args: CallArgs = serde_yaml::from_str(
+            r#"
+vars:
+  side: { choice: [] }
+values:
+  - { var: side }
+"#,
+        )
+        .expect("valid call args");
+        let accounts = AccountManager::empty();
+        let address_pools = AddressPoolManager::empty();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut resolver =
+            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+
+        let err = args.resolve(&mut resolver).expect_err("empty choice should fail");
+        let err = format!("{err:?}");
+
+        assert!(err.contains("choice generator must contain at least one value"));
     }
 }
