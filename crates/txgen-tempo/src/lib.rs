@@ -60,9 +60,11 @@ impl TempoAdapter {
         scheduling_key: [u8; 20],
         address: Address,
         nonce_key: U256,
+        fetch_nonce: bool,
     ) -> Result<u64> {
-        if !ctx.nonces.contains(&scheduling_key) &&
-            let Some(provider) = self.nonce_rpc.get()
+        if fetch_nonce
+            && !ctx.nonces.contains(&scheduling_key)
+            && let Some(provider) = self.nonce_rpc.get()
         {
             let n = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
@@ -93,8 +95,9 @@ impl NetworkAdapter for TempoAdapter {
         let selected = ctx.select_signer(&template.from)?;
         let is_tempo = template.tx_type == TempoTxType::Tempo;
         let nonce_mode = resolve_nonce_mode(&template, is_tempo, ctx)?;
-        if !matches!(nonce_mode, TempoNonceMode::Expiring) &&
-            let Some(valid_for_secs) = template.valid_for_secs
+        let fetch_parallel_nonce = should_fetch_parallel_nonce(&template, nonce_mode)?;
+        if !matches!(nonce_mode, TempoNonceMode::Expiring)
+            && let Some(valid_for_secs) = template.valid_for_secs
         {
             bail!(
                 "`valid_for_secs` is only supported for expiring Tempo transactions (got {valid_for_secs}s on {:?})",
@@ -105,11 +108,15 @@ impl NetworkAdapter for TempoAdapter {
         let nonce = match nonce_mode {
             TempoNonceMode::Expiring => 0,
             TempoNonceMode::Protocol => {
-                self.next_nonce_lazy(ctx, scheduling_key, selected.address, U256::ZERO)?
+                self.next_nonce_lazy(ctx, scheduling_key, selected.address, U256::ZERO, true)?
             }
-            TempoNonceMode::Parallel(nonce_key) => {
-                self.next_nonce_lazy(ctx, scheduling_key, selected.address, nonce_key)?
-            }
+            TempoNonceMode::Parallel(nonce_key) => self.next_nonce_lazy(
+                ctx,
+                scheduling_key,
+                selected.address,
+                nonce_key,
+                fetch_parallel_nonce,
+            )?,
         };
 
         let (to, value, input, calls) = resolve_call_data(&template, is_tempo, ctx)?;
@@ -272,6 +279,25 @@ fn resolve_nonce_mode(
         key if key == TEMPO_EXPIRING_NONCE_KEY => Ok(TempoNonceMode::Expiring),
         key if key.is_zero() => Ok(TempoNonceMode::Protocol),
         key => Ok(TempoNonceMode::Parallel(key)),
+    }
+}
+
+fn should_fetch_parallel_nonce(
+    template: &TempoTemplate,
+    nonce_mode: TempoNonceMode,
+) -> Result<bool> {
+    let Some(prefetch_key) = template.nonce_prefetch_key else {
+        return Ok(true);
+    };
+
+    if !matches!(nonce_mode, TempoNonceMode::Parallel(_)) {
+        bail!("`nonce_prefetch_key` is only supported for parallel Tempo nonces");
+    }
+
+    if prefetch_key.is_zero() {
+        Ok(false)
+    } else {
+        bail!("only `nonce_prefetch_key: 0` is currently supported");
     }
 }
 
@@ -504,6 +530,7 @@ mod tests {
             max_fee_per_gas: Some(1_000_000_000),
             max_priority_fee_per_gas: Some(1_000_000_000),
             nonce_key: None,
+            nonce_prefetch_key: None,
             expiring_nonce: false,
             fee_token: None,
             sponsor: None,
@@ -598,6 +625,26 @@ mod tests {
 
         let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
 
+        assert_eq!(tx_req.request.nonce(), Some(0));
+    }
+
+    #[test]
+    fn test_nonce_prefetch_key_zero_skips_fetch_for_parallel_nonce() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let mut template = base_template(TempoTxType::Tempo);
+        template.nonce_key = Some(GenValue::Literal(U256::from(42)));
+        template.nonce_prefetch_key = Some(U256::ZERO);
+
+        let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
+
+        assert_eq!(tx_req.request.nonce_key, Some(U256::from(42)));
         assert_eq!(tx_req.request.nonce(), Some(0));
     }
 

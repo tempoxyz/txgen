@@ -62,6 +62,13 @@ pub struct TempoTemplate {
     #[serde(default)]
     pub nonce_key: Option<GenValue<U256>>,
 
+    /// Optional prefetch control for parallel nonce lanes.
+    ///
+    /// Set to 0 to skip RPC nonce fetching for the resolved parallel lane and
+    /// start from the local nonce tracker instead.
+    #[serde(default)]
+    pub nonce_prefetch_key: Option<U256>,
+
     /// Use Tempo expiring nonce mode (TIP-1009).
     ///
     /// When enabled, txgen sets `nonce_key = U256::MAX` and `nonce = 0`

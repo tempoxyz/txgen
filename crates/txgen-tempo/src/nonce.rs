@@ -138,11 +138,12 @@ fn collect_nonce_key_from_template_value(
     use crate::TempoTemplate;
     use txgen_core::GenValue;
 
-    if let Ok(template) = serde_yaml::from_value::<TempoTemplate>(value) &&
-        !template.expiring_nonce &&
-        let Some(GenValue::Literal(key)) = &template.nonce_key &&
-        !key.is_zero() &&
-        *key != TEMPO_EXPIRING_NONCE_KEY
+    if let Ok(template) = serde_yaml::from_value::<TempoTemplate>(value)
+        && !template.expiring_nonce
+        && template.nonce_prefetch_key != Some(U256::ZERO)
+        && let Some(GenValue::Literal(key)) = &template.nonce_key
+        && !key.is_zero()
+        && *key != TEMPO_EXPIRING_NONCE_KEY
     {
         nonce_keys.insert(*key);
     }
@@ -265,5 +266,29 @@ mix:
         let nonce_keys = collect_prefetchable_parallel_nonce_keys(&spec);
         assert_eq!(nonce_keys.len(), 1);
         assert!(nonce_keys.contains(&U256::from(42)));
+    }
+
+    #[test]
+    fn test_collect_prefetchable_parallel_nonce_keys_skips_disabled_prefetch() {
+        let spec = WorkloadSpec::parse(
+            r#"
+chain_id: 1
+templates:
+  disabled_prefetch:
+    type: tempo
+    from: { pool: users, select: random }
+    to: "0x0000000000000000000000000000000000000001"
+    gas_limit: 21000
+    nonce_key: "42"
+    nonce_prefetch_key: 0
+mix:
+  - template: disabled_prefetch
+    weight: 1
+"#,
+        )
+        .unwrap();
+
+        let nonce_keys = collect_prefetchable_parallel_nonce_keys(&spec);
+        assert!(nonce_keys.is_empty());
     }
 }
