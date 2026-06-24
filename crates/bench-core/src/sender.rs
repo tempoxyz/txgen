@@ -202,8 +202,8 @@ impl Sender {
                 break;
             };
 
-            if let Some(limiter) = &self.rate_limiter &&
-                let Some(delay) = limiter.try_acquire_or_delay().await
+            if let Some(limiter) = &self.rate_limiter
+                && let Some(delay) = limiter.try_acquire_or_delay().await
             {
                 drop(permit);
                 tokio::time::sleep(delay).await;

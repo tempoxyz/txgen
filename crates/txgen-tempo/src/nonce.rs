@@ -138,11 +138,11 @@ fn collect_nonce_key_from_template_value(
     use crate::TempoTemplate;
     use txgen_core::GenValue;
 
-    if let Ok(template) = serde_yaml::from_value::<TempoTemplate>(value) &&
-        !template.expiring_nonce &&
-        let Some(GenValue::Literal(key)) = &template.nonce_key &&
-        !key.is_zero() &&
-        *key != TEMPO_EXPIRING_NONCE_KEY
+    if let Ok(template) = serde_yaml::from_value::<TempoTemplate>(value)
+        && !template.expiring_nonce
+        && let Some(GenValue::Literal(key)) = &template.nonce_key
+        && !key.is_zero()
+        && *key != TEMPO_EXPIRING_NONCE_KEY
     {
         nonce_keys.insert(*key);
     }

@@ -498,8 +498,8 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         writeln!(self.writer)?;
 
         // Stream-compress the finalized NDJSON archive to the report sidecar.
-        if let Some(samples_path) = &self.samples_path &&
-            report.has_samples()
+        if let Some(samples_path) = &self.samples_path
+            && report.has_samples()
         {
             let count = copy_and_gzip_samples_ndjson(report, samples_path)?;
             tracing::info!(
@@ -1185,8 +1185,8 @@ mod tests {
         let report_json: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&report_path).unwrap()).unwrap();
         assert!(
-            report_json.get("samples").is_none() ||
-                report_json["samples"].as_array().unwrap().is_empty()
+            report_json.get("samples").is_none()
+                || report_json["samples"].as_array().unwrap().is_empty()
         );
 
         // Compressed samples NDJSON should exist with 2 lines.

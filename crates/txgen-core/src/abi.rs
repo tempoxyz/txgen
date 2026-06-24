@@ -146,8 +146,8 @@ fn load_bytecode(path: &PathBuf, base_path: &std::path::Path) -> Result<Bytes> {
     let path = resolve_path(path, base_path);
     let content = std::fs::read_to_string(&path)
         .wrap_err_with(|| format!("failed to read bytecode: {}", path.display()))?;
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) &&
-        let Some(bytecode) = parse_bytecode_json(&json).transpose()?
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(bytecode) = parse_bytecode_json(&json).transpose()?
     {
         return Ok(bytecode);
     }
@@ -281,12 +281,12 @@ fn yaml_to_sol_value(
     // Handle generator expressions
     if value.is_mapping() {
         // Check if it's a generator
-        if value.get("uniform").is_some() ||
-            value.get("choice").is_some() ||
-            value.get("pool").is_some() ||
-            value.get("address_pool").is_some() ||
-            value.get("random_bytes").is_some() ||
-            value.get("const").is_some()
+        if value.get("uniform").is_some()
+            || value.get("choice").is_some()
+            || value.get("pool").is_some()
+            || value.get("address_pool").is_some()
+            || value.get("random_bytes").is_some()
+            || value.get("const").is_some()
         {
             return resolve_generator_to_sol(value, sol_type, resolver);
         }
