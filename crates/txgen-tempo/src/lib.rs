@@ -12,11 +12,7 @@ use alloy_signer::SignerSync;
 use eyre::{bail, Result, WrapErr};
 use rand::RngCore;
 use serde::Deserialize;
-use std::{
-    collections::HashMap,
-    num::NonZeroU64,
-    sync::{Mutex, OnceLock},
-};
+use std::{collections::HashMap, num::NonZeroU64, sync::OnceLock};
 use tempo_alloy::{
     provider::keychain::{authorize_key, KeyRestrictions},
     rpc::TempoTransactionRequest,
@@ -62,7 +58,7 @@ pub struct TempoAdapter {
     /// on the hot path by [`Self::next_nonce_lazy`].
     nonce_rpc: OnceLock<DynProvider<Ethereum>>,
     /// Keychain setup state keyed by setup step id.
-    keychain_setups: OnceLock<Mutex<HashMap<String, TempoKeychainSetup>>>,
+    keychain_setups: HashMap<String, TempoKeychainSetup>,
 }
 
 #[derive(Clone)]
@@ -150,33 +146,20 @@ struct KeychainAccountsDef {
 impl TempoAdapter {
     /// Create a new adapter. The nonce RPC is populated by
     /// [`Self::prefetch_nonces`] when `--rpc` is supplied.
-    pub const fn new() -> Self {
-        Self { nonce_rpc: OnceLock::new(), keychain_setups: OnceLock::new() }
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    fn keychain_setups(&self) -> &Mutex<HashMap<String, TempoKeychainSetup>> {
-        self.keychain_setups.get_or_init(|| Mutex::new(HashMap::new()))
-    }
-
-    fn register_keychain_setup(&self, step_id: &str, setup: TempoKeychainSetup) -> Result<()> {
-        let mut setups = self
-            .keychain_setups()
-            .lock()
-            .map_err(|_| eyre::eyre!("keychain setup registry lock poisoned"))?;
-        if setups.insert(step_id.to_string(), setup).is_some() {
+    fn register_keychain_setup(&mut self, step_id: &str, setup: TempoKeychainSetup) -> Result<()> {
+        if self.keychain_setups.insert(step_id.to_string(), setup).is_some() {
             bail!("duplicate keychain setup step id '{step_id}'");
         }
         Ok(())
     }
 
-    fn keychain_setup(&self, step_id: &str) -> Result<TempoKeychainSetup> {
-        let setups = self
-            .keychain_setups()
-            .lock()
-            .map_err(|_| eyre::eyre!("keychain setup registry lock poisoned"))?;
-        setups
+    fn keychain_setup(&self, step_id: &str) -> Result<&TempoKeychainSetup> {
+        self.keychain_setups
             .get(step_id)
-            .cloned()
             .ok_or_else(|| eyre::eyre!("keychain setup step '{step_id}' not found"))
     }
 
@@ -207,7 +190,7 @@ impl TempoAdapter {
     }
 
     fn expand_keychain_authorize_pool(
-        &self,
+        &mut self,
         step_id: &str,
         def: KeychainAuthorizePoolDef,
         ctx: &mut BuildContext<'_>,
@@ -231,15 +214,6 @@ impl TempoAdapter {
         }
 
         let key_type = def.key_type.unwrap_or(KeyTypeDef::Secp256k1).signature_type();
-        self.register_keychain_setup(
-            step_id,
-            TempoKeychainSetup {
-                account_pool: def.accounts.pool.clone(),
-                key_type,
-                access_keys: access_keys.clone(),
-            },
-        )?;
-
         let mut templates = Vec::with_capacity(access_keys.len());
         for (idx, access_key) in access_keys.iter().enumerate() {
             let restrictions =
@@ -250,6 +224,11 @@ impl TempoAdapter {
             let call = authorize_key(access_key.address(), key_type, restrictions);
             templates.push(keychain_setup_template_value(&def, idx, call)?);
         }
+
+        self.register_keychain_setup(
+            step_id,
+            TempoKeychainSetup { account_pool: def.accounts.pool, key_type, access_keys },
+        )?;
 
         Ok(templates)
     }
@@ -503,7 +482,7 @@ impl NetworkAdapter for TempoAdapter {
     }
 
     fn expand_setup_extension(
-        &self,
+        &mut self,
         step_id: &str,
         extension_name: &str,
         value: serde_yaml::Value,
@@ -1092,7 +1071,7 @@ mod tests {
         let mut nonces = NonceTracker::new();
         let mut rng = StdRng::seed_from_u64(42);
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
-        let adapter = TempoAdapter::new();
+        let mut adapter = TempoAdapter::new();
 
         let setup_value: serde_yaml::Value = serde_yaml::from_str(&format!(
             r#"

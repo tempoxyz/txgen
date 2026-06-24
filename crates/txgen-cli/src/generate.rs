@@ -235,7 +235,7 @@ pub trait NetworkAdapter: Send + Sync {
     ///
     /// Returning `Ok(None)` means the adapter does not support the extension.
     fn expand_setup_extension(
-        &self,
+        &mut self,
         _step_id: &str,
         _extension_name: &str,
         _value: serde_yaml::Value,
@@ -256,7 +256,7 @@ pub trait NetworkAdapter: Send + Sync {
     }
 }
 
-pub(crate) async fn run_generate<A>(adapter: A, args: GenerateArgs) -> Result<()>
+pub(crate) async fn run_generate<A>(mut adapter: A, args: GenerateArgs) -> Result<()>
 where
     A: NetworkAdapter + 'static,
     <A::Network as Network>::TransactionRequest: Send + 'static,
@@ -272,7 +272,7 @@ where
         adapter.prefetch_nonces(&mut ctx, rpc).await?;
     }
 
-    generate_loop(&adapter, &mut ctx, output)
+    generate_loop(&mut adapter, &mut ctx, output)
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +326,11 @@ struct GenerationLimit {
     duration: Option<Duration>,
 }
 
-fn generate_loop<A>(adapter: &A, ctx: &mut GenerateContext, output: Option<PathBuf>) -> Result<()>
+fn generate_loop<A>(
+    adapter: &mut A,
+    ctx: &mut GenerateContext,
+    output: Option<PathBuf>,
+) -> Result<()>
 where
     A: NetworkAdapter + 'static,
     <A::Network as Network>::TransactionRequest: Send + 'static,
@@ -458,7 +462,7 @@ struct EmittedTxInfo {
 }
 
 fn emit_setup<A: NetworkAdapter, W: Write>(
-    adapter: &A,
+    adapter: &mut A,
     spec: &WorkloadSpec,
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
@@ -485,7 +489,7 @@ where
 }
 
 fn emit_setup_step<A: NetworkAdapter, W: Write>(
-    adapter: &A,
+    adapter: &mut A,
     step: &SetupStep,
     setup_bindings: &mut std::collections::HashMap<String, ResolvedBinding>,
     setup_key: SchedulingKey,

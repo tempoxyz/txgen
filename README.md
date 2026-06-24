@@ -1003,12 +1003,23 @@ Each chain binary implements the `NetworkAdapter` trait from `txgen-cli`:
 pub trait NetworkAdapter: Send + Sync {
     type Template: DeserializeOwned + Send;
     type Network: Network;
+    type SignContext: RequestSignContext<Self::Network>;
 
     fn build_request(
         &self,
         template: Self::Template,
         ctx: &mut BuildContext<'_>,
-    ) -> Result<TxRequest<<Self::Network as Network>::TransactionRequest>>;
+    ) -> Result<TxRequest<<Self::Network as Network>::TransactionRequest, Self::SignContext>>;
+
+    fn expand_setup_extension(
+        &mut self,
+        step_id: &str,
+        extension_name: &str,
+        value: serde_yaml::Value,
+        ctx: &mut BuildContext<'_>,
+    ) -> Result<Option<Vec<serde_yaml::Value>>> {
+        Ok(None)
+    }
 
     fn prefetch_nonces(/* ... */) -> impl Future<Output = Result<()>> { ... }
 }
