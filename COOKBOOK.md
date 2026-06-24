@@ -322,7 +322,7 @@ txgen-tempo generate \
 
 Access keys are signing-only keys derived from the setup step's `access_keys` mnemonic/range. They do not become funded workload accounts and are not included in `txgen-tempo addresses`.
 
-For inline provisioning traffic, use `auth.mode: key_authorization`. Each workload transaction carries a signed secp256k1 `key_authorization`, optional limits, and an optional TIP-1053 witness:
+For inline provisioning traffic, use `auth.mode: key_authorization`. Each workload transaction carries a signed secp256k1 `key_authorization`, optional limits, and an optional TIP-1053 witness. Inline access keys can be derived from a separate mnemonic/range under `auth.access_key`; if omitted, txgen uses a public benchmark-only mnemonic starting at index `1000000`:
 
 ```bash
 txgen-tempo generate \

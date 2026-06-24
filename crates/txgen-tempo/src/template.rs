@@ -2,7 +2,7 @@ use alloy_primitives::{Address, Bytes, B256, U256};
 use eyre::{bail, Result};
 use serde::{Deserialize, Deserializer};
 use tempo_primitives::transaction::{CallScope, SelectorRule, TokenLimit};
-use txgen_core::{AccountRef, CallDef, GenValue};
+use txgen_core::{AccountPoolDef, AccountRef, CallDef, GenValue};
 
 /// Tempo transaction type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -171,6 +171,43 @@ pub struct AccessKeyDef {
     /// Inline derivation mode.
     #[serde(default)]
     pub derive: Option<AccessKeyDeriveMode>,
+
+    /// BIP-39 mnemonic used for inline per-transaction access keys.
+    #[serde(default)]
+    pub mnemonic: Option<String>,
+
+    /// Single starting account index for inline access-key derivation.
+    pub index: Option<u32>,
+
+    /// Account index range `[start, end)` for inline access-key derivation.
+    pub range: Option<[u32; 2]>,
+}
+
+impl AccessKeyDef {
+    pub(crate) fn inline_source(&self) -> Result<Option<AccountPoolDef>> {
+        let has_index = self.index.is_some();
+        let has_range = self.range.is_some();
+        if has_index && has_range {
+            bail!("inline access_key must set at most one of `index` or `range`");
+        }
+
+        let Some(mnemonic) = &self.mnemonic else {
+            if has_index || has_range {
+                bail!("inline access_key `index` or `range` requires `mnemonic`");
+            }
+            return Ok(None);
+        };
+
+        Ok(Some(AccountPoolDef {
+            mnemonic: mnemonic.clone(),
+            index: self.index,
+            range: self.range,
+        }))
+    }
+
+    pub(crate) fn has_inline_source_fields(&self) -> bool {
+        self.mnemonic.is_some() || self.index.is_some() || self.range.is_some()
+    }
 }
 
 /// Setup access-key pairing mode.

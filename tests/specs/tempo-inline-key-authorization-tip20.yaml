@@ -19,6 +19,8 @@ templates:
       mode: key_authorization
       access_key:
         derive: per_tx
+        mnemonic: "test test test test test test test test test test test junk"
+        range: [1000000, 1001000]
       key_type: secp256k1
       limits:
         - token: "0x20c0000000000000000000000000000000000000"

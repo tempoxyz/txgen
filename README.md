@@ -931,6 +931,8 @@ auth:
   mode: key_authorization
   access_key:
     derive: per_tx
+    mnemonic: "${TXGEN_ACCESS_KEY_MNEMONIC}"
+    range: [1000000, 1001000]
   key_type: secp256k1
   limits:
     - token: "0x20c0000000000000000000000000000000000000"
@@ -939,6 +941,8 @@ auth:
   witness:
     random_bytes: 32
 ```
+
+Inline `access_key.mnemonic` is a hidden signing seed for generated access keys; it does not need funded accounts and is not listed by `txgen addresses`. Omit it only for disposable benchmark specs, where txgen falls back to the public benchmark mnemonic at index `1000000`.
 
 `allowed_calls` may be `unrestricted`, `deny_all`, or a list of scopes with `target` and `selectors` entries. Selector values are 4-byte `0x` hex strings.
 

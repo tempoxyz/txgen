@@ -32,8 +32,8 @@ use txgen_core::{
 };
 
 use template::{
-    resolve_allowed_calls, token_limit, AccessKeyDeriveMode, AccessKeyPairMode, AllowedCallsDef,
-    KeyTypeDef, TempoAuthDef, TempoAuthMode, TokenLimitDef,
+    resolve_allowed_calls, token_limit, AccessKeyDef, AccessKeyDeriveMode, AccessKeyPairMode,
+    AllowedCallsDef, KeyTypeDef, TempoAuthDef, TempoAuthMode, TokenLimitDef,
 };
 pub use template::{TempoTemplate, TempoTxType};
 
@@ -42,6 +42,7 @@ pub use template::{TempoTemplate, TempoTxType};
 const EXPIRING_UNIQUENESS_COUNTER_KEY: [u8; 20] = *b"tempo-expiring-seq!!";
 const INLINE_ACCESS_KEY_MNEMONIC: &str =
     "test test test test test test test test test test test junk";
+const INLINE_ACCESS_KEY_START_INDEX: u32 = 1_000_000;
 
 /// Tempo network adapter for transaction generation.
 ///
@@ -295,6 +296,11 @@ impl TempoAdapter {
             .ok_or_else(|| eyre::eyre!("`auth.mode: keychain` requires `access_key`"))?;
         if access_key.derive.is_some() {
             bail!("`auth.mode: keychain` does not support `access_key.derive`");
+        }
+        if access_key.has_inline_source_fields() {
+            bail!(
+                "`auth.mode: keychain` does not support inline access-key `mnemonic`, `index`, or `range`"
+            );
         }
         if access_key.pair.unwrap_or(AccessKeyPairMode::SameIndex) != AccessKeyPairMode::SameIndex {
             bail!("only `access_key.pair: same_index` is supported");
@@ -752,24 +758,75 @@ fn derive_inline_access_signer(
     auth: &TempoAuthDef,
     ctx: &mut BuildContext<'_>,
 ) -> Result<EcdsaSigner> {
-    if let Some(access_key) = &auth.access_key {
-        if access_key.from_setup.is_some() {
-            bail!("`auth.mode: key_authorization` does not support `access_key.from_setup`");
-        }
-        if access_key.pair.is_some() {
-            bail!("`auth.mode: key_authorization` does not support `access_key.pair`");
-        }
-        if access_key.derive.unwrap_or(AccessKeyDeriveMode::PerTx) != AccessKeyDeriveMode::PerTx {
-            bail!("only `access_key.derive: per_tx` is supported");
-        }
-    }
-
+    let source = inline_access_key_source(auth.access_key.as_ref())?;
     let offset = u32::try_from(ctx.next_nonce(inline_access_key_counter_key()))
         .map_err(|_| eyre::eyre!("inline key_authorization access-key counter exceeded u32"))?;
-    let index = 1_000_000u32
-        .checked_add(offset)
-        .ok_or_else(|| eyre::eyre!("inline key_authorization access-key index overflowed"))?;
-    derive_mnemonic_signer(INLINE_ACCESS_KEY_MNEMONIC, index)
+    match source {
+        InlineAccessKeySource::Default => {
+            let index = INLINE_ACCESS_KEY_START_INDEX.checked_add(offset).ok_or_else(|| {
+                eyre::eyre!("inline key_authorization access-key index overflowed")
+            })?;
+            derive_mnemonic_signer(INLINE_ACCESS_KEY_MNEMONIC, index)
+        }
+        InlineAccessKeySource::Configured(source) => {
+            let (start, len) = inline_access_key_range(&source)?;
+            let offset_usize = usize::try_from(offset).map_err(|_| {
+                eyre::eyre!("inline key_authorization access-key counter exceeded usize")
+            })?;
+            if offset_usize >= len {
+                bail!(
+                    "inline access_key range exhausted after {len} key(s); increase `access_key.range`"
+                );
+            }
+            let index = start.checked_add(offset).ok_or_else(|| {
+                eyre::eyre!("inline key_authorization access-key index overflowed")
+            })?;
+            derive_mnemonic_signer(&source.mnemonic, index)
+        }
+    }
+}
+
+enum InlineAccessKeySource {
+    Default,
+    Configured(AccountPoolDef),
+}
+
+fn inline_access_key_source(access_key: Option<&AccessKeyDef>) -> Result<InlineAccessKeySource> {
+    let Some(access_key) = access_key else {
+        return Ok(InlineAccessKeySource::Default);
+    };
+
+    if access_key.from_setup.is_some() {
+        bail!("`auth.mode: key_authorization` does not support `access_key.from_setup`");
+    }
+    if access_key.pair.is_some() {
+        bail!("`auth.mode: key_authorization` does not support `access_key.pair`");
+    }
+    if access_key.derive.unwrap_or(AccessKeyDeriveMode::PerTx) != AccessKeyDeriveMode::PerTx {
+        bail!("only `access_key.derive: per_tx` is supported");
+    }
+
+    match access_key.inline_source()? {
+        Some(source) => Ok(InlineAccessKeySource::Configured(source)),
+        None => Ok(InlineAccessKeySource::Default),
+    }
+}
+
+fn inline_access_key_range(source: &AccountPoolDef) -> Result<(u32, usize)> {
+    if let Some(index) = source.index {
+        return Ok((index, usize::MAX));
+    }
+    if let Some([start, end]) = source.range {
+        let len = end
+            .checked_sub(start)
+            .ok_or_else(|| eyre::eyre!("inline access_key range end must be >= start"))?;
+        if len == 0 {
+            bail!("inline access_key range must not be empty");
+        }
+        return Ok((start, len as usize));
+    }
+
+    Ok((INLINE_ACCESS_KEY_START_INDEX, usize::MAX))
 }
 
 fn inline_access_key_counter_key() -> [u8; 20] {
@@ -1145,13 +1202,15 @@ input: "0x"
         let mut rng = StdRng::seed_from_u64(42);
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
 
-        let template: TempoTemplate = serde_yaml::from_str(
+        let template: TempoTemplate = serde_yaml::from_str(&format!(
             r#"
 type: tempo
 auth:
   mode: key_authorization
   access_key:
     derive: per_tx
+    mnemonic: "{TEST_MNEMONIC}"
+    range: [200, 220]
   key_type: secp256k1
   limits:
     - token: "0x20c0000000000000000000000000000000000000"
@@ -1161,14 +1220,14 @@ auth:
     random_bytes: 32
 from:
   pool: users
-  select: { index: 0 }
+  select: {{ index: 0 }}
 gas_limit: 400000
 max_fee_per_gas: 1000000000
 max_priority_fee_per_gas: 1000000000
 to: "0x20c0000000000000000000000000000000000000"
 input: "0x"
-"#,
-        )
+"#
+        ))
         .unwrap();
 
         let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
@@ -1183,7 +1242,10 @@ input: "0x"
         );
         assert_eq!(signed_authorization.limits.as_ref().unwrap().len(), 1);
         assert!(signed_authorization.witness().is_some());
-        assert!(tx_req.request.key_id.is_some());
+        assert_eq!(
+            tx_req.request.key_id,
+            Some(derive_mnemonic_signer(TEST_MNEMONIC, 200).unwrap().address())
+        );
 
         let generated = sign_tempo_request(tx_req, &ctx, "inline_key_authorization");
         assert_eq!(generated.raw[0], TEMPO_TX_TYPE_ID);
