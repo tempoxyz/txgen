@@ -8,6 +8,7 @@ use crate::{AccountManager, AddressPoolManager, SelectMode};
 /// A value that can be either a literal or a generator expression.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
+#[expect(clippy::large_enum_variant)]
 pub enum GenValue<T> {
     /// Literal value.
     Literal(T),
