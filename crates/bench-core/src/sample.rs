@@ -103,8 +103,8 @@ impl SampleArchive {
             }
 
             if sample_line_unix_ms(&line)
-                .wrap_err("failed to scan sample archive line timestamp")?
-                <= cutoff_ms
+                .wrap_err("failed to scan sample archive line timestamp")? <=
+                cutoff_ms
             {
                 writer.write_all(&line)?;
                 written += 1;
@@ -205,8 +205,8 @@ fn sample_line_unix_ms(line: &[u8]) -> Result<u64> {
     if !has_digits {
         eyre::bail!("sample archive line has invalid unix_ms value");
     }
-    if let Some(byte) = line.get(index).copied()
-        && !matches!(byte, b',' | b'}' | b' ' | b'\n' | b'\r' | b'\t')
+    if let Some(byte) = line.get(index).copied() &&
+        !matches!(byte, b',' | b'}' | b' ' | b'\n' | b'\r' | b'\t')
     {
         eyre::bail!("sample archive line has invalid unix_ms delimiter");
     }
