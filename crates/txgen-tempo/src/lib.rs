@@ -61,8 +61,8 @@ impl TempoAdapter {
         address: Address,
         nonce_key: U256,
     ) -> Result<u64> {
-        if !ctx.nonces.contains(&scheduling_key) &&
-            let Some(provider) = self.nonce_rpc.get()
+        if !ctx.nonces.contains(&scheduling_key)
+            && let Some(provider) = self.nonce_rpc.get()
         {
             let n = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
@@ -93,8 +93,8 @@ impl NetworkAdapter for TempoAdapter {
         let selected = ctx.select_signer(&template.from)?;
         let is_tempo = template.tx_type == TempoTxType::Tempo;
         let nonce_mode = resolve_nonce_mode(&template, is_tempo, ctx)?;
-        if !matches!(nonce_mode, TempoNonceMode::Expiring) &&
-            let Some(valid_for_secs) = template.valid_for_secs
+        if !matches!(nonce_mode, TempoNonceMode::Expiring)
+            && let Some(valid_for_secs) = template.valid_for_secs
         {
             bail!(
                 "`valid_for_secs` is only supported for expiring Tempo transactions (got {valid_for_secs}s on {:?})",
@@ -143,8 +143,8 @@ impl NetworkAdapter for TempoAdapter {
                     }
                 };
 
-                if let Some(fee_token) = template.fee_token {
-                    req.set_fee_token(fee_token);
+                if let Some(fee_token) = &template.fee_token {
+                    req.set_fee_token(ctx.resolve_value(fee_token)?);
                 }
                 if let Some(valid_after) = template.valid_after {
                     let valid_after = NonZeroU64::new(valid_after).ok_or_else(|| {
@@ -453,7 +453,7 @@ mod tests {
     use tempo_primitives::TEMPO_TX_TYPE_ID;
     use txgen_core::{
         AccountManager, AccountPoolDef, AccountRef, ArtifactManager, GasConfig, GenValue,
-        NonceTracker, SelectMode,
+        Generator, NonceTracker, SelectMode,
     };
 
     const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -557,6 +557,27 @@ mod tests {
 
         assert!(!raw.is_empty());
         assert_eq!(raw[0], TEMPO_TX_TYPE_ID);
+    }
+
+    #[test]
+    fn test_build_tempo_with_generated_fee_token() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let fee_token: Address = "0x20c0000000000000000000000000000000000001".parse().unwrap();
+        let mut template = base_template(TempoTxType::Tempo);
+        template.fee_token = Some(GenValue::Generator(Generator::Choice(vec![
+            serde_yaml::to_value(fee_token).unwrap(),
+        ])));
+
+        let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
+
+        assert_eq!(tx_req.request.fee_token, Some(fee_token));
     }
 
     #[test]

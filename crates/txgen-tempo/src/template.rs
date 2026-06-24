@@ -71,7 +71,7 @@ pub struct TempoTemplate {
 
     /// Fee token address for paying gas in stablecoins (Tempo 0x76).
     #[serde(default)]
-    pub fee_token: Option<Address>,
+    pub fee_token: Option<GenValue<Address>>,
 
     /// Fee payer/sponsor account (Tempo 0x76).
     #[serde(default)]
