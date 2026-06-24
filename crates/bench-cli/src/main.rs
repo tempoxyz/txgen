@@ -113,6 +113,18 @@ pub struct SendArgs {
     /// Set to 0 to disable. Keeps the metrics scraper running during the wait.
     #[arg(long, default_value = "0")]
     pub drain_timeout: u64,
+
+    /// Background receipt polling workers for non-blocking workload transactions.
+    ///
+    /// Set to 0 to disable out-of-band receipt collection.
+    #[arg(long, default_value = "64")]
+    pub receipt_workers: usize,
+
+    /// Seconds to wait for background receipt collection after sending completes.
+    ///
+    /// Uncollected receipts are reported as pending.
+    #[arg(long, default_value = "30")]
+    pub receipt_drain_timeout: u64,
 }
 
 /// Arguments for the `send-blocks` subcommand.

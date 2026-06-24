@@ -6,7 +6,7 @@
 
 use crate::metrics::MetricsCollector;
 use alloy_network::{primitives::ReceiptResponse, AnyNetwork};
-use alloy_primitives::Bytes;
+use alloy_primitives::{Bytes, B256};
 use alloy_provider::{DynProvider, Provider};
 use eyre::Result;
 use rand::seq::IndexedRandom;
@@ -76,6 +76,7 @@ pub struct Sender {
     active_keys: HashSet<SchedulingKey>,
     completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
     completion_rx: mpsc::UnboundedReceiver<SchedulingKeys>,
+    receipt_tx: Option<mpsc::UnboundedSender<B256>>,
     /// Worker tasks for awaiting completion and reaping completed task state.
     worker_tasks: JoinSet<()>,
     /// Rate limiter tokens.
@@ -111,10 +112,17 @@ impl Sender {
             active_keys: HashSet::new(),
             completion_tx,
             completion_rx,
+            receipt_tx: None,
             worker_tasks: JoinSet::new(),
             rate_limiter,
             max_buffered,
         }
+    }
+
+    /// Attach a best-effort background receipt collector.
+    pub fn with_receipt_collector(mut self, receipt_tx: mpsc::UnboundedSender<B256>) -> Self {
+        self.receipt_tx = Some(receipt_tx);
+        self
     }
 
     /// Send a transaction.
@@ -202,8 +210,8 @@ impl Sender {
                 break;
             };
 
-            if let Some(limiter) = &self.rate_limiter &&
-                let Some(delay) = limiter.try_acquire_or_delay().await
+            if let Some(limiter) = &self.rate_limiter
+                && let Some(delay) = limiter.try_acquire_or_delay().await
             {
                 drop(permit);
                 tokio::time::sleep(delay).await;
@@ -244,9 +252,10 @@ impl Sender {
         let providers = self.providers.clone();
         let metrics = self.metrics.clone();
         let completion_tx = self.completion_tx.clone();
+        let receipt_tx = self.receipt_tx.clone();
 
         self.worker_tasks.spawn(async move {
-            submit_tx(pending, providers, metrics, permit, completion_tx).await;
+            submit_tx(pending, providers, metrics, permit, completion_tx, receipt_tx).await;
         });
     }
 }
@@ -281,6 +290,7 @@ async fn submit_tx(
     metrics: Arc<MetricsCollector>,
     permit: OwnedSemaphorePermit,
     completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
+    receipt_tx: Option<mpsc::UnboundedSender<B256>>,
 ) {
     let release_all_keys = || {
         let mut keys = pending.submission_keys.clone();
@@ -314,13 +324,17 @@ async fn submit_tx(
     release_keys(&completion_tx, pending.submission_keys);
 
     if pending.inclusion_keys.is_empty() && pending.phase != TxPhase::Setup {
+        if let Some(receipt_tx) = receipt_tx {
+            let _ = receipt_tx.send(tx_hash);
+        }
         return;
     }
 
     match wait_for_receipt(provider, tx_hash).await {
-        Ok(true) => {}
+        Ok(true) => metrics.record_receipt(true),
         Ok(false) => {
             tracing::error!(id = pending.id.as_deref(), phase = ?pending.phase, %tx_hash, "Transaction reverted");
+            metrics.record_receipt(false);
             metrics.record_failure();
         }
         Err(e) => {
