@@ -167,6 +167,24 @@ pub trait NetworkAdapter: Send + Sync {
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
         async { Ok(()) }
     }
+
+    /// Collect a workload nonce lane from a materialized template.
+    fn collect_workload_nonce(
+        &self,
+        _template: Self::Template,
+        _ctx: &mut BuildContext<'_>,
+    ) -> Result<Option<(Address, U256)>> {
+        Ok(None)
+    }
+
+    /// Prefetch nonce lanes collected during a planning pass.
+    fn prefetch_collected_workload_nonces<'a>(
+        &'a self,
+        _lanes: Vec<(Address, U256)>,
+        _ctx: &'a mut BuildContext<'_>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async { Ok(()) }
+    }
 }
 
 pub(crate) async fn run_generate<A>(adapter: A, args: GenerateArgs) -> Result<()>
@@ -185,7 +203,7 @@ where
         adapter.prefetch_nonces(&mut ctx, rpc).await?;
     }
 
-    generate_loop(&adapter, &mut ctx, output)
+    generate_loop(&adapter, &mut ctx, output).await
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +257,11 @@ struct GenerationLimit {
     duration: Option<Duration>,
 }
 
-fn generate_loop<A>(adapter: &A, ctx: &mut GenerateContext, output: Option<PathBuf>) -> Result<()>
+async fn generate_loop<A>(
+    adapter: &A,
+    ctx: &mut GenerateContext,
+    output: Option<PathBuf>,
+) -> Result<()>
 where
     A: NetworkAdapter + 'static,
     <A::Network as Network>::TransactionRequest: Send + 'static,
@@ -265,6 +287,14 @@ where
         Some(path) => {
             let mut writer = txgen_core::output::file_writer(&path)?;
             let setup_bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+            prefetch_planned_workload_nonces(
+                adapter,
+                &ctx.spec,
+                ctx.limit,
+                &setup_bindings,
+                &mut build_ctx,
+            )
+            .await?;
             let written = generate_txs(
                 adapter,
                 &ctx.spec,
@@ -279,6 +309,14 @@ where
         None => {
             let mut writer = txgen_core::output::stdout_writer();
             let setup_bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+            prefetch_planned_workload_nonces(
+                adapter,
+                &ctx.spec,
+                ctx.limit,
+                &setup_bindings,
+                &mut build_ctx,
+            )
+            .await?;
             generate_txs(
                 adapter,
                 &ctx.spec,
@@ -723,6 +761,119 @@ where
         submission_keys: vec![SchedulingKey::from(key)],
         inclusion_keys,
     })
+}
+
+async fn prefetch_planned_workload_nonces<A: NetworkAdapter>(
+    adapter: &A,
+    spec: &WorkloadSpec,
+    limit: GenerationLimit,
+    setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
+    ctx: &mut BuildContext<'_>,
+) -> Result<()> {
+    let Some(count) = limit.count else {
+        return Ok(());
+    };
+
+    let mut plan_rng = ctx.rng.clone();
+    let mut plan_nonces = NonceTracker::new();
+    let mut plan_ctx = BuildContext::new_with_address_pools(
+        ctx.chain_id,
+        ctx.gas,
+        ctx.accounts,
+        ctx.address_pools,
+        ctx.artifacts,
+        &mut plan_nonces,
+        &mut plan_rng,
+    );
+
+    let mut lanes = Vec::new();
+    let mut planned = 0u64;
+    let mut sequence_instances = 0u64;
+
+    while planned < count {
+        let remaining = count - planned;
+        let Some(item) = pick_workload_item(spec, plan_ctx.rng, remaining)? else {
+            break;
+        };
+
+        match item {
+            MixItem::Template(name) => {
+                let value = spec
+                    .templates
+                    .get(&name)
+                    .ok_or_else(|| eyre::eyre!("template '{}' not found", name))?
+                    .clone();
+                let materialized = substitute_vars(value, setup_bindings)
+                    .wrap_err_with(|| format!("failed to materialize template '{name}'"))?;
+                collect_template_workload_nonce(
+                    adapter,
+                    name,
+                    materialized,
+                    &mut plan_ctx,
+                    &mut lanes,
+                )?;
+                planned += 1;
+            }
+            MixItem::Sequence(name) => {
+                let sequence = spec
+                    .sequences
+                    .get(&name)
+                    .ok_or_else(|| eyre::eyre!("sequence '{}' not found", name))?;
+                let sequence_instance = sequence_instances;
+                sequence_instances = sequence_instances
+                    .checked_add(1)
+                    .ok_or_else(|| eyre::eyre!("sequence instance counter overflowed u64"))?;
+                let _sequence_key = compute_sequence_key(&name, sequence_instance);
+                let bindings =
+                    resolve_sequence_bindings(&sequence.bindings, &mut plan_ctx, setup_bindings)
+                        .wrap_err_with(|| {
+                            format!("failed to resolve bindings for sequence '{name}'")
+                        })?;
+
+                for (idx, step) in sequence.steps.iter().enumerate() {
+                    let label = step.name.as_deref().unwrap_or(&step.template);
+                    let base = spec
+                        .templates
+                        .get(&step.template)
+                        .ok_or_else(|| eyre::eyre!("template '{}' not found", step.template))?
+                        .clone();
+                    let merged = merge_template_overlay(base, step.with_value.clone());
+                    let materialized = substitute_vars(merged, &bindings).wrap_err_with(|| {
+                        format!("failed to materialize sequence '{name}' step {idx} ('{label}')")
+                    })?;
+                    collect_template_workload_nonce(
+                        adapter,
+                        format!("{name}.{label}"),
+                        materialized,
+                        &mut plan_ctx,
+                        &mut lanes,
+                    )?;
+                    planned += 1;
+                }
+            }
+        }
+    }
+
+    adapter.prefetch_collected_workload_nonces(lanes, ctx).await
+}
+
+fn collect_template_workload_nonce<A: NetworkAdapter>(
+    adapter: &A,
+    name: impl Into<String>,
+    value: serde_yaml::Value,
+    ctx: &mut BuildContext<'_>,
+    lanes: &mut Vec<(Address, U256)>,
+) -> Result<()> {
+    let name = name.into();
+    let template: A::Template = serde_yaml::from_value(value)
+        .wrap_err_with(|| format!("failed to parse template '{name}'"))?;
+    if let Some(lane) = adapter
+        .collect_workload_nonce(template, ctx)
+        .wrap_err_with(|| format!("failed to plan workload nonce from template '{name}'"))?
+    {
+        lanes.push(lane);
+    }
+    Ok(())
 }
 
 fn generate_txs<A, W: Write>(

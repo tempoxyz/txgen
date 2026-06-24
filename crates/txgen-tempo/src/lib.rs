@@ -10,7 +10,7 @@ use alloy_provider::{network::Ethereum, DynProvider};
 use alloy_signer::SignerSync;
 use eyre::{bail, Result};
 use rand::RngCore;
-use std::{num::NonZeroU64, sync::OnceLock};
+use std::{collections::HashSet, num::NonZeroU64, sync::OnceLock};
 use tempo_alloy::{rpc::TempoTransactionRequest, TempoNetwork};
 use tempo_primitives::transaction::{
     Call, TEMPO_EXPIRING_NONCE_KEY, TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS,
@@ -61,8 +61,8 @@ impl TempoAdapter {
         address: Address,
         nonce_key: U256,
     ) -> Result<u64> {
-        if !ctx.nonces.contains(&scheduling_key) &&
-            let Some(provider) = self.nonce_rpc.get()
+        if !ctx.nonces.contains(&scheduling_key)
+            && let Some(provider) = self.nonce_rpc.get()
         {
             let n = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
@@ -93,8 +93,8 @@ impl NetworkAdapter for TempoAdapter {
         let selected = ctx.select_signer(&template.from)?;
         let is_tempo = template.tx_type == TempoTxType::Tempo;
         let nonce_mode = resolve_nonce_mode(&template, is_tempo, ctx)?;
-        if !matches!(nonce_mode, TempoNonceMode::Expiring) &&
-            let Some(valid_for_secs) = template.valid_for_secs
+        if !matches!(nonce_mode, TempoNonceMode::Expiring)
+            && let Some(valid_for_secs) = template.valid_for_secs
         {
             bail!(
                 "`valid_for_secs` is only supported for expiring Tempo transactions (got {valid_for_secs}s on {:?})",
@@ -240,6 +240,56 @@ impl NetworkAdapter for TempoAdapter {
         // accept silently because prefetch is only invoked once per run.
         let _ = self.nonce_rpc.set(provider);
 
+        Ok(())
+    }
+
+    fn collect_workload_nonce(
+        &self,
+        template: Self::Template,
+        ctx: &mut BuildContext<'_>,
+    ) -> Result<Option<(Address, U256)>> {
+        let selected = ctx.select_signer(&template.from)?;
+        let is_tempo = template.tx_type == TempoTxType::Tempo;
+        let nonce_mode = resolve_nonce_mode(&template, is_tempo, ctx)?;
+
+        Ok(match nonce_mode {
+            TempoNonceMode::Parallel(nonce_key) => Some((selected.address, nonce_key)),
+            TempoNonceMode::Protocol | TempoNonceMode::Expiring => None,
+        })
+    }
+
+    async fn prefetch_collected_workload_nonces(
+        &self,
+        lanes: Vec<(Address, U256)>,
+        ctx: &mut BuildContext<'_>,
+    ) -> Result<()> {
+        let Some(provider) = self.nonce_rpc.get() else {
+            return Ok(());
+        };
+
+        let mut unique_lanes = HashSet::new();
+        for (address, nonce_key) in lanes {
+            if !nonce_key.is_zero() && nonce_key != TEMPO_EXPIRING_NONCE_KEY {
+                unique_lanes.insert((address, nonce_key));
+            }
+        }
+
+        if unique_lanes.is_empty() {
+            return Ok(());
+        }
+
+        eprintln!("prefetching {} planned parallel nonce lane(s)...", unique_lanes.len());
+
+        let mut fetched = 0usize;
+        for (address, nonce_key) in unique_lanes {
+            let nonce = nonce::fetch_lane_nonce(provider, address, nonce_key).await?;
+            let scheduling_key =
+                compute_scheduling_key(address, TempoNonceMode::Parallel(nonce_key), ctx);
+            ctx.nonces.reset(scheduling_key, nonce);
+            fetched += 1;
+        }
+
+        eprintln!("prefetched {fetched} planned parallel nonce lane(s)");
         Ok(())
     }
 }

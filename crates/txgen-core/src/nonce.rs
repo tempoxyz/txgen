@@ -4,7 +4,7 @@ use std::collections::HashMap;
 ///
 /// Each scheduling key maps to a monotonically increasing nonce counter.
 /// This ensures transactions with the same key are ordered correctly.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct NonceTracker {
     nonces: HashMap<[u8; 20], u64>,
 }
