@@ -139,6 +139,7 @@ def plot_send(plt, report, rows, metadata, datadir):
     # ── Extract columns ──────────────────────────────────────────────
     # Throughput
     tx_last = col(rows, f"{P}_total_transactions_last", int)
+    reverted_last = col(rows, f"{P}_reverted_transactions_last", int)
     gps = col(rows, f"{P}_gas_per_second_last")
     rlp_size = col(rows, f"{P}_rlp_block_size_bytes_last")
 
@@ -311,6 +312,7 @@ def plot_send(plt, report, rows, metadata, datadir):
     print(f"\nScrapes: {n_scrapes}")
     print(f"Time range: {ts[0]:.1f}s – {ts[-1]:.1f}s ({duration:.1f}s)")
     print(f"Avg txs/block: {avg(tx_last):.0f}")
+    print(f"Reverted txs/block: {avg(reverted_last):.0f} avg, {reverted_last[-1] if reverted_last else 0} latest")
     print(f"Steady Ggas/s: {steady_avg(ts, ggas_s):.2f}")
     print(f"Block gas:  {steady_avg(ts, gas_pct):.2f}%")
     print(f"Pay fill:   {steady_avg(ts, pay_fill):.1f}%")

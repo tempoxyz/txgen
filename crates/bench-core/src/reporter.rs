@@ -18,6 +18,9 @@ use std::{
     path::Path,
 };
 
+const BUILDER_REVERTED_TRANSACTIONS_LAST: &str =
+    "reth_tempo_payload_builder_reverted_transactions_last";
+
 /// Unified final report passed to reporters at finalization.
 ///
 /// Contains both typed aggregates (for console/JSON reporters) and
@@ -224,6 +227,10 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
             writeln!(self.writer, "  Total Sent:      {:>10}", metrics.sent)?;
             writeln!(self.writer, "  Successful:      {:>10}", metrics.success)?;
             writeln!(self.writer, "  Failed:          {:>10}", metrics.failed)?;
+            if let Some(reverted) = latest_sample_value(report, BUILDER_REVERTED_TRANSACTIONS_LAST)?
+            {
+                writeln!(self.writer, "  Reverted:        {:>10}", reverted as u64)?;
+            }
             writeln!(self.writer)?;
             writeln!(self.writer, "  Duration:        {:>10.2}s", metrics.elapsed.as_secs_f64())?;
             writeln!(self.writer, "  Throughput:      {:>10.2} tx/s", metrics.tps())?;
@@ -287,6 +294,21 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
 
         Ok(())
     }
+}
+
+fn latest_sample_value(report: &FinalReport, name: &str) -> Result<Option<f64>> {
+    let Some(archive) = &report.sample_archive else {
+        return Ok(None);
+    };
+
+    let mut value = None;
+    for sample in archive.iter()? {
+        let sample = sample?;
+        if sample.name == name {
+            value = Some(sample.value);
+        }
+    }
+    Ok(value)
 }
 
 /// JSON output format.
@@ -995,6 +1017,24 @@ mod tests {
         assert!(output_str.contains("1000"));
         assert!(output_str.contains("950"));
         assert!(output_str.contains("100.00 tx/s"));
+    }
+
+    #[tokio::test]
+    async fn test_console_reporter_includes_builder_reverted_transactions() {
+        let mut output = Vec::new();
+        {
+            let mut reporter = ConsoleReporter::new(&mut output, false);
+            let report = sample_report_with_samples(vec![sample(
+                BUILDER_REVERTED_TRANSACTIONS_LAST,
+                7.0,
+                0,
+            )])
+            .await;
+            reporter.finalize(&report).unwrap();
+        }
+
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(output_str.contains("Reverted:                 7"));
     }
 
     #[test]
