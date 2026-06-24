@@ -102,13 +102,17 @@ impl NetworkAdapter for TempoAdapter {
             );
         }
         let scheduling_key = compute_scheduling_key(selected.address, nonce_mode, ctx);
-        let nonce = match nonce_mode {
-            TempoNonceMode::Expiring => 0,
-            TempoNonceMode::Protocol => {
-                self.next_nonce_lazy(ctx, scheduling_key, selected.address, U256::ZERO)?
-            }
-            TempoNonceMode::Parallel(nonce_key) => {
-                self.next_nonce_lazy(ctx, scheduling_key, selected.address, nonce_key)?
+        let nonce = if let Some(nonce) = template.nonce {
+            nonce
+        } else {
+            match nonce_mode {
+                TempoNonceMode::Expiring => 0,
+                TempoNonceMode::Protocol => {
+                    self.next_nonce_lazy(ctx, scheduling_key, selected.address, U256::ZERO)?
+                }
+                TempoNonceMode::Parallel(nonce_key) => {
+                    self.next_nonce_lazy(ctx, scheduling_key, selected.address, nonce_key)?
+                }
             }
         };
 
@@ -504,6 +508,7 @@ mod tests {
             max_fee_per_gas: Some(1_000_000_000),
             max_priority_fee_per_gas: Some(1_000_000_000),
             nonce_key: None,
+            nonce: None,
             expiring_nonce: false,
             fee_token: None,
             sponsor: None,
@@ -598,6 +603,26 @@ mod tests {
 
         let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
 
+        assert_eq!(tx_req.request.nonce(), Some(0));
+    }
+
+    #[test]
+    fn test_explicit_nonce_skips_lane_nonce_tracking() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let mut template = base_template(TempoTxType::Tempo);
+        template.nonce_key = Some(GenValue::Literal(U256::from(42)));
+        template.nonce = Some(0);
+
+        let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
+
+        assert_eq!(tx_req.request.nonce_key, Some(U256::from(42)));
         assert_eq!(tx_req.request.nonce(), Some(0));
     }
 

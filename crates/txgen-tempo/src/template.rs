@@ -62,6 +62,13 @@ pub struct TempoTemplate {
     #[serde(default)]
     pub nonce_key: Option<GenValue<U256>>,
 
+    /// Explicit transaction nonce.
+    ///
+    /// When set, txgen uses this value directly instead of fetching or
+    /// incrementing nonce state for the transaction's nonce lane.
+    #[serde(default)]
+    pub nonce: Option<u64>,
+
     /// Use Tempo expiring nonce mode (TIP-1009).
     ///
     /// When enabled, txgen sets `nonce_key = U256::MAX` and `nonce = 0`
