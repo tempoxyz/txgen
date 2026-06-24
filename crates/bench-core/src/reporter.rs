@@ -224,10 +224,6 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
             writeln!(self.writer, "  Total Sent:      {:>10}", metrics.sent)?;
             writeln!(self.writer, "  Successful:      {:>10}", metrics.success)?;
             writeln!(self.writer, "  Failed:          {:>10}", metrics.failed)?;
-            writeln!(self.writer, "  Included:        {:>10}", metrics.included)?;
-            writeln!(self.writer, "  Reverted:        {:>10}", metrics.reverted)?;
-            writeln!(self.writer, "  Receipt Pending: {:>10}", metrics.receipt_pending)?;
-            writeln!(self.writer, "  Receipt Errors:  {:>10}", metrics.receipt_errors)?;
             writeln!(self.writer)?;
             writeln!(self.writer, "  Duration:        {:>10.2}s", metrics.elapsed.as_secs_f64())?;
             writeln!(self.writer, "  Throughput:      {:>10.2} tx/s", metrics.tps())?;
@@ -308,18 +304,6 @@ pub struct JsonReport {
     /// Failed transactions (send mode).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed: Option<u64>,
-    /// Transactions with observed receipts (send mode).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub included: Option<u64>,
-    /// Transactions with reverted receipts (send mode).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reverted: Option<u64>,
-    /// Transactions still missing receipts when the report was finalized.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub receipt_pending: Option<u64>,
-    /// Receipt polling errors (send mode).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub receipt_errors: Option<u64>,
     /// Elapsed time in seconds (send mode).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_secs: Option<f64>,
@@ -454,56 +438,40 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             return Ok(());
         }
 
-        let (
-            sent,
-            success,
-            failed,
-            included,
-            reverted,
-            receipt_pending,
-            receipt_errors,
-            elapsed_secs,
-            tps,
-            success_rate,
-            latency,
-            time_series,
-        ) = if let Some(metrics) = &report.bench_metrics {
-            let ts = report.time_series.as_ref().map(|ts| JsonTimeSeries {
-                throughput: ts.throughput.to_vec(),
-                latencies: ts
-                    .latencies
-                    .iter()
-                    .map(|l| JsonLatencySample {
-                        offset_ms: l.offset_ms,
-                        latency_ms: l.latency.as_secs_f64() * 1000.0,
-                    })
-                    .collect(),
-            });
+        let (sent, success, failed, elapsed_secs, tps, success_rate, latency, time_series) =
+            if let Some(metrics) = &report.bench_metrics {
+                let ts = report.time_series.as_ref().map(|ts| JsonTimeSeries {
+                    throughput: ts.throughput.to_vec(),
+                    latencies: ts
+                        .latencies
+                        .iter()
+                        .map(|l| JsonLatencySample {
+                            offset_ms: l.offset_ms,
+                            latency_ms: l.latency.as_secs_f64() * 1000.0,
+                        })
+                        .collect(),
+                });
 
-            (
-                Some(metrics.sent),
-                Some(metrics.success),
-                Some(metrics.failed),
-                Some(metrics.included),
-                Some(metrics.reverted),
-                Some(metrics.receipt_pending),
-                Some(metrics.receipt_errors),
-                Some(metrics.elapsed.as_secs_f64()),
-                Some(metrics.tps()),
-                Some(metrics.success_rate()),
-                metrics.latency.as_ref().map(|latency| JsonLatency {
-                    min_ms: latency.min.as_secs_f64() * 1000.0,
-                    max_ms: latency.max.as_secs_f64() * 1000.0,
-                    mean_ms: latency.mean.as_secs_f64() * 1000.0,
-                    p50_ms: latency.p50.as_secs_f64() * 1000.0,
-                    p95_ms: latency.p95.as_secs_f64() * 1000.0,
-                    p99_ms: latency.p99.as_secs_f64() * 1000.0,
-                }),
-                ts,
-            )
-        } else {
-            (None, None, None, None, None, None, None, None, None, None, None, None)
-        };
+                (
+                    Some(metrics.sent),
+                    Some(metrics.success),
+                    Some(metrics.failed),
+                    Some(metrics.elapsed.as_secs_f64()),
+                    Some(metrics.tps()),
+                    Some(metrics.success_rate()),
+                    metrics.latency.as_ref().map(|latency| JsonLatency {
+                        min_ms: latency.min.as_secs_f64() * 1000.0,
+                        max_ms: latency.max.as_secs_f64() * 1000.0,
+                        mean_ms: latency.mean.as_secs_f64() * 1000.0,
+                        p50_ms: latency.p50.as_secs_f64() * 1000.0,
+                        p95_ms: latency.p95.as_secs_f64() * 1000.0,
+                        p99_ms: latency.p99.as_secs_f64() * 1000.0,
+                    }),
+                    ts,
+                )
+            } else {
+                (None, None, None, None, None, None, None, None)
+            };
 
         let blocks = if report.blocks.is_empty() { None } else { Some(report.blocks.clone()) };
 
@@ -515,10 +483,6 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             sent,
             success,
             failed,
-            included,
-            reverted,
-            receipt_pending,
-            receipt_errors,
             elapsed_secs,
             tps,
             success_rate,
@@ -534,8 +498,8 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         writeln!(self.writer)?;
 
         // Stream-compress the finalized NDJSON archive to the report sidecar.
-        if let Some(samples_path) = &self.samples_path
-            && report.has_samples()
+        if let Some(samples_path) = &self.samples_path &&
+            report.has_samples()
         {
             let count = copy_and_gzip_samples_ndjson(report, samples_path)?;
             tracing::info!(
@@ -976,10 +940,6 @@ mod tests {
             sent: 1000,
             success: 950,
             failed: 50,
-            included: 940,
-            reverted: 3,
-            receipt_pending: 60,
-            receipt_errors: 2,
             elapsed: Duration::from_secs(10),
             latency: Some(LatencyStats {
                 min: Duration::from_millis(1),
@@ -1051,10 +1011,6 @@ mod tests {
         assert_eq!(parsed["benchmark_id"], benchmark_id.to_string());
         assert_eq!(parsed["sent"], 1000);
         assert_eq!(parsed["success"], 950);
-        assert_eq!(parsed["included"], 940);
-        assert_eq!(parsed["reverted"], 3);
-        assert_eq!(parsed["receipt_pending"], 60);
-        assert_eq!(parsed["receipt_errors"], 2);
     }
 
     #[test]
@@ -1229,8 +1185,8 @@ mod tests {
         let report_json: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&report_path).unwrap()).unwrap();
         assert!(
-            report_json.get("samples").is_none()
-                || report_json["samples"].as_array().unwrap().is_empty()
+            report_json.get("samples").is_none() ||
+                report_json["samples"].as_array().unwrap().is_empty()
         );
 
         // Compressed samples NDJSON should exist with 2 lines.

@@ -12,8 +12,8 @@ use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     collect_block_stats, parse_reporters, start_scrapers, trim_trailing_empty_blocks,
     ConsoleReporter, FileSource, FinalReport, GeneratedTx, MetricsCollector, ProgressState,
-    ReceiptCollector, Reporter, RunClock, RunStats, SampleStore, ScraperConfig, Sender,
-    SenderConfig, StdinSource, TxPhase, TxSource,
+    Reporter, RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, StdinSource,
+    TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, time::Duration};
@@ -100,21 +100,7 @@ async fn execute_source<S: TxSource>(
         Vec::new()
     };
 
-    let receipt_collector = (args.receipt_workers > 0).then(|| {
-        ReceiptCollector::start(
-            providers.clone(),
-            metrics.clone(),
-            args.receipt_workers,
-            Duration::from_secs(args.receipt_drain_timeout),
-        )
-    });
-
-    let mut sender = if let Some(collector) = &receipt_collector {
-        Sender::new(providers.clone(), config.clone(), metrics.clone())
-            .with_receipt_collector(collector.sender())
-    } else {
-        Sender::new(providers.clone(), config.clone(), metrics.clone())
-    };
+    let mut sender = Sender::new(providers.clone(), config.clone(), metrics.clone());
 
     let mut reporters = parse_reporters(&args.reports, "send", metadata)?;
     if reporters.is_empty() {
@@ -133,7 +119,6 @@ async fn execute_source<S: TxSource>(
     send_workload_from_source(source, &mut sender, &metrics, &config, &mut reporters).await?;
 
     sender.flush().await;
-    drop(sender);
 
     let (sent, success, failed) = metrics.counts();
     tracing::info!(sent, success, failed, "Bench send completed; starting post-processing");
@@ -145,10 +130,6 @@ async fn execute_source<S: TxSource>(
         tracing::info!("Txpool drain completed");
     } else {
         tracing::info!(reason = "--drain-timeout=0", "Skipped txpool drain");
-    }
-
-    if let Some(collector) = receipt_collector {
-        collector.finish().await;
     }
 
     // Stop the scraper before finalizing.

@@ -11,7 +11,6 @@ pub mod clock;
 pub mod metrics;
 pub mod prometheus;
 pub mod prometheus_reporter;
-pub mod receipt_collector;
 pub mod reporter;
 pub mod reth_api;
 pub mod sample;
@@ -30,7 +29,6 @@ pub use prometheus_reporter::{
     PrometheusConfig, PrometheusForwarder, PrometheusForwarderHandle, PrometheusForwarderSummary,
     PrometheusReporter,
 };
-pub use receipt_collector::ReceiptCollector;
 pub use reporter::{
     parse_reporters, ClickHouseConfig, ClickHouseReporter, ConsoleReporter, FinalReport,
     JsonLatency, JsonLatencySample, JsonReport, JsonReporter, JsonTimeSeries, ProgressState,

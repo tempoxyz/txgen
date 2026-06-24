@@ -38,18 +38,6 @@ pub struct BenchMetrics {
     pub success: u64,
     /// Failed transactions (rejected by RPC or network error).
     pub failed: u64,
-    /// Transactions with observed receipts.
-    #[serde(default)]
-    pub included: u64,
-    /// Transactions with observed reverted receipts.
-    #[serde(default)]
-    pub reverted: u64,
-    /// Transactions still missing receipts when final metrics were collected.
-    #[serde(default)]
-    pub receipt_pending: u64,
-    /// Receipt polling errors.
-    #[serde(default)]
-    pub receipt_errors: u64,
     /// Total elapsed time.
     #[serde(with = "duration_serde")]
     pub elapsed: Duration,
@@ -414,8 +402,8 @@ pub fn trim_trailing_empty_blocks(blocks: &mut Vec<BlockStats>) -> Option<u64> {
 /// combines it with the second-precision timestamp. Falls back to
 /// `timestamp_secs * 1000` for standard Ethereum blocks.
 fn extract_timestamp_ms<B: BlockResponse>(block: &B, timestamp_secs: u64) -> u64 {
-    if let Some(other) = block.other_fields()
-        && let Some(Ok(ms_part)) =
+    if let Some(other) = block.other_fields() &&
+        let Some(Ok(ms_part)) =
             other.get_deserialized::<alloy_primitives::U64>("timestampMillisPart")
     {
         return timestamp_secs.saturating_mul(1000).saturating_add(ms_part.to());
@@ -541,10 +529,6 @@ pub struct MetricsCollector {
     sent: AtomicU64,
     success: AtomicU64,
     failed: AtomicU64,
-    included: AtomicU64,
-    reverted: AtomicU64,
-    receipt_pending: AtomicU64,
-    receipt_errors: AtomicU64,
     clock: RunClock,
     collect_latencies: bool,
     latency_tx: mpsc::UnboundedSender<TimestampedLatency>,
@@ -592,10 +576,6 @@ impl MetricsCollector {
             sent: AtomicU64::new(0),
             success: AtomicU64::new(0),
             failed: AtomicU64::new(0),
-            included: AtomicU64::new(0),
-            reverted: AtomicU64::new(0),
-            receipt_pending: AtomicU64::new(0),
-            receipt_errors: AtomicU64::new(0),
             clock,
             collect_latencies: options.collect_latencies,
             latency_tx,
@@ -645,24 +625,6 @@ impl MetricsCollector {
         let _ = self.event_tx.send(TimestampedEvent { offset, event: TxEvent::Failed });
     }
 
-    /// Record that a transaction receipt was observed.
-    pub fn record_receipt(&self, success: bool) {
-        self.included.fetch_add(1, Ordering::Relaxed);
-        if !success {
-            self.reverted.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Record transactions still missing receipts after receipt collection drained.
-    pub fn set_receipt_pending(&self, pending: u64) {
-        self.receipt_pending.store(pending, Ordering::Relaxed);
-    }
-
-    /// Record a receipt polling error.
-    pub fn record_receipt_error(&self) {
-        self.receipt_errors.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Get the current counts (sent, success, failed).
     pub fn counts(&self) -> (u64, u64, u64) {
         (
@@ -680,10 +642,6 @@ impl MetricsCollector {
         let sent = self.sent.load(Ordering::Relaxed);
         let success = self.success.load(Ordering::Relaxed);
         let failed = self.failed.load(Ordering::Relaxed);
-        let included = self.included.load(Ordering::Relaxed);
-        let reverted = self.reverted.load(Ordering::Relaxed);
-        let receipt_pending = self.receipt_pending.load(Ordering::Relaxed);
-        let receipt_errors = self.receipt_errors.load(Ordering::Relaxed);
         let inflight = sent.saturating_sub(success + failed);
         let offset_ms = self.clock.offset_ms();
         let unix_ms = self.clock.unix_ms();
@@ -712,34 +670,6 @@ impl MetricsCollector {
                 unix_ms,
             },
             Sample {
-                name: "txgen_transactions_included_total".to_string(),
-                labels: labels.clone(),
-                value: included as f64,
-                offset_ms,
-                unix_ms,
-            },
-            Sample {
-                name: "txgen_transactions_reverted_total".to_string(),
-                labels: labels.clone(),
-                value: reverted as f64,
-                offset_ms,
-                unix_ms,
-            },
-            Sample {
-                name: "txgen_receipts_pending".to_string(),
-                labels: labels.clone(),
-                value: receipt_pending as f64,
-                offset_ms,
-                unix_ms,
-            },
-            Sample {
-                name: "txgen_receipt_errors_total".to_string(),
-                labels: labels.clone(),
-                value: receipt_errors as f64,
-                offset_ms,
-                unix_ms,
-            },
-            Sample {
                 name: "txgen_transactions_inflight".to_string(),
                 labels,
                 value: inflight as f64,
@@ -754,8 +684,8 @@ impl MetricsCollector {
             let _ = shutdown.send(());
         }
 
-        if let Some(handle) = self.aggregation_handle.lock().await.take()
-            && let Err(err) = handle.await
+        if let Some(handle) = self.aggregation_handle.lock().await.take() &&
+            let Err(err) = handle.await
         {
             tracing::warn!(%err, "metrics aggregation task failed");
         }
@@ -780,10 +710,6 @@ impl MetricsCollector {
             sent: self.sent.load(Ordering::Relaxed),
             success: self.success.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
-            included: self.included.load(Ordering::Relaxed),
-            reverted: self.reverted.load(Ordering::Relaxed),
-            receipt_pending: self.receipt_pending.load(Ordering::Relaxed),
-            receipt_errors: self.receipt_errors.load(Ordering::Relaxed),
             elapsed,
             latency,
         }
@@ -872,12 +798,9 @@ mod tests {
         collector.record_sent();
         collector.record_success(Duration::from_millis(5));
         collector.record_failure();
-        collector.record_receipt(false);
-        collector.set_receipt_pending(1);
-        collector.record_receipt_error();
 
         let samples = collector.snapshot_samples();
-        assert_eq!(samples.len(), 8);
+        assert_eq!(samples.len(), 4);
 
         let by_name: std::collections::HashMap<&str, f64> =
             samples.iter().map(|s| (s.name.as_str(), s.value)).collect();
@@ -885,10 +808,6 @@ mod tests {
         assert_eq!(by_name["txgen_transactions_sent_total"], 3.0);
         assert_eq!(by_name["txgen_transactions_success_total"], 1.0);
         assert_eq!(by_name["txgen_transactions_failed_total"], 1.0);
-        assert_eq!(by_name["txgen_transactions_included_total"], 1.0);
-        assert_eq!(by_name["txgen_transactions_reverted_total"], 1.0);
-        assert_eq!(by_name["txgen_receipts_pending"], 1.0);
-        assert_eq!(by_name["txgen_receipt_errors_total"], 1.0);
         assert_eq!(by_name["txgen_transactions_inflight"], 1.0);
 
         // All samples share the same timestamp.
@@ -917,10 +836,6 @@ mod tests {
             sent: 100,
             success: 90,
             failed: 10,
-            included: 0,
-            reverted: 0,
-            receipt_pending: 0,
-            receipt_errors: 0,
             elapsed: Duration::from_secs(10),
             latency: None,
         };
@@ -1048,10 +963,6 @@ mod tests {
             sent: 100,
             success: 90,
             failed: 10,
-            included: 90,
-            reverted: 1,
-            receipt_pending: 9,
-            receipt_errors: 2,
             elapsed: Duration::from_millis(1500),
             latency: Some(LatencyStats {
                 min: Duration::from_millis(5),
