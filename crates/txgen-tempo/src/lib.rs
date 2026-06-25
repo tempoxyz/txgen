@@ -18,11 +18,13 @@ use tempo_alloy::{
     rpc::TempoTransactionRequest,
     TempoNetwork,
 };
-use tempo_primitives::transaction::{
-    Call, KeyAuthorization, KeychainSignature, PrimitiveSignature, SignatureType,
-    TEMPO_EXPIRING_NONCE_KEY, TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS,
+use tempo_primitives::{
+    transaction::{
+        Call, KeyAuthorization, KeychainSignature, PrimitiveSignature, SignatureType,
+        TEMPO_EXPIRING_NONCE_KEY, TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS,
+    },
+    TempoSignature, TempoTxEnvelope,
 };
-use tempo_primitives::{TempoSignature, TempoTxEnvelope};
 use txgen_cli::{
     sign_standard_request, GenerateContext, NetworkAdapter, RequestSignContext, TxRequest,
 };
@@ -178,8 +180,8 @@ impl TempoAdapter {
         address: Address,
         nonce_key: U256,
     ) -> Result<u64> {
-        if !ctx.nonces.contains(&scheduling_key)
-            && let Some(provider) = self.nonce_rpc.get()
+        if !ctx.nonces.contains(&scheduling_key) &&
+            let Some(provider) = self.nonce_rpc.get()
         {
             let n = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
@@ -280,10 +282,10 @@ impl TempoAdapter {
         selected: &SelectedSigner,
         key_type: SignatureType,
     ) -> Result<EcdsaSigner> {
-        if auth.expiry.is_some()
-            || auth.limits.is_some()
-            || auth.allowed_calls.is_some()
-            || auth.witness.is_some()
+        if auth.expiry.is_some() ||
+            auth.limits.is_some() ||
+            auth.allowed_calls.is_some() ||
+            auth.witness.is_some()
         {
             bail!(
                 "`auth.mode: keychain` uses restrictions from its setup step; put expiry, limits, allowed_calls, and witness on the setup or use `key_authorization`"
@@ -353,8 +355,8 @@ impl NetworkAdapter for TempoAdapter {
             bail!("Tempo keychain auth is only supported for `type: tempo` templates");
         }
         let nonce_mode = resolve_nonce_mode(&template, is_tempo, ctx)?;
-        if !matches!(nonce_mode, TempoNonceMode::Expiring)
-            && let Some(valid_for_secs) = template.valid_for_secs
+        if !matches!(nonce_mode, TempoNonceMode::Expiring) &&
+            let Some(valid_for_secs) = template.valid_for_secs
         {
             bail!(
                 "`valid_for_secs` is only supported for expiring Tempo transactions (got {valid_for_secs}s on {:?})",
