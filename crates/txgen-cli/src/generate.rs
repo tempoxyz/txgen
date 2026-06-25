@@ -126,7 +126,7 @@ impl GenerateContext {
 // NetworkAdapter trait — implemented by per-network binaries
 // ---------------------------------------------------------------------------
 
-/// Output from [`NetworkAdapter::into_request`].
+/// Output from [`NetworkAdapter::build_request`].
 pub struct TxRequest<R, C = ()> {
     /// The network-specific transaction request.
     pub request: R,
@@ -136,13 +136,21 @@ pub struct TxRequest<R, C = ()> {
     pub signer_index: usize,
     /// Scheduling key (e.g. sender address or hash of sender+nonce_key).
     pub key: [u8; 20],
-    /// Adapter-specific signing context.
+    /// State the signing worker needs in addition to the selected account.
+    ///
+    /// Most adapters use `()`. Tempo keychain auth uses this to carry the
+    /// access-key signer and authorized user address without adding
+    /// Tempo-specific branches to the generic generation loop.
     pub sign_context: C,
 }
 
-/// Per-request signing behavior.
+/// Converts an adapter-built request into the raw transaction emitted by txgen.
+///
+/// The default implementation signs with the selected account. Adapters can
+/// carry request-local context when the final signature is not the network's
+/// standard account signature, such as Tempo keychain access-key signing.
 pub trait RequestSignContext<N: Network>: Send + 'static {
-    /// Sign and encode a network request into txgen NDJSON payload data.
+    /// Sign and encode one request with its scheduling metadata.
     fn sign_request(
         self,
         name: String,
@@ -221,7 +229,7 @@ pub trait NetworkAdapter: Send + Sync {
     /// The alloy [`Network`] whose types are used.
     type Network: Network;
 
-    /// Adapter-specific signing context attached to each request.
+    /// Extra per-request state needed by the signing worker.
     type SignContext: RequestSignContext<Self::Network>;
 
     /// Map a template to a network-specific transaction request.

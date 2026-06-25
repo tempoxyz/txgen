@@ -73,12 +73,11 @@ struct TempoKeychainSetup {
 
 #[derive(Clone, Default)]
 pub enum TempoSignContext {
+    /// Sign the request with the selected account as a normal Tempo transaction.
     #[default]
     Standard,
-    Keychain {
-        user_address: Address,
-        access_signer: EcdsaSigner,
-    },
+    /// Sign the request with an authorized access key on behalf of `user_address`.
+    Keychain { user_address: Address, access_signer: EcdsaSigner },
 }
 
 impl RequestSignContext<TempoNetwork> for TempoSignContext {
