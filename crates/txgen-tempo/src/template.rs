@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_primitives::{Address, Bytes, Selector, B256, U256};
 use eyre::{bail, Result};
 use serde::{Deserialize, Deserializer};
 use tempo_primitives::transaction::{CallScope, SelectorRule, TokenLimit};
@@ -265,8 +265,7 @@ pub struct CallScopeDef {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SelectorRuleDef {
     /// 4-byte selector as `0x`-prefixed hex.
-    #[serde(deserialize_with = "deserialize_selector")]
-    pub selector: [u8; 4],
+    pub selector: Selector,
 
     /// Optional first-address-argument allowlist.
     #[serde(default)]
@@ -326,7 +325,7 @@ impl CallScopeDef {
 
 impl SelectorRuleDef {
     fn resolve(&self) -> SelectorRule {
-        SelectorRule { selector: self.selector, recipients: self.recipients.clone() }
+        SelectorRule { selector: self.selector.into(), recipients: self.recipients.clone() }
     }
 }
 
@@ -335,26 +334,6 @@ pub(crate) fn resolve_allowed_calls(def: &Option<AllowedCallsDef>) -> Option<Vec
         None | Some(AllowedCallsDef::Unrestricted) => None,
         Some(allowed_calls) => Some(allowed_calls.resolve()),
     }
-}
-
-pub(crate) fn deserialize_selector<'de, D>(
-    deserializer: D,
-) -> std::result::Result<[u8; 4], D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    parse_selector(&value).map_err(serde::de::Error::custom)
-}
-
-fn parse_selector(value: &str) -> Result<[u8; 4]> {
-    let hex = value.strip_prefix("0x").unwrap_or(value);
-    if hex.len() != 8 {
-        bail!("selector must be 4 bytes encoded as 8 hex characters");
-    }
-    let mut selector = [0u8; 4];
-    hex::decode_to_slice(hex, &mut selector)?;
-    Ok(selector)
 }
 
 pub(crate) fn token_limit(token: Address, limit: U256, period: u64) -> TokenLimit {
