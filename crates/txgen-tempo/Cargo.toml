@@ -33,4 +33,8 @@ tempo-primitives.workspace = true
 # misc
 rand.workspace = true
 eyre.workspace = true
+hex.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[dev-dependencies]
+serde_json.workspace = true

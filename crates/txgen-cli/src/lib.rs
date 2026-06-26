@@ -17,7 +17,8 @@ use extract::{run_extract, run_extract_big_blocks};
 pub use extract::{ExtractArgs, ExtractBigBlocksArgs};
 use generate::run_generate;
 pub use generate::{
-    fetch_protocol_nonces, GenerateArgs, GenerateContext, NetworkAdapter, TxRequest,
+    fetch_protocol_nonces, sign_standard_request, GenerateArgs, GenerateContext, NetworkAdapter,
+    RequestSignContext, TxRequest,
 };
 
 // ---------------------------------------------------------------------------

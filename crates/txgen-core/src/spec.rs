@@ -141,6 +141,9 @@ pub struct SetupStep {
     /// Transaction definition using the same shape as workload templates.
     #[serde(default)]
     pub tx: Option<serde_yaml::Value>,
+    /// Tempo-specific keychain pool authorization setup action.
+    #[serde(default)]
+    pub keychain_authorize_pool: Option<serde_yaml::Value>,
 }
 
 /// A multi-transaction workload unit.

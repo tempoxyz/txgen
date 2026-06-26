@@ -4,25 +4,47 @@ mod template;
 pub use nonce::{prefetch_parallel_nonces, NONCE_PRECOMPILE};
 pub use txgen_cli::fetch_protocol_nonces;
 
+use alloy_eips::eip2718::Encodable2718;
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{keccak256, Address, Bytes, TxKind, U256};
 use alloy_provider::{network::Ethereum, DynProvider};
 use alloy_signer::SignerSync;
-use eyre::{bail, Result};
+use eyre::{bail, Result, WrapErr};
 use rand::RngCore;
-use std::{num::NonZeroU64, sync::OnceLock};
-use tempo_alloy::{rpc::TempoTransactionRequest, TempoNetwork};
-use tempo_primitives::transaction::{
-    Call, TEMPO_EXPIRING_NONCE_KEY, TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS,
+use serde::Deserialize;
+use std::{collections::HashMap, num::NonZeroU64, sync::OnceLock};
+use tempo_alloy::{
+    provider::keychain::{authorize_key, KeyRestrictions},
+    rpc::TempoTransactionRequest,
+    TempoNetwork,
 };
-use txgen_cli::{GenerateContext, NetworkAdapter, TxRequest};
-use txgen_core::BuildContext;
+use tempo_primitives::{
+    transaction::{
+        Call, KeyAuthorization, KeychainSignature, PrimitiveSignature, SignatureType,
+        TEMPO_EXPIRING_NONCE_KEY, TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS,
+    },
+    TempoSignature, TempoTxEnvelope,
+};
+use txgen_cli::{
+    sign_standard_request, GenerateContext, NetworkAdapter, RequestSignContext, TxRequest,
+};
+use txgen_core::{
+    derive_mnemonic_signer, AccountPoolDef, BuildContext, EcdsaSigner, GeneratedTx, SchedulingKey,
+    SelectedSigner, TxPhase,
+};
 
+use template::{
+    resolve_allowed_calls, token_limit, AccessKeyDef, AccessKeyDeriveMode, AccessKeyPairMode,
+    AllowedCallsDef, KeyTypeDef, TempoAuthDef, TempoAuthMode, TokenLimitDef,
+};
 pub use template::{TempoTemplate, TempoTxType};
 
 /// Internal nonce-tracker slot used to derive deterministic uniqueness bumps for
 /// expiring nonce transactions.
 const EXPIRING_UNIQUENESS_COUNTER_KEY: [u8; 20] = *b"tempo-expiring-seq!!";
+const INLINE_ACCESS_KEY_MNEMONIC: &str =
+    "test test test test test test test test test test test junk";
+const INLINE_ACCESS_KEY_START_INDEX: u32 = 1_000_000;
 
 /// Tempo network adapter for transaction generation.
 ///
@@ -38,13 +60,109 @@ pub struct TempoAdapter {
     /// Set exactly once by [`Self::prefetch_nonces`], then read lock-free
     /// on the hot path by [`Self::next_nonce_lazy`].
     nonce_rpc: OnceLock<DynProvider<Ethereum>>,
+    /// Keychain setup state keyed by setup step id.
+    keychain_setups: HashMap<String, TempoKeychainSetup>,
+}
+
+#[derive(Clone)]
+struct TempoKeychainSetup {
+    account_pool: String,
+    key_type: SignatureType,
+    access_keys: Vec<EcdsaSigner>,
+}
+
+#[derive(Clone, Default)]
+pub enum TempoSignContext {
+    /// Sign the request with the selected account as a normal Tempo transaction.
+    #[default]
+    Standard,
+    /// Sign the request with an authorized access key on behalf of `user_address`.
+    Keychain { user_address: Address, access_signer: EcdsaSigner },
+}
+
+impl RequestSignContext<TempoNetwork> for TempoSignContext {
+    fn sign_request(
+        self,
+        name: String,
+        phase: TxPhase,
+        request: TempoTransactionRequest,
+        signer: EcdsaSigner,
+        key: [u8; 20],
+        inclusion_keys: Vec<SchedulingKey>,
+    ) -> Result<GeneratedTx>
+    where
+        <TempoNetwork as alloy_network::Network>::UnsignedTx:
+            alloy_consensus::SignableTransaction<alloy_primitives::Signature>,
+        <TempoNetwork as alloy_network::Network>::TxEnvelope: From<alloy_consensus::Signed<<TempoNetwork as alloy_network::Network>::UnsignedTx>>
+            + Encodable2718,
+    {
+        match self {
+            Self::Standard => sign_standard_request::<TempoNetwork>(
+                name,
+                phase,
+                request,
+                signer,
+                key,
+                inclusion_keys,
+            ),
+            Self::Keychain { user_address, access_signer } => sign_keychain_request(
+                name,
+                phase,
+                request,
+                access_signer,
+                user_address,
+                key,
+                inclusion_keys,
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct KeychainAuthorizePoolDef {
+    accounts: KeychainAccountsDef,
+    access_keys: AccountPoolDef,
+    #[serde(default)]
+    key_type: Option<KeyTypeDef>,
+    #[serde(default)]
+    expiry: Option<u64>,
+    #[serde(default)]
+    limits: Option<Vec<TokenLimitDef>>,
+    #[serde(default)]
+    allowed_calls: Option<AllowedCallsDef>,
+    #[serde(default)]
+    gas_limit: Option<u64>,
+    #[serde(default)]
+    max_fee_per_gas: Option<u128>,
+    #[serde(default)]
+    max_priority_fee_per_gas: Option<u128>,
+    #[serde(default)]
+    fee_token: Option<Address>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct KeychainAccountsDef {
+    pool: String,
 }
 
 impl TempoAdapter {
     /// Create a new adapter. The nonce RPC is populated by
     /// [`Self::prefetch_nonces`] when `--rpc` is supplied.
-    pub const fn new() -> Self {
-        Self { nonce_rpc: OnceLock::new() }
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn register_keychain_setup(&mut self, step_id: &str, setup: TempoKeychainSetup) -> Result<()> {
+        if self.keychain_setups.insert(step_id.to_string(), setup).is_some() {
+            bail!("duplicate keychain setup step id '{step_id}'");
+        }
+        Ok(())
+    }
+
+    fn keychain_setup(&self, step_id: &str) -> Result<&TempoKeychainSetup> {
+        self.keychain_setups
+            .get(step_id)
+            .ok_or_else(|| eyre::eyre!("keychain setup step '{step_id}' not found"))
     }
 
     /// Return the next nonce for `scheduling_key`, fetching the on-chain
@@ -72,6 +190,145 @@ impl TempoAdapter {
         }
         Ok(ctx.next_nonce(scheduling_key))
     }
+
+    fn expand_keychain_authorize_pool(
+        &mut self,
+        step_id: &str,
+        def: KeychainAuthorizePoolDef,
+        ctx: &mut BuildContext<'_>,
+    ) -> Result<Vec<serde_yaml::Value>> {
+        let account_pool = ctx.accounts.get_pool(&def.accounts.pool)?;
+        if account_pool.is_empty() {
+            bail!("keychain setup accounts pool '{}' is empty", def.accounts.pool);
+        }
+
+        let access_keys = def
+            .access_keys
+            .derive_signers()
+            .wrap_err("failed to derive keychain setup access keys")?;
+        if access_keys.len() != account_pool.len() {
+            bail!(
+                "keychain setup access key count ({}) must match account pool '{}' count ({})",
+                access_keys.len(),
+                def.accounts.pool,
+                account_pool.len()
+            );
+        }
+
+        let key_type = def.key_type.unwrap_or(KeyTypeDef::Secp256k1).signature_type();
+        let mut templates = Vec::with_capacity(access_keys.len());
+        for (idx, access_key) in access_keys.iter().enumerate() {
+            let restrictions =
+                build_key_restrictions(def.expiry, &def.limits, &def.allowed_calls, ctx)
+                    .wrap_err_with(|| {
+                        format!("failed to build key restrictions for account index {idx}")
+                    })?;
+            let call = authorize_key(access_key.address(), key_type, restrictions);
+            templates.push(keychain_setup_template_value(&def, idx, call)?);
+        }
+
+        self.register_keychain_setup(
+            step_id,
+            TempoKeychainSetup { account_pool: def.accounts.pool, key_type, access_keys },
+        )?;
+
+        Ok(templates)
+    }
+
+    fn apply_auth(
+        &self,
+        template: &TempoTemplate,
+        selected: &SelectedSigner,
+        req: &mut TempoTransactionRequest,
+        sign_context: &mut TempoSignContext,
+        ctx: &mut BuildContext<'_>,
+    ) -> Result<()> {
+        let Some(auth) = &template.auth else {
+            return Ok(());
+        };
+
+        let key_type = auth.key_type.unwrap_or(KeyTypeDef::Secp256k1).signature_type();
+        match auth.mode {
+            TempoAuthMode::Keychain => {
+                let access_signer = self.resolve_setup_access_signer(auth, selected, key_type)?;
+                req.set_key_type(key_type);
+                req.set_key_id(access_signer.address());
+                *sign_context =
+                    TempoSignContext::Keychain { user_address: selected.address, access_signer };
+            }
+            TempoAuthMode::KeyAuthorization => {
+                let access_signer = derive_inline_access_signer(auth, ctx)?;
+                let key_id = access_signer.address();
+                let authorization = build_key_authorization(auth, key_type, key_id, ctx)?;
+                let root_signer = ctx.accounts.get_by_index(&selected.pool, selected.index)?;
+                let signature = root_signer.sign_hash_sync(&authorization.signature_hash())?;
+                req.set_key_authorization(
+                    authorization.into_signed(PrimitiveSignature::Secp256k1(signature)),
+                );
+                req.set_key_type(key_type);
+                req.set_key_id(key_id);
+                *sign_context =
+                    TempoSignContext::Keychain { user_address: selected.address, access_signer };
+            }
+        }
+
+        Ok(())
+    }
+
+    fn resolve_setup_access_signer(
+        &self,
+        auth: &TempoAuthDef,
+        selected: &SelectedSigner,
+        key_type: SignatureType,
+    ) -> Result<EcdsaSigner> {
+        if auth.expiry.is_some() ||
+            auth.limits.is_some() ||
+            auth.allowed_calls.is_some() ||
+            auth.witness.is_some()
+        {
+            bail!(
+                "`auth.mode: keychain` uses restrictions from its setup step; put expiry, limits, allowed_calls, and witness on the setup or use `key_authorization`"
+            );
+        }
+
+        let access_key = auth
+            .access_key
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("`auth.mode: keychain` requires `access_key`"))?;
+        if access_key.derive.is_some() {
+            bail!("`auth.mode: keychain` does not support `access_key.derive`");
+        }
+        if access_key.has_inline_source_fields() {
+            bail!(
+                "`auth.mode: keychain` does not support inline access-key `mnemonic`, `index`, or `range`"
+            );
+        }
+        if access_key.pair.unwrap_or(AccessKeyPairMode::SameIndex) != AccessKeyPairMode::SameIndex {
+            bail!("only `access_key.pair: same_index` is supported");
+        }
+        let setup_id = access_key
+            .from_setup
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("`auth.mode: keychain` requires `access_key.from_setup`"))?;
+        let setup = self.keychain_setup(setup_id)?;
+        if setup.account_pool != selected.pool {
+            bail!(
+                "keychain setup '{setup_id}' was created for account pool '{}', but template selected pool '{}'",
+                setup.account_pool,
+                selected.pool
+            );
+        }
+        if setup.key_type != key_type {
+            bail!("keychain setup '{setup_id}' key_type does not match template auth key_type");
+        }
+        setup.access_keys.get(selected.index).cloned().ok_or_else(|| {
+            eyre::eyre!(
+                "selected account index {} has no paired access key in setup '{}'",
+                selected.index,
+                setup_id
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,14 +341,18 @@ enum TempoNonceMode {
 impl NetworkAdapter for TempoAdapter {
     type Template = TempoTemplate;
     type Network = TempoNetwork;
+    type SignContext = TempoSignContext;
 
     fn build_request(
         &self,
         template: Self::Template,
         ctx: &mut BuildContext<'_>,
-    ) -> Result<TxRequest<TempoTransactionRequest>> {
+    ) -> Result<TxRequest<TempoTransactionRequest, TempoSignContext>> {
         let selected = ctx.select_signer(&template.from)?;
         let is_tempo = template.tx_type == TempoTxType::Tempo;
+        if template.auth.is_some() && !is_tempo {
+            bail!("Tempo keychain auth is only supported for `type: tempo` templates");
+        }
         let nonce_mode = resolve_nonce_mode(&template, is_tempo, ctx)?;
         if !matches!(nonce_mode, TempoNonceMode::Expiring) &&
             let Some(valid_for_secs) = template.valid_for_secs
@@ -122,6 +383,7 @@ impl NetworkAdapter for TempoAdapter {
         req.set_chain_id(ctx.chain_id);
         req.set_nonce(nonce);
         req.set_gas_limit(template.gas_limit);
+        let mut sign_context = TempoSignContext::Standard;
 
         match template.tx_type {
             TempoTxType::Tempo => {
@@ -167,6 +429,8 @@ impl NetworkAdapter for TempoAdapter {
                 if is_expiring {
                     apply_expiring_uniqueness_bump(&mut req, ctx)?;
                 }
+
+                self.apply_auth(&template, &selected, &mut req, &mut sign_context, ctx)?;
 
                 // Handle sponsor signing: build a temporary TempoTransaction to
                 // compute the fee_payer_signature_hash, sign it, then set on the request.
@@ -220,7 +484,24 @@ impl NetworkAdapter for TempoAdapter {
             signer_pool: selected.pool,
             signer_index: selected.index,
             key: scheduling_key,
+            sign_context,
         })
+    }
+
+    fn expand_setup_extension(
+        &mut self,
+        step_id: &str,
+        extension_name: &str,
+        value: serde_yaml::Value,
+        ctx: &mut BuildContext<'_>,
+    ) -> Result<Option<Vec<serde_yaml::Value>>> {
+        if extension_name != "keychain_authorize_pool" {
+            return Ok(None);
+        }
+
+        let def: KeychainAuthorizePoolDef = serde_yaml::from_value(value)
+            .wrap_err("failed to parse keychain_authorize_pool setup step")?;
+        self.expand_keychain_authorize_pool(step_id, def, ctx).map(Some)
     }
 
     async fn prefetch_nonces(&self, ctx: &mut GenerateContext, rpc: &str) -> Result<()> {
@@ -442,11 +723,244 @@ fn resolve_call_data(
     }
 }
 
+fn sign_keychain_request(
+    name: String,
+    phase: TxPhase,
+    request: TempoTransactionRequest,
+    access_signer: EcdsaSigner,
+    user_address: Address,
+    key: [u8; 20],
+    inclusion_keys: Vec<SchedulingKey>,
+) -> Result<GeneratedTx> {
+    let tx = request
+        .build_aa()
+        .map_err(|e| eyre::eyre!("failed to build AA tx from template '{name}': {e}"))?;
+    let signing_hash = KeychainSignature::signing_hash(tx.signature_hash(), user_address);
+    let signature = access_signer
+        .sign_hash_sync(&signing_hash)
+        .map_err(|e| eyre::eyre!("failed to sign keychain tx from template '{name}': {e}"))?;
+    let signature = TempoSignature::Keychain(KeychainSignature::new(
+        user_address,
+        PrimitiveSignature::Secp256k1(signature),
+    ));
+    let envelope = TempoTxEnvelope::AA(tx.into_signed(signature));
+    let raw = Bytes::from(envelope.encoded_2718());
+
+    Ok(GeneratedTx {
+        phase,
+        id: Some(name),
+        raw,
+        submission_keys: vec![SchedulingKey::from(key)],
+        inclusion_keys,
+    })
+}
+
+fn derive_inline_access_signer(
+    auth: &TempoAuthDef,
+    ctx: &mut BuildContext<'_>,
+) -> Result<EcdsaSigner> {
+    let source = inline_access_key_source(auth.access_key.as_ref())?;
+    let offset = u32::try_from(ctx.next_nonce(inline_access_key_counter_key()))
+        .map_err(|_| eyre::eyre!("inline key_authorization access-key counter exceeded u32"))?;
+    match source {
+        InlineAccessKeySource::Default => {
+            let index = INLINE_ACCESS_KEY_START_INDEX.checked_add(offset).ok_or_else(|| {
+                eyre::eyre!("inline key_authorization access-key index overflowed")
+            })?;
+            derive_mnemonic_signer(INLINE_ACCESS_KEY_MNEMONIC, index)
+        }
+        InlineAccessKeySource::Configured(source) => {
+            let (start, len) = inline_access_key_range(&source)?;
+            let offset_usize = usize::try_from(offset).map_err(|_| {
+                eyre::eyre!("inline key_authorization access-key counter exceeded usize")
+            })?;
+            if offset_usize >= len {
+                bail!(
+                    "inline access_key range exhausted after {len} key(s); increase `access_key.range`"
+                );
+            }
+            let index = start.checked_add(offset).ok_or_else(|| {
+                eyre::eyre!("inline key_authorization access-key index overflowed")
+            })?;
+            derive_mnemonic_signer(&source.mnemonic, index)
+        }
+    }
+}
+
+enum InlineAccessKeySource {
+    Default,
+    Configured(AccountPoolDef),
+}
+
+fn inline_access_key_source(access_key: Option<&AccessKeyDef>) -> Result<InlineAccessKeySource> {
+    let Some(access_key) = access_key else {
+        return Ok(InlineAccessKeySource::Default);
+    };
+
+    if access_key.from_setup.is_some() {
+        bail!("`auth.mode: key_authorization` does not support `access_key.from_setup`");
+    }
+    if access_key.pair.is_some() {
+        bail!("`auth.mode: key_authorization` does not support `access_key.pair`");
+    }
+    if access_key.derive.unwrap_or(AccessKeyDeriveMode::PerTx) != AccessKeyDeriveMode::PerTx {
+        bail!("only `access_key.derive: per_tx` is supported");
+    }
+
+    match access_key.inline_source()? {
+        Some(source) => Ok(InlineAccessKeySource::Configured(source)),
+        None => Ok(InlineAccessKeySource::Default),
+    }
+}
+
+fn inline_access_key_range(source: &AccountPoolDef) -> Result<(u32, usize)> {
+    if let Some(index) = source.index {
+        return Ok((index, usize::MAX));
+    }
+    if let Some([start, end]) = source.range {
+        let len = end
+            .checked_sub(start)
+            .ok_or_else(|| eyre::eyre!("inline access_key range end must be >= start"))?;
+        if len == 0 {
+            bail!("inline access_key range must not be empty");
+        }
+        return Ok((start, len as usize));
+    }
+
+    Ok((INLINE_ACCESS_KEY_START_INDEX, usize::MAX))
+}
+
+fn inline_access_key_counter_key() -> [u8; 20] {
+    let hash = keccak256(b"txgen:tempo:inline-access-key");
+    let mut key = [0u8; 20];
+    key.copy_from_slice(&hash[..20]);
+    key
+}
+
+fn build_key_authorization(
+    auth: &TempoAuthDef,
+    key_type: SignatureType,
+    key_id: Address,
+    ctx: &mut BuildContext<'_>,
+) -> Result<KeyAuthorization> {
+    let mut authorization = KeyAuthorization::unrestricted(ctx.chain_id, key_type, key_id);
+    if let Some(expiry) = auth.expiry {
+        if expiry == 0 {
+            bail!("key_authorization expiry must be greater than 0");
+        }
+        authorization = authorization.with_expiry(expiry);
+    }
+    if let Some(limits) = resolve_token_limits(&auth.limits, ctx)? {
+        authorization = authorization.with_limits(limits);
+    }
+    if let Some(allowed_calls) = resolve_allowed_calls(&auth.allowed_calls) {
+        authorization = authorization.with_allowed_calls(allowed_calls);
+    }
+    if let Some(witness) = &auth.witness {
+        authorization = authorization.with_witness(ctx.resolve_value(witness)?);
+    }
+    Ok(authorization)
+}
+
+fn build_key_restrictions(
+    expiry: Option<u64>,
+    limits: &Option<Vec<TokenLimitDef>>,
+    allowed_calls: &Option<AllowedCallsDef>,
+    ctx: &mut BuildContext<'_>,
+) -> Result<KeyRestrictions> {
+    let mut restrictions = KeyRestrictions::default();
+    if let Some(expiry) = expiry {
+        if expiry == 0 {
+            bail!("keychain setup expiry must be greater than 0");
+        }
+        restrictions = restrictions.with_expiry(expiry);
+    }
+    if let Some(limits) = resolve_token_limits(limits, ctx)? {
+        restrictions = restrictions.with_limits(limits);
+    }
+    if let Some(allowed_calls) = resolve_allowed_calls(allowed_calls) {
+        restrictions = restrictions.with_allowed_calls(allowed_calls);
+    }
+    Ok(restrictions)
+}
+
+fn resolve_token_limits(
+    limits: &Option<Vec<TokenLimitDef>>,
+    ctx: &mut BuildContext<'_>,
+) -> Result<Option<Vec<tempo_primitives::transaction::TokenLimit>>> {
+    let Some(limits) = limits else {
+        return Ok(None);
+    };
+
+    limits
+        .iter()
+        .map(|limit| {
+            let amount = ctx.resolve_value(&limit.limit)?;
+            Ok(token_limit(limit.token, amount, limit.period))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn keychain_setup_template_value(
+    def: &KeychainAuthorizePoolDef,
+    account_index: usize,
+    call: Call,
+) -> Result<serde_yaml::Value> {
+    let to = call
+        .to
+        .into_to()
+        .ok_or_else(|| eyre::eyre!("keychain authorize call unexpectedly targets CREATE"))?;
+    let mut mapping = serde_yaml::Mapping::new();
+    insert_yaml(&mut mapping, "type", "tempo")?;
+    insert_yaml(&mut mapping, "from", account_ref_value(&def.accounts.pool, account_index)?)?;
+    insert_yaml(&mut mapping, "gas_limit", def.gas_limit.unwrap_or(400_000))?;
+    if let Some(max_fee_per_gas) = def.max_fee_per_gas {
+        insert_yaml(&mut mapping, "max_fee_per_gas", max_fee_per_gas)?;
+    }
+    if let Some(max_priority_fee_per_gas) = def.max_priority_fee_per_gas {
+        insert_yaml(&mut mapping, "max_priority_fee_per_gas", max_priority_fee_per_gas)?;
+    }
+    if let Some(fee_token) = def.fee_token {
+        insert_yaml(&mut mapping, "fee_token", fee_token.to_string())?;
+    }
+    insert_yaml(&mut mapping, "to", to.to_string())?;
+    if !call.value.is_zero() {
+        insert_yaml(&mut mapping, "value", call.value.to_string())?;
+    }
+    insert_yaml(&mut mapping, "input", call.input.to_string())?;
+
+    Ok(serde_yaml::Value::Mapping(mapping))
+}
+
+fn insert_yaml<T: serde::Serialize>(
+    mapping: &mut serde_yaml::Mapping,
+    key: &str,
+    value: T,
+) -> Result<()> {
+    mapping.insert(serde_yaml::Value::String(key.to_string()), serde_yaml::to_value(value)?);
+    Ok(())
+}
+
+fn account_ref_value(pool: &str, index: usize) -> Result<serde_yaml::Value> {
+    let mut select = serde_yaml::Mapping::new();
+    insert_yaml(&mut select, "index", index)?;
+
+    let mut account = serde_yaml::Mapping::new();
+    insert_yaml(&mut account, "pool", pool)?;
+    account.insert(
+        serde_yaml::Value::String("select".to_string()),
+        serde_yaml::Value::Mapping(select),
+    );
+
+    Ok(serde_yaml::Value::Mapping(account))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_consensus::SignableTransaction;
-    use alloy_eips::eip2718::Encodable2718;
+    use alloy_eips::eip2718::{Decodable2718, Encodable2718};
     use alloy_network::{NetworkTransactionBuilder, TxSignerSync};
     use alloy_primitives::Address;
     use rand::{rngs::StdRng, SeedableRng};
@@ -480,6 +994,27 @@ mod tests {
         let signed = unsigned.into_signed(sig);
         let envelope = <A::Network as alloy_network::Network>::TxEnvelope::from(signed);
         Bytes::from(envelope.encoded_2718())
+    }
+
+    fn sign_tempo_request(
+        tx_req: TxRequest<TempoTransactionRequest, TempoSignContext>,
+        ctx: &BuildContext<'_>,
+        name: &str,
+    ) -> GeneratedTx {
+        let signer =
+            ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index).unwrap().clone();
+        let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context } = tx_req;
+        sign_context
+            .sign_request(name.to_string(), TxPhase::Workload, request, signer, key, Vec::new())
+            .unwrap()
+    }
+
+    fn assert_keychain_signature(raw: &Bytes) {
+        let envelope = TempoTxEnvelope::decode_2718(&mut raw.as_ref()).unwrap();
+        let TempoTxEnvelope::AA(tx) = envelope else {
+            panic!("expected Tempo AA envelope");
+        };
+        assert!(tx.signature().is_keychain());
     }
 
     fn test_accounts() -> AccountManager {
@@ -516,6 +1051,7 @@ mod tests {
             valid_before: None,
             valid_for_secs: None,
             calls: None,
+            auth: None,
         }
     }
 
@@ -583,6 +1119,138 @@ mod tests {
         let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
 
         assert_eq!(tx_req.request.fee_token, Some(fee_token));
+    }
+
+    #[test]
+    fn test_keychain_setup_expands_and_workload_signs_with_access_key() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        let mut adapter = TempoAdapter::new();
+
+        let setup_value: serde_yaml::Value = serde_yaml::from_str(&format!(
+            r#"
+accounts:
+  pool: users
+access_keys:
+  mnemonic: "{TEST_MNEMONIC}"
+  range: [100, 110]
+key_type: secp256k1
+limits:
+  - token: "0x20c0000000000000000000000000000000000000"
+    amount: "1000"
+    period: 0
+allowed_calls: unrestricted
+"#
+        ))
+        .unwrap();
+        let templates = adapter
+            .expand_setup_extension(
+                "authorize_keychain_users",
+                "keychain_authorize_pool",
+                setup_value,
+                &mut ctx,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(templates.len(), 10);
+        let setup_template: TempoTemplate = serde_yaml::from_value(templates[0].clone()).unwrap();
+        assert_eq!(setup_template.tx_type, TempoTxType::Tempo);
+        assert_eq!(setup_template.from.pool, "users");
+        assert!(setup_template.auth.is_none());
+
+        let workload: TempoTemplate = serde_yaml::from_str(
+            r#"
+type: tempo
+auth:
+  mode: keychain
+  access_key:
+    from_setup: authorize_keychain_users
+    pair: same_index
+from:
+  pool: users
+  select: { index: 1 }
+gas_limit: 400000
+max_fee_per_gas: 1000000000
+max_priority_fee_per_gas: 1000000000
+to: "0x20c0000000000000000000000000000000000000"
+input: "0x"
+"#,
+        )
+        .unwrap();
+
+        let tx_req = adapter.build_request(workload, &mut ctx).unwrap();
+        assert_eq!(
+            tx_req.request.key_id,
+            Some(derive_mnemonic_signer(TEST_MNEMONIC, 101).unwrap().address())
+        );
+
+        let generated = sign_tempo_request(tx_req, &ctx, "keychain");
+        assert_eq!(generated.raw[0], TEMPO_TX_TYPE_ID);
+        assert_keychain_signature(&generated.raw);
+    }
+
+    #[test]
+    fn test_inline_key_authorization_signs_authorization_and_keychain_tx() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let template: TempoTemplate = serde_yaml::from_str(&format!(
+            r#"
+type: tempo
+auth:
+  mode: key_authorization
+  access_key:
+    derive: per_tx
+    mnemonic: "{TEST_MNEMONIC}"
+    range: [200, 220]
+  key_type: secp256k1
+  limits:
+    - token: "0x20c0000000000000000000000000000000000000"
+      amount: "1000"
+      period: 0
+  witness:
+    random_bytes: 32
+from:
+  pool: users
+  select: {{ index: 0 }}
+gas_limit: 400000
+max_fee_per_gas: 1000000000
+max_priority_fee_per_gas: 1000000000
+to: "0x20c0000000000000000000000000000000000000"
+input: "0x"
+"#
+        ))
+        .unwrap();
+
+        let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
+        let signed_authorization = tx_req
+            .request
+            .key_authorization
+            .as_ref()
+            .expect("inline auth should attach a signed key_authorization");
+        assert_eq!(
+            signed_authorization.recover_signer().unwrap(),
+            accounts.get_by_index("users", 0).unwrap().address()
+        );
+        assert_eq!(signed_authorization.limits.as_ref().unwrap().len(), 1);
+        assert!(signed_authorization.witness().is_some());
+        assert_eq!(
+            tx_req.request.key_id,
+            Some(derive_mnemonic_signer(TEST_MNEMONIC, 200).unwrap().address())
+        );
+
+        let generated = sign_tempo_request(tx_req, &ctx, "inline_key_authorization");
+        assert_eq!(generated.raw[0], TEMPO_TX_TYPE_ID);
+        assert_keychain_signature(&generated.raw);
     }
 
     #[test]

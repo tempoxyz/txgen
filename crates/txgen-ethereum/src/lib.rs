@@ -17,6 +17,7 @@ pub struct EthereumAdapter;
 impl NetworkAdapter for EthereumAdapter {
     type Template = EthereumTemplate;
     type Network = Ethereum;
+    type SignContext = ();
 
     fn build_request(
         &self,
@@ -63,6 +64,7 @@ impl NetworkAdapter for EthereumAdapter {
             signer_pool: selected.pool,
             signer_index: selected.index,
             key,
+            sign_context: (),
         })
     }
 

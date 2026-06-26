@@ -241,18 +241,7 @@ impl AccountPoolDef {
     pub fn derive_signers(&self) -> Result<Vec<EcdsaSigner>> {
         let indices = selected_indices(self.index, self.range, "account pool")?;
 
-        indices
-            .into_iter()
-            .map(|idx| {
-                MnemonicBuilder::<English>::default()
-                    .phrase(&self.mnemonic)
-                    .index(idx)
-                    .map_err(|e| eyre::eyre!("failed to set mnemonic: {e}"))?
-                    .build()
-                    .map(|signer| signer.to_secp256k1())
-                    .map_err(|e| eyre::eyre!("failed to derive signer at index {idx}: {e}"))
-            })
-            .collect()
+        indices.into_iter().map(|idx| derive_mnemonic_signer(&self.mnemonic, idx)).collect()
     }
 }
 
@@ -385,13 +374,17 @@ fn selected_fast_range(
 }
 
 fn derive_address(mnemonic: &str, idx: u32) -> Result<Address> {
+    derive_mnemonic_signer(mnemonic, idx).map(|signer| signer.address())
+}
+
+/// Derive one signer from a BIP-39 mnemonic and account index.
+pub fn derive_mnemonic_signer(mnemonic: &str, idx: u32) -> Result<EcdsaSigner> {
     MnemonicBuilder::<English>::default()
         .phrase(mnemonic)
         .index(idx)
         .map_err(|e| eyre::eyre!("failed to set mnemonic: {e}"))?
         .build()
         .map(|signer| signer.to_secp256k1())
-        .map(|signer: EcdsaSigner| signer.address())
         .map_err(|e| eyre::eyre!("failed to derive address at index {idx}: {e}"))
 }
 

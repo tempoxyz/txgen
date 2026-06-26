@@ -885,6 +885,67 @@ Recommended benchmark setting: `valid_for_secs: 25`. This matches `tempo-bench`'
 
 **Benchmarking caveat:** Expiring nonce transactions are still time-bounded by `valid_before <= now + 30s`. Streamed generation/send pipelines are practical because txgen builds and signs each transaction immediately before emitting it, but pre-generating a large expiring-tx file and replaying it later is still unsafe because many transactions will expire before submission.
 
+**Keychain access keys:** Tempo templates can sign workload transactions with an AccountKeychain access key while keeping the logical sender as `from`. Add a setup step to pre-authorize one deterministic access key per account, then reference that setup step from workload templates:
+
+```yaml
+setup:
+  steps:
+    - id: authorize_keychain_users
+      keychain_authorize_pool:
+        accounts: { pool: users }
+        access_keys:
+          mnemonic: "test test test test test test test test test test test junk"
+          range: [100000, 100003]
+        key_type: secp256k1
+        limits:
+          - token: "0x20c0000000000000000000000000000000000000"
+            amount: "1000000000000000000000000"
+            period: 0
+        allowed_calls: unrestricted
+
+templates:
+  keychain_tip20_transfer:
+    type: tempo
+    auth:
+      mode: keychain
+      access_key:
+        from_setup: authorize_keychain_users
+        pair: same_index
+    from: { pool: users, select: random }
+    gas_limit: 400000
+    call:
+      to: "0x20c0000000000000000000000000000000000000"
+      abi: ERC20
+      function: transfer
+      args:
+        - { pool: users, select: random }
+        - 1
+```
+
+Access keys derived by `keychain_authorize_pool.access_keys` are hidden signing keys. They are not added to `accounts` and are not printed by `txgen addresses`.
+
+For inline provisioning workloads, use `auth.mode: key_authorization`. txgen derives a deterministic per-transaction secp256k1 access key, signs the `key_authorization` with the root `from` account, attaches it to the Tempo transaction, and signs the transaction with a keychain signature:
+
+```yaml
+auth:
+  mode: key_authorization
+  access_key:
+    derive: per_tx
+    mnemonic: "${TXGEN_ACCESS_KEY_MNEMONIC}"
+    range: [1000000, 1001000]
+  key_type: secp256k1
+  limits:
+    - token: "0x20c0000000000000000000000000000000000000"
+      amount: "1000000000000000000000000"
+      period: 0
+  witness:
+    random_bytes: 32
+```
+
+Inline `access_key.mnemonic` is a hidden signing seed for generated access keys; it does not need funded accounts and is not listed by `txgen addresses`. Omit it only for disposable benchmark specs, where txgen falls back to the public benchmark mnemonic at index `1000000`.
+
+`allowed_calls` may be `unrestricted`, `deny_all`, or a list of scopes with `target` and `selectors` entries. Selector values are 4-byte `0x` hex strings.
+
 **Prefetch caveat:** `txgen-tempo generate --rpc` only prefetches constant 2D nonce keys that are fixed in the spec. Dynamic/generated `nonce_key` values (`uniform`, `choice`, etc.) are resolved per transaction and are not prefetched automatically.
 
 ## RPC Methods
@@ -946,12 +1007,23 @@ Each chain binary implements the `NetworkAdapter` trait from `txgen-cli`:
 pub trait NetworkAdapter: Send + Sync {
     type Template: DeserializeOwned + Send;
     type Network: Network;
+    type SignContext: RequestSignContext<Self::Network>;
 
     fn build_request(
         &self,
         template: Self::Template,
         ctx: &mut BuildContext<'_>,
-    ) -> Result<TxRequest<<Self::Network as Network>::TransactionRequest>>;
+    ) -> Result<TxRequest<<Self::Network as Network>::TransactionRequest, Self::SignContext>>;
+
+    fn expand_setup_extension(
+        &mut self,
+        step_id: &str,
+        extension_name: &str,
+        value: serde_yaml::Value,
+        ctx: &mut BuildContext<'_>,
+    ) -> Result<Option<Vec<serde_yaml::Value>>> {
+        Ok(None)
+    }
 
     fn prefetch_nonces(/* ... */) -> impl Future<Output = Result<()>> { ... }
 }

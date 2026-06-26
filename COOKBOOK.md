@@ -24,6 +24,7 @@ Use `txgen-ethereum` for standard Ethereum transactions and `txgen-tempo` for Te
 - [Build and replay big-block payloads](#build-and-replay-big-block-payloads)
 - [Exercise reorg paths](#exercise-reorg-paths)
 - [Use setup transactions and skip them later](#use-setup-transactions-and-skip-them-later)
+- [Generate Tempo keychain TIP20 workloads](#generate-tempo-keychain-tip20-workloads)
 - [Generate dependent transaction sequences](#generate-dependent-transaction-sequences)
 - [Generate random fixed-size values](#generate-random-fixed-size-values)
 - [Use Tempo parallel and expiring nonces](#use-tempo-parallel-and-expiring-nonces)
@@ -304,6 +305,31 @@ If the chain is already prepared, reuse the same generated stream but ignore set
 
 ```bash
 bench send --input txs-with-setup.ndjson --rpc-url http://localhost:8545 --skip-setup
+```
+
+## Generate Tempo keychain TIP20 workloads
+
+Use `keychain_authorize_pool` in setup to authorize one deterministic access key per user, then sign measured workload transactions with the paired access key:
+
+```bash
+txgen-tempo generate \
+  --spec tests/specs/tempo-keychain-tip20.yaml \
+  --count 1000 \
+  --seed 7 \
+  --rpc http://localhost:8545 \
+| bench send --rpc-url http://localhost:8545 --report json:keychain-report.json
+```
+
+Access keys are signing-only keys derived from the setup step's `access_keys` mnemonic/range. They do not become funded workload accounts and are not included in `txgen-tempo addresses`.
+
+For inline provisioning traffic, use `auth.mode: key_authorization`. Each workload transaction carries a signed secp256k1 `key_authorization`, optional limits, and an optional TIP-1053 witness. Inline access keys can be derived from a separate mnemonic/range under `auth.access_key`; if omitted, txgen uses a public benchmark-only mnemonic starting at index `1000000`:
+
+```bash
+txgen-tempo generate \
+  --spec tests/specs/tempo-inline-key-authorization-tip20.yaml \
+  --count 1000 \
+  --seed 7 \
+| bench send --rpc-url http://localhost:8545 --report json:inline-key-auth-report.json
 ```
 
 ## Generate dependent transaction sequences
