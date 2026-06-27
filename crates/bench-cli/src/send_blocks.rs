@@ -15,10 +15,11 @@ use crate::{
 use alloy_consensus::Header as ConsensusHeader;
 use alloy_network::Ethereum;
 use alloy_primitives::{Address, Bytes, B256};
-use alloy_provider::{ext::TestingApi, Provider, RootProvider};
+use alloy_provider::{Provider, RootProvider};
 use alloy_rlp::{Decodable, Header};
 use alloy_rpc_types_engine::{
-    ExecutionData, ForkchoiceState, JwtSecret, PayloadAttributes, TestingBuildBlockRequestV1,
+    ExecutionData, ExecutionPayloadEnvelopeV5, ForkchoiceState, JwtSecret, PayloadAttributes,
+    TestingBuildBlockRequestV1, TESTING_BUILD_BLOCK_V1,
 };
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
@@ -286,7 +287,7 @@ fn report_progress(
 
 async fn process_input_and_wait(
     provider: &(impl Provider + RethApi<Ethereum>),
-    testing_provider: &(impl Provider + TestingApi<Ethereum>),
+    testing_provider: &impl Provider,
     input: &InputLine,
     state: ProcessingState<'_>,
     wait_time: Option<Duration>,
@@ -318,7 +319,7 @@ async fn process_input_and_wait(
 
 async fn process_input(
     provider: &(impl Provider + RethApi<Ethereum>),
-    testing_provider: &(impl Provider + TestingApi<Ethereum>),
+    testing_provider: &impl Provider,
     input: &InputLine,
     collector: &mut MetricsCollector,
     reorg_state: Option<&mut ReorgState>,
@@ -347,7 +348,7 @@ async fn process_input(
 
 async fn process_block(
     provider: &(impl Provider + RethApi<Ethereum>),
-    testing_provider: &(impl Provider + TestingApi<Ethereum>),
+    testing_provider: &impl Provider,
     block: &BlockLine,
     collector: &mut MetricsCollector,
     reorg_state: Option<&mut ReorgState>,
@@ -470,7 +471,7 @@ async fn process_block(
 
 async fn process_reorg_block(
     provider: &(impl Provider + RethApi<Ethereum>),
-    testing_provider: &(impl Provider + TestingApi<Ethereum>),
+    testing_provider: &impl Provider,
     block: &BlockLine,
     collector: &MetricsCollector,
     reorg_state: &mut ReorgState,
@@ -520,13 +521,25 @@ async fn process_reorg_block(
         extra_data: Some(Bytes::new()),
     };
 
-    let envelope = testing_provider.build_block_v1(request).await.wrap_err_with(|| {
-        format!(
-            "testing_buildBlockV1 failed for block {}. Ensure the target exposes the hidden \
-                 testing RPC, for example: reth node --http --http.api eth,testing ...",
-            block.number
+    let TestingBuildBlockRequestV1 {
+        parent_block_hash,
+        payload_attributes,
+        transactions,
+        extra_data,
+    } = request;
+    let envelope: ExecutionPayloadEnvelopeV5 = testing_provider
+        .raw_request(
+            TESTING_BUILD_BLOCK_V1.into(),
+            (parent_block_hash, payload_attributes, Some(transactions), extra_data),
         )
-    })?;
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "testing_buildBlockV1 failed for block {}. Ensure the target exposes the hidden \
+                 testing RPC, for example: reth node --http --http.api eth,testing ...",
+                block.number
+            )
+        })?;
     let synthetic_block_hash = envelope.execution_payload.payload_inner.payload_inner.block_hash;
     let (payload, sidecar) = envelope.into_payload_and_sidecar(parent_beacon_block_root);
     let execution_data = ExecutionData::new(payload, sidecar);
