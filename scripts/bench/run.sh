@@ -34,7 +34,7 @@
 #   --jwt-secret <PATH>    Path to JWT secret file (required)
 #   --from <N>             Starting block number (required)
 #   --to <N>               Ending block number (required)
-#   --wait-for-persistence <POLICY>  always, never, or every:N (default: every:2)
+#   --wait-for-persistence <POLICY>  always, never, or every:N (default: never)
 #
 # Node options (used with setup):
 #   --genesis <PATH>       Genesis JSON (default: /tmp/txgen-localnet/genesis.json)
@@ -79,7 +79,7 @@ ENGINE="http://localhost:8551"
 JWT_SECRET=""
 FROM_BLOCK=""
 TO_BLOCK=""
-WAIT_FOR_PERSISTENCE="every:2"
+WAIT_FOR_PERSISTENCE="never"
 
 # Node
 GENESIS="/tmp/txgen-localnet/genesis.json"
