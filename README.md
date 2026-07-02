@@ -192,7 +192,7 @@ bench send-blocks \
 | `--engine <URL>` | Engine API endpoint |
 | `--jwt-secret <PATH>` | Path to JWT secret file |
 | `-i, --input <PATH>` | Input NDJSON file (default: stdin) |
-| `--wait-for-persistence <POLICY>` | Persistence wait policy: `always`, `never`, or `every:N` (default: `every:2`) |
+| `--wait-for-persistence <POLICY>` | Persistence wait policy: `always`, `never`, or `every:N` (default: `never`) |
 | `--wait-time <DURATION>` | Minimum interval between block submissions. Accepts `100ms`, `2s`, or bare milliseconds like `400` |
 | `--reorg [DEPTH]` | Build synthetic side-fork blocks and alternate forkchoice updates to exercise reorg paths. If `DEPTH` is omitted, defaults to `8`. Requires raw RLP block input |
 | `--rpc <URL>` | Regular HTTP RPC endpoint for `testing_buildBlockV1` when `--reorg` is enabled (default: `http://localhost:8545`) |

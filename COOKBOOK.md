@@ -192,7 +192,7 @@ txgen-ethereum extract \
 | bench send-blocks \
   --engine http://localhost:8551 \
   --jwt-secret /path/to/jwt.hex \
-  --wait-for-persistence every:2 \
+  --wait-for-persistence never \
   --report console \
   --report json:replay-report.json
 ```

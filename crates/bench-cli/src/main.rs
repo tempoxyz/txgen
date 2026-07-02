@@ -133,9 +133,8 @@ pub struct SendBlocksArgs {
     /// Wait for persistence policy: always, never, or every:N
     ///
     /// Controls whether reth_newPayload blocks until the persistence
-    /// threshold is crossed. Default is every:2 (matching reth's
-    /// DEFAULT_PERSISTENCE_THRESHOLD).
-    #[arg(long, default_value = "every:2", value_parser = parse_wait_for_persistence)]
+    /// threshold is crossed. Default is never.
+    #[arg(long, default_value = "never", value_parser = parse_wait_for_persistence)]
     pub wait_for_persistence: bench_core::WaitForPersistence,
 
     /// Minimum interval between block submissions.
