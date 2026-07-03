@@ -1,11 +1,12 @@
-use crate::{AccountPoolDef, AccountRef, AddressPoolDef, ArtifactDef, GenValue};
+use crate::{yaml, AccountPoolDef, AccountRef, AddressPoolDef, ArtifactDef, GenValue};
 use alloy_primitives::{Address, B256, U256};
-use eyre::{bail, Result, WrapErr};
+use eyre::{Result, WrapErr};
 use serde::{Deserialize, Deserializer};
-use std::{collections::HashMap, env};
+use std::collections::HashMap;
 
 /// Workload specification parsed from YAML.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadSpec {
     /// Chain ID for transactions.
     pub chain_id: u64,
@@ -269,17 +270,14 @@ impl<'de> Deserialize<'de> for SequenceBinding {
 impl WorkloadSpec {
     /// Load and parse a workload spec from a YAML file.
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .wrap_err_with(|| format!("failed to read spec file: {}", path.display()))?;
-        Self::parse(&content)
+        let value = yaml::load_yaml(path)?;
+        serde_yaml::from_value(value).wrap_err("failed to parse workload spec")
     }
 
     /// Parse a workload spec from YAML string.
     pub fn parse(yaml: &str) -> Result<Self> {
-        let expanded = expand_env_vars(yaml).wrap_err("failed to expand environment variables")?;
-        let spec: WorkloadSpec =
-            serde_yaml::from_str(&expanded).wrap_err("failed to parse workload spec")?;
-        Ok(spec)
+        let value = yaml::parse_yaml(yaml)?;
+        serde_yaml::from_value(value).wrap_err("failed to parse workload spec")
     }
 
     /// Get total weight of all mix entries.
@@ -288,50 +286,24 @@ impl WorkloadSpec {
     }
 }
 
-/// Expand `${VAR}` patterns with environment variable values.
-fn expand_env_vars(input: &str) -> Result<String> {
-    let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '$' && chars.peek() == Some(&'{') {
-            chars.next(); // consume '{'
-            let mut var_name = String::new();
-            let mut found_end = false;
-            for c in chars.by_ref() {
-                if c == '}' {
-                    found_end = true;
-                    break;
-                }
-                var_name.push(c);
-            }
-
-            if !found_end {
-                bail!("unterminated environment variable expansion: ${{{var_name}");
-            }
-
-            match env::var(&var_name) {
-                Ok(value) => result.push_str(&value),
-                Err(env::VarError::NotPresent) => {
-                    bail!("environment variable `{var_name}` referenced in spec is not set")
-                }
-                Err(env::VarError::NotUnicode(_)) => {
-                    bail!(
-                        "environment variable `{var_name}` referenced in spec is not valid Unicode"
-                    )
-                }
-            }
-        } else {
-            result.push(c);
-        }
-    }
-
-    Ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[test]
+    fn test_unknown_top_level_key_fails() {
+        let yaml = r#"
+chain_id: 1
+templtes: {}
+"#;
+        let err = WorkloadSpec::parse(yaml).expect_err("unknown key should fail");
+        assert!(err.chain().any(|cause| cause.to_string().contains("unknown field `templtes`")));
+    }
 
     #[test]
     fn test_parse_minimal_spec() {
@@ -349,7 +321,7 @@ chain_id: 1
     fn test_env_var_expansion() {
         // SAFETY: Test is single-threaded and we restore the env var after
         unsafe {
-            env::set_var("TEST_MNEMONIC", "test test test");
+            std::env::set_var("TEST_MNEMONIC", "test test test");
         }
         let yaml = r#"
 chain_id: 1
@@ -367,7 +339,7 @@ address_pools:
         assert_eq!(spec.address_pools["recipients"].mnemonic.as_deref(), Some("test test test"));
         // SAFETY: Test cleanup
         unsafe {
-            env::remove_var("TEST_MNEMONIC");
+            std::env::remove_var("TEST_MNEMONIC");
         }
     }
 
@@ -375,7 +347,7 @@ address_pools:
     fn test_missing_env_var_fails() {
         // SAFETY: This test uses a unique variable name and removes it before parsing.
         unsafe {
-            env::remove_var("TXGEN_TEST_MISSING_ENV_VAR");
+            std::env::remove_var("TXGEN_TEST_MISSING_ENV_VAR");
         }
         let yaml = r#"
 chain_id: 1
@@ -461,5 +433,133 @@ mix:
         assert!(matches!(sequence.bindings["salt"], SequenceBinding::Bytes32(_)));
         assert!(matches!(sequence.bindings["channel_id"], SequenceBinding::AbiHash(_)));
         assert_eq!(spec.mix[0].item, MixItem::Sequence("pair".to_string()));
+    }
+
+    #[test]
+    fn test_load_composed_spec_with_merge_and_append() {
+        let dir = temp_spec_dir("composed");
+        let pieces = dir.join("pieces");
+        fs::create_dir_all(&pieces).unwrap();
+
+        write_file(
+            &pieces.join("base.yml"),
+            r#"
+merge:
+  chain_id: 1
+  artifacts:
+    ERC20: erc20.json
+  templates:
+    transfer:
+      type: eip1559
+      gas_limit: 21000
+  mix:
+    - template: transfer
+      weight: 1
+"#,
+        );
+        write_file(
+            &pieces.join("gas.yml"),
+            r#"
+merge:
+  templates:
+    transfer:
+      gas_limit: 30000
+"#,
+        );
+        write_file(
+            &pieces.join("setup-a.yml"),
+            r#"
+append:
+  setup:
+    steps:
+      - id: first
+        tx:
+          type: eip1559
+"#,
+        );
+        write_file(
+            &pieces.join("setup-b.yml"),
+            r#"
+append:
+  setup:
+    steps:
+      - id: second
+        tx:
+          type: eip1559
+"#,
+        );
+        write_file(
+            &dir.join("spec.yml"),
+            r#"
+include:
+  - pieces/base.yml
+  - pieces/gas.yml
+  - pieces/setup-a.yml
+  - pieces/setup-b.yml
+"#,
+        );
+
+        let spec = WorkloadSpec::load(&dir.join("spec.yml")).unwrap();
+        assert_eq!(spec.chain_id, 1);
+        assert_eq!(spec.templates["transfer"]["gas_limit"], serde_yaml::to_value(30000).unwrap());
+        let setup = spec.setup.expect("setup should be appended");
+        assert_eq!(setup.steps.len(), 2);
+        assert_eq!(setup.steps[0].id, "first");
+        assert_eq!(setup.steps[1].id, "second");
+
+        let ArtifactDef::Path(path) = &spec.artifacts["ERC20"] else {
+            panic!("expected path artifact");
+        };
+        assert!(path.is_absolute());
+        assert_eq!(path, &pieces.join("erc20.json"));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_append_rejects_non_sequence_leaf() {
+        let dir = temp_spec_dir("append-invalid");
+        write_file(
+            &dir.join("spec.yml"),
+            r#"
+chain_id: 1
+append:
+  setup:
+    steps:
+      id: not-a-list
+"#,
+        );
+
+        let err = WorkloadSpec::load(&dir.join("spec.yml")).expect_err("append should fail");
+        assert!(err
+            .chain()
+            .any(|cause| cause.to_string().contains("append section leaves must be sequences")));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_include_cycle_fails() {
+        let dir = temp_spec_dir("include-cycle");
+        write_file(&dir.join("a.yml"), "include: b.yml\n");
+        write_file(&dir.join("b.yml"), "include: a.yml\n");
+
+        let err = WorkloadSpec::load(&dir.join("a.yml")).expect_err("cycle should fail");
+        assert!(err.chain().any(|cause| cause.to_string().contains("cyclic spec include")));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn temp_spec_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("txgen-{name}-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // Canonicalize so path assertions survive symlinked temp dirs (macOS `/var`).
+        fs::canonicalize(dir).unwrap()
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        fs::write(path, content.trim_start()).unwrap();
     }
 }

@@ -22,4 +22,4 @@ pub use spec::{
     SequenceStep, SetupDef, SetupStep, WorkloadSpec,
 };
 pub use value::{FromGenerator, GenValue, Generator, ValueResolver};
-pub use yaml::merge_yaml;
+pub use yaml::{append_yaml, merge_yaml};

@@ -387,6 +387,49 @@ Transactions are output as NDJSON with scheduling keys split by release policy:
 
 Workload specs are YAML files that define accounts, transaction templates, optional transaction sequences, and mix ratios.
 
+### Composable Specs
+
+Specs can be assembled from reusable YAML pieces with `include`, `merge`, and
+`append`. Includes are applied in order and are resolved relative to the file
+that declares them. Artifact paths inside included files are also resolved
+relative to the file that declares the artifact.
+
+```yaml
+include:
+  - tip20/base.yml
+  - tip20/recipient-random.yml
+  - tip20/fee-token-any-tip20.yml
+  - tip20/auth-keychain.yml
+  - tip20/nonce-expiring.yml
+```
+
+Piece files can use `merge` for normal recursive object overlays. Mapping
+values are merged recursively; scalar and sequence values replace the previous
+value.
+
+```yaml
+merge:
+  templates:
+    tip20_transfer:
+      gas_limit: 3000000
+```
+
+Use `append` when a piece needs to add to a sequence without replacing earlier
+entries. The leaves of an `append` section must be lists.
+
+```yaml
+append:
+  setup:
+    steps:
+      - id: authorize_keychain_users
+        keychain_authorize_pool:
+          accounts:
+            pool: users
+          access_keys:
+            mnemonic: "${ACCESS_KEY_MNEMONIC}"
+            range: [100000, 101000]
+```
+
 ### Structure
 
 ```yaml
