@@ -511,6 +511,7 @@ async fn process_reorg_block(
         withdrawals: None,
         parent_beacon_block_root,
         slot_number: None,
+        target_gas_limit: None,
     };
     let parent_beacon_block_root = payload_attributes.parent_beacon_block_root.unwrap_or_default();
     let request = TestingBuildBlockRequestV1 {
