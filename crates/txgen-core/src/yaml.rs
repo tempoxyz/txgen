@@ -28,11 +28,24 @@ pub fn parse_yaml(yaml: &str) -> Result<serde_yaml::Value> {
 
 /// Deep-merge a YAML overlay into a base value.
 ///
-/// Mapping values are merged recursively. All other overlay values replace the
-/// base value. A `null` overlay is treated as no-op so omitted `with` blocks do
-/// not erase the referenced template.
+/// Mapping values are merged recursively, except variable references of the
+/// form `{ var: ... }`, which replace the base value atomically. All other
+/// overlay values replace the base value. A `null` overlay is treated as no-op
+/// so omitted `with` blocks do not erase the referenced template.
 pub fn merge_yaml(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
     if matches!(overlay, serde_yaml::Value::Null) {
+        return;
+    }
+
+    // Variable references are scalar leaves even though their YAML encoding is
+    // a mapping. Replacing a mapping field with `{ var: ... }` must discard the
+    // original mapping instead of retaining its keys alongside `var`.
+    if matches!(
+        &overlay,
+        serde_yaml::Value::Mapping(mapping)
+            if mapping.len() == 1 && mapping.contains_key("var")
+    ) {
+        *base = overlay;
         return;
     }
 
@@ -318,5 +331,74 @@ fn normalize_path_string(path: &str, base_dir: &Path) -> String {
         path.display().to_string()
     } else {
         base_dir.join(path).display().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_yaml;
+
+    #[test]
+    fn variable_reference_replaces_mapping_atomically() {
+        let mut base = serde_yaml::from_str(
+            r#"
+from:
+  pool: users
+  select: { index: 0 }
+"#,
+        )
+        .unwrap();
+        let overlay = serde_yaml::from_str(
+            r#"
+from: { var: claim.from }
+"#,
+        )
+        .unwrap();
+
+        merge_yaml(&mut base, overlay);
+
+        let expected: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+from: { var: claim.from }
+"#,
+        )
+        .unwrap();
+        assert_eq!(base, expected);
+    }
+
+    #[test]
+    fn regular_mappings_still_merge_recursively() {
+        let mut base = serde_yaml::from_str(
+            r#"
+call:
+  to: "0x0000000000000000000000000000000000000001"
+  args:
+    amount: 1
+    recipient: alice
+"#,
+        )
+        .unwrap();
+        let overlay = serde_yaml::from_str(
+            r#"
+call:
+  args:
+    amount: 2
+"#,
+        )
+        .unwrap();
+
+        merge_yaml(&mut base, overlay);
+
+        let expected: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+call:
+  to: "0x0000000000000000000000000000000000000001"
+  args:
+    amount: 2
+    recipient: alice
+"#,
+        )
+        .unwrap();
+        assert_eq!(base, expected);
     }
 }
