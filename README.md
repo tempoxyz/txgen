@@ -473,6 +473,8 @@ artifacts:
   token:
     abi: "./out/Token.sol/Token.json"
     bytecode: "./out/Token.sol/Token.json"
+  bytecode_only:
+    bytecode: "./out/Contract.bin" # ABI defaults to empty when omitted
 
 # Optional deterministic setup transactions emitted before workload txs
 setup:
