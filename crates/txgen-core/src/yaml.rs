@@ -303,9 +303,13 @@ fn normalize_resource_paths(value: &mut serde_yaml::Value, base_dir: Option<&Pat
         }
     }
 
-    if let Some(serde_yaml::Value::Mapping(record_pools)) = mapping.get_mut("record_pools") {
-        for record_pool in record_pools.values_mut() {
-            if let serde_yaml::Value::Mapping(definition) = record_pool {
+    normalize_fixture_pool_paths(mapping, base_dir);
+}
+
+fn normalize_fixture_pool_paths(mapping: &mut serde_yaml::Mapping, base_dir: &Path) {
+    if let Some(serde_yaml::Value::Mapping(fixture_pools)) = mapping.get_mut("fixture_pools") {
+        for fixture_pool in fixture_pools.values_mut() {
+            if let serde_yaml::Value::Mapping(definition) = fixture_pool {
                 normalize_artifact_object_path(definition, "path", base_dir);
                 normalize_artifact_object_path(definition, "file", base_dir);
             }

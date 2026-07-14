@@ -17,8 +17,8 @@ use std::{
 };
 use txgen_core::{
     dedup_scheduling_keys, merge_yaml, AbiEncodePackedDef, AbiHashDef, AccountManager,
-    AddressPoolManager, ArtifactManager, BuildContext, EcdsaSigner, GeneratedTx, MixItem,
-    NdjsonWriter, NonceTracker, RecordPoolManager, SchedulingKey, SequenceBinding, SetupStep,
+    AddressPoolManager, ArtifactManager, BuildContext, EcdsaSigner, FixturePoolManager,
+    GeneratedTx, MixItem, NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, SetupStep,
     TxPhase, WorkloadSpec,
 };
 
@@ -75,7 +75,7 @@ pub struct GenerateContext {
     spec: WorkloadSpec,
     accounts: AccountManager,
     address_pools: AddressPoolManager,
-    record_pools: RecordPoolManager,
+    fixture_pools: FixturePoolManager,
     artifacts: ArtifactManager,
     nonces: NonceTracker,
     rng: StdRng,
@@ -100,13 +100,13 @@ impl GenerateContext {
             Some(seed) => StdRng::seed_from_u64(seed),
             None => StdRng::from_os_rng(),
         };
-        let record_pools = RecordPoolManager::load(&spec.record_pools, base_path, &mut rng)?;
+        let fixture_pools = FixturePoolManager::load(&spec.fixture_pools, base_path, &mut rng)?;
         let limit = GenerationLimit { count: args.count, duration: args.duration };
         Ok(Self {
             spec,
             accounts,
             address_pools,
-            record_pools,
+            fixture_pools,
             artifacts,
             nonces,
             rng,
@@ -359,7 +359,7 @@ where
         &ctx.spec.gas,
         &ctx.accounts,
         &ctx.address_pools,
-        &ctx.record_pools,
+        &ctx.fixture_pools,
         &ctx.artifacts,
         &mut ctx.nonces,
         &mut ctx.rng,
@@ -401,7 +401,7 @@ where
 #[derive(Debug, Clone)]
 enum ResolvedBinding {
     Account { pool: String, index: usize, address: Address },
-    Record(serde_yaml::Value),
+    Fixture(serde_yaml::Value),
     Address(Address),
     Bytes32(B256),
     Bytes(Bytes),
@@ -1049,7 +1049,7 @@ fn resolve_sequence_binding(
                 address: selected.address,
             }
         }
-        SequenceBinding::Record(record) => ResolvedBinding::Record(ctx.select_record(record)?),
+        SequenceBinding::Fixture(fixture) => ResolvedBinding::Fixture(ctx.select_fixture(fixture)?),
         SequenceBinding::Address(address) => ResolvedBinding::Address(ctx.resolve_value(address)?),
         SequenceBinding::Bytes32(bytes32) => ResolvedBinding::Bytes32(ctx.resolve_value(bytes32)?),
         SequenceBinding::AbiEncodePacked(def) => {
@@ -1100,7 +1100,7 @@ fn binding_dependency_names(
                 collect_var_names(value, bindings, &mut deps);
             }
         }
-        SequenceBinding::Record(_) => {}
+        SequenceBinding::Fixture(_) => {}
         _ => {}
     }
     deps
@@ -1295,7 +1295,7 @@ fn binding_to_value(
         (ResolvedBinding::Account { .. }, None) => {
             bail!("account binding '{name}' requires `.ref` or `.address`")
         }
-        (ResolvedBinding::Record(record), field) => project_record_binding(name, record, field),
+        (ResolvedBinding::Fixture(fixture), field) => project_fixture_binding(name, fixture, field),
         (ResolvedBinding::Address(address), None) => {
             Ok(serde_yaml::Value::String(address.to_string()))
         }
@@ -1324,32 +1324,32 @@ fn binding_to_value(
     }
 }
 
-fn project_record_binding(
+fn project_fixture_binding(
     name: &str,
-    record: &serde_yaml::Value,
+    fixture: &serde_yaml::Value,
     field: Option<&str>,
 ) -> Result<serde_yaml::Value> {
     let Some(field) = field else {
-        return Ok(record.clone());
+        return Ok(fixture.clone());
     };
 
-    let mut value = record;
+    let mut value = fixture;
     for segment in field.split('.') {
         value = match value {
             serde_yaml::Value::Mapping(mapping) => mapping
                 .get(serde_yaml::Value::String(segment.to_string()))
-                .ok_or_else(|| eyre::eyre!("record binding '{name}' has no field '{field}'"))?,
+                .ok_or_else(|| eyre::eyre!("fixture binding '{name}' has no field '{field}'"))?,
             serde_yaml::Value::Sequence(values) => {
                 let index: usize = segment.parse().map_err(|_| {
                     eyre::eyre!(
-                        "record binding '{name}' field '{field}' uses non-numeric array index '{segment}'"
+                        "fixture binding '{name}' field '{field}' uses non-numeric array index '{segment}'"
                     )
                 })?;
                 values
                     .get(index)
-                    .ok_or_else(|| eyre::eyre!("record binding '{name}' has no field '{field}'"))?
+                    .ok_or_else(|| eyre::eyre!("fixture binding '{name}' has no field '{field}'"))?
             }
-            _ => bail!("record binding '{name}' has no field '{field}'"),
+            _ => bail!("fixture binding '{name}' has no field '{field}'"),
         };
     }
 
@@ -1463,7 +1463,7 @@ call:
     }
 
     #[test]
-    fn record_binding_projects_correlated_from_and_input_fields() -> Result<()> {
+    fn fixture_binding_projects_correlated_from_and_input_fields() -> Result<()> {
         let base = serde_yaml::from_str::<serde_yaml::Value>(
             r#"
 from:
@@ -1479,7 +1479,7 @@ from: { var: claim.from }
 input: { var: claim.input }
 "#,
         )?;
-        let record = serde_yaml::from_str::<serde_yaml::Value>(
+        let fixture = serde_yaml::from_str::<serde_yaml::Value>(
             r#"
 from:
   pool: users
@@ -1489,7 +1489,7 @@ metadata:
   proof: ["0xabcd"]
 "#,
         )?;
-        let bindings = HashMap::from([("claim".to_string(), ResolvedBinding::Record(record))]);
+        let bindings = HashMap::from([("claim".to_string(), ResolvedBinding::Fixture(fixture))]);
 
         let materialized = substitute_vars(merge_template_overlay(base, overlay), &bindings)?;
 
@@ -1538,15 +1538,15 @@ call:
     }
 
     #[test]
-    fn record_binding_rejects_missing_projection() {
+    fn fixture_binding_rejects_missing_projection() {
         let bindings = HashMap::from([(
             "claim".to_string(),
-            ResolvedBinding::Record(serde_yaml::from_str("input: 0x1234").unwrap()),
+            ResolvedBinding::Fixture(serde_yaml::from_str("input: 0x1234").unwrap()),
         )]);
 
         let err = binding_to_value("claim.from", &bindings)
-            .expect_err("missing record fields must fail during materialization");
-        assert!(err.to_string().contains("record binding 'claim' has no field 'from'"));
+            .expect_err("missing fixture fields must fail during materialization");
+        assert!(err.to_string().contains("fixture binding 'claim' has no field 'from'"));
     }
 
     #[test]

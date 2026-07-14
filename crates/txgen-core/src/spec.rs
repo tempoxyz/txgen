@@ -1,6 +1,6 @@
 use crate::{
-    yaml, AccountPoolDef, AccountRef, AddressPoolDef, ArtifactDef, GenValue, RecordPoolDef,
-    RecordRef,
+    yaml, AccountPoolDef, AccountRef, AddressPoolDef, ArtifactDef, FixturePoolDef, FixtureRef,
+    GenValue,
 };
 use alloy_primitives::{Address, B256, U256};
 use eyre::{Result, WrapErr};
@@ -26,9 +26,9 @@ pub struct WorkloadSpec {
     #[serde(default)]
     pub address_pools: HashMap<String, AddressPoolDef>,
 
-    /// External record pools keyed by name.
+    /// External fixture pools keyed by name.
     #[serde(default)]
-    pub record_pools: HashMap<String, RecordPoolDef>,
+    pub fixture_pools: HashMap<String, FixturePoolDef>,
 
     /// ABI/deployment artifact definitions keyed by name.
     #[serde(default)]
@@ -182,8 +182,8 @@ pub struct SequenceStep {
 pub enum SequenceBinding {
     /// Select an account once. Exposes `<name>.ref` and `<name>.address`.
     Account(AccountRef),
-    /// Select one external record. Exposes its fields as `<name>.<field>`.
-    Record(RecordRef),
+    /// Select one external fixture row. Exposes its fields as `<name>.<field>`.
+    Fixture(FixtureRef),
     /// Resolve an address once.
     Address(GenValue<Address>),
     /// Resolve a bytes32 value once.
@@ -226,9 +226,10 @@ impl<'de> Deserialize<'de> for SequenceBinding {
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct SequenceBindingDef {
             account: Option<AccountRef>,
-            record: Option<RecordRef>,
+            fixture: Option<FixtureRef>,
             address: Option<GenValue<Address>>,
             bytes32: Option<GenValue<B256>>,
             abi_encode_packed: Option<AbiEncodePackedDef>,
@@ -241,7 +242,7 @@ impl<'de> Deserialize<'de> for SequenceBinding {
         let def = SequenceBindingDef::deserialize(deserializer)?;
         let mut fields_set = 0;
         fields_set += usize::from(def.account.is_some());
-        fields_set += usize::from(def.record.is_some());
+        fields_set += usize::from(def.fixture.is_some());
         fields_set += usize::from(def.address.is_some());
         fields_set += usize::from(def.bytes32.is_some());
         fields_set += usize::from(def.abi_encode_packed.is_some());
@@ -258,8 +259,8 @@ impl<'de> Deserialize<'de> for SequenceBinding {
 
         if let Some(account) = def.account {
             Ok(Self::Account(account))
-        } else if let Some(record) = def.record {
-            Ok(Self::Record(record))
+        } else if let Some(fixture) = def.fixture {
+            Ok(Self::Fixture(fixture))
         } else if let Some(address) = def.address {
             Ok(Self::Address(address))
         } else if let Some(bytes32) = def.bytes32 {
@@ -327,7 +328,7 @@ chain_id: 1
         assert_eq!(spec.chain_id, 1);
         assert!(spec.accounts.is_empty());
         assert!(spec.address_pools.is_empty());
-        assert!(spec.record_pools.is_empty());
+        assert!(spec.fixture_pools.is_empty());
         assert!(spec.templates.is_empty());
     }
 
@@ -450,10 +451,10 @@ mix:
     }
 
     #[test]
-    fn test_parse_record_pool_binding() {
+    fn test_parse_fixture_pool_binding() {
         let yaml = r#"
 chain_id: 1
-record_pools:
+fixture_pools:
   claims:
     path: claims.json
 templates:
@@ -462,7 +463,7 @@ sequences:
   claims:
     bindings:
       claim:
-        record:
+        fixture:
           pool: claims
           select: shuffled_once
     steps:
@@ -473,8 +474,8 @@ mix:
 "#;
 
         let spec = WorkloadSpec::parse(yaml).unwrap();
-        assert_eq!(spec.record_pools["claims"].path, PathBuf::from("claims.json"));
-        assert!(matches!(spec.sequences["claims"].bindings["claim"], SequenceBinding::Record(_)));
+        assert_eq!(spec.fixture_pools["claims"].path, PathBuf::from("claims.json"));
+        assert!(matches!(spec.sequences["claims"].bindings["claim"], SequenceBinding::Fixture(_)));
     }
 
     #[test]
@@ -490,7 +491,7 @@ merge:
   chain_id: 1
   artifacts:
     ERC20: erc20.json
-  record_pools:
+  fixture_pools:
     claims:
       path: claims.json
   templates:
@@ -557,7 +558,7 @@ include:
         };
         assert!(path.is_absolute());
         assert_eq!(path, &pieces.join("erc20.json"));
-        assert_eq!(spec.record_pools["claims"].path, pieces.join("claims.json"));
+        assert_eq!(spec.fixture_pools["claims"].path, pieces.join("claims.json"));
 
         fs::remove_dir_all(dir).unwrap();
     }

@@ -12,7 +12,7 @@ For end-to-end workflow examples, see the [txgen Cookbook](COOKBOOK.md).
 - **Chain-agnostic**: Plugin architecture supports multiple chains (Ethereum, Tempo)
 - **Deterministic**: Seed-based RNG for reproducible transaction generation
 - **Flexible**: YAML specs with weighted template mixing, value generators, and account pools
-- **Correlated fixtures**: External record pools project one row into multiple transaction fields
+- **Correlated fixtures**: External fixture pools project one row into multiple transaction fields
 - **Fast**: Generates transactions without network I/O
 
 ## Installation
@@ -468,8 +468,8 @@ address_pools:
       - "0x0000000000000000000000000000000000000001"
       - "0x0000000000000000000000000000000000000002"
 
-# External JSON/YAML record arrays for correlated transaction fields
-record_pools:
+# External JSON/YAML fixture arrays for correlated transaction fields
+fixture_pools:
   claims:
     path: "./fixtures/claims.json"
 
@@ -598,9 +598,9 @@ to:
 
 `txgen addresses` intentionally omits `address_pools`; it only lists signer account addresses for funding.
 
-### External Record Pools
+### External Fixture Pools
 
-Use `record_pools` when several fields must come from the same fixture row, such
+Use `fixture_pools` when several fields must come from the same fixture row, such
 as a signer account reference paired with its pre-encoded claim calldata. The
 external JSON or YAML file must contain a top-level array of mappings. Paths are
 resolved relative to the spec (or included spec piece) that declares them.
@@ -620,7 +620,7 @@ Select one row in a sequence binding, then project any of its fields with
 `{ var: <binding>.<field> }`:
 
 ```yaml
-record_pools:
+fixture_pools:
   merkl_claims:
     path: ./fixtures/claims.json
 
@@ -636,7 +636,7 @@ sequences:
   unique_merkl_claim:
     bindings:
       claim:
-        record:
+        fixture:
           pool: merkl_claims
           select: shuffled_once
     steps:
@@ -646,7 +646,7 @@ sequences:
           input: { var: claim.input }
 ```
 
-Record selection is shuffled and without replacement within each pass. It uses
+Fixture selection is shuffled and without replacement within each pass. It uses
 the workload seed, so repeated runs with the same spec and `--seed` produce the
 same order. A pool cannot mix selection modes in one generation run.
 
@@ -888,7 +888,7 @@ Supported binding references:
 | Binding | References |
 |---------|------------|
 | `account` | `<name>.ref`, `<name>.address` |
-| `record` | `<name>` or `<name>.<field>` (including nested dotted paths) |
+| `fixture` | `<name>` or `<name>.<field>` (including nested dotted paths) |
 | `address` | `<name>` |
 | `bytes32` | `<name>` |
 | `abi_hash` | `<name>` |
