@@ -16,9 +16,9 @@ use crate::{value::parse_generator, GenValue, Generator, ValueResolver};
 pub enum ArtifactDef {
     /// Path to an ABI JSON file or a compiler artifact containing an `abi` field.
     Path(PathBuf),
-    /// Separate ABI and bytecode paths. `bytecode` may point at a raw hex file or compiler
-    /// artifact.
-    Object { abi: PathBuf, bytecode: Option<PathBuf> },
+    /// Separate ABI and bytecode paths. If `abi` is omitted, an empty ABI is used. `bytecode`
+    /// may point at a raw hex file or compiler artifact.
+    Object { abi: Option<PathBuf>, bytecode: Option<PathBuf> },
 }
 
 #[derive(Debug)]
@@ -43,9 +43,9 @@ impl ArtifactManager {
 
         for (name, def) in artifacts {
             let artifact = match def {
-                ArtifactDef::Path(path) => load_artifact(path, None, base_path)?,
+                ArtifactDef::Path(path) => load_artifact(Some(path), None, base_path)?,
                 ArtifactDef::Object { abi, bytecode } => {
-                    load_artifact(abi, bytecode.as_ref(), base_path)?
+                    load_artifact(abi.as_ref(), bytecode.as_ref(), base_path)?
                 }
             };
             loaded.insert(name.clone(), artifact);
@@ -108,22 +108,30 @@ impl ArtifactManager {
 }
 
 fn load_artifact(
-    abi_path: &PathBuf,
+    abi_path: Option<&PathBuf>,
     bytecode_path: Option<&PathBuf>,
     base_path: &std::path::Path,
 ) -> Result<Artifact> {
-    let abi_path = resolve_path(abi_path, base_path);
-    let content = std::fs::read_to_string(&abi_path)
-        .wrap_err_with(|| format!("failed to read artifact: {}", abi_path.display()))?;
-    let json: serde_json::Value = serde_json::from_str(&content)
-        .wrap_err_with(|| format!("failed to parse artifact JSON: {}", abi_path.display()))?;
+    let json = abi_path
+        .map(|path| {
+            let path = resolve_path(path, base_path);
+            let content = std::fs::read_to_string(&path)
+                .wrap_err_with(|| format!("failed to read artifact: {}", path.display()))?;
+            serde_json::from_str(&content)
+                .wrap_err_with(|| format!("failed to parse artifact JSON: {}", path.display()))
+        })
+        .transpose()?;
 
-    let abi = parse_abi_json(&json)
-        .wrap_err_with(|| format!("failed to parse ABI: {}", abi_path.display()))?;
+    let abi = match (&json, abi_path) {
+        (Some(json), Some(path)) => parse_abi_json(json).wrap_err_with(|| {
+            format!("failed to parse ABI: {}", resolve_path(path, base_path).display())
+        })?,
+        _ => JsonAbi::default(),
+    };
     let bytecode = if let Some(path) = bytecode_path {
         Some(load_bytecode(path, base_path)?)
     } else {
-        parse_bytecode_json(&json).transpose()?
+        json.as_ref().and_then(parse_bytecode_json).transpose()?
     };
 
     Ok(Artifact { abi, bytecode })
@@ -592,6 +600,36 @@ mod tests {
     fn test_artifact_manager_empty() {
         let manager = ArtifactManager::empty();
         assert!(manager.get("nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_bytecode_only_artifact_defaults_to_empty_abi() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "txgen-bytecode-only-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("contract.bin"), "0x6000")?;
+
+        let definitions = HashMap::from([(
+            "contract".to_string(),
+            ArtifactDef::Object { abi: None, bytecode: Some("contract.bin".into()) },
+        )]);
+        let manager = ArtifactManager::load(&definitions, &dir)?;
+        let accounts = AccountManager::empty();
+        let address_pools = AddressPoolManager::empty();
+        let mut rng = rand::rng();
+        let mut resolver =
+            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+
+        assert_eq!(manager.get("contract")?, &JsonAbi::default());
+        assert_eq!(
+            manager.encode_constructor("contract", &[], &mut resolver)?,
+            Bytes::from_static(&[0x60, 0x00])
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]
