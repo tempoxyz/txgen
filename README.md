@@ -12,6 +12,7 @@ For end-to-end workflow examples, see the [txgen Cookbook](COOKBOOK.md).
 - **Chain-agnostic**: Plugin architecture supports multiple chains (Ethereum, Tempo)
 - **Deterministic**: Seed-based RNG for reproducible transaction generation
 - **Flexible**: YAML specs with weighted template mixing, value generators, and account pools
+- **Correlated fixtures**: External record pools project one row into multiple transaction fields
 - **Fast**: Generates transactions without network I/O
 
 ## Installation
@@ -68,7 +69,7 @@ txgen-ethereum generate -s workload.yaml -n 1000 -o transactions.ndjson
 
 #### `addresses`
 
-List signer account addresses from a workload spec (useful for funding). Destination-only `address_pools` are intentionally omitted.
+List signer account addresses from a workload spec (useful for funding). Destination-only `address_pools` are intentionally omitted. Duplicate signer addresses shared by multiple account pools are emitted once.
 
 ```bash
 txgen-ethereum addresses -s workload.yaml
@@ -467,6 +468,11 @@ address_pools:
       - "0x0000000000000000000000000000000000000001"
       - "0x0000000000000000000000000000000000000002"
 
+# External JSON/YAML record arrays for correlated transaction fields
+record_pools:
+  claims:
+    path: "./fixtures/claims.json"
+
 # ABI/deployment artifacts for contract calls and setup deploys
 artifacts:
   erc20: "./abis/ERC20.json"
@@ -591,6 +597,68 @@ to:
 ```
 
 `txgen addresses` intentionally omits `address_pools`; it only lists signer account addresses for funding.
+
+### External Record Pools
+
+Use `record_pools` when several fields must come from the same fixture row, such
+as a signer account reference paired with its pre-encoded claim calldata. The
+external JSON or YAML file must contain a top-level array of mappings. Paths are
+resolved relative to the spec (or included spec piece) that declares them.
+
+For example, `fixtures/claims.json` can contain:
+
+```json
+[
+  {
+    "from": { "pool": "users", "select": { "index": 17 } },
+    "input": "0x1234"
+  }
+]
+```
+
+Select one row in a sequence binding, then project any of its fields with
+`{ var: <binding>.<field> }`:
+
+```yaml
+record_pools:
+  merkl_claims:
+    path: ./fixtures/claims.json
+
+templates:
+  merkl_claim:
+    type: eip1559
+    from: { pool: users, select: { index: 0 } }
+    to: "0x0000000000000000000000000000000000000001"
+    input: "0x"
+    gas_limit: 500000
+
+sequences:
+  unique_merkl_claim:
+    bindings:
+      claim:
+        record:
+          pool: merkl_claims
+          select: shuffled_once
+    steps:
+      - template: merkl_claim
+        with:
+          from: { var: claim.from }
+          input: { var: claim.input }
+```
+
+Record selection is shuffled and without replacement within each pass. It uses
+the workload seed, so repeated runs with the same spec and `--seed` produce the
+same order. A pool cannot mix selection modes in one generation run.
+
+| Selection mode | Exhaustion behavior |
+|----------------|---------------------|
+| `shuffled_once` | Fails generation after the last unique row; use for finite runs where every claim must be fresh |
+| `shuffled_cycle` | Deterministically reshuffles and begins another complete pass; use for sustained runs where replaying proofs is intentional |
+
+Nested mapping fields and numeric array indices can be projected with dotted
+paths such as `{ var: claim.metadata.proof.0 }`. A one-step sequence does not
+add a synthetic inclusion key, so this binding pattern does not make the sender
+wait for a receipt between otherwise independent claims.
 
 ### Value Generators
 
@@ -820,6 +888,7 @@ Supported binding references:
 | Binding | References |
 |---------|------------|
 | `account` | `<name>.ref`, `<name>.address` |
+| `record` | `<name>` or `<name>.<field>` (including nested dotted paths) |
 | `address` | `<name>` |
 | `bytes32` | `<name>` |
 | `abi_hash` | `<name>` |
@@ -855,6 +924,8 @@ bindings:
 ```
 
 Each emitted sequence step gets its natural nonce-lane key as a `submission_key`. Txgen then groups adjacent sequence steps by lane. Steps in the same lane rely on nonce order and can be submitted back-to-back. When a sequence crosses lanes, txgen adds a synthetic boundary key: the previous run releases it after inclusion, and the next run requires it as a `submission_key`. This preserves cross-lane ordering without receipt-gating same-lane nonce chains.
+
+A sequence with only one step has no cross-step dependency, so txgen does not add a synthetic inclusion key for it.
 
 When set, `txgen generate -n` counts emitted transactions, not sequence instances. txgen never emits a partial sequence; if no remaining mix entry fits the remaining transaction budget or `--duration` elapses before the next workload item starts, generation stops early.
 

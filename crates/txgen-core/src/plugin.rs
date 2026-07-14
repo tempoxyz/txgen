@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 use crate::{
     AccountManager, AccountRef, AddressPoolManager, ArtifactManager, GasConfig, NonceTracker,
-    SelectMode,
+    RecordPoolManager, RecordRef, SelectMode,
 };
 
 /// Result of selecting a signer from a pool.
@@ -35,6 +35,9 @@ pub struct BuildContext<'a> {
     /// Artifact manager for ABI access.
     pub artifacts: &'a ArtifactManager,
 
+    /// External record pools for correlated sequence bindings.
+    pub record_pools: &'a RecordPoolManager,
+
     /// Nonce tracker for ordering.
     pub nonces: &'a mut NonceTracker,
 
@@ -45,6 +48,11 @@ pub struct BuildContext<'a> {
 fn empty_address_pools() -> &'static AddressPoolManager {
     static EMPTY_ADDRESS_POOLS: OnceLock<AddressPoolManager> = OnceLock::new();
     EMPTY_ADDRESS_POOLS.get_or_init(AddressPoolManager::empty)
+}
+
+fn empty_record_pools() -> &'static RecordPoolManager {
+    static EMPTY_RECORD_POOLS: OnceLock<RecordPoolManager> = OnceLock::new();
+    EMPTY_RECORD_POOLS.get_or_init(RecordPoolManager::empty)
 }
 
 impl<'a> BuildContext<'a> {
@@ -78,7 +86,31 @@ impl<'a> BuildContext<'a> {
         nonces: &'a mut NonceTracker,
         rng: &'a mut StdRng,
     ) -> Self {
-        Self { chain_id, gas, accounts, address_pools, artifacts, nonces, rng }
+        Self::new_with_pools(
+            chain_id,
+            gas,
+            accounts,
+            address_pools,
+            empty_record_pools(),
+            artifacts,
+            nonces,
+            rng,
+        )
+    }
+
+    /// Create a new build context with destination-only address and external record pools.
+    #[expect(clippy::too_many_arguments)]
+    pub fn new_with_pools(
+        chain_id: u64,
+        gas: &'a GasConfig,
+        accounts: &'a AccountManager,
+        address_pools: &'a AddressPoolManager,
+        record_pools: &'a RecordPoolManager,
+        artifacts: &'a ArtifactManager,
+        nonces: &'a mut NonceTracker,
+        rng: &'a mut StdRng,
+    ) -> Self {
+        Self { chain_id, gas, accounts, address_pools, artifacts, record_pools, nonces, rng }
     }
 
     /// Get the next nonce for a scheduling key.
@@ -115,6 +147,11 @@ impl<'a> BuildContext<'a> {
                 })
             }
         }
+    }
+
+    /// Select the next correlated record from an external pool.
+    pub fn select_record(&self, reference: &RecordRef) -> Result<serde_yaml::Value> {
+        self.record_pools.select(reference)
     }
 
     /// Encode a contract call definition into calldata.

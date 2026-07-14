@@ -209,7 +209,7 @@ impl YamlResolver {
 
         if !has_directives {
             let mut value = serde_yaml::Value::Mapping(mapping);
-            normalize_artifact_paths(&mut value, base_dir);
+            normalize_resource_paths(&mut value, base_dir);
             merge_yaml(output, value);
             return Ok(());
         }
@@ -229,13 +229,13 @@ impl YamlResolver {
 
         if !mapping.is_empty() {
             let mut value = serde_yaml::Value::Mapping(mapping);
-            normalize_artifact_paths(&mut value, base_dir);
+            normalize_resource_paths(&mut value, base_dir);
             merge_yaml(output, value);
         }
 
         if let Some(mut merge_value) = merge {
             ensure_mapping(&merge_value, label, MERGE_KEY)?;
-            normalize_artifact_paths(&mut merge_value, base_dir);
+            normalize_resource_paths(&mut merge_value, base_dir);
             merge_yaml(output, merge_value);
         }
 
@@ -288,7 +288,7 @@ fn ensure_mapping(value: &serde_yaml::Value, label: &str, section: &str) -> Resu
     }
 }
 
-fn normalize_artifact_paths(value: &mut serde_yaml::Value, base_dir: Option<&Path>) {
+fn normalize_resource_paths(value: &mut serde_yaml::Value, base_dir: Option<&Path>) {
     let Some(base_dir) = base_dir else {
         return;
     };
@@ -297,12 +297,19 @@ fn normalize_artifact_paths(value: &mut serde_yaml::Value, base_dir: Option<&Pat
         return;
     };
 
-    let Some(serde_yaml::Value::Mapping(artifacts)) = mapping.get_mut("artifacts") else {
-        return;
-    };
+    if let Some(serde_yaml::Value::Mapping(artifacts)) = mapping.get_mut("artifacts") {
+        for artifact in artifacts.values_mut() {
+            normalize_artifact_def_paths(artifact, base_dir);
+        }
+    }
 
-    for artifact in artifacts.values_mut() {
-        normalize_artifact_def_paths(artifact, base_dir);
+    if let Some(serde_yaml::Value::Mapping(record_pools)) = mapping.get_mut("record_pools") {
+        for record_pool in record_pools.values_mut() {
+            if let serde_yaml::Value::Mapping(definition) = record_pool {
+                normalize_artifact_object_path(definition, "path", base_dir);
+                normalize_artifact_object_path(definition, "file", base_dir);
+            }
+        }
     }
 }
 

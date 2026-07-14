@@ -5741,6 +5741,7 @@ dependencies = [
  "eyre",
  "hex",
  "rand 0.9.4",
+ "rayon",
  "serde",
  "serde_json",
  "serde_yaml",

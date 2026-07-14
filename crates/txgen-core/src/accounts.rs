@@ -3,6 +3,7 @@ use alloy_signer::Signer;
 use alloy_signer_local::{coins_bip39::English, MnemonicBuilder, Secp256k1Signer};
 use eyre::{bail, Result, WrapErr};
 use rand::Rng;
+use rayon::prelude::*;
 use serde::{Deserialize, Deserializer};
 use std::{collections::HashMap, sync::Mutex};
 
@@ -240,8 +241,43 @@ impl AccountPoolDef {
     /// Derive signers from this pool definition.
     pub fn derive_signers(&self) -> Result<Vec<EcdsaSigner>> {
         let indices = selected_indices(self.index, self.range, "account pool")?;
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        indices.into_iter().map(|idx| derive_mnemonic_signer(&self.mnemonic, idx)).collect()
+        // Preserve MnemonicBuilder's validation for a final component that
+        // cannot be represented as a normal (non-hardened) BIP-32 child.
+        if indices.iter().any(|index| *index >= 1 << 31) {
+            return indices
+                .into_par_iter()
+                .map(|idx| derive_mnemonic_signer(&self.mnemonic, idx))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .collect();
+        }
+
+        // PBKDF2 and the fixed BIP-44 prefix are expensive. Derive them once
+        // per pool, then derive only the final account component in parallel.
+        let first_index = indices[0];
+        let parent = MnemonicBuilder::<English>::default()
+            .phrase(&self.mnemonic)
+            .build_parent_key()
+            .map_err(|err| eyre::eyre!("failed to derive address at index {first_index}: {err}"))?;
+
+        // `Vec`'s indexed parallel collection preserves the source order. Keep
+        // errors in that ordered vector and unwrap them sequentially so an
+        // invalid range reports the same first failing index as before.
+        indices
+            .into_par_iter()
+            .map(|idx| {
+                parent
+                    .child(idx)
+                    .map(|key| key.signer().to_secp256k1())
+                    .map_err(|err| eyre::eyre!("failed to derive address at index {idx}: {err}"))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect()
     }
 }
 
@@ -471,9 +507,28 @@ mod tests {
         let signers = def.derive_signers().unwrap();
         assert_eq!(signers.len(), 10);
 
-        // Verify all addresses are unique
+        // Verify the parallel collection preserves derivation-index order.
+        let expected: Vec<_> = (0..10)
+            .map(|index| derive_mnemonic_signer(TEST_MNEMONIC, index).unwrap().address())
+            .collect();
+        let actual: Vec<_> = signers.iter().map(|signer| signer.address()).collect();
+        assert_eq!(actual, expected);
+
+        // Verify all addresses are unique.
         let addresses: std::collections::HashSet<_> = signers.iter().map(|s| s.address()).collect();
         assert_eq!(addresses.len(), 10);
+    }
+
+    #[test]
+    fn test_parallel_range_preserves_first_error() {
+        let def = AccountPoolDef {
+            mnemonic: "not a valid mnemonic".to_string(),
+            index: None,
+            range: Some([7, 10]),
+        };
+
+        let err = def.derive_signers().expect_err("invalid mnemonic must fail");
+        assert!(err.to_string().contains("index 7"), "unexpected error: {err}");
     }
 
     #[test]

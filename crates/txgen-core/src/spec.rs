@@ -1,4 +1,7 @@
-use crate::{yaml, AccountPoolDef, AccountRef, AddressPoolDef, ArtifactDef, GenValue};
+use crate::{
+    yaml, AccountPoolDef, AccountRef, AddressPoolDef, ArtifactDef, GenValue, RecordPoolDef,
+    RecordRef,
+};
 use alloy_primitives::{Address, B256, U256};
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Deserializer};
@@ -22,6 +25,10 @@ pub struct WorkloadSpec {
     /// Destination-only address pools keyed by name.
     #[serde(default)]
     pub address_pools: HashMap<String, AddressPoolDef>,
+
+    /// External record pools keyed by name.
+    #[serde(default)]
+    pub record_pools: HashMap<String, RecordPoolDef>,
 
     /// ABI/deployment artifact definitions keyed by name.
     #[serde(default)]
@@ -175,6 +182,8 @@ pub struct SequenceStep {
 pub enum SequenceBinding {
     /// Select an account once. Exposes `<name>.ref` and `<name>.address`.
     Account(AccountRef),
+    /// Select one external record. Exposes its fields as `<name>.<field>`.
+    Record(RecordRef),
     /// Resolve an address once.
     Address(GenValue<Address>),
     /// Resolve a bytes32 value once.
@@ -219,6 +228,7 @@ impl<'de> Deserialize<'de> for SequenceBinding {
         #[derive(Deserialize)]
         struct SequenceBindingDef {
             account: Option<AccountRef>,
+            record: Option<RecordRef>,
             address: Option<GenValue<Address>>,
             bytes32: Option<GenValue<B256>>,
             abi_encode_packed: Option<AbiEncodePackedDef>,
@@ -231,6 +241,7 @@ impl<'de> Deserialize<'de> for SequenceBinding {
         let def = SequenceBindingDef::deserialize(deserializer)?;
         let mut fields_set = 0;
         fields_set += usize::from(def.account.is_some());
+        fields_set += usize::from(def.record.is_some());
         fields_set += usize::from(def.address.is_some());
         fields_set += usize::from(def.bytes32.is_some());
         fields_set += usize::from(def.abi_encode_packed.is_some());
@@ -247,6 +258,8 @@ impl<'de> Deserialize<'de> for SequenceBinding {
 
         if let Some(account) = def.account {
             Ok(Self::Account(account))
+        } else if let Some(record) = def.record {
+            Ok(Self::Record(record))
         } else if let Some(address) = def.address {
             Ok(Self::Address(address))
         } else if let Some(bytes32) = def.bytes32 {
@@ -314,6 +327,7 @@ chain_id: 1
         assert_eq!(spec.chain_id, 1);
         assert!(spec.accounts.is_empty());
         assert!(spec.address_pools.is_empty());
+        assert!(spec.record_pools.is_empty());
         assert!(spec.templates.is_empty());
     }
 
@@ -436,6 +450,34 @@ mix:
     }
 
     #[test]
+    fn test_parse_record_pool_binding() {
+        let yaml = r#"
+chain_id: 1
+record_pools:
+  claims:
+    path: claims.json
+templates:
+  claim: {}
+sequences:
+  claims:
+    bindings:
+      claim:
+        record:
+          pool: claims
+          select: shuffled_once
+    steps:
+      - template: claim
+mix:
+  - sequence: claims
+    weight: 1
+"#;
+
+        let spec = WorkloadSpec::parse(yaml).unwrap();
+        assert_eq!(spec.record_pools["claims"].path, PathBuf::from("claims.json"));
+        assert!(matches!(spec.sequences["claims"].bindings["claim"], SequenceBinding::Record(_)));
+    }
+
+    #[test]
     fn test_load_composed_spec_with_merge_and_append() {
         let dir = temp_spec_dir("composed");
         let pieces = dir.join("pieces");
@@ -448,6 +490,9 @@ merge:
   chain_id: 1
   artifacts:
     ERC20: erc20.json
+  record_pools:
+    claims:
+      path: claims.json
   templates:
     transfer:
       type: eip1559
@@ -512,6 +557,7 @@ include:
         };
         assert!(path.is_absolute());
         assert_eq!(path, &pieces.join("erc20.json"));
+        assert_eq!(spec.record_pools["claims"].path, pieces.join("claims.json"));
 
         fs::remove_dir_all(dir).unwrap();
     }
