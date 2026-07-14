@@ -12,7 +12,36 @@ pub type EcdsaSigner = Secp256k1Signer;
 /// Manages signer account pools derived from mnemonics.
 #[derive(Debug)]
 pub struct AccountManager {
-    pools: HashMap<String, Vec<EcdsaSigner>>,
+    pools: HashMap<String, SignerPool>,
+}
+
+/// A signer pool: either an eagerly-derived list or a lazily-derived
+/// deterministic range (billions of accounts; deriving each signer on pick).
+#[derive(Debug)]
+enum SignerPool {
+    Eager(Vec<EcdsaSigner>),
+    FastSignable(FastSignablePool),
+}
+
+/// Deterministic signable range: `sk_i = keccak256(seed || be64(i) || "sk")`
+/// (rehashed in the negligible case the scalar is invalid). Byte-identical to
+/// the derivation in tempo's `generate-state-bloat --keccak-signable`, so the
+/// bloated balances belong to addresses this pool can actually sign for.
+#[derive(Debug)]
+struct FastSignablePool {
+    seed: B256,
+    start: u64,
+    len: usize,
+}
+
+impl FastSignablePool {
+    fn signer(&self, idx: usize) -> Result<EcdsaSigner> {
+        let index = self
+            .start
+            .checked_add(idx as u64)
+            .ok_or_else(|| eyre::eyre!("fast signable index {idx} overflows"))?;
+        Ok(derive_fast_signable_signer(self.seed, index))
+    }
 }
 
 /// Manages destination-only address pools.
@@ -30,6 +59,9 @@ enum AddressPool {
     Mnemonic(MnemonicAddressPool),
     /// Fast deterministic address range.
     Fast(FastAddressPool),
+    /// Addresses of a fast deterministic *signable* range (same derivation as
+    /// the `fast_signable` account pool, returning the address only).
+    FastSignable(FastSignablePool),
 }
 
 /// A lazily-derived mnemonic address range with an on-demand cache.
@@ -60,46 +92,76 @@ impl AccountManager {
         let mut pools = HashMap::new();
 
         for (name, def) in accounts {
-            let signers = def
-                .derive_signers()
+            let pool = def
+                .to_signer_pool()
                 .wrap_err_with(|| format!("failed to derive signers for pool '{name}'"))?;
-            pools.insert(name.clone(), signers);
+            pools.insert(name.clone(), pool);
         }
 
         Ok(Self { pools })
     }
 
-    /// Get all signers in a pool.
-    pub fn get_pool(&self, name: &str) -> Result<&[EcdsaSigner]> {
-        self.pools
-            .get(name)
-            .map(|v| v.as_slice())
-            .ok_or_else(|| eyre::eyre!("account pool '{}' not found", name))
+    fn pool(&self, name: &str) -> Result<&SignerPool> {
+        self.pools.get(name).ok_or_else(|| eyre::eyre!("account pool '{}' not found", name))
     }
 
-    /// Get a random signer from a pool.
-    pub fn get_random(&self, pool: &str, rng: &mut dyn rand::RngCore) -> Result<&EcdsaSigner> {
-        let signers = self.get_pool(pool)?;
-        if signers.is_empty() {
+    /// Get all signers in a pool (eager pools only).
+    pub fn get_pool(&self, name: &str) -> Result<&[EcdsaSigner]> {
+        match self.pool(name)? {
+            SignerPool::Eager(v) => Ok(v.as_slice()),
+            SignerPool::FastSignable(_) => {
+                bail!("account pool '{name}' is lazily derived; enumerating it is not supported")
+            }
+        }
+    }
+
+    /// Number of signers in a pool.
+    pub fn pool_len(&self, name: &str) -> Result<usize> {
+        Ok(match self.pool(name)? {
+            SignerPool::Eager(v) => v.len(),
+            SignerPool::FastSignable(p) => p.len,
+        })
+    }
+
+    /// Pick a uniformly random signer, returning its index and the signer.
+    pub fn select_random(
+        &self,
+        pool: &str,
+        rng: &mut dyn rand::RngCore,
+    ) -> Result<(usize, EcdsaSigner)> {
+        let len = self.pool_len(pool)?;
+        if len == 0 {
             bail!("account pool '{}' is empty", pool);
         }
-        let idx = rng.random_range(0..signers.len());
-        Ok(&signers[idx])
+        let idx = rng.random_range(0..len);
+        Ok((idx, self.get_by_index(pool, idx)?))
     }
 
     /// Get a signer by index from a pool.
-    pub fn get_by_index(&self, pool: &str, index: usize) -> Result<&EcdsaSigner> {
-        let signers = self.get_pool(pool)?;
-        signers
-            .get(index)
-            .ok_or_else(|| eyre::eyre!("index {} out of range for pool '{}'", index, pool))
+    pub fn get_by_index(&self, pool: &str, index: usize) -> Result<EcdsaSigner> {
+        match self.pool(pool)? {
+            SignerPool::Eager(v) => v
+                .get(index)
+                .cloned()
+                .ok_or_else(|| eyre::eyre!("index {} out of range for pool '{}'", index, pool)),
+            SignerPool::FastSignable(p) => {
+                if index >= p.len {
+                    bail!("index {} out of range for pool '{}'", index, pool);
+                }
+                p.signer(index)
+            }
+        }
     }
 
-    /// Get all addresses grouped by pool name.
+    /// Get all addresses grouped by pool name (eager pools only; lazily
+    /// derived pools are skipped — they are far too large to enumerate).
     pub fn all_addresses(&self) -> impl Iterator<Item = (&str, Vec<Address>)> {
-        self.pools.iter().map(|(name, signers)| {
-            let addresses: Vec<Address> = signers.iter().map(Signer::address).collect();
-            (name.as_str(), addresses)
+        self.pools.iter().filter_map(|(name, pool)| match pool {
+            SignerPool::Eager(signers) => {
+                let addresses: Vec<Address> = signers.iter().map(Signer::address).collect();
+                Some((name.as_str(), addresses))
+            }
+            SignerPool::FastSignable(_) => None,
         })
     }
 }
@@ -160,6 +222,7 @@ impl AddressPool {
             Self::Literal(addresses) => addresses.len(),
             Self::Mnemonic(pool) => pool.len,
             Self::Fast(pool) => pool.len,
+            Self::FastSignable(pool) => pool.len,
         }
     }
 
@@ -175,6 +238,7 @@ impl AddressPool {
                 .ok_or_else(|| eyre::eyre!("index {index} out of range for literal address pool")),
             Self::Mnemonic(pool) => pool.get_by_index(index),
             Self::Fast(pool) => pool.get_by_index(index),
+            Self::FastSignable(pool) => pool.signer(index).map(|s| Signer::address(&s)),
         }
     }
 }
@@ -227,21 +291,57 @@ impl FastAddressPool {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountPoolDef {
     /// BIP-39 mnemonic phrase (supports `${ENV_VAR}` expansion).
-    pub mnemonic: String,
+    #[serde(default)]
+    pub mnemonic: Option<String>,
 
     /// Single account index (mutually exclusive with `range`).
     pub index: Option<u32>,
 
     /// Range of account indices `[start, end)` (mutually exclusive with `index`).
     pub range: Option<[u32; 2]>,
+
+    /// Lazily-derived deterministic signable range (mutually exclusive with
+    /// `mnemonic`); supports billions of accounts.
+    #[serde(default)]
+    pub fast_signable: Option<FastSignablePoolDef>,
+}
+
+/// Definition of a fast deterministic signable account range.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FastSignablePoolDef {
+    /// Seed string hashed before deriving keys.
+    pub seed: String,
+
+    /// Range of account indices `[start, end)`.
+    pub range: [u64; 2],
 }
 
 impl AccountPoolDef {
-    /// Derive signers from this pool definition.
+    /// Derive signers from this pool definition (eager pools only).
     pub fn derive_signers(&self) -> Result<Vec<EcdsaSigner>> {
+        let mnemonic = self
+            .mnemonic
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("account pool must have a mnemonic to derive eagerly"))?;
         let indices = selected_indices(self.index, self.range, "account pool")?;
 
-        indices.into_iter().map(|idx| derive_mnemonic_signer(&self.mnemonic, idx)).collect()
+        indices.into_iter().map(|idx| derive_mnemonic_signer(mnemonic, idx)).collect()
+    }
+
+    fn to_signer_pool(&self) -> Result<SignerPool> {
+        match (&self.mnemonic, &self.fast_signable) {
+            (Some(_), None) => Ok(SignerPool::Eager(self.derive_signers()?)),
+            (None, Some(fast)) => {
+                let (start, len) =
+                    selected_fast_range(None, Some(fast.range), "fast signable pool")?;
+                Ok(SignerPool::FastSignable(FastSignablePool {
+                    seed: keccak256(fast.seed.as_bytes()),
+                    start,
+                    len,
+                }))
+            }
+            _ => bail!("account pool must set exactly one of 'mnemonic' or 'fast_signable'"),
+        }
     }
 }
 
@@ -265,6 +365,10 @@ pub struct AddressPoolDef {
     /// Fast deterministic address pool.
     #[serde(default)]
     pub fast: Option<FastAddressPoolDef>,
+
+    /// Addresses of a fast deterministic signable range.
+    #[serde(default)]
+    pub fast_signable: Option<FastSignablePoolDef>,
 }
 
 /// Definition of a fast deterministic destination-only address pool.
@@ -291,17 +395,29 @@ impl AddressPoolDef {
         let has_addresses = !self.addresses.is_empty();
         let has_mnemonic = self.mnemonic.is_some();
         let has_fast = self.fast.is_some();
-        let fields_set =
-            usize::from(has_addresses) + usize::from(has_mnemonic) + usize::from(has_fast);
+        let has_fast_signable = self.fast_signable.is_some();
+        let fields_set = usize::from(has_addresses) +
+            usize::from(has_mnemonic) +
+            usize::from(has_fast) +
+            usize::from(has_fast_signable);
 
         if fields_set != 1 {
-            bail!("address pool must set exactly one of 'addresses', 'mnemonic', or 'fast'");
+            bail!(
+                "address pool must set exactly one of 'addresses', 'mnemonic', 'fast', or 'fast_signable'"
+            );
         }
 
         if has_addresses {
             Ok(AddressPool::Literal(self.addresses.clone()))
         } else if has_mnemonic {
             self.to_mnemonic_pool()
+        } else if let Some(fast) = &self.fast_signable {
+            let (start, len) = selected_fast_range(None, Some(fast.range), "fast signable pool")?;
+            Ok(AddressPool::FastSignable(FastSignablePool {
+                seed: keccak256(fast.seed.as_bytes()),
+                start,
+                len,
+            }))
         } else {
             self.to_fast_pool()
         }
@@ -388,6 +504,23 @@ pub fn derive_mnemonic_signer(mnemonic: &str, idx: u32) -> Result<EcdsaSigner> {
         .map_err(|e| eyre::eyre!("failed to derive address at index {idx}: {e}"))
 }
 
+/// Derive the deterministic signable key for `index`:
+/// `sk = keccak256(seed || be64(index) || "sk")`, rehashing on the
+/// (cryptographically negligible) chance the scalar is invalid.
+pub fn derive_fast_signable_signer(seed: B256, index: u64) -> EcdsaSigner {
+    let mut buf = [0u8; 42];
+    buf[..32].copy_from_slice(seed.as_slice());
+    buf[32..40].copy_from_slice(&index.to_be_bytes());
+    buf[40..].copy_from_slice(b"sk");
+    let mut hash = keccak256(buf);
+    loop {
+        if let Ok(signer) = EcdsaSigner::from_bytes(&hash) {
+            return signer;
+        }
+        hash = keccak256(hash);
+    }
+}
+
 fn derive_fast_address(seed: B256, index: u64) -> Address {
     let mut buf = [0u8; 40];
     buf[..32].copy_from_slice(seed.as_slice());
@@ -456,7 +589,7 @@ mod tests {
     #[test]
     fn test_derive_single_signer() {
         let def =
-            AccountPoolDef { mnemonic: TEST_MNEMONIC.to_string(), index: Some(0), range: None };
+            AccountPoolDef { mnemonic: Some(TEST_MNEMONIC.to_string()), index: Some(0), range: None, fast_signable: None };
         let signers = def.derive_signers().unwrap();
         assert_eq!(signers.len(), 1);
     }
@@ -464,10 +597,9 @@ mod tests {
     #[test]
     fn test_derive_range_signers() {
         let def = AccountPoolDef {
-            mnemonic: TEST_MNEMONIC.to_string(),
+            mnemonic: Some(TEST_MNEMONIC.to_string()),
             index: None,
-            range: Some([0, 10]),
-        };
+            range: Some([0, 10]), fast_signable: None };
         let signers = def.derive_signers().unwrap();
         assert_eq!(signers.len(), 10);
 
@@ -484,15 +616,14 @@ mod tests {
         accounts.insert(
             "users".to_string(),
             AccountPoolDef {
-                mnemonic: TEST_MNEMONIC.to_string(),
+                mnemonic: Some(TEST_MNEMONIC.to_string()),
                 index: None,
-                range: Some([0, 5]),
-            },
+                range: Some([0, 5]), fast_signable: None },
         );
         let manager = AccountManager::from_spec(&accounts).unwrap();
 
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let signer = manager.get_random("users", &mut rng).unwrap();
+        let signer = manager.select_random("users", &mut rng).unwrap().1;
         assert!(!signer.address().is_zero());
     }
 
@@ -503,14 +634,13 @@ mod tests {
             mnemonic: Some(TEST_MNEMONIC.to_string()),
             index: None,
             range: Some([0, 3]),
-            fast: None,
-        };
+            fast: None, fast_signable: None };
 
         let addresses = def.derive_addresses()?;
         assert_eq!(addresses.len(), 3);
         assert_eq!(
             addresses[0],
-            AccountPoolDef { mnemonic: TEST_MNEMONIC.to_string(), index: Some(0), range: None }
+            AccountPoolDef { mnemonic: Some(TEST_MNEMONIC.to_string()), index: Some(0), range: None, fast_signable: None }
                 .derive_signers()?[0]
                 .address()
         );
@@ -530,8 +660,7 @@ mod tests {
                 mnemonic: None,
                 index: None,
                 range: None,
-                fast: None,
-            },
+                fast: None, fast_signable: None },
         );
 
         let manager = AddressPoolManager::from_spec(&defs)?;
@@ -551,17 +680,15 @@ mod tests {
                 mnemonic: Some(TEST_MNEMONIC.to_string()),
                 index: None,
                 range: Some([0, 1_000_000]),
-                fast: None,
-            },
+                fast: None, fast_signable: None },
         );
 
         let manager = AddressPoolManager::from_spec(&defs)?;
         let address = manager.get_by_index("recipients", 999_999)?;
         let expected = AccountPoolDef {
-            mnemonic: TEST_MNEMONIC.to_string(),
+            mnemonic: Some(TEST_MNEMONIC.to_string()),
             index: Some(999_999),
-            range: None,
-        }
+            range: None, fast_signable: None }
         .derive_signers()?[0]
             .address();
 
@@ -584,6 +711,7 @@ mod tests {
                     index: None,
                     range: Some([10_000, 1_000_000]),
                 }),
+                fast_signable: None,
             },
         );
 

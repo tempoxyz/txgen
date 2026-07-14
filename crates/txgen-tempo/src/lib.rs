@@ -782,7 +782,12 @@ fn derive_inline_access_signer(
             let index = start.checked_add(offset).ok_or_else(|| {
                 eyre::eyre!("inline key_authorization access-key index overflowed")
             })?;
-            derive_mnemonic_signer(&source.mnemonic, index)
+            derive_mnemonic_signer(
+                source.mnemonic.as_deref().ok_or_else(|| {
+                    eyre::eyre!("inline access_key pool requires a mnemonic")
+                })?,
+                index,
+            )
         }
     }
 }

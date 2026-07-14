@@ -649,8 +649,7 @@ mod tests {
                 mnemonic: None,
                 index: None,
                 range: None,
-                fast: None,
-            },
+                fast: None, fast_signable: None },
         )]))?;
         let mut rng = rand::rng();
         let mut resolver =

@@ -199,9 +199,10 @@ impl AccessKeyDef {
         };
 
         Ok(Some(AccountPoolDef {
-            mnemonic: mnemonic.clone(),
+            mnemonic: Some(mnemonic.clone()),
             index: self.index,
             range: self.range,
+            fast_signable: None,
         }))
     }
 
