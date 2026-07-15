@@ -723,3 +723,16 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod fast_signable_probe {
+    use super::*;
+    #[test]
+    fn print_first_addresses() {
+        let seed = keccak256("test test test test test test test test test test test junk".as_bytes());
+        for i in 0..3u64 {
+            let s = derive_fast_signable_signer(seed, i);
+            println!("idx {i}: {}", Signer::address(&s));
+        }
+    }
+}
