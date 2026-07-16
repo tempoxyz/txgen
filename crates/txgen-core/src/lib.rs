@@ -1,3 +1,7 @@
+// `eyre::bail!` expands with a trailing semicolon, which Rust 1.93 warns about when the macro is
+// used as the value of a match arm. Keep these idiomatic call sites until eyre updates the macro.
+#![allow(semicolon_in_expressions_from_macros)]
+
 mod abi;
 mod accounts;
 mod nonce;
