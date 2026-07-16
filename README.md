@@ -359,7 +359,7 @@ bench send-blocks \
 
 For `send-blocks`, aggregate run rates use benchmark wall-clock duration. Per-block timestamps remain the original chain timestamps from the input. With `--reorg`, canonical block stats remain canonical-only, but the wall-clock duration includes synthetic fork block build/submission work.
 
-**Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API). Big-block inputs require a `reth-bb` compatible node. `--reorg` additionally requires `testing_buildBlockV1` on the regular HTTP RPC endpoint, for example from a node started with `--http --http.api eth,testing`. `--rpc-url` and `--local-rpc-url` are accepted as backwards-compatible aliases for `--rpc`.
+**Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API). Big-block inputs require a `reth-bb` compatible node. `--reorg` additionally requires `testing_buildBlockV1` on the regular HTTP RPC endpoint. Because synthetic forks intentionally omit transactions, start Reth with `--http --http.api eth,testing --testing.skip-invalid-transactions`. `--rpc-url` and `--local-rpc-url` are accepted as backwards-compatible aliases for `--rpc`.
 
 #### `bench view`
 

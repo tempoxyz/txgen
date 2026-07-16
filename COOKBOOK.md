@@ -703,7 +703,7 @@ txgen-ethereum extract \
 
 Notes:
 - Reorg mode only supports raw RLP block input, not big-block input.
-- The regular HTTP RPC must expose `testing_buildBlockV1` (for example, a node started with `--http --http.api eth,testing`).
+- The regular HTTP RPC must expose `testing_buildBlockV1` and allow invalid reorg transactions to be skipped. Start Reth with `--http --http.api eth,testing --testing.skip-invalid-transactions`.
 - Canonical block stats remain canonical-only; run wall-clock time includes synthetic fork work.
 
 ## Use setup transactions and skip them later
