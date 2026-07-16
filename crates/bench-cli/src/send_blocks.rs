@@ -141,7 +141,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             let line = line.wrap_err("failed to read line")?;
             let input = parse_input_line(&line)?;
 
-            process_or_buffer_input(
+            process_input_and_wait(
                 &provider,
                 &testing_provider,
                 input,
@@ -171,7 +171,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
 
             let input = parse_input_line(&line_buf)?;
 
-            process_or_buffer_input(
+            process_input_and_wait(
                 &provider,
                 &testing_provider,
                 input,
@@ -280,7 +280,7 @@ fn report_progress(
     Ok(())
 }
 
-async fn process_or_buffer_input(
+async fn process_input_and_wait(
     provider: &(impl Provider + RethApi<Ethereum>),
     testing_provider: &(impl Provider + TestingApi<Ethereum>),
     input: InputLine,
@@ -290,49 +290,28 @@ async fn process_or_buffer_input(
     reporters: &mut [Box<dyn Reporter>],
 ) -> Result<()> {
     let ProcessingState { collector, reorg_state, persistence_policy } = state;
-    let Some(reorg_state) = reorg_state else {
-        return process_input_and_wait(
+    if let Some(reorg_state) = reorg_state {
+        let InputLine::RawBlock(block) = input else {
+            eyre::bail!("--reorg is only supported for raw RLP block input");
+        };
+        reorg_state.push(block);
+        return drive_reorg_state_machine(
             provider,
-            &input,
+            testing_provider,
+            reorg_state,
             collector,
             persistence_policy,
             wait_time,
             start,
             reporters,
+            false,
         )
         .await;
-    };
+    }
 
-    let InputLine::RawBlock(block) = input else {
-        eyre::bail!("--reorg is only supported for raw RLP block input");
-    };
-    reorg_state.push(block);
-    drive_reorg_state_machine(
-        provider,
-        testing_provider,
-        reorg_state,
-        collector,
-        persistence_policy,
-        wait_time,
-        start,
-        reporters,
-        false,
-    )
-    .await
-}
-
-async fn process_input_and_wait(
-    provider: &(impl Provider + RethApi<Ethereum>),
-    input: &InputLine,
-    collector: &mut MetricsCollector,
-    persistence_policy: &WaitForPersistence,
-    wait_time: Option<Duration>,
-    start: Instant,
-    reporters: &mut [Box<dyn Reporter>],
-) -> Result<()> {
     let block_start = Instant::now();
 
-    match input {
+    match &input {
         InputLine::RawBlock(block) => {
             process_block(provider, block, collector, None, persistence_policy).await?
         }

@@ -38,11 +38,10 @@ struct SyntheticStep<'a> {
 }
 
 impl SyntheticStep<'_> {
-    fn prepare_payload(&self) -> Result<PreparedSyntheticPayload> {
-        let extracted =
-            extract_tx_bytes_from_block_rlp(self.block.raw.as_ref()).wrap_err_with(|| {
-                format!("failed to extract raw transaction bytes from block {}", self.block.number)
-            })?;
+    fn prepare_payload(
+        &self,
+        transactions: Vec<Bytes>,
+    ) -> Result<(TestingBuildBlockRequestV1, B256)> {
         let parent_beacon_block_root = extract_block_header_from_block_rlp(self.block.raw.as_ref())
             .wrap_err_with(|| {
                 format!(
@@ -66,17 +65,11 @@ impl SyntheticStep<'_> {
         let request = TestingBuildBlockRequestV1 {
             parent_block_hash: self.parent_block_hash,
             payload_attributes,
-            transactions: extracted.transactions,
+            transactions,
             extra_data: Some(Bytes::new()),
         };
 
-        Ok(PreparedSyntheticPayload {
-            request,
-            parent_beacon_block_root,
-            kept_non_blob_txs: extracted.kept_non_blob_txs,
-            skipped_blob_txs: extracted.skipped_blob_txs,
-            dropped_non_blob_txs: extracted.dropped_non_blob_txs,
-        })
+        Ok((request, parent_beacon_block_root))
     }
 
     fn persistence_index(&self, canonical_blocks_submitted: u64) -> u64 {
@@ -91,14 +84,6 @@ impl SyntheticStep<'_> {
             finalized_block_hash: self.branch_point_hash,
         }
     }
-}
-
-struct PreparedSyntheticPayload {
-    request: TestingBuildBlockRequestV1,
-    parent_beacon_block_root: B256,
-    kept_non_blob_txs: usize,
-    skipped_blob_txs: usize,
-    dropped_non_blob_txs: usize,
 }
 
 struct CanonicalStep<'a> {
@@ -262,30 +247,17 @@ async fn process_synthetic_block(
     collector: &MetricsCollector,
     persistence_policy: &WaitForPersistence,
 ) -> Result<B256> {
-    let PreparedSyntheticPayload {
-        request,
-        parent_beacon_block_root,
-        kept_non_blob_txs,
-        skipped_blob_txs,
-        dropped_non_blob_txs,
-    } = step.prepare_payload()?;
-
-    if skipped_blob_txs > 0 {
-        tracing::warn!(skipped_blob_txs, "Skipped blob transactions while building synthetic fork");
-    }
-    if dropped_non_blob_txs > 0 {
-        tracing::info!(
-            kept_non_blob_txs,
-            dropped_non_blob_txs,
-            "Kept 90% of non-blob transactions while building synthetic fork"
-        );
-    }
+    let block = step.block;
+    let transactions = extract_tx_bytes_from_block_rlp(block.raw.as_ref()).wrap_err_with(|| {
+        format!("failed to extract raw transaction bytes from block {}", block.number)
+    })?;
+    let (request, parent_beacon_block_root) = step.prepare_payload(transactions)?;
 
     let envelope = testing_provider.build_block_v1(request).await.wrap_err_with(|| {
         format!(
             "testing_buildBlockV1 failed for block {}. Ensure the target exposes the hidden \
              testing RPC, for example: reth node --http --http.api eth,testing ...",
-            step.block.number
+            block.number
         )
     })?;
     let synthetic_block_hash = envelope.execution_payload.payload_inner.payload_inner.block_hash;
@@ -301,16 +273,13 @@ async fn process_synthetic_block(
         .reth_new_payload(RethNewPayloadInput::ExecutionData(Box::new(execution_data)), wait)
         .await
         .wrap_err_with(|| {
-            format!(
-                "reth_newPayload failed for synthetic fork block after block {}",
-                step.block.number
-            )
+            format!("reth_newPayload failed for synthetic fork block after block {}", block.number)
         })?;
 
     if !payload_status.status.is_valid() {
         eyre::bail!(
             "reth_newPayload returned non-VALID status for synthetic fork block after block {}: {:?}",
-            step.block.number,
+            block.number,
             payload_status.status,
         );
     }
@@ -321,20 +290,20 @@ async fn process_synthetic_block(
         .wrap_err_with(|| {
             format!(
                 "reth_forkchoiceUpdated failed for synthetic fork block after block {}",
-                step.block.number
+                block.number
             )
         })?;
 
     if !fcu_result.is_valid() {
         eyre::bail!(
             "reth_forkchoiceUpdated returned non-VALID status for synthetic fork block after block {}: {:?}",
-            step.block.number,
+            block.number,
             fcu_result.payload_status,
         );
     }
 
     tracing::info!(
-        block = step.block.number,
+        block = block.number,
         fork_length = step.fork_length,
         reorg_depth = step.reorg_depth,
         branch_point = %step.branch_point_hash,
@@ -356,14 +325,7 @@ fn extract_block_header_from_block_rlp(raw: &[u8]) -> Result<ConsensusHeader> {
     ConsensusHeader::decode(&mut block_payload).wrap_err("failed to decode block header")
 }
 
-struct ExtractedTransactions {
-    transactions: Vec<Bytes>,
-    kept_non_blob_txs: usize,
-    skipped_blob_txs: usize,
-    dropped_non_blob_txs: usize,
-}
-
-fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<ExtractedTransactions> {
+fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<Vec<Bytes>> {
     let mut block_buf = raw;
     let mut block_payload = Header::decode_bytes(&mut block_buf, true)
         .wrap_err("failed to decode outer block RLP list")?;
@@ -408,12 +370,18 @@ fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<ExtractedTransactions> 
         txs_payload = &txs_payload[header.payload_length..];
     }
 
-    Ok(ExtractedTransactions {
-        kept_non_blob_txs: transactions.len(),
-        transactions,
-        skipped_blob_txs,
-        dropped_non_blob_txs,
-    })
+    if skipped_blob_txs > 0 {
+        tracing::warn!(skipped_blob_txs, "Skipped blob transactions while building synthetic fork");
+    }
+    if dropped_non_blob_txs > 0 {
+        tracing::info!(
+            kept_non_blob_txs = transactions.len(),
+            dropped_non_blob_txs,
+            "Kept 90% of non-blob transactions while building synthetic fork"
+        );
+    }
+
+    Ok(transactions)
 }
 
 fn should_keep_reorg_transaction(non_blob_tx_index: usize) -> bool {
@@ -659,10 +627,7 @@ mod tests {
             .take(REORG_NON_BLOB_TX_DROP_INTERVAL - 1)
             .map(Bytes::from)
             .collect::<Vec<_>>();
-        assert_eq!(extracted.transactions, expected);
-        assert_eq!(extracted.kept_non_blob_txs, 9);
-        assert_eq!(extracted.dropped_non_blob_txs, 1);
-        assert_eq!(extracted.skipped_blob_txs, 0);
+        assert_eq!(extracted, expected);
     }
 
     #[test]
@@ -680,9 +645,6 @@ mod tests {
             .take(REORG_NON_BLOB_TX_DROP_INTERVAL - 1)
             .map(Bytes::from)
             .collect::<Vec<_>>();
-        assert_eq!(extracted.transactions, expected);
-        assert_eq!(extracted.kept_non_blob_txs, 9);
-        assert_eq!(extracted.dropped_non_blob_txs, 1);
-        assert_eq!(extracted.skipped_blob_txs, 1);
+        assert_eq!(extracted, expected);
     }
 }
