@@ -172,7 +172,9 @@ impl FromGenerator for u64 {
                 Ok(serde_yaml::from_value(choices[idx].clone())?)
             }
             Generator::Random => Ok(resolver.rng.random()),
-            _ => bail!("cannot generate u64 from {:?}", generator),
+            _ => {
+                bail!("cannot generate u64 from {:?}", generator);
+            }
         }
     }
 }
@@ -187,7 +189,9 @@ impl FromGenerator for u128 {
                 Ok(serde_yaml::from_value(choices[idx].clone())?)
             }
             Generator::Random => Ok(resolver.rng.random()),
-            _ => bail!("cannot generate u128 from {:?}", generator),
+            _ => {
+                bail!("cannot generate u128 from {:?}", generator);
+            }
         }
     }
 }
@@ -206,7 +210,7 @@ impl FromGenerator for U256 {
                 } else if let Some(s) = v.as_str() {
                     Ok(s.parse()?)
                 } else {
-                    bail!("cannot parse U256 from {:?}", v)
+                    bail!("cannot parse U256 from {:?}", v);
                 }
             }
             Generator::Choice(choices) => {
@@ -217,11 +221,13 @@ impl FromGenerator for U256 {
                 } else if let Some(s) = v.as_str() {
                     Ok(s.parse()?)
                 } else {
-                    bail!("cannot parse U256 from {:?}", v)
+                    bail!("cannot parse U256 from {:?}", v);
                 }
             }
             Generator::Random => Ok(resolver.rng.random()),
-            _ => bail!("cannot generate U256 from {:?}", generator),
+            _ => {
+                bail!("cannot generate U256 from {:?}", generator);
+            }
         }
     }
 }
@@ -250,7 +256,9 @@ impl FromGenerator for Address {
                 Ok(s.parse()?)
             }
             Generator::Random => Ok(resolver.rng.random()),
-            _ => bail!("cannot generate Address from {:?}", generator),
+            _ => {
+                bail!("cannot generate Address from {:?}", generator);
+            }
         }
     }
 }
@@ -267,7 +275,9 @@ impl FromGenerator for Bytes {
                 let s: String = serde_yaml::from_value(v.clone())?;
                 Ok(s.parse()?)
             }
-            _ => bail!("cannot generate Bytes from {:?}", generator),
+            _ => {
+                bail!("cannot generate Bytes from {:?}", generator);
+            }
         }
     }
 }
@@ -293,7 +303,9 @@ impl FromGenerator for B256 {
                 Ok(s.parse()?)
             }
             Generator::Random => Ok(resolver.rng.random()),
-            _ => bail!("cannot generate B256 from {:?}", generator),
+            _ => {
+                bail!("cannot generate B256 from {:?}", generator);
+            }
         }
     }
 }
@@ -306,7 +318,9 @@ impl FromGenerator for String {
                 let idx = resolver.rng.random_range(0..choices.len());
                 Ok(serde_yaml::from_value(choices[idx].clone())?)
             }
-            _ => bail!("cannot generate String from {:?}", generator),
+            _ => {
+                bail!("cannot generate String from {:?}", generator);
+            }
         }
     }
 }
@@ -342,7 +356,7 @@ impl FromGenerator for serde_yaml::Value {
             }
             Generator::Const(value) => Ok(value.clone()),
             Generator::Random => {
-                bail!("cannot resolve untyped random generator to a YAML value")
+                bail!("cannot resolve untyped random generator to a YAML value");
             }
         }
     }

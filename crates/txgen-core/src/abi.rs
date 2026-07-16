@@ -550,7 +550,9 @@ fn yaml_to_sol_value(
                 arr.iter().map(|v| yaml_to_sol_value(v, inner_type, resolver)).collect();
             Ok(DynSolValue::Array(values?))
         }
-        _ => bail!("unsupported Solidity type: {}", sol_type),
+        _ => {
+            bail!("unsupported Solidity type: {}", sol_type);
+        }
     }
 }
 
@@ -565,7 +567,9 @@ fn resolve_generator_to_sol(
             t if t.starts_with("uint") => {
                 serde_yaml::Value::String(resolver.resolve::<U256>(value)?.to_string())
             }
-            _ => bail!("generator not supported for type: {}", sol_type),
+            _ => {
+                bail!("generator not supported for type: {}", sol_type);
+            }
         };
         return yaml_to_sol_value(&value, sol_type, resolver);
     }

@@ -1276,7 +1276,7 @@ fn binding_to_value(
             Ok(serde_yaml::Value::String(address.to_string()))
         }
         (ResolvedBinding::Account { .. }, None) => {
-            bail!("account binding '{name}' requires `.ref` or `.address`")
+            bail!("account binding '{name}' requires `.ref` or `.address`");
         }
         (ResolvedBinding::Address(address), None) => {
             Ok(serde_yaml::Value::String(address.to_string()))
@@ -1290,7 +1290,7 @@ fn binding_to_value(
             Ok(serde_yaml::Value::String(address.to_string()))
         }
         (ResolvedBinding::SetupTx { address: None, .. }, Some("address")) => {
-            bail!("setup transaction binding '{name}' has no deployed address")
+            bail!("setup transaction binding '{name}' has no deployed address");
         }
         (ResolvedBinding::SetupTx { tx_hash, .. }, Some("tx_hash")) => {
             Ok(serde_yaml::Value::String(tx_hash.to_string()))
@@ -1300,9 +1300,11 @@ fn binding_to_value(
         }
         (ResolvedBinding::SetupTx { nonce, .. }, Some("nonce")) => Ok(serde_yaml::to_value(nonce)?),
         (ResolvedBinding::SetupTx { .. }, None) => {
-            bail!("setup transaction binding '{name}' requires a field")
+            bail!("setup transaction binding '{name}' requires a field");
         }
-        (_, Some(field)) => bail!("binding '{name}' has no field '{field}'"),
+        (_, Some(field)) => {
+            bail!("binding '{name}' has no field '{field}'");
+        }
     }
 }
 

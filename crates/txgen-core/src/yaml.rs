@@ -107,7 +107,9 @@ pub fn append_yaml(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) -> 
             base_values.append(&mut overlay_values);
             Ok(())
         }
-        _ => bail!("append section leaves must be sequences"),
+        _ => {
+            bail!("append section leaves must be sequences");
+        }
     }
 }
 
@@ -142,12 +144,12 @@ fn expand_env_vars(input: &str) -> Result<String> {
             match std::env::var(&var_name) {
                 Ok(value) => result.push_str(&value),
                 Err(std::env::VarError::NotPresent) => {
-                    bail!("environment variable `{var_name}` referenced in spec is not set")
+                    bail!("environment variable `{var_name}` referenced in spec is not set");
                 }
                 Err(std::env::VarError::NotUnicode(_)) => {
                     bail!(
                         "environment variable `{var_name}` referenced in spec is not valid Unicode"
-                    )
+                    );
                 }
             }
         } else {
@@ -257,10 +259,14 @@ fn parse_include_paths(value: serde_yaml::Value, label: &str) -> Result<Vec<Stri
             .into_iter()
             .map(|value| match value {
                 serde_yaml::Value::String(path) => Ok(path),
-                _ => bail!("include entries in {label} must be strings"),
+                _ => {
+                    bail!("include entries in {label} must be strings");
+                }
             })
             .collect(),
-        _ => bail!("include section in {label} must be a string or list of strings"),
+        _ => {
+            bail!("include section in {label} must be a string or list of strings");
+        }
     }
 }
 
@@ -284,7 +290,9 @@ fn resolve_include_path(
 fn ensure_mapping(value: &serde_yaml::Value, label: &str, section: &str) -> Result<()> {
     match value {
         serde_yaml::Value::Null | serde_yaml::Value::Mapping(_) => Ok(()),
-        _ => bail!("{section} section in {label} must be a mapping"),
+        _ => {
+            bail!("{section} section in {label} must be a mapping");
+        }
     }
 }
 
