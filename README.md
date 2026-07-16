@@ -89,6 +89,10 @@ Extract raw RLP-encoded blocks from an archive node as NDJSON. Use `--bal` to at
 
 ```bash
 txgen-ethereum extract --rpc http://localhost:8545 --from 1000 --to 2000 -o blocks.ndjson
+
+# Extract the blocks' signed transactions for replay on transaction basis
+txgen-ethereum extract --rpc http://localhost:8545 --from 1000 --to 2000 \
+  --format transactions | bench send --rpc-url http://localhost:8545
 ```
 
 | Flag | Description |
@@ -99,6 +103,12 @@ txgen-ethereum extract --rpc http://localhost:8545 --from 1000 --to 2000 -o bloc
 | `-o, --output <PATH>` | Output file (default: stdout) |
 | `--buffer-size <N>` | Number of blocks to prefetch ahead (default: 20) |
 | `--bal` | Include RLP-encoded block access lists in the `bal` field |
+| `--format <FORMAT>` | Output `blocks` (default) or `transactions`; transaction output is accepted by `bench send` |
+
+`--format transactions` preserves source block and transaction order. Transactions from different
+senders may be submitted concurrently by `bench send`; transactions from the same sender use a
+shared scheduling key and are submitted in order. The target node must be at the state immediately
+before the replay range and configured to build blocks.
 
 **Required RPC methods:** `debug_getRawBlock`; with `--bal`: `eth_getBlockAccessListByBlockNumber`
 

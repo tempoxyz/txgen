@@ -14,7 +14,7 @@ mod generate;
 use addresses::run_addresses;
 pub use addresses::AddressesArgs;
 use extract::{run_extract, run_extract_big_blocks};
-pub use extract::{ExtractArgs, ExtractBigBlocksArgs};
+pub use extract::{ExtractArgs, ExtractBigBlocksArgs, ExtractFormat};
 use generate::run_generate;
 pub use generate::{
     fetch_protocol_nonces, sign_standard_request, GenerateArgs, GenerateContext, NetworkAdapter,
@@ -52,8 +52,11 @@ pub async fn run<A: NetworkAdapter + 'static>(adapter: A) -> Result<()>
 where
     <A::Network as Network>::TransactionRequest: Send + 'static,
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
-    <A::Network as Network>::TxEnvelope:
-        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718 + Decodable + Transaction,
+    <A::Network as Network>::TxEnvelope: From<Signed<<A::Network as Network>::UnsignedTx>>
+        + Encodable2718
+        + Decodable
+        + Transaction
+        + alloy_consensus::transaction::SignerRecoverable,
     <A::Network as Network>::Header: Decodable + BlockHeader + Sealable,
 {
     let cli = Cli::parse();
