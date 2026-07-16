@@ -524,7 +524,8 @@ async fn process_reorg_block(
     let envelope = testing_provider.build_block_v1(request).await.wrap_err_with(|| {
         format!(
             "testing_buildBlockV1 failed for block {}. Ensure the target exposes the hidden \
-                 testing RPC, for example: reth node --http --http.api eth,testing ...",
+                 testing RPC and skips invalid reorg transactions, for example: reth node \
+                 --http --http.api eth,testing --testing.skip-invalid-transactions ...",
             block.number
         )
     })?;
