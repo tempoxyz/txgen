@@ -38,7 +38,7 @@ use std::{
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// NDJSON line from the block source (`txgen extract` output).
-#[derive(Clone, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 pub(crate) struct BlockLine {
     /// RLP-encoded block bytes (hex with 0x prefix).
     raw: Bytes,
