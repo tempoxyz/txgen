@@ -28,7 +28,7 @@ use bench_core::{
 };
 use eyre::{Context, Result};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     io::BufRead,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -39,7 +39,7 @@ use std::{
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// NDJSON line from the block source (`txgen extract` output).
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub(crate) struct BlockLine {
     /// RLP-encoded block bytes (hex with 0x prefix).
     raw: Bytes,
@@ -70,32 +70,163 @@ enum InputLine {
     BigBlock(Box<BigBlockData<ExecutionData>>),
 }
 
-struct ReorgState {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReorgPhase {
+    Buffering,
+    Synthetic,
+    Canonical,
+}
+
+#[derive(Clone)]
+enum ReorgStep {
+    Synthetic {
+        block: BlockLine,
+        parent_block_hash: B256,
+        branch_point_hash: B256,
+        fork_length: usize,
+        reorg_depth: usize,
+    },
+    Canonical {
+        block: BlockLine,
+        branch_point_hash: B256,
+    },
+}
+
+/// Buffers enough canonical input to run one reorg cycle and exposes the next
+/// branch operation. Synthetic blocks are always scheduled before canonical
+/// blocks, and a successful synthetic step supplies the parent for the next
+/// synthetic build.
+struct ReorgStateMachine {
     depth: usize,
-    fork_length: usize,
+    every: usize,
+    pending: VecDeque<BlockLine>,
+    phase: ReorgPhase,
+    next_block: usize,
+    batch_side_len: usize,
+    batch_canonical_len: usize,
     branch_point_hash: Option<B256>,
     fork_parent_hash: Option<B256>,
 }
 
-impl ReorgState {
-    const fn new(depth: usize) -> Self {
-        Self { depth, fork_length: 0, branch_point_hash: None, fork_parent_hash: None }
+impl ReorgStateMachine {
+    fn new(depth: usize, every: usize) -> Self {
+        debug_assert!(depth > 0);
+        debug_assert!(every > 0);
+        Self {
+            depth,
+            every,
+            pending: VecDeque::new(),
+            phase: ReorgPhase::Buffering,
+            next_block: 0,
+            batch_side_len: 0,
+            batch_canonical_len: 0,
+            branch_point_hash: None,
+            fork_parent_hash: None,
+        }
     }
 
-    fn reset(&mut self) {
-        self.fork_length = 0;
+    fn push(&mut self, block: BlockLine) {
+        self.pending.push_back(block);
+    }
+
+    fn first_pending(&self) -> Option<&BlockLine> {
+        self.pending.front()
+    }
+
+    fn is_buffering(&self) -> bool {
+        self.phase == ReorgPhase::Buffering
+    }
+
+    fn batch_ready(&self, flush: bool) -> bool {
+        !self.pending.is_empty() && (flush || self.pending.len() >= self.required_lookahead())
+    }
+
+    fn start_batch(&mut self, branch_point_hash: B256, flush: bool) -> bool {
+        debug_assert!(self.is_buffering());
+
+        if !self.batch_ready(flush) {
+            return false;
+        }
+
+        self.batch_side_len = self.depth.min(self.pending.len());
+        // At EOF there cannot be another synthetic cycle, so drain the
+        // canonical tail in one bounded partial batch.
+        self.batch_canonical_len =
+            if flush { self.pending.len() } else { self.every.min(self.pending.len()) };
+        self.next_block = 0;
+        self.branch_point_hash = Some(branch_point_hash);
+        self.fork_parent_hash = Some(branch_point_hash);
+        self.phase = ReorgPhase::Synthetic;
+        true
+    }
+
+    fn current_step(&self) -> Option<ReorgStep> {
+        match self.phase {
+            ReorgPhase::Buffering => None,
+            ReorgPhase::Synthetic => {
+                let block = self.pending.get(self.next_block)?.clone();
+                Some(ReorgStep::Synthetic {
+                    block,
+                    parent_block_hash: self.fork_parent_hash?,
+                    branch_point_hash: self.branch_point_hash?,
+                    fork_length: self.next_block + 1,
+                    reorg_depth: self.depth,
+                })
+            }
+            ReorgPhase::Canonical => Some(ReorgStep::Canonical {
+                block: self.pending.get(self.next_block)?.clone(),
+                branch_point_hash: self.branch_point_hash?,
+            }),
+        }
+    }
+
+    fn synthetic_succeeded(&mut self, block_hash: B256) {
+        debug_assert_eq!(self.phase, ReorgPhase::Synthetic);
+
+        self.fork_parent_hash = Some(block_hash);
+        self.next_block += 1;
+        if self.next_block == self.batch_side_len {
+            self.next_block = 0;
+            self.phase = ReorgPhase::Canonical;
+        }
+    }
+
+    fn canonical_succeeded(&mut self) {
+        debug_assert_eq!(self.phase, ReorgPhase::Canonical);
+
+        self.next_block += 1;
+        if self.next_block != self.batch_canonical_len {
+            return;
+        }
+
+        for _ in 0..self.batch_canonical_len {
+            self.pending.pop_front();
+        }
+        self.phase = ReorgPhase::Buffering;
+        self.next_block = 0;
+        self.batch_side_len = 0;
+        self.batch_canonical_len = 0;
         self.branch_point_hash = None;
         self.fork_parent_hash = None;
+    }
+
+    fn required_lookahead(&self) -> usize {
+        self.depth.max(self.every)
     }
 }
 
 struct ProcessingState<'a> {
     collector: &'a mut MetricsCollector,
-    reorg_state: Option<&'a mut ReorgState>,
+    reorg_state: Option<&'a mut ReorgStateMachine>,
     persistence_policy: &'a WaitForPersistence,
 }
 
 const REORG_NON_BLOB_TX_DROP_INTERVAL: usize = 10;
+
+fn synthetic_block_index(canonical_blocks_submitted: u64, fork_length: usize) -> u64 {
+    let source_offset = u64::try_from(fork_length.saturating_sub(1)).unwrap_or(u64::MAX);
+    canonical_blocks_submitted.saturating_add(source_offset)
+}
 
 pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let jwt_secret_hex =
@@ -107,6 +238,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let scraper_configs =
         metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
     let persistence_policy = args.wait_for_persistence;
+    let reorg_every = args.reorg.map(|depth| args.reorg_every.unwrap_or(depth));
 
     tracing::info!(
         engine = %args.engine,
@@ -114,6 +246,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         wait_for_persistence = ?persistence_policy,
         wait_time_ms = args.wait_time.map(|d| d.as_millis()),
         reorg_depth = args.reorg,
+        reorg_every,
         rpc = %args.rpc,
         "Starting block submission"
     );
@@ -149,7 +282,8 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     };
 
     let mut collector = MetricsCollector::new(counters);
-    let mut reorg_state = args.reorg.map(ReorgState::new);
+    let mut reorg_state =
+        args.reorg.map(|depth| ReorgStateMachine::new(depth, reorg_every.unwrap_or(depth)));
     let start = Instant::now();
 
     if let Some(ref path) = args.input {
@@ -160,10 +294,10 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             let line = line.wrap_err("failed to read line")?;
             let input = parse_input_line(&line)?;
 
-            process_input_and_wait(
+            process_or_buffer_input(
                 &provider,
                 &testing_provider,
-                &input,
+                input,
                 ProcessingState {
                     collector: &mut collector,
                     reorg_state: reorg_state.as_mut(),
@@ -190,10 +324,10 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
 
             let input = parse_input_line(&line_buf)?;
 
-            process_input_and_wait(
+            process_or_buffer_input(
                 &provider,
                 &testing_provider,
-                &input,
+                input,
                 ProcessingState {
                     collector: &mut collector,
                     reorg_state: reorg_state.as_mut(),
@@ -205,6 +339,21 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             )
             .await?;
         }
+    }
+
+    if let Some(reorg_state) = reorg_state.as_mut() {
+        drive_reorg_state_machine(
+            &provider,
+            &testing_provider,
+            reorg_state,
+            &mut collector,
+            &persistence_policy,
+            args.wait_time,
+            start,
+            &mut reporters,
+            true,
+        )
+        .await?;
     }
 
     // Stop the scraper before finalizing.
@@ -284,73 +433,177 @@ fn report_progress(
     Ok(())
 }
 
-async fn process_input_and_wait(
+async fn process_or_buffer_input(
     provider: &(impl Provider + RethApi<Ethereum>),
     testing_provider: &(impl Provider + TestingApi<Ethereum>),
-    input: &InputLine,
+    input: InputLine,
     state: ProcessingState<'_>,
+    wait_time: Option<Duration>,
+    start: Instant,
+    reporters: &mut [Box<dyn Reporter>],
+) -> Result<()> {
+    let ProcessingState { collector, reorg_state, persistence_policy } = state;
+    let Some(reorg_state) = reorg_state else {
+        return process_input_and_wait(
+            provider,
+            &input,
+            collector,
+            persistence_policy,
+            wait_time,
+            start,
+            reporters,
+        )
+        .await;
+    };
+
+    let InputLine::RawBlock(block) = input else {
+        eyre::bail!("--reorg is only supported for raw RLP block input");
+    };
+    reorg_state.push(block);
+    drive_reorg_state_machine(
+        provider,
+        testing_provider,
+        reorg_state,
+        collector,
+        persistence_policy,
+        wait_time,
+        start,
+        reporters,
+        false,
+    )
+    .await
+}
+
+async fn process_input_and_wait(
+    provider: &(impl Provider + RethApi<Ethereum>),
+    input: &InputLine,
+    collector: &mut MetricsCollector,
+    persistence_policy: &WaitForPersistence,
     wait_time: Option<Duration>,
     start: Instant,
     reporters: &mut [Box<dyn Reporter>],
 ) -> Result<()> {
     let block_start = Instant::now();
 
-    process_input(
-        provider,
-        testing_provider,
-        input,
-        state.collector,
-        state.reorg_state,
-        state.persistence_policy,
-    )
-    .await?;
-    report_progress(state.collector, start, reporters)?;
+    match input {
+        InputLine::RawBlock(block) => {
+            process_block(provider, block, collector, None, persistence_policy).await?
+        }
+        InputLine::BigBlock(big_block) => {
+            process_big_block(provider, big_block, collector, persistence_policy).await?
+        }
+    }
+    report_progress(collector, start, reporters)?;
+    wait_for_next_block(block_start, wait_time).await;
+    Ok(())
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn drive_reorg_state_machine(
+    provider: &(impl Provider + RethApi<Ethereum>),
+    testing_provider: &(impl Provider + TestingApi<Ethereum>),
+    reorg_state: &mut ReorgStateMachine,
+    collector: &mut MetricsCollector,
+    persistence_policy: &WaitForPersistence,
+    wait_time: Option<Duration>,
+    start: Instant,
+    reporters: &mut [Box<dyn Reporter>],
+    flush: bool,
+) -> Result<()> {
+    loop {
+        if reorg_state.is_buffering() {
+            if !reorg_state.batch_ready(flush) {
+                return Ok(());
+            }
+
+            let first_block = reorg_state
+                .first_pending()
+                .ok_or_else(|| eyre::eyre!("reorg state is missing its first buffered block"))?;
+            let branch_point_hash = if let Some(hash) = collector.prev_block_hash {
+                hash
+            } else {
+                extract_block_header_from_block_rlp(first_block.raw.as_ref())
+                    .wrap_err_with(|| {
+                        format!("failed to extract parent hash from block {}", first_block.number)
+                    })?
+                    .parent_hash
+            };
+
+            if !reorg_state.start_batch(branch_point_hash, flush) {
+                return Ok(());
+            }
+
+            tracing::info!(
+                reorg_depth = reorg_state.depth,
+                reorg_every = reorg_state.every,
+                side_blocks = reorg_state.batch_side_len,
+                canonical_blocks = reorg_state.batch_canonical_len,
+                branch_point = %branch_point_hash,
+                "Starting reorg batch"
+            );
+        }
+
+        let step = reorg_state
+            .current_step()
+            .ok_or_else(|| eyre::eyre!("reorg state is missing its current step"))?;
+        match step {
+            ReorgStep::Synthetic {
+                block,
+                parent_block_hash,
+                branch_point_hash,
+                fork_length,
+                reorg_depth,
+            } => {
+                let block_start = Instant::now();
+                let block_hash = process_synthetic_block(
+                    provider,
+                    testing_provider,
+                    &block,
+                    collector,
+                    parent_block_hash,
+                    branch_point_hash,
+                    fork_length,
+                    reorg_depth,
+                    persistence_policy,
+                )
+                .await?;
+                reorg_state.synthetic_succeeded(block_hash);
+                wait_for_next_block(block_start, wait_time).await;
+            }
+            ReorgStep::Canonical { block, branch_point_hash } => {
+                let block_start = Instant::now();
+                // Keep both anchors at the common ancestor while switching
+                // away from the completed synthetic fork.
+                process_block(
+                    provider,
+                    &block,
+                    collector,
+                    Some(branch_point_hash),
+                    persistence_policy,
+                )
+                .await?;
+                report_progress(collector, start, reporters)?;
+                reorg_state.canonical_succeeded();
+                wait_for_next_block(block_start, wait_time).await;
+            }
+        }
+    }
+}
+
+async fn wait_for_next_block(block_start: Instant, wait_time: Option<Duration>) {
     if let Some(wait_time) = wait_time {
         let remaining = wait_time.saturating_sub(block_start.elapsed());
         if !remaining.is_zero() {
             tokio::time::sleep(remaining).await;
         }
     }
-
-    Ok(())
-}
-
-async fn process_input(
-    provider: &(impl Provider + RethApi<Ethereum>),
-    testing_provider: &(impl Provider + TestingApi<Ethereum>),
-    input: &InputLine,
-    collector: &mut MetricsCollector,
-    reorg_state: Option<&mut ReorgState>,
-    persistence_policy: &WaitForPersistence,
-) -> Result<()> {
-    match input {
-        InputLine::RawBlock(block) => {
-            process_block(
-                provider,
-                testing_provider,
-                block,
-                collector,
-                reorg_state,
-                persistence_policy,
-            )
-            .await
-        }
-        InputLine::BigBlock(big_block) => {
-            if reorg_state.is_some() {
-                eyre::bail!("--reorg is only supported for raw RLP block input");
-            }
-            process_big_block(provider, big_block, collector, persistence_policy).await
-        }
-    }
 }
 
 async fn process_block(
     provider: &(impl Provider + RethApi<Ethereum>),
-    testing_provider: &(impl Provider + TestingApi<Ethereum>),
     block: &BlockLine,
     collector: &mut MetricsCollector,
-    reorg_state: Option<&mut ReorgState>,
+    forkchoice_anchor: Option<B256>,
     persistence_policy: &WaitForPersistence,
 ) -> Result<()> {
     let input = RethNewPayloadInput::BlockRlp { block: block.raw.clone(), bal: block.bal.clone() };
@@ -370,45 +623,34 @@ async fn process_block(
         );
     }
 
-    let safe_hash = collector.prev_block_hash.unwrap_or(block.key);
-    if collector.finalized_hash.is_none() {
-        collector.finalized_hash = Some(block.key);
-    }
-
-    let forkchoice_state = ForkchoiceState {
-        head_block_hash: block.key,
-        safe_block_hash: safe_hash,
-        // SAFETY: finalized_hash is always Some after the check above
-        finalized_block_hash: collector.finalized_hash.unwrap(),
-    };
-    let canonical_forkchoice_state = forkchoice_state;
-    let delay_canonical_fcu = reorg_state.as_ref().is_some_and(|state| state.fork_length > 0);
-
-    let fcu_latency = if delay_canonical_fcu {
-        tracing::debug!(
-            block = block.number,
-            "Delaying canonical forkchoice update until synthetic fork reaches reorg depth"
-        );
-        Duration::ZERO
+    let (safe_block_hash, finalized_block_hash) = if let Some(anchor) = forkchoice_anchor {
+        (anchor, anchor)
     } else {
-        let fcu_start = Instant::now();
-        let fcu_result = provider
-            .reth_forkchoice_updated(forkchoice_state)
-            .await
-            .wrap_err("reth_forkchoiceUpdated failed")?;
-        let fcu_latency = fcu_start.elapsed();
-
-        if !fcu_result.is_valid() {
-            collector.record_failure();
-            eyre::bail!(
-                "reth_forkchoiceUpdated returned non-VALID status for block {}: {:?}",
-                block.number,
-                fcu_result.payload_status,
-            );
+        let safe_hash = collector.prev_block_hash.unwrap_or(block.key);
+        if collector.finalized_hash.is_none() {
+            collector.finalized_hash = Some(block.key);
         }
-
-        fcu_latency
+        // SAFETY: finalized_hash is always Some after the check above.
+        (safe_hash, collector.finalized_hash.unwrap())
     };
+
+    let forkchoice_state =
+        ForkchoiceState { head_block_hash: block.key, safe_block_hash, finalized_block_hash };
+    let fcu_start = Instant::now();
+    let fcu_result = provider
+        .reth_forkchoice_updated(forkchoice_state)
+        .await
+        .wrap_err("reth_forkchoiceUpdated failed")?;
+    let fcu_latency = fcu_start.elapsed();
+
+    if !fcu_result.is_valid() {
+        collector.record_failure();
+        eyre::bail!(
+            "reth_forkchoiceUpdated returned non-VALID status for block {}: {:?}",
+            block.number,
+            fcu_result.payload_status,
+        );
+    }
 
     let total_latency = new_payload_latency + fcu_latency;
     let payload_status_str = payload_status.status.status.to_string();
@@ -446,19 +688,6 @@ async fn process_block(
         "Submitted block"
     );
 
-    if let Some(reorg_state) = reorg_state {
-        process_reorg_block(
-            provider,
-            testing_provider,
-            block,
-            collector,
-            reorg_state,
-            canonical_forkchoice_state,
-            persistence_policy,
-        )
-        .await?;
-    }
-
     collector.prev_block_hash = Some(block.key);
 
     if block.number.is_multiple_of(32) {
@@ -468,34 +697,18 @@ async fn process_block(
     Ok(())
 }
 
-async fn process_reorg_block(
+#[allow(clippy::too_many_arguments)]
+async fn process_synthetic_block(
     provider: &(impl Provider + RethApi<Ethereum>),
     testing_provider: &(impl Provider + TestingApi<Ethereum>),
     block: &BlockLine,
     collector: &MetricsCollector,
-    reorg_state: &mut ReorgState,
-    canonical_forkchoice_state: ForkchoiceState,
+    parent_block_hash: B256,
+    branch_point_hash: B256,
+    fork_length: usize,
+    reorg_depth: usize,
     persistence_policy: &WaitForPersistence,
-) -> Result<()> {
-    let parent_block_hash = if reorg_state.fork_length == 0 {
-        let Some(parent_hash) = collector.prev_block_hash else {
-            tracing::warn!(
-                block = block.number,
-                "Skipping first synthetic fork block because the canonical parent hash is unknown"
-            );
-            return Ok(());
-        };
-        reorg_state.branch_point_hash = Some(parent_hash);
-        parent_hash
-    } else {
-        reorg_state
-            .fork_parent_hash
-            .ok_or_else(|| eyre::eyre!("reorg state is missing synthetic fork parent hash"))?
-    };
-
-    let branch_point_hash = reorg_state
-        .branch_point_hash
-        .ok_or_else(|| eyre::eyre!("reorg state is missing branch point hash"))?;
+) -> Result<B256> {
     let transactions = extract_tx_bytes_from_block_rlp(block.raw.as_ref()).wrap_err_with(|| {
         format!("failed to extract raw transaction bytes from block {}", block.number)
     })?;
@@ -532,7 +745,12 @@ async fn process_reorg_block(
     let (payload, sidecar) = envelope.into_payload_and_sidecar(parent_beacon_block_root);
     let execution_data = ExecutionData::new(payload, sidecar);
 
-    let wait = persistence_policy.should_wait(collector.blocks_submitted());
+    // The testing builder only resolves canonical parent state. Submit and
+    // select this payload before the state machine asks it to build the child.
+    // Synthetic and canonical versions of the same source height use the same
+    // persistence cadence even though the entire synthetic batch runs first.
+    let wait = persistence_policy
+        .should_wait(synthetic_block_index(collector.blocks_submitted(), fork_length));
     let payload_status = provider
         .reth_new_payload(RethNewPayloadInput::ExecutionData(Box::new(execution_data)), wait)
         .await
@@ -569,50 +787,23 @@ async fn process_reorg_block(
         );
     }
 
-    reorg_state.fork_length += 1;
-    reorg_state.fork_parent_hash = Some(synthetic_block_hash);
-
     tracing::info!(
         block = block.number,
-        fork_length = reorg_state.fork_length,
-        reorg_depth = reorg_state.depth,
+        fork_length,
+        reorg_depth,
         branch_point = %branch_point_hash,
         synthetic_head = %synthetic_block_hash,
         "Submitted synthetic fork block"
     );
 
-    if reorg_state.fork_length == reorg_state.depth {
-        let fcu_result = provider
-            .reth_forkchoice_updated(canonical_forkchoice_state)
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "reth_forkchoiceUpdated failed while switching back to canonical block {}",
-                    block.number
-                )
-            })?;
-
-        if !fcu_result.is_valid() {
-            eyre::bail!(
-                "reth_forkchoiceUpdated returned non-VALID status while switching back to canonical block {}: {:?}",
-                block.number,
-                fcu_result.payload_status,
-            );
-        }
-
-        tracing::info!(
-            block = block.number,
-            reorg_depth = reorg_state.depth,
-            canonical_head = %block.key,
-            "Switched forkchoice back to canonical head"
-        );
-        reorg_state.reset();
-    }
-
-    Ok(())
+    Ok(synthetic_block_hash)
 }
 
 fn extract_parent_beacon_block_root_from_block_rlp(raw: &[u8]) -> Result<Option<B256>> {
+    Ok(extract_block_header_from_block_rlp(raw)?.parent_beacon_block_root)
+}
+
+fn extract_block_header_from_block_rlp(raw: &[u8]) -> Result<ConsensusHeader> {
     let mut block_buf = raw;
     let mut block_payload = Header::decode_bytes(&mut block_buf, true)
         .wrap_err("failed to decode outer block RLP list")?;
@@ -620,10 +811,7 @@ fn extract_parent_beacon_block_root_from_block_rlp(raw: &[u8]) -> Result<Option<
         eyre::bail!("block RLP has trailing bytes after outer list");
     }
 
-    let header =
-        ConsensusHeader::decode(&mut block_payload).wrap_err("failed to decode block header")?;
-
-    Ok(header.parent_beacon_block_root)
+    ConsensusHeader::decode(&mut block_payload).wrap_err("failed to decode block header")
 }
 
 fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<Vec<Bytes>> {
@@ -700,6 +888,207 @@ mod tests {
     use super::*;
     use alloy_rlp::Encodable;
 
+    #[derive(Debug, Eq, PartialEq)]
+    enum ScheduledStep {
+        Synthetic { number: u64, parent: B256, branch_point: B256 },
+        Canonical(u64),
+    }
+
+    fn test_hash(byte: u8) -> B256 {
+        B256::from([byte; 32])
+    }
+
+    fn synthetic_hash(number: u64) -> B256 {
+        test_hash(u8::try_from(number + 100).unwrap())
+    }
+
+    fn scheduler_block(number: u64) -> BlockLine {
+        BlockLine {
+            raw: Bytes::new(),
+            bal: None,
+            key: test_hash(u8::try_from(number).unwrap()),
+            number,
+            timestamp: number,
+            gas_used: 0,
+            gas_limit: 0,
+            tx_count: 0,
+        }
+    }
+
+    fn run_scheduler_batch(
+        state: &mut ReorgStateMachine,
+        branch_point: B256,
+        flush: bool,
+    ) -> Vec<ScheduledStep> {
+        assert!(state.start_batch(branch_point, flush));
+        let mut steps = Vec::new();
+
+        while !state.is_buffering() {
+            match state.current_step().unwrap() {
+                ReorgStep::Synthetic { block, parent_block_hash, branch_point_hash, .. } => {
+                    steps.push(ScheduledStep::Synthetic {
+                        number: block.number,
+                        parent: parent_block_hash,
+                        branch_point: branch_point_hash,
+                    });
+                    state.synthetic_succeeded(synthetic_hash(block.number));
+                }
+                ReorgStep::Canonical { block, branch_point_hash } => {
+                    assert_eq!(branch_point_hash, branch_point);
+                    steps.push(ScheduledStep::Canonical(block.number));
+                    state.canonical_succeeded();
+                }
+            }
+        }
+
+        steps
+    }
+
+    #[test]
+    fn reorg_scheduler_builds_each_side_chain_before_canonical_blocks() {
+        let branch_one = test_hash(50);
+        let branch_two = test_hash(51);
+        let mut state = ReorgStateMachine::new(3, 3);
+        for number in 1..=6 {
+            state.push(scheduler_block(number));
+        }
+
+        let mut steps = run_scheduler_batch(&mut state, branch_one, false);
+        steps.extend(run_scheduler_batch(&mut state, branch_two, false));
+
+        assert_eq!(
+            steps,
+            vec![
+                ScheduledStep::Synthetic {
+                    number: 1,
+                    parent: branch_one,
+                    branch_point: branch_one,
+                },
+                ScheduledStep::Synthetic {
+                    number: 2,
+                    parent: synthetic_hash(1),
+                    branch_point: branch_one,
+                },
+                ScheduledStep::Synthetic {
+                    number: 3,
+                    parent: synthetic_hash(2),
+                    branch_point: branch_one,
+                },
+                ScheduledStep::Canonical(1),
+                ScheduledStep::Canonical(2),
+                ScheduledStep::Canonical(3),
+                ScheduledStep::Synthetic {
+                    number: 4,
+                    parent: branch_two,
+                    branch_point: branch_two,
+                },
+                ScheduledStep::Synthetic {
+                    number: 5,
+                    parent: synthetic_hash(4),
+                    branch_point: branch_two,
+                },
+                ScheduledStep::Synthetic {
+                    number: 6,
+                    parent: synthetic_hash(5),
+                    branch_point: branch_two,
+                },
+                ScheduledStep::Canonical(4),
+                ScheduledStep::Canonical(5),
+                ScheduledStep::Canonical(6),
+            ]
+        );
+        assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn reorg_every_controls_canonical_blocks_between_side_chains() {
+        let mut state = ReorgStateMachine::new(3, 2);
+        for number in 1..=5 {
+            state.push(scheduler_block(number));
+        }
+
+        let first = run_scheduler_batch(&mut state, test_hash(50), false);
+        let second = run_scheduler_batch(&mut state, test_hash(51), false);
+
+        assert_eq!(
+            first
+                .iter()
+                .map(|step| match step {
+                    ScheduledStep::Synthetic { number, .. } => (*number, true),
+                    ScheduledStep::Canonical(number) => (*number, false),
+                })
+                .collect::<Vec<_>>(),
+            vec![(1, true), (2, true), (3, true), (1, false), (2, false)]
+        );
+        assert_eq!(
+            second
+                .iter()
+                .map(|step| match step {
+                    ScheduledStep::Synthetic { number, .. } => (*number, true),
+                    ScheduledStep::Canonical(number) => (*number, false),
+                })
+                .collect::<Vec<_>>(),
+            vec![(3, true), (4, true), (5, true), (3, false), (4, false)]
+        );
+        assert_eq!(state.pending.front().map(|block| block.number), Some(5));
+    }
+
+    #[test]
+    fn reorg_scheduler_uses_extra_canonical_blocks_when_every_exceeds_depth() {
+        let mut state = ReorgStateMachine::new(2, 3);
+        for number in 1..=3 {
+            state.push(scheduler_block(number));
+        }
+
+        let steps = run_scheduler_batch(&mut state, test_hash(50), false);
+
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| match step {
+                    ScheduledStep::Synthetic { number, .. } => (*number, true),
+                    ScheduledStep::Canonical(number) => (*number, false),
+                })
+                .collect::<Vec<_>>(),
+            vec![(1, true), (2, true), (1, false), (2, false), (3, false)]
+        );
+        assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn reorg_scheduler_flushes_a_partial_final_batch() {
+        let branch_point = test_hash(50);
+        let mut state = ReorgStateMachine::new(3, 1);
+        state.push(scheduler_block(1));
+        state.push(scheduler_block(2));
+
+        assert!(!state.batch_ready(false));
+        let steps = run_scheduler_batch(&mut state, branch_point, true);
+
+        assert_eq!(
+            steps,
+            vec![
+                ScheduledStep::Synthetic { number: 1, parent: branch_point, branch_point },
+                ScheduledStep::Synthetic { number: 2, parent: synthetic_hash(1), branch_point },
+                ScheduledStep::Canonical(1),
+                ScheduledStep::Canonical(2),
+            ]
+        );
+        assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn synthetic_persistence_cadence_follows_source_block_indexes() {
+        let policy = WaitForPersistence::EveryN(2);
+
+        let waits = (1..=4)
+            .map(|fork_length| policy.should_wait(synthetic_block_index(0, fork_length)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(waits, vec![Some(false), Some(true), Some(false), Some(true)]);
+        assert_eq!(synthetic_block_index(2, 1), 2);
+    }
+
     fn rlp_bytes(payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         payload.encode(&mut out);
@@ -729,6 +1118,23 @@ mod tests {
         let transactions = rlp_list_from_encoded(transactions);
         let ommers = rlp_list_from_encoded(&[]);
         rlp_list_from_encoded(&[header, transactions, ommers])
+    }
+
+    #[test]
+    fn extracts_branch_point_from_first_buffered_block() {
+        let parent_hash = test_hash(42);
+        let header = ConsensusHeader { parent_hash, ..Default::default() };
+        let mut encoded_header = Vec::new();
+        header.encode(&mut encoded_header);
+        let block = rlp_list_from_encoded(&[
+            encoded_header,
+            rlp_list_from_encoded(&[]),
+            rlp_list_from_encoded(&[]),
+        ]);
+
+        let extracted = extract_block_header_from_block_rlp(&block).unwrap();
+
+        assert_eq!(extracted.parent_hash, parent_hash);
     }
 
     #[test]

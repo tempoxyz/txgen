@@ -183,7 +183,7 @@ pub struct SendBlocksArgs {
     #[arg(long = "metrics-forward", value_name = "URL")]
     pub metrics_forward: Option<String>,
 
-    /// Build a synthetic side fork and alternate forkchoice updates.
+    /// Build a synthetic side fork, resetting it after DEPTH blocks.
     #[arg(
         long,
         value_name = "DEPTH",
@@ -192,6 +192,12 @@ pub struct SendBlocksArgs {
         value_parser = parse_reorg_depth,
     )]
     pub reorg: Option<usize>,
+
+    /// Number of canonical blocks to add after each synthetic side chain.
+    ///
+    /// Defaults to the depth passed to --reorg.
+    #[arg(long, value_name = "BLOCKS", requires = "reorg", value_parser = parse_reorg_every)]
+    pub reorg_every: Option<usize>,
 
     /// Regular HTTP RPC URL for testing_buildBlockV1.
     #[arg(
@@ -258,6 +264,14 @@ fn parse_reorg_depth(s: &str) -> Result<usize, String> {
         return Err("reorg depth requires DEPTH > 0".to_string());
     }
     Ok(depth)
+}
+
+fn parse_reorg_every(s: &str) -> Result<usize, String> {
+    let every = s.trim().parse::<usize>().map_err(|e| format!("invalid reorg interval: {e}"))?;
+    if every == 0 {
+        return Err("reorg interval requires BLOCKS > 0".to_string());
+    }
+    Ok(every)
 }
 
 fn parse_wait_for_persistence(s: &str) -> Result<bench_core::WaitForPersistence, String> {
@@ -343,6 +357,95 @@ mod tests {
         assert_eq!(parse_reorg_depth("8"), Ok(8));
         assert!(parse_reorg_depth("0").is_err());
         assert!(parse_reorg_depth("abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_reorg_every() {
+        assert_eq!(parse_reorg_every("1"), Ok(1));
+        assert_eq!(parse_reorg_every("2"), Ok(2));
+        assert!(parse_reorg_every("0").is_err());
+        assert!(parse_reorg_every("abc").is_err());
+    }
+
+    #[test]
+    fn test_send_blocks_reorg_every_uses_runtime_depth_default_when_omitted() {
+        let cli = Cli::try_parse_from([
+            "bench",
+            "send-blocks",
+            "--engine",
+            "http://localhost:8551",
+            "--jwt-secret",
+            "/tmp/jwt.hex",
+            "--reorg",
+        ])
+        .unwrap();
+
+        let Command::SendBlocks(args) = cli.command else {
+            panic!("expected send-blocks command");
+        };
+
+        assert_eq!(args.reorg, Some(8));
+        assert_eq!(args.reorg_every, None);
+        assert_eq!(args.reorg_every.unwrap_or(args.reorg.unwrap()), 8);
+    }
+
+    #[test]
+    fn test_send_blocks_reorg_every_accepts_positive_value() {
+        let cli = Cli::try_parse_from([
+            "bench",
+            "send-blocks",
+            "--engine",
+            "http://localhost:8551",
+            "--jwt-secret",
+            "/tmp/jwt.hex",
+            "--reorg",
+            "8",
+            "--reorg-every",
+            "2",
+        ])
+        .unwrap();
+
+        let Command::SendBlocks(args) = cli.command else {
+            panic!("expected send-blocks command");
+        };
+
+        assert_eq!(args.reorg, Some(8));
+        assert_eq!(args.reorg_every, Some(2));
+    }
+
+    #[test]
+    fn test_send_blocks_reorg_every_rejects_invalid_values() {
+        for value in ["0", "abc"] {
+            let result = Cli::try_parse_from([
+                "bench",
+                "send-blocks",
+                "--engine",
+                "http://localhost:8551",
+                "--jwt-secret",
+                "/tmp/jwt.hex",
+                "--reorg",
+                "--reorg-every",
+                value,
+            ]);
+
+            assert!(result.is_err(), "expected {value:?} to be rejected");
+        }
+    }
+
+    #[test]
+    fn test_send_blocks_reorg_every_requires_reorg() {
+        let result = Cli::try_parse_from([
+            "bench",
+            "send-blocks",
+            "--engine",
+            "http://localhost:8551",
+            "--jwt-secret",
+            "/tmp/jwt.hex",
+            "--reorg-every",
+            "2",
+        ]);
+
+        assert!(result.is_err());
     }
 
     #[test]
