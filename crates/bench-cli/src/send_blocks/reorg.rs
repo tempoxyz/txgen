@@ -245,7 +245,7 @@ impl ReorgStateMachine {
                 }
             }
             (phase, completion) => {
-                eyre::bail!("cannot apply {completion:?} completion in {phase:?} phase")
+                eyre::bail!("cannot apply {completion:?} completion in {phase:?} phase");
             }
         }
 
@@ -305,7 +305,7 @@ impl ReorgStateMachine {
     fn current_action(&self) -> Result<ReorgAction> {
         match self.phase {
             ReorgPhase::Buffering => {
-                eyre::bail!("reorg state has no current action while buffering")
+                eyre::bail!("reorg state has no current action while buffering");
             }
             ReorgPhase::Synthetic => {
                 let block = self
