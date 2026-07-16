@@ -565,7 +565,7 @@ fn resolve_expiring_valid_before(template: &TempoTemplate) -> Result<u64> {
         (Some(_), Some(_)) => {
             bail!(
                 "expiring nonce templates must set either `valid_before` or `valid_for_secs`, not both"
-            )
+            );
         }
         (Some(valid_before), None) => {
             if valid_before == 0 {
@@ -593,7 +593,7 @@ fn resolve_expiring_valid_before(template: &TempoTemplate) -> Result<u64> {
                 })
         }
         (None, None) => {
-            bail!("expiring nonce templates require either `valid_before` or `valid_for_secs`")
+            bail!("expiring nonce templates require either `valid_before` or `valid_for_secs`");
         }
     }
 }
