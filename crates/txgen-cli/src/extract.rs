@@ -1,16 +1,16 @@
 use crate::bal::{
     fetch_block_access_list, fetch_encoded_block_access_list, merge_block_access_lists,
 };
-use alloy_consensus::{BlockHeader, Sealed, Transaction};
+use alloy_consensus::{transaction::SignerRecoverable, BlockHeader, Sealed, Transaction};
 use alloy_eips::{eip2718::Encodable2718, eip7928::BlockAccessList, BlockNumberOrTag};
 use alloy_network::Network;
-use alloy_primitives::{Bytes, Sealable, B256};
+use alloy_primitives::{Address, Bytes, Sealable, B256};
 use alloy_provider::{ext::DebugApi, Provider, RootProvider};
 use alloy_rlp::Decodable;
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload};
 use alloy_transport::layers::RetryBackoffLayer;
-use clap::Args;
+use clap::{Args, ValueEnum};
 use eyre::{bail, Result, WrapErr};
 use futures::{stream, StreamExt};
 use std::{io::Write, path::PathBuf};
@@ -44,6 +44,23 @@ pub struct ExtractArgs {
     /// Include RLP-encoded block access lists from eth_getBlockAccessListByBlockNumber.
     #[arg(long, default_value_t = false)]
     pub bal: bool,
+
+    /// Output raw blocks or the signed transactions contained in them.
+    ///
+    /// Transaction output is compatible with `bench send` and therefore
+    /// replays the source transactions through `eth_sendRawTransaction` and
+    /// the node's transaction pool.
+    #[arg(long, value_enum, default_value_t = ExtractFormat::Blocks)]
+    pub format: ExtractFormat,
+}
+
+/// Output produced by `extract`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ExtractFormat {
+    /// One raw RLP-encoded block per line, for `bench send-blocks`.
+    Blocks,
+    /// One signed transaction per line, for `bench send`.
+    Transactions,
 }
 
 #[derive(Args)]
@@ -113,7 +130,7 @@ struct BigBlockData<T> {
 pub(crate) async fn run_extract<N>(args: ExtractArgs) -> Result<()>
 where
     N: Network,
-    N::TxEnvelope: Decodable + 'static,
+    N::TxEnvelope: Decodable + Encodable2718 + SignerRecoverable + 'static,
     N::Header: Decodable + 'static,
 {
     if args.from > args.to {
@@ -128,8 +145,9 @@ where
     let to = args.to;
     let include_bal = args.bal;
     let buffer_size = args.buffer_size;
+    let format = args.format;
     let fetch_handle = tokio::spawn(async move {
-        fetch_blocks::<N, _>(provider, from, to, include_bal, buffer_size, tx).await
+        fetch_blocks::<N, _>(provider, from, to, include_bal, buffer_size, format, tx).await
     });
 
     let total = to - from + 1;
@@ -138,15 +156,23 @@ where
             let file = std::fs::File::create(path)
                 .wrap_err_with(|| format!("failed to create output file: {}", path.display()))?;
             let mut writer = std::io::BufWriter::new(file);
-            let result = write_extracted_blocks(&mut rx, &mut writer, total).await;
-            if result.is_ok() {
-                eprintln!("wrote {} blocks to {}", total, path.display());
+            let result = write_extracted_blocks(&mut rx, &mut writer, total, format).await;
+            if let Ok(item_count) = &result {
+                match format {
+                    ExtractFormat::Blocks => {
+                        eprintln!("wrote {item_count} blocks to {}", path.display())
+                    }
+                    ExtractFormat::Transactions => eprintln!(
+                        "wrote {item_count} transactions from {total} blocks to {}",
+                        path.display()
+                    ),
+                }
             }
-            result
+            result.map(|_| ())
         }
         None => {
             let mut writer = std::io::stdout();
-            write_extracted_blocks(&mut rx, &mut writer, total).await
+            write_extracted_blocks(&mut rx, &mut writer, total, format).await.map(|_| ())
         }
     };
 
@@ -199,33 +225,63 @@ struct BlockOutputLine<'a> {
     tx_count: usize,
 }
 
+#[derive(serde::Serialize)]
+struct TransactionOutputLine<'a> {
+    phase: &'static str,
+    id: String,
+    raw: String,
+    submission_keys: [&'a Address; 1],
+    inclusion_keys: [Address; 0],
+}
+
 async fn write_extracted_blocks<W: Write>(
     rx: &mut mpsc::Receiver<Result<FetchedBlock>>,
     writer: &mut W,
     total: u64,
-) -> Result<()> {
+    format: ExtractFormat,
+) -> Result<u64> {
     let start = std::time::Instant::now();
     let mut last_log = start;
     let mut count = 0u64;
+    let mut item_count = 0u64;
 
     while let Some(result) = rx.recv().await {
         let block = result?;
 
-        let raw_hex = format!("0x{}", hex::encode(&block.rlp_bytes));
-        let bal_hex = block.bal_rlp.as_ref().map(|bal| format!("0x{}", hex::encode(bal)));
-        let key_hex = format!("{}", block.hash);
-        let line = BlockOutputLine {
-            raw: &raw_hex,
-            bal: bal_hex.as_deref(),
-            key: &key_hex,
-            number: block.number,
-            timestamp: block.timestamp,
-            gas_used: block.gas_used,
-            gas_limit: block.gas_limit,
-            tx_count: block.tx_count,
-        };
-        serde_json::to_writer(&mut *writer, &line)?;
-        writer.write_all(b"\n")?;
+        match format {
+            ExtractFormat::Blocks => {
+                let raw_hex = format!("0x{}", hex::encode(&block.rlp_bytes));
+                let bal_hex = block.bal_rlp.as_ref().map(|bal| format!("0x{}", hex::encode(bal)));
+                let key_hex = format!("{}", block.hash);
+                let line = BlockOutputLine {
+                    raw: &raw_hex,
+                    bal: bal_hex.as_deref(),
+                    key: &key_hex,
+                    number: block.number,
+                    timestamp: block.timestamp,
+                    gas_used: block.gas_used,
+                    gas_limit: block.gas_limit,
+                    tx_count: block.tx_count,
+                };
+                serde_json::to_writer(&mut *writer, &line)?;
+                writer.write_all(b"\n")?;
+                item_count += 1;
+            }
+            ExtractFormat::Transactions => {
+                for (index, transaction) in block.transactions.iter().enumerate() {
+                    let line = TransactionOutputLine {
+                        phase: "workload",
+                        id: format!("block:{}:tx:{index}", block.number),
+                        raw: format!("0x{}", hex::encode(&transaction.raw)),
+                        submission_keys: [&transaction.signer],
+                        inclusion_keys: [],
+                    };
+                    serde_json::to_writer(&mut *writer, &line)?;
+                    writer.write_all(b"\n")?;
+                    item_count += 1;
+                }
+            }
+        }
         count += 1;
 
         let now = std::time::Instant::now();
@@ -244,7 +300,12 @@ async fn write_extracted_blocks<W: Write>(
     }
 
     writer.flush()?;
-    Ok(())
+    Ok(item_count)
+}
+
+struct FetchedTransaction {
+    raw: Bytes,
+    signer: Address,
 }
 
 struct FetchedBlock {
@@ -256,6 +317,7 @@ struct FetchedBlock {
     gas_used: u64,
     gas_limit: u64,
     tx_count: usize,
+    transactions: Vec<FetchedTransaction>,
 }
 
 async fn fetch_blocks<N, P>(
@@ -264,10 +326,11 @@ async fn fetch_blocks<N, P>(
     to: u64,
     include_bal: bool,
     buffer_size: usize,
+    format: ExtractFormat,
     tx: mpsc::Sender<Result<FetchedBlock>>,
 ) where
     N: Network,
-    N::TxEnvelope: Decodable + 'static,
+    N::TxEnvelope: Decodable + Encodable2718 + SignerRecoverable + 'static,
     N::Header: Decodable + 'static,
     P: Provider<N> + DebugApi<N> + Clone + 'static,
 {
@@ -293,6 +356,27 @@ async fn fetch_blocks<N, P>(
 
                 let hash = sealed.hash();
                 let block = sealed.inner();
+                let transactions = match format {
+                    ExtractFormat::Blocks => Vec::new(),
+                    ExtractFormat::Transactions => block
+                        .body
+                        .transactions
+                        .iter()
+                        .enumerate()
+                        .map(|(index, transaction)| {
+                            let signer =
+                                transaction.recover_signer_unchecked().map_err(|error| {
+                                    eyre::eyre!(
+                                        "failed to recover signer for transaction {index} in block {block_num}: {error}"
+                                    )
+                                })?;
+                            Ok(FetchedTransaction {
+                                raw: transaction.encoded_2718().into(),
+                                signer,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                };
 
                 Ok(FetchedBlock {
                     rlp_bytes,
@@ -303,6 +387,7 @@ async fn fetch_blocks<N, P>(
                     gas_used: block.header.gas_used(),
                     gas_limit: block.header.gas_limit(),
                     tx_count: block.body.transactions.len(),
+                    transactions,
                 })
             }
         })
@@ -466,4 +551,61 @@ fn build_big_block(
         block_number: first_source_block + big_block_idx,
         merged_block_access_list,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fetched_block() -> FetchedBlock {
+        FetchedBlock {
+            rlp_bytes: Bytes::from_static(&[0xaa, 0xbb]),
+            bal_rlp: None,
+            hash: B256::repeat_byte(0x11),
+            number: 42,
+            timestamp: 1_700_000_000,
+            gas_used: 21_000,
+            gas_limit: 30_000_000,
+            tx_count: 1,
+            transactions: vec![FetchedTransaction {
+                raw: Bytes::from_static(&[0x02, 0xca, 0xfe]),
+                signer: Address::repeat_byte(0x22),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn writes_transaction_output_for_bench_send() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender.send(Ok(fetched_block())).await.unwrap();
+        drop(sender);
+
+        let mut output = Vec::new();
+        let count =
+            write_extracted_blocks(&mut receiver, &mut output, 1, ExtractFormat::Transactions)
+                .await
+                .unwrap();
+
+        assert_eq!(count, 1);
+        let line: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(line["phase"], "workload");
+        assert_eq!(line["id"], "block:42:tx:0");
+        assert_eq!(line["raw"], "0x02cafe");
+        assert_eq!(line["submission_keys"][0], "0x2222222222222222222222222222222222222222");
+        assert_eq!(line["inclusion_keys"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn block_output_keeps_original_transaction_count() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender.send(Ok(fetched_block())).await.unwrap();
+        drop(sender);
+
+        let mut output = Vec::new();
+        write_extracted_blocks(&mut receiver, &mut output, 1, ExtractFormat::Blocks).await.unwrap();
+
+        let line: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(line["tx_count"], 1);
+        assert_eq!(line["raw"], "0xaabb");
+    }
 }
