@@ -1279,6 +1279,7 @@ dependencies = [
  "snap",
  "tokio",
  "tracing",
+ "tracing-subscriber 0.3.23",
  "txgen-core",
  "urlencoding",
  "uuid",
