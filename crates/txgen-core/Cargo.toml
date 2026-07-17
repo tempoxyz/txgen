@@ -20,5 +20,6 @@ alloy-signer-local = { workspace = true, features = ["mnemonic", "secp256k1"] }
 
 # misc
 rand.workspace = true
+rayon.workspace = true
 eyre.workspace = true
 hex.workspace = true

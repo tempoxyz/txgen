@@ -1,5 +1,6 @@
 mod abi;
 mod accounts;
+mod fixtures;
 mod nonce;
 pub mod output;
 mod plugin;
@@ -13,6 +14,7 @@ pub use accounts::{
     derive_mnemonic_signer, AccountManager, AccountPoolDef, AccountRef, AddressPoolDef,
     AddressPoolManager, EcdsaSigner, FastAddressPoolDef, SelectMode, SignerExt,
 };
+pub use fixtures::{FixturePoolDef, FixturePoolManager, FixtureRef, FixtureSelectMode};
 pub use nonce::NonceTracker;
 pub use output::{GeneratedTx, NdjsonWriter, TxPhase};
 pub use plugin::{BuildContext, SelectedSigner};

@@ -17,8 +17,9 @@ use std::{
 };
 use txgen_core::{
     dedup_scheduling_keys, merge_yaml, AbiEncodePackedDef, AbiHashDef, AccountManager,
-    AddressPoolManager, ArtifactManager, BuildContext, EcdsaSigner, GeneratedTx, MixItem,
-    NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase, WorkloadSpec,
+    AddressPoolManager, ArtifactManager, BuildContext, EcdsaSigner, FixturePoolManager,
+    GeneratedTx, MixItem, NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, SetupStep,
+    TxPhase, WorkloadSpec,
 };
 
 fn default_signing_workers() -> usize {
@@ -74,6 +75,7 @@ pub struct GenerateContext {
     spec: WorkloadSpec,
     accounts: AccountManager,
     address_pools: AddressPoolManager,
+    fixture_pools: FixturePoolManager,
     artifacts: ArtifactManager,
     nonces: NonceTracker,
     rng: StdRng,
@@ -94,15 +96,17 @@ impl GenerateContext {
         let address_pools = AddressPoolManager::from_spec(&spec.address_pools)?;
         let artifacts = ArtifactManager::load(&spec.artifacts, base_path)?;
         let nonces = NonceTracker::new();
-        let rng = match args.seed {
+        let mut rng = match args.seed {
             Some(seed) => StdRng::seed_from_u64(seed),
             None => StdRng::from_os_rng(),
         };
+        let fixture_pools = FixturePoolManager::load(&spec.fixture_pools, base_path, &mut rng)?;
         let limit = GenerationLimit { count: args.count, duration: args.duration };
         Ok(Self {
             spec,
             accounts,
             address_pools,
+            fixture_pools,
             artifacts,
             nonces,
             rng,
@@ -350,11 +354,12 @@ where
         bail!("no workload entries in mix (total weight is 0)");
     }
 
-    let mut build_ctx = BuildContext::new_with_address_pools(
+    let mut build_ctx = BuildContext::new_with_pools(
         ctx.spec.chain_id,
         &ctx.spec.gas,
         &ctx.accounts,
         &ctx.address_pools,
+        &ctx.fixture_pools,
         &ctx.artifacts,
         &mut ctx.nonces,
         &mut ctx.rng,
@@ -396,6 +401,7 @@ where
 #[derive(Debug, Clone)]
 enum ResolvedBinding {
     Account { pool: String, index: usize, address: Address },
+    Fixture(serde_yaml::Value),
     Address(Address),
     Bytes32(B256),
     Bytes(Bytes),
@@ -899,6 +905,7 @@ where
                     .checked_add(1)
                     .ok_or_else(|| eyre::eyre!("sequence instance counter overflowed u64"))?;
                 let sequence_key = compute_sequence_key(&name, sequence_instance);
+                let inclusion_keys = sequence_inclusion_keys(sequence_key, sequence.steps.len());
                 let bindings = resolve_sequence_bindings(&sequence.bindings, ctx, setup_bindings)
                     .wrap_err_with(|| {
                     format!("failed to resolve bindings for sequence '{name}'")
@@ -921,7 +928,7 @@ where
                         format!("{name}.{label}"),
                         materialized,
                         TxPhase::Workload,
-                        &[sequence_key],
+                        &inclusion_keys,
                         sequence,
                         ctx,
                     )?;
@@ -1042,6 +1049,7 @@ fn resolve_sequence_binding(
                 address: selected.address,
             }
         }
+        SequenceBinding::Fixture(fixture) => ResolvedBinding::Fixture(ctx.select_fixture(fixture)?),
         SequenceBinding::Address(address) => ResolvedBinding::Address(ctx.resolve_value(address)?),
         SequenceBinding::Bytes32(bytes32) => ResolvedBinding::Bytes32(ctx.resolve_value(bytes32)?),
         SequenceBinding::AbiEncodePacked(def) => {
@@ -1092,6 +1100,7 @@ fn binding_dependency_names(
                 collect_var_names(value, bindings, &mut deps);
             }
         }
+        SequenceBinding::Fixture(_) => {}
         _ => {}
     }
     deps
@@ -1214,6 +1223,14 @@ fn compute_sequence_key(sequence_name: &str, sequence_instance: u64) -> Scheduli
     scheduling_key_from_hash(keccak256(data))
 }
 
+fn sequence_inclusion_keys(key: SchedulingKey, step_count: usize) -> Vec<SchedulingKey> {
+    if step_count > 1 {
+        vec![key]
+    } else {
+        Vec::new()
+    }
+}
+
 fn merge_template_overlay(
     mut base: serde_yaml::Value,
     overlay: serde_yaml::Value,
@@ -1278,6 +1295,7 @@ fn binding_to_value(
         (ResolvedBinding::Account { .. }, None) => {
             bail!("account binding '{name}' requires `.ref` or `.address`");
         }
+        (ResolvedBinding::Fixture(fixture), field) => project_fixture_binding(name, fixture, field),
         (ResolvedBinding::Address(address), None) => {
             Ok(serde_yaml::Value::String(address.to_string()))
         }
@@ -1306,6 +1324,38 @@ fn binding_to_value(
             bail!("binding '{name}' has no field '{field}'");
         }
     }
+}
+
+fn project_fixture_binding(
+    name: &str,
+    fixture: &serde_yaml::Value,
+    field: Option<&str>,
+) -> Result<serde_yaml::Value> {
+    let Some(field) = field else {
+        return Ok(fixture.clone());
+    };
+
+    let mut value = fixture;
+    for segment in field.split('.') {
+        value = match value {
+            serde_yaml::Value::Mapping(mapping) => mapping
+                .get(serde_yaml::Value::String(segment.to_string()))
+                .ok_or_else(|| eyre::eyre!("fixture binding '{name}' has no field '{field}'"))?,
+            serde_yaml::Value::Sequence(values) => {
+                let index: usize = segment.parse().map_err(|_| {
+                    eyre::eyre!(
+                        "fixture binding '{name}' field '{field}' uses non-numeric array index '{segment}'"
+                    )
+                })?;
+                values
+                    .get(index)
+                    .ok_or_else(|| eyre::eyre!("fixture binding '{name}' has no field '{field}'"))?
+            }
+            _ => bail!("fixture binding '{name}' has no field '{field}'"),
+        };
+    }
+
+    Ok(value.clone())
 }
 
 fn split_binding_path<'a>(
@@ -1412,5 +1462,100 @@ call:
         assert_eq!(values[3], var("tick"));
         assert_eq!(yaml_get(yaml_get(&values[4], "if"), "cond"), &var("is_bid"));
         Ok(())
+    }
+
+    #[test]
+    fn fixture_binding_projects_correlated_from_and_input_fields() -> Result<()> {
+        let base = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+from:
+  pool: users
+  select: { index: 0 }
+input: "0x"
+first_proof: { var: claim.metadata.proof.0 }
+"#,
+        )?;
+        let overlay = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+from: { var: claim.from }
+input: { var: claim.input }
+"#,
+        )?;
+        let fixture = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+from:
+  pool: users
+  select: { index: 17 }
+input: "0x1234"
+metadata:
+  proof: ["0xabcd"]
+"#,
+        )?;
+        let bindings = HashMap::from([("claim".to_string(), ResolvedBinding::Fixture(fixture))]);
+
+        let materialized = substitute_vars(merge_template_overlay(base, overlay), &bindings)?;
+
+        assert_eq!(yaml_get(&materialized, "input").as_str(), Some("0x1234"));
+        assert_eq!(yaml_get(&materialized, "first_proof").as_str(), Some("0xabcd"));
+        let from = yaml_get(&materialized, "from");
+        assert_eq!(yaml_get(from, "pool").as_str(), Some("users"));
+        assert_eq!(yaml_get(yaml_get(from, "select"), "index").as_u64(), Some(17));
+        Ok(())
+    }
+
+    #[test]
+    fn template_overlay_still_deep_merges_regular_mappings() -> Result<()> {
+        let base = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+call:
+  to: "0x0000000000000000000000000000000000000001"
+  args:
+    values: [1]
+    vars:
+      amount: 1
+      recipient: alice
+"#,
+        )?;
+        let overlay = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+call:
+  args:
+    vars:
+      amount: 2
+"#,
+        )?;
+
+        let merged = merge_template_overlay(base, overlay);
+        let call = yaml_get(&merged, "call");
+        assert_eq!(
+            yaml_get(call, "to").as_str(),
+            Some("0x0000000000000000000000000000000000000001")
+        );
+        let args = yaml_get(call, "args");
+        assert_eq!(yaml_get(args, "values").as_sequence().unwrap().len(), 1);
+        let vars = yaml_get(args, "vars");
+        assert_eq!(yaml_get(vars, "amount").as_u64(), Some(2));
+        assert_eq!(yaml_get(vars, "recipient").as_str(), Some("alice"));
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_binding_rejects_missing_projection() {
+        let bindings = HashMap::from([(
+            "claim".to_string(),
+            ResolvedBinding::Fixture(serde_yaml::from_str("input: 0x1234").unwrap()),
+        )]);
+
+        let err = binding_to_value("claim.from", &bindings)
+            .expect_err("missing fixture fields must fail during materialization");
+        assert!(err.to_string().contains("fixture binding 'claim' has no field 'from'"));
+    }
+
+    #[test]
+    fn single_step_sequences_do_not_wait_for_inclusion() {
+        let key = SchedulingKey::from([0x42; 20]);
+        assert!(sequence_inclusion_keys(key, 1).is_empty());
+        assert_eq!(sequence_inclusion_keys(key, 2), vec![key]);
+        assert_eq!(sequence_inclusion_keys(key, 3), vec![key]);
     }
 }
