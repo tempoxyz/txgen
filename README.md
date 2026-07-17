@@ -184,7 +184,6 @@ bench send-blocks \
   --jwt-secret /path/to/jwt.hex \
   --rpc http://localhost:8545 \
   --reorg 8 \
-  --reorg-gap 2 \
   --input blocks.ndjson
 ```
 
@@ -195,8 +194,8 @@ bench send-blocks \
 | `-i, --input <PATH>` | Input NDJSON file (default: stdin) |
 | `--wait-for-persistence <POLICY>` | Persistence wait policy: `always`, `never`, or `every:N` (default: `never`) |
 | `--wait-time <DURATION>` | Minimum interval between block submissions. Accepts `100ms`, `2s`, or bare milliseconds like `400` |
-| `--reorg [DEPTH]` | Build `DEPTH` synthetic side-fork blocks before returning to the canonical chain. If `DEPTH` is omitted, defaults to `8`. Requires raw RLP block input |
-| `--reorg-gap <BLOCKS>` | After resolving each synthetic side chain with `DEPTH` canonical blocks, add this many more canonical blocks before starting the next one. Defaults to `0`; requires `--reorg` |
+| `--reorg [DEPTH]` | Build synthetic side-fork blocks and alternate forkchoice updates to exercise reorg paths. If `DEPTH` is omitted, defaults to `8`. Requires raw RLP block input |
+| `--reorg-gap <BLOCKS>` | Add `BLOCKS` canonical blocks between resolved side chains (default: `0`; requires `--reorg`) |
 | `--rpc <URL>` | Regular HTTP RPC endpoint for `testing_buildBlockV1` when `--reorg` is enabled (default: `http://localhost:8545`) |
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
 | `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
@@ -205,7 +204,7 @@ bench send-blocks \
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
 | `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url` |
 
-For `send-blocks`, aggregate run rates use benchmark wall-clock duration. Per-block timestamps remain the original chain timestamps from the input. With `--reorg`, canonical block stats remain canonical-only, but the wall-clock duration includes synthetic fork block build/submission work. Each cycle submits `DEPTH` synthetic blocks, resolves them with the corresponding `DEPTH` canonical blocks, then submits the additional canonical blocks requested by `--reorg-gap`. The gap defaults to `0`, so synthetic side chains never overlap.
+For `send-blocks`, aggregate run rates use benchmark wall-clock duration. Per-block timestamps remain the original chain timestamps from the input. With `--reorg`, canonical block stats remain canonical-only, but the wall-clock duration includes synthetic fork block build/submission work.
 
 **Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API). Big-block inputs require a `reth-bb` compatible node. `--reorg` additionally requires `testing_buildBlockV1` on the regular HTTP RPC endpoint, for example from a node started with `--http --http.api eth,testing`. `--rpc-url` and `--local-rpc-url` are accepted as backwards-compatible aliases for `--rpc`.
 

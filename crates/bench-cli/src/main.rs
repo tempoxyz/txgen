@@ -183,7 +183,7 @@ pub struct SendBlocksArgs {
     #[arg(long = "metrics-forward", value_name = "URL")]
     pub metrics_forward: Option<String>,
 
-    /// Build a synthetic side fork, resetting it after DEPTH blocks.
+    /// Build a synthetic side fork and alternate forkchoice updates.
     #[arg(
         long,
         value_name = "DEPTH",
@@ -194,11 +194,8 @@ pub struct SendBlocksArgs {
     pub reorg: Option<usize>,
 
     /// Additional canonical blocks between resolved synthetic side chains.
-    ///
-    /// Defaults to zero. The canonical blocks that replace the synthetic side
-    /// chain are not included in this gap.
-    #[arg(long, value_name = "BLOCKS", requires = "reorg")]
-    pub reorg_gap: Option<usize>,
+    #[arg(long, value_name = "BLOCKS", default_value_t = 0, requires = "reorg")]
+    pub reorg_gap: usize,
 
     /// Regular HTTP RPC URL for testing_buildBlockV1.
     #[arg(
@@ -353,40 +350,13 @@ mod tests {
     }
 
     #[test]
-    fn test_send_blocks_reorg_gap() {
-        let parse_gap = |gap: Option<&str>| {
-            let mut args = vec![
-                "bench",
-                "send-blocks",
-                "--engine",
-                "http://localhost:8551",
-                "--jwt-secret",
-                "/tmp/jwt.hex",
-                "--reorg",
-                "3",
-            ];
-            if let Some(gap) = gap {
-                args.extend(["--reorg-gap", gap]);
-            }
-            let cli = Cli::try_parse_from(args).unwrap();
-            let Command::SendBlocks(args) = cli.command else {
-                panic!("expected send-blocks command");
-            };
-            args.reorg_gap.unwrap_or_default()
-        };
-
-        assert_eq!(parse_gap(None), 0);
-        assert_eq!(parse_gap(Some("0")), 0);
-        assert_eq!(parse_gap(Some("2")), 2);
+    fn test_send_blocks_reorg_gap_requires_reorg() {
         assert!(Cli::try_parse_from([
             "bench",
             "send-blocks",
-            "--engine",
-            "http://localhost:8551",
-            "--jwt-secret",
-            "/tmp/jwt.hex",
-            "--reorg-gap",
-            "0",
+            "--engine=http://localhost:8551",
+            "--jwt-secret=/tmp/jwt.hex",
+            "--reorg-gap=0",
         ])
         .is_err());
     }

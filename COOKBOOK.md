@@ -290,7 +290,6 @@ txgen-ethereum extract \
 
 Notes:
 - Reorg mode only supports raw RLP block input, not big-block input.
-- `--reorg-gap` requires `--reorg`, defaults to zero, and counts only canonical blocks beyond the `DEPTH` blocks needed to resolve the side chain.
 - The regular HTTP RPC must expose `testing_buildBlockV1` (for example, a node started with `--http --http.api eth,testing`).
 - Canonical block stats remain canonical-only; run wall-clock time includes synthetic fork work.
 

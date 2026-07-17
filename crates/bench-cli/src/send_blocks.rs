@@ -6,18 +6,20 @@
 //! (as `BlockRlp`) and `reth_forkchoiceUpdated`,
 //! collecting per-block timing and engine status from [`RethPayloadStatus`].
 
-mod reorg;
-
 use crate::{
     metrics_forwarder::{build_metrics_forwarder, finish_metrics_forwarder, push_samples},
     metrics_url::metrics_scraper_configs,
     send::parse_metadata,
     SendBlocksArgs,
 };
+use alloy_consensus::Header as ConsensusHeader;
 use alloy_network::Ethereum;
-use alloy_primitives::{Bytes, B256};
+use alloy_primitives::{Address, Bytes, B256};
 use alloy_provider::{ext::TestingApi, Provider, RootProvider};
-use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, JwtSecret};
+use alloy_rlp::{Decodable, Header};
+use alloy_rpc_types_engine::{
+    ExecutionData, ForkchoiceState, JwtSecret, PayloadAttributes, TestingBuildBlockRequestV1,
+};
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
     parse_reporters, start_scrapers, BigBlockData, BlockStats, ConsoleReporter, FinalReport,
@@ -25,7 +27,6 @@ use bench_core::{
     WaitForPersistence,
 };
 use eyre::{Context, Result};
-use reorg::{drive_reorg_state_machine, ReorgStateMachine};
 use std::{
     collections::BTreeMap,
     io::BufRead,
@@ -69,11 +70,51 @@ enum InputLine {
     BigBlock(Box<BigBlockData<ExecutionData>>),
 }
 
+struct ReorgState {
+    depth: usize,
+    gap: usize,
+    gap_remaining: usize,
+    pending: Vec<BlockLine>,
+}
+
+enum ReorgAction {
+    Pending,
+    Canonical(Vec<BlockLine>),
+    Batch(Vec<BlockLine>),
+}
+
+impl ReorgState {
+    const fn new(depth: usize, gap: usize) -> Self {
+        Self { depth, gap, gap_remaining: 0, pending: Vec::new() }
+    }
+
+    fn push(&mut self, block: BlockLine) -> ReorgAction {
+        if self.gap_remaining > 0 {
+            self.gap_remaining -= 1;
+            return ReorgAction::Canonical(vec![block]);
+        }
+
+        self.pending.push(block);
+        if self.pending.len() < self.depth {
+            return ReorgAction::Pending;
+        }
+
+        self.gap_remaining = self.gap;
+        ReorgAction::Batch(std::mem::take(&mut self.pending))
+    }
+
+    fn finish(&mut self) -> ReorgAction {
+        ReorgAction::Canonical(std::mem::take(&mut self.pending))
+    }
+}
+
 struct ProcessingState<'a> {
     collector: &'a mut MetricsCollector,
-    reorg_state: Option<&'a mut ReorgStateMachine>,
+    reorg_state: Option<&'a mut ReorgState>,
     persistence_policy: &'a WaitForPersistence,
 }
+
+const REORG_NON_BLOB_TX_DROP_INTERVAL: usize = 10;
 
 pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let jwt_secret_hex =
@@ -85,15 +126,13 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let scraper_configs =
         metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
     let persistence_policy = args.wait_for_persistence;
-    let reorg_gap = args.reorg_gap.unwrap_or_default();
-
     tracing::info!(
         engine = %args.engine,
         input = args.input.as_ref().map_or("<stdin>", |p| p.to_str().unwrap_or("?")),
         wait_for_persistence = ?persistence_policy,
         wait_time_ms = args.wait_time.map(|d| d.as_millis()),
         reorg_depth = args.reorg,
-        reorg_gap = args.reorg.map(|_| reorg_gap),
+        reorg_gap = args.reorg.map(|_| args.reorg_gap),
         rpc = %args.rpc,
         "Starting block submission"
     );
@@ -129,8 +168,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     };
 
     let mut collector = MetricsCollector::new(counters);
-    let mut reorg_state =
-        args.reorg.map(|depth| ReorgStateMachine::new(depth, reorg_gap)).transpose()?;
+    let mut reorg_state = args.reorg.map(|depth| ReorgState::new(depth, args.reorg_gap));
     let start = Instant::now();
 
     if let Some(ref path) = args.input {
@@ -189,7 +227,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     }
 
     if let Some(reorg_state) = reorg_state.as_mut() {
-        drive_reorg_state_machine(
+        process_reorg_action(
             &provider,
             &testing_provider,
             reorg_state,
@@ -198,7 +236,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             args.wait_time,
             start,
             &mut reporters,
-            true,
+            None,
         )
         .await?;
     }
@@ -294,8 +332,7 @@ async fn process_input_and_wait(
         let InputLine::RawBlock(block) = input else {
             eyre::bail!("--reorg is only supported for raw RLP block input");
         };
-        reorg_state.push(block);
-        return drive_reorg_state_machine(
+        return process_reorg_action(
             provider,
             testing_provider,
             reorg_state,
@@ -304,7 +341,7 @@ async fn process_input_and_wait(
             wait_time,
             start,
             reporters,
-            false,
+            Some(block),
         )
         .await;
     }
@@ -361,11 +398,7 @@ async fn process_block(
         (anchor, anchor)
     } else {
         let safe_hash = collector.prev_block_hash.unwrap_or(block.key);
-        if collector.finalized_hash.is_none() {
-            collector.finalized_hash = Some(safe_hash);
-        }
-        // SAFETY: finalized_hash is always Some after the check above.
-        (safe_hash, collector.finalized_hash.unwrap())
+        (safe_hash, *collector.finalized_hash.get_or_insert(safe_hash))
     };
 
     let forkchoice_state =
@@ -429,6 +462,355 @@ async fn process_block(
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_reorg_action(
+    provider: &(impl Provider + RethApi<Ethereum>),
+    testing_provider: &(impl Provider + TestingApi<Ethereum>),
+    state: &mut ReorgState,
+    collector: &mut MetricsCollector,
+    persistence_policy: &WaitForPersistence,
+    wait_time: Option<Duration>,
+    start: Instant,
+    reporters: &mut [Box<dyn Reporter>],
+    block: Option<BlockLine>,
+) -> Result<()> {
+    let action = match block {
+        Some(block) => state.push(block),
+        None => state.finish(),
+    };
+    let (blocks, forkchoice_anchor) = match action {
+        ReorgAction::Pending => return Ok(()),
+        ReorgAction::Canonical(blocks) => (blocks, None),
+        ReorgAction::Batch(blocks) => {
+            let first = blocks.first().expect("reorg batch must not be empty");
+            let branch_point_hash = extract_block_header_from_block_rlp(first.raw.as_ref())
+                .wrap_err_with(|| {
+                    format!("failed to extract parent hash from block {}", first.number)
+                })?
+                .parent_hash;
+
+            tracing::info!(
+                reorg_depth = state.depth,
+                reorg_gap = state.gap,
+                branch_point = %branch_point_hash,
+                "Starting reorg batch"
+            );
+
+            let mut parent_block_hash = branch_point_hash;
+            for (index, block) in blocks.iter().enumerate() {
+                let block_start = Instant::now();
+                let source_offset = u64::try_from(index).unwrap_or(u64::MAX);
+                let wait = persistence_policy
+                    .should_wait(collector.blocks_submitted().saturating_add(source_offset));
+                parent_block_hash = process_synthetic_block(
+                    provider,
+                    testing_provider,
+                    block,
+                    parent_block_hash,
+                    branch_point_hash,
+                    wait,
+                )
+                .await?;
+                tracing::info!(
+                    block = block.number,
+                    fork_length = index + 1,
+                    reorg_depth = state.depth,
+                    branch_point = %branch_point_hash,
+                    synthetic_head = %parent_block_hash,
+                    "Submitted synthetic fork block"
+                );
+                wait_for_next_block(block_start, wait_time).await;
+            }
+
+            (blocks, Some(branch_point_hash))
+        }
+    };
+
+    for block in &blocks {
+        let block_start = Instant::now();
+        process_block(provider, block, collector, forkchoice_anchor, persistence_policy).await?;
+        report_progress(collector, start, reporters)?;
+        wait_for_next_block(block_start, wait_time).await;
+    }
+
+    Ok(())
+}
+
+async fn process_synthetic_block(
+    provider: &(impl Provider + RethApi<Ethereum>),
+    testing_provider: &(impl Provider + TestingApi<Ethereum>),
+    block: &BlockLine,
+    parent_block_hash: B256,
+    branch_point_hash: B256,
+    wait: Option<bool>,
+) -> Result<B256> {
+    let transactions = extract_tx_bytes_from_block_rlp(block.raw.as_ref()).wrap_err_with(|| {
+        format!("failed to extract raw transaction bytes from block {}", block.number)
+    })?;
+    let parent_beacon_block_root = extract_block_header_from_block_rlp(block.raw.as_ref())
+        .wrap_err_with(|| {
+            format!("failed to extract parent beacon block root from block {}", block.number)
+        })?
+        .parent_beacon_block_root;
+    let payload_attributes = PayloadAttributes {
+        timestamp: block.timestamp,
+        prev_randao: B256::ZERO,
+        suggested_fee_recipient: Address::ZERO,
+        withdrawals: None,
+        parent_beacon_block_root,
+        slot_number: None,
+        target_gas_limit: None,
+    };
+    let parent_beacon_block_root = parent_beacon_block_root.unwrap_or_default();
+    let request = TestingBuildBlockRequestV1 {
+        parent_block_hash,
+        payload_attributes,
+        transactions,
+        extra_data: Some(Bytes::new()),
+    };
+
+    let envelope = testing_provider.build_block_v1(request).await.wrap_err_with(|| {
+        format!(
+            "testing_buildBlockV1 failed for block {}. Ensure the target exposes the hidden \
+             testing RPC, for example: reth node --http --http.api eth,testing ...",
+            block.number
+        )
+    })?;
+    let synthetic_block_hash = envelope.execution_payload.payload_inner.payload_inner.block_hash;
+    let (payload, sidecar) = envelope.into_payload_and_sidecar(parent_beacon_block_root);
+    let execution_data = ExecutionData::new(payload, sidecar);
+
+    let payload_status = provider
+        .reth_new_payload(RethNewPayloadInput::ExecutionData(Box::new(execution_data)), wait)
+        .await
+        .wrap_err_with(|| {
+            format!("reth_newPayload failed for synthetic fork block after block {}", block.number)
+        })?;
+
+    if !payload_status.status.is_valid() {
+        eyre::bail!(
+            "reth_newPayload returned non-VALID status for synthetic fork block after block {}: {:?}",
+            block.number,
+            payload_status.status,
+        );
+    }
+
+    let fcu_result = provider
+        .reth_forkchoice_updated(ForkchoiceState {
+            head_block_hash: synthetic_block_hash,
+            safe_block_hash: branch_point_hash,
+            finalized_block_hash: branch_point_hash,
+        })
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "reth_forkchoiceUpdated failed for synthetic fork block after block {}",
+                block.number
+            )
+        })?;
+
+    if !fcu_result.is_valid() {
+        eyre::bail!(
+            "reth_forkchoiceUpdated returned non-VALID status for synthetic fork block after block {}: {:?}",
+            block.number,
+            fcu_result.payload_status,
+        );
+    }
+
+    Ok(synthetic_block_hash)
+}
+
+fn extract_block_header_from_block_rlp(raw: &[u8]) -> Result<ConsensusHeader> {
+    let mut block_buf = raw;
+    let mut block_payload = Header::decode_bytes(&mut block_buf, true)
+        .wrap_err("failed to decode outer block RLP list")?;
+    if !block_buf.is_empty() {
+        eyre::bail!("block RLP has trailing bytes after outer list");
+    }
+
+    ConsensusHeader::decode(&mut block_payload).wrap_err("failed to decode block header")
+}
+
+fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<Vec<Bytes>> {
+    let mut block_buf = raw;
+    let mut block_payload = Header::decode_bytes(&mut block_buf, true)
+        .wrap_err("failed to decode outer block RLP list")?;
+    if !block_buf.is_empty() {
+        eyre::bail!("block RLP has trailing bytes after outer list");
+    }
+
+    skip_rlp_item(&mut block_payload).wrap_err("failed to skip block header")?;
+    let mut txs_payload = Header::decode_bytes(&mut block_payload, true)
+        .wrap_err("failed to decode transactions RLP list")?;
+
+    let mut transactions = Vec::new();
+    let mut skipped_blob_txs = 0usize;
+    let mut non_blob_txs = 0usize;
+    let mut dropped_non_blob_txs = 0usize;
+    while !txs_payload.is_empty() {
+        let item_start = txs_payload;
+        let header =
+            Header::decode(&mut txs_payload).wrap_err("failed to decode transaction RLP item")?;
+        let header_len = item_start.len() - txs_payload.len();
+        let payload = &txs_payload[..header.payload_length];
+        let encoded = &item_start[..header_len + header.payload_length];
+
+        if header.list {
+            non_blob_txs += 1;
+            if should_keep_reorg_transaction(non_blob_txs) {
+                transactions.push(Bytes::copy_from_slice(encoded));
+            } else {
+                dropped_non_blob_txs += 1;
+            }
+        } else if payload.first() == Some(&0x03) {
+            skipped_blob_txs += 1;
+        } else {
+            non_blob_txs += 1;
+            if should_keep_reorg_transaction(non_blob_txs) {
+                transactions.push(Bytes::copy_from_slice(payload));
+            } else {
+                dropped_non_blob_txs += 1;
+            }
+        }
+
+        txs_payload = &txs_payload[header.payload_length..];
+    }
+
+    if skipped_blob_txs > 0 {
+        tracing::warn!(skipped_blob_txs, "Skipped blob transactions while building synthetic fork");
+    }
+    if dropped_non_blob_txs > 0 {
+        tracing::info!(
+            kept_non_blob_txs = transactions.len(),
+            dropped_non_blob_txs,
+            "Kept 90% of non-blob transactions while building synthetic fork"
+        );
+    }
+
+    Ok(transactions)
+}
+
+fn should_keep_reorg_transaction(non_blob_tx_index: usize) -> bool {
+    !non_blob_tx_index.is_multiple_of(REORG_NON_BLOB_TX_DROP_INTERVAL)
+}
+
+fn skip_rlp_item(buf: &mut &[u8]) -> Result<()> {
+    let header = Header::decode(buf).wrap_err("failed to decode RLP item header")?;
+    *buf = &buf[header.payload_length..];
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_rlp::Encodable;
+
+    fn rlp_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        payload.encode(&mut out);
+        out
+    }
+
+    fn rlp_list_from_encoded(items: &[Vec<u8>]) -> Vec<u8> {
+        let payload_length = items.iter().map(Vec::len).sum();
+        let mut out = Vec::new();
+        Header { list: true, payload_length }.encode(&mut out);
+        for item in items {
+            out.extend_from_slice(item);
+        }
+        out
+    }
+
+    fn legacy_tx(id: u8) -> Vec<u8> {
+        rlp_list_from_encoded(&[rlp_bytes(&[id])])
+    }
+
+    fn typed_tx(tx_type: u8, id: u8) -> Vec<u8> {
+        rlp_bytes(&[tx_type, id])
+    }
+
+    fn block_with_transactions(transactions: &[Vec<u8>]) -> Vec<u8> {
+        let header = rlp_list_from_encoded(&[]);
+        let transactions = rlp_list_from_encoded(transactions);
+        let ommers = rlp_list_from_encoded(&[]);
+        rlp_list_from_encoded(&[header, transactions, ommers])
+    }
+
+    fn scheduler_block(number: u64) -> BlockLine {
+        BlockLine {
+            raw: Bytes::new(),
+            bal: None,
+            key: B256::ZERO,
+            number,
+            timestamp: 0,
+            gas_used: 0,
+            gas_limit: 0,
+            tx_count: 0,
+        }
+    }
+
+    fn record_action(action: ReorgAction, observed: &mut String) {
+        match action {
+            ReorgAction::Pending => {}
+            ReorgAction::Canonical(blocks) => observed.push_str(&"C".repeat(blocks.len())),
+            ReorgAction::Batch(blocks) => {
+                observed.push_str(&"S".repeat(blocks.len()));
+                observed.push_str(&"C".repeat(blocks.len()));
+            }
+        }
+    }
+
+    fn schedule(depth: usize, gap: usize, count: u64) -> String {
+        let mut state = ReorgState::new(depth, gap);
+        let mut observed = String::new();
+        for number in 1..=count {
+            record_action(state.push(scheduler_block(number)), &mut observed);
+        }
+        record_action(state.finish(), &mut observed);
+        observed
+    }
+
+    #[test]
+    fn schedules_non_overlapping_reorgs_with_canonical_gaps_and_eof_tails() {
+        assert_eq!(schedule(2, 0, 4), "SSCCSSCC");
+        assert_eq!(schedule(2, 1, 7), "SSCCCSSCCCC");
+    }
+
+    #[test]
+    fn extracts_nine_of_ten_non_blob_transactions_for_reorg_payloads() {
+        let source_transactions = (0..10).map(legacy_tx).collect::<Vec<_>>();
+        let block = block_with_transactions(&source_transactions);
+
+        let extracted = extract_tx_bytes_from_block_rlp(&block)
+            .expect("valid block RLP should extract transactions");
+
+        let expected = source_transactions
+            .into_iter()
+            .take(REORG_NON_BLOB_TX_DROP_INTERVAL - 1)
+            .map(Bytes::from)
+            .collect::<Vec<_>>();
+        assert_eq!(extracted, expected);
+    }
+
+    #[test]
+    fn blob_transactions_do_not_count_toward_reorg_payload_keep_ratio() {
+        let mut source_transactions = (0..9).map(legacy_tx).collect::<Vec<_>>();
+        source_transactions.push(typed_tx(0x03, 0));
+        source_transactions.push(legacy_tx(9));
+        let block = block_with_transactions(&source_transactions);
+
+        let extracted = extract_tx_bytes_from_block_rlp(&block)
+            .expect("valid block RLP should extract transactions");
+
+        let expected = source_transactions
+            .into_iter()
+            .take(REORG_NON_BLOB_TX_DROP_INTERVAL - 1)
+            .map(Bytes::from)
+            .collect::<Vec<_>>();
+        assert_eq!(extracted, expected);
+    }
 }
 
 async fn process_big_block(
