@@ -93,29 +93,29 @@ struct CanonicalStep<'a> {
 
 /// Pure scheduler for reorg batches.
 ///
-/// The machine decides when a side-chain batch can start, tracks how many
-/// canonical blocks must follow it, and retains overlapping source blocks when
-/// the canonical interval is shorter than the side chain. An EOF tail shorter
-/// than `depth` is emitted canonically instead of creating a partial side chain.
+/// The machine decides when a side-chain batch can start and tracks how many
+/// canonical blocks must follow it. An EOF tail shorter than `depth` is emitted
+/// canonically instead of creating a partial side chain. A final gap may end
+/// early at EOF because there is no subsequent side chain to space out.
 pub(super) struct ReorgStateMachine {
     depth: usize,
-    every: usize,
+    gap: usize,
     pending: VecDeque<BlockLine>,
     phase: ReorgPhase,
     canonical_head: Option<B256>,
 }
 
 impl ReorgStateMachine {
-    pub(super) fn new(depth: usize, every: usize) -> Self {
+    pub(super) fn new(depth: usize, gap: usize) -> Result<Self> {
         assert!(depth > 0, "reorg depth must be greater than zero");
-        assert!(every > 0, "reorg interval must be greater than zero");
-        Self {
+        eyre::ensure!(depth.checked_add(gap).is_some(), "reorg depth plus gap overflows usize");
+        Ok(Self {
             depth,
-            every,
+            gap,
             pending: VecDeque::new(),
             phase: ReorgPhase::AwaitingSideChain,
             canonical_head: None,
-        }
+        })
     }
 
     pub(super) fn push(&mut self, block: BlockLine) {
@@ -150,12 +150,14 @@ impl ReorgStateMachine {
 
     fn synthetic_succeeded(&mut self, branch_point_hash: B256) {
         self.canonical_head.get_or_insert(branch_point_hash);
-        self.phase = ReorgPhase::Canonical { branch_point_hash, remaining: self.every };
+        self.phase = ReorgPhase::Canonical { branch_point_hash, remaining: self.depth + self.gap };
     }
 
     fn next_canonical(&self, flush: bool) -> Option<CanonicalStep<'_>> {
         let forkchoice_anchor = match self.phase {
-            ReorgPhase::Canonical { branch_point_hash, .. } => Some(branch_point_hash),
+            ReorgPhase::Canonical { branch_point_hash, remaining } => {
+                (remaining > self.gap).then_some(branch_point_hash)
+            }
             ReorgPhase::AwaitingSideChain if flush => None,
             ReorgPhase::AwaitingSideChain => return None,
         };
@@ -191,9 +193,9 @@ pub(super) async fn drive_reorg_state_machine(
         if let Some(batch) = reorg_state.next_batch()? {
             tracing::info!(
                 reorg_depth = reorg_state.depth,
-                reorg_every = reorg_state.every,
+                reorg_gap = reorg_state.gap,
                 side_blocks = batch.synthetic_blocks.len(),
-                canonical_blocks = reorg_state.every,
+                canonical_blocks = reorg_state.depth + reorg_state.gap,
                 branch_point = %batch.branch_point_hash,
                 "Starting reorg batch"
             );
@@ -224,8 +226,8 @@ pub(super) async fn drive_reorg_state_machine(
             return Ok(());
         };
         let block_start = Instant::now();
-        // Keep both anchors at the common ancestor while switching away from
-        // the completed synthetic fork.
+        // Replay blocks keep both anchors at the common ancestor; gap blocks
+        // resume normal canonical anchors.
         process_block(
             provider,
             canonical.block,
@@ -524,7 +526,7 @@ mod tests {
     fn chains_side_blocks_and_anchors_each_batch() {
         let first_branch = test_hash(50);
         let second_branch = test_hash(2);
-        let mut state = ReorgStateMachine::new(2, 2);
+        let mut state = ReorgStateMachine::new(2, 0).unwrap();
         push_chain(&mut state, 1..=4, first_branch);
 
         assert_eq!(
@@ -544,51 +546,52 @@ mod tests {
     }
 
     #[test]
-    fn streams_long_canonical_intervals_and_overlaps_short_ones() {
-        let mut short = ReorgStateMachine::new(3, 2);
-        push_chain(&mut short, 1..=5, test_hash(50));
+    fn streams_canonical_gaps_without_overlapping_side_chains() {
+        let mut state = ReorgStateMachine::new(2, 1).unwrap();
+        push_chain(&mut state, 1..=2, test_hash(50));
         assert_eq!(
-            shape(&run_scheduler(&mut short, false)),
-            vec![
-                (1, true),
-                (2, true),
-                (3, true),
-                (1, false),
-                (2, false),
-                (3, true),
-                (4, true),
-                (5, true),
-                (3, false),
-                (4, false),
-            ]
-        );
-        assert_eq!(short.pending.front().map(|block| block.number), Some(5));
-
-        let mut long = ReorgStateMachine::new(2, 3);
-        push_chain(&mut long, 1..=2, test_hash(50));
-        assert_eq!(
-            shape(&run_scheduler(&mut long, false)),
+            shape(&run_scheduler(&mut state, false)),
             vec![(1, true), (2, true), (1, false), (2, false)]
         );
         assert_eq!(
-            long.phase,
+            state.phase,
             ReorgPhase::Canonical { branch_point_hash: test_hash(50), remaining: 1 }
         );
 
-        push_chain(&mut long, 3..=3, test_hash(2));
-        assert_eq!(shape(&run_scheduler(&mut long, false)), vec![(3, false)]);
-        assert_eq!(long.phase, ReorgPhase::AwaitingSideChain);
+        push_chain(&mut state, 3..=6, test_hash(2));
+        assert_eq!(
+            run_scheduler(&mut state, false),
+            vec![
+                ObservedStep::Canonical { number: 3, branch_point: None },
+                synthetic(4, test_hash(3), test_hash(3)),
+                synthetic(5, synthetic_hash(4), test_hash(3)),
+                canonical(4, test_hash(3)),
+                canonical(5, test_hash(3)),
+                ObservedStep::Canonical { number: 6, branch_point: None },
+            ]
+        );
+        assert_eq!(state.phase, ReorgPhase::AwaitingSideChain);
     }
 
     #[test]
-    fn flushes_a_short_tail_without_building_a_partial_side_chain() {
-        let mut state = ReorgStateMachine::new(3, 1);
+    fn handles_eof_without_building_a_partial_side_chain() {
+        let mut state = ReorgStateMachine::new(3, 0).unwrap();
         push_chain(&mut state, 1..=2, test_hash(50));
 
         assert!(run_scheduler(&mut state, false).is_empty());
         assert!(state.next_canonical(true).unwrap().forkchoice_anchor.is_none());
         assert_eq!(shape(&run_scheduler(&mut state, true)), vec![(1, false), (2, false)]);
         assert!(state.pending.is_empty());
+
+        let mut state = ReorgStateMachine::new(3, 2).unwrap();
+        push_chain(&mut state, 1..=4, test_hash(50));
+        let steps = run_scheduler(&mut state, true);
+        assert_eq!(steps.last(), Some(&ObservedStep::Canonical { number: 4, branch_point: None }));
+    }
+
+    #[test]
+    fn rejects_an_overflowing_canonical_interval() {
+        assert!(ReorgStateMachine::new(1, usize::MAX).is_err());
     }
 
     #[test]

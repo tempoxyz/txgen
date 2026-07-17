@@ -272,7 +272,7 @@ bench send-blocks \
 
 ## Exercise reorg paths
 
-`bench send-blocks --reorg DEPTH` first builds `DEPTH` synthetic side-fork blocks with `testing_buildBlockV1`, then submits canonical replay blocks. Use `--reorg-every N` to submit `N` canonical blocks before starting the next synthetic side chain. When `--reorg-every` is omitted, it defaults to `DEPTH`.
+`bench send-blocks --reorg DEPTH` first builds `DEPTH` synthetic side-fork blocks with `testing_buildBlockV1`, then resolves the side chain with the corresponding `DEPTH` canonical blocks. Use `--reorg-gap N` to submit `N` additional canonical blocks before starting the next synthetic side chain. The gap defaults to `0`, and synthetic side chains never overlap.
 
 ```bash
 txgen-ethereum extract \
@@ -284,13 +284,13 @@ txgen-ethereum extract \
   --jwt-secret /path/to/jwt.hex \
   --rpc http://localhost:8545 \
   --reorg 8 \
-  --reorg-every 2 \
+  --reorg-gap 2 \
   --report json:reorg-report.json
 ```
 
 Notes:
 - Reorg mode only supports raw RLP block input, not big-block input.
-- `--reorg-every` requires `--reorg`, defaults to the reorg depth, and must be greater than zero.
+- `--reorg-gap` requires `--reorg`, defaults to zero, and counts only canonical blocks beyond the `DEPTH` blocks needed to resolve the side chain.
 - The regular HTTP RPC must expose `testing_buildBlockV1` (for example, a node started with `--http --http.api eth,testing`).
 - Canonical block stats remain canonical-only; run wall-clock time includes synthetic fork work.
 

@@ -85,7 +85,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let scraper_configs =
         metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
     let persistence_policy = args.wait_for_persistence;
-    let reorg_every = args.reorg.map(|depth| args.reorg_every.unwrap_or(depth));
+    let reorg_gap = args.reorg_gap.unwrap_or_default();
 
     tracing::info!(
         engine = %args.engine,
@@ -93,7 +93,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         wait_for_persistence = ?persistence_policy,
         wait_time_ms = args.wait_time.map(|d| d.as_millis()),
         reorg_depth = args.reorg,
-        reorg_every,
+        reorg_gap = args.reorg.map(|_| reorg_gap),
         rpc = %args.rpc,
         "Starting block submission"
     );
@@ -130,7 +130,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
 
     let mut collector = MetricsCollector::new(counters);
     let mut reorg_state =
-        args.reorg.map(|depth| ReorgStateMachine::new(depth, reorg_every.unwrap_or(depth)));
+        args.reorg.map(|depth| ReorgStateMachine::new(depth, reorg_gap)).transpose()?;
     let start = Instant::now();
 
     if let Some(ref path) = args.input {
@@ -362,7 +362,7 @@ async fn process_block(
     } else {
         let safe_hash = collector.prev_block_hash.unwrap_or(block.key);
         if collector.finalized_hash.is_none() {
-            collector.finalized_hash = Some(block.key);
+            collector.finalized_hash = Some(safe_hash);
         }
         // SAFETY: finalized_hash is always Some after the check above.
         (safe_hash, collector.finalized_hash.unwrap())
