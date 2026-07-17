@@ -272,7 +272,7 @@ bench send-blocks \
 
 ## Exercise reorg paths
 
-`bench send-blocks --reorg` submits canonical replay blocks, then builds synthetic side-fork blocks with `testing_buildBlockV1`, alternates forkchoice to the side fork, and switches back to canonical after the requested depth.
+`bench send-blocks --reorg DEPTH` first builds `DEPTH` synthetic side-fork blocks with `testing_buildBlockV1`, then resolves the side chain with the corresponding `DEPTH` canonical blocks. Use `--reorg-gap N` to submit `N` additional canonical blocks before starting the next synthetic side chain. The gap defaults to `0`, and synthetic side chains never overlap.
 
 ```bash
 txgen-ethereum extract \
@@ -284,6 +284,7 @@ txgen-ethereum extract \
   --jwt-secret /path/to/jwt.hex \
   --rpc http://localhost:8545 \
   --reorg 8 \
+  --reorg-gap 2 \
   --report json:reorg-report.json
 ```
 

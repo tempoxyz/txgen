@@ -193,6 +193,10 @@ pub struct SendBlocksArgs {
     )]
     pub reorg: Option<usize>,
 
+    /// Additional canonical blocks between resolved synthetic side chains.
+    #[arg(long, value_name = "BLOCKS", default_value_t = 0, requires = "reorg")]
+    pub reorg_gap: usize,
+
     /// Regular HTTP RPC URL for testing_buildBlockV1.
     #[arg(
         long = "rpc",
@@ -343,6 +347,18 @@ mod tests {
         assert_eq!(parse_reorg_depth("8"), Ok(8));
         assert!(parse_reorg_depth("0").is_err());
         assert!(parse_reorg_depth("abc").is_err());
+    }
+
+    #[test]
+    fn test_send_blocks_reorg_gap_requires_reorg() {
+        assert!(Cli::try_parse_from([
+            "bench",
+            "send-blocks",
+            "--engine=http://localhost:8551",
+            "--jwt-secret=/tmp/jwt.hex",
+            "--reorg-gap=0",
+        ])
+        .is_err());
     }
 
     #[test]
