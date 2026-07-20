@@ -36,6 +36,8 @@ pub struct ScenarioReportConfig {
     pub default_step_timeout_ms: u64,
     pub transaction_rate_per_chain: u64,
     pub maximum_rpc_in_flight_per_chain: usize,
+    pub commands_enabled: bool,
+    pub maximum_commands_in_flight: usize,
     pub seed: u64,
     pub failure_policy: String,
 }
@@ -450,6 +452,8 @@ mod tests {
                 default_step_timeout_ms: 1_000,
                 transaction_rate_per_chain: 0,
                 maximum_rpc_in_flight_per_chain: 2,
+                commands_enabled: false,
+                maximum_commands_in_flight: 4,
                 seed: 1,
                 failure_policy: "continue".into(),
             },

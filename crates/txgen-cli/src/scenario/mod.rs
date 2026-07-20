@@ -10,6 +10,7 @@ use std::{io::Write, path::PathBuf, time::Duration};
 
 use crate::NetworkAdapter;
 
+mod command;
 mod engine;
 mod error;
 mod report;
@@ -84,6 +85,14 @@ pub struct ScenarioRunArgs {
     #[arg(long, default_value_t = 100)]
     pub max_rpc_in_flight: usize,
 
+    /// Permit trusted scenario files to execute local commands.
+    #[arg(long)]
+    pub allow_commands: bool,
+
+    /// Maximum local commands running at once.
+    #[arg(long, default_value_t = 4)]
+    pub max_command_in_flight: usize,
+
     /// Write the JSON report to this path instead of stdout.
     #[arg(long)]
     pub report: Option<PathBuf>,
@@ -145,6 +154,8 @@ where
             failure_policy: args.failure_policy.into(),
             transaction_rate: args.tx_rate,
             max_rpc_in_flight: args.max_rpc_in_flight,
+            allow_commands: args.allow_commands,
+            max_command_in_flight: args.max_command_in_flight,
             sample_instances: args.sample_instances,
         },
     )

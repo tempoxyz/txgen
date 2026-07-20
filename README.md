@@ -96,6 +96,8 @@ txgen-tempo scenario run \
 | `--failure-policy <POLICY>` | `continue` (default) or `fail-fast` |
 | `--tx-rate <TPS>` | Separate per-chain transaction-submission limit across scenario instances (`0` = unlimited) |
 | `--max-rpc-in-flight <N>` | Upper bound on simultaneous transaction-submission RPC calls per chain (default: `100`) |
+| `--allow-commands` | Permit trusted scenario files to execute local programs (disabled by default) |
+| `--max-command-in-flight <N>` | Upper bound on local command processes across all instances (default: `4`) |
 | `--report <PATH>` | JSON report path; the report is written to stdout when omitted |
 | `--sample-instances <N>` | Include up to `N` sanitized instance lifecycle records in the report (default: `0`) |
 
@@ -487,7 +489,7 @@ bench send -i txs.ndjson \
 
 Scenarios describe complete journeys across asynchronous RPC boundaries. Each named chain points to an ordinary txgen workload spec; `submit` selects a template from that workload and applies the same deep-merge behavior used by workload sequences. Existing workload specs, templates, `generate` commands, and NDJSON formats remain valid.
 
-Scenario files use `version: 1`. Environment references such as `${ORIGIN_RPC_URL}` are expanded before parsing. Relative `workload` and request-auth map paths are resolved from the directory containing the scenario file. Paths inside a workload, including ABI artifacts, remain relative to the workload file.
+Scenario files use `version: 1`. Environment references such as `${ORIGIN_RPC_URL}` are expanded before parsing. Relative `workload`, request-auth map, command working-directory, and path-like command program paths are resolved from the directory containing the scenario file. Paths inside a workload, including ABI artifacts, remain relative to the workload file. The `chains` map may be omitted when every step is a command.
 
 Each binary supplies one network adapter for the whole run: every chain in a `txgen-tempo` scenario must use `network: tempo`, and every chain in a `txgen-ethereum` scenario must use `network: ethereum`. The endpoints may still represent independent chains with different chain IDs and workload files. Named chains must use distinct normalized submission RPC URLs so they cannot maintain conflicting nonce state for one endpoint.
 
@@ -623,7 +625,33 @@ The selected header is attached only to `eth_sendRawTransaction` and sender-scop
 
 ### Steps
 
-Every step selects one named chain. `save` and `timeout` are sibling keys of the step action, as shown above.
+Chain operations select one named chain. A `command` step is chain-independent. `save` and `timeout` are sibling keys of the step action, as shown above.
+
+#### `command`
+
+Runs one local program per scenario instance and saves exactly one JSON value from stdout. Arguments and explicit environment values accept the same runtime expressions as other steps, but each must resolve to a scalar. Programs receive a cleared environment containing only a minimal `PATH` and the configured `env` entries; txgen never implicitly invokes a shell.
+
+```yaml
+- command:
+    program: /usr/local/bin/zone-encrypt-deposit
+    args:
+      - --recipient
+      - { var: user.address }
+    stdout: json
+  save: encrypted_deposit
+  timeout: 10s
+
+- submit:
+    chain: zone
+    template: deposit
+    with:
+      from: { var: user.ref }
+      input: { var: encrypted_deposit.calldata }
+```
+
+Command stdout and stderr are each limited to 1 MiB and are never copied into reports. A nonzero exit, malformed JSON, floating-point JSON number, oversized output, or timeout fails the instance. Emit large EVM integers as JSON strings so they do not lose precision. On timeout, txgen kills and reaps the command's process tree before releasing the instance's account leases.
+
+Commands are disabled unless `--allow-commands` is supplied (or `ScenarioExecutionConfig::allow_commands` is set programmatically). The runner rejects a command-bearing scenario before chain initialization when permission is absent. Treat an enabled scenario file as executable code: command processes can use host filesystem and network access. The child does not inherit txgen's environment, mnemonic, authorization map, or request headers; pass only intentionally selected, non-secret values through `env` or `args`.
 
 #### `checkpoint`
 
@@ -688,6 +716,7 @@ A log wait must provide `from_block` or `transaction_hash`. Optional `address`, 
 
 | Step | Saved fields |
 |------|--------------|
+| `command` | The complete JSON value written to stdout; nested object fields and array indices are addressable by dotted paths |
 | `checkpoint` | `chain`, `block_number`, optional `block_hash`, `captured_at` |
 | `submit` | `chain`, `template`/`id`, `sender`, `tx_hash`, `submitted_at`, `acceptance_latency`, optional `receipt` |
 | `submit.receipt` | `chain`, `transaction_hash`, `block_hash`, `block_number`, `status`, `gas_used`, `observed_at` |
@@ -740,11 +769,11 @@ correlation:
       - { var: delivered.args.messageId }
 ```
 
-`abi_encode_packed` and `keccak256_packed` also accept an inferred list, for example `keccak256_packed: [{ var: user.address }, { var: publish.tx_hash }]`. Prefer the typed form when integer widths or another Solidity type distinction matters. Transformations are deterministic; arbitrary scripting is not supported.
+`abi_encode_packed` and `keccak256_packed` also accept an inferred list, for example `keccak256_packed: [{ var: user.address }, { var: publish.tx_hash }]`. Prefer the typed form when integer widths or another Solidity type distinction matters. These in-process transformations are deterministic; use an explicitly enabled `command` step when a workflow needs an external helper.
 
 ### Rate, concurrency, leases, and failures
 
-`--starts-per-second` controls journeys: a value of `5` starts at most five new scenario instances per second, regardless of how many transactions each instance submits. `--max-in-flight` limits whole instances. These controls are independent from `--tx-rate` and `--max-rpc-in-flight`, which limit individual transaction submissions on each chain across all active instances.
+`--starts-per-second` controls journeys: a value of `5` starts at most five new scenario instances per second, regardless of how many transactions each instance submits. `--max-in-flight` limits whole instances. These controls are independent from `--tx-rate` and `--max-rpc-in-flight`, which limit individual transaction submissions on each chain across all active instances, and `--max-command-in-flight`, which bounds local command processes across the run.
 
 An account binding with `select: lease` holds one pool account for the entire instance and returns it on success, failure, timeout, or cancellation. Two active instances do not receive the same leased account. `select: random` and `select: { index: N }` retain their non-exclusive workload-style behavior.
 

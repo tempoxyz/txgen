@@ -97,6 +97,57 @@ impl RuntimeContext {
 }
 
 impl RuntimeValue {
+    /// Convert a JSON value to a typed runtime value.
+    ///
+    /// JSON floating-point numbers are rejected so command output cannot silently
+    /// lose precision. Integers outside JSON's native signed/unsigned 64-bit range
+    /// should be emitted as strings.
+    pub fn from_json(value: &serde_json::Value) -> Result<Self> {
+        match value {
+            serde_json::Value::Null => Ok(Self::Null),
+            serde_json::Value::Bool(value) => Ok(Self::Bool(*value)),
+            serde_json::Value::Number(value) => {
+                if let Some(value) = value.as_u64() {
+                    return Ok(Self::Uint(U256::from(value)));
+                }
+                if let Some(value) = value.as_i64() {
+                    return Ok(Self::Int(I256::try_from(value)?));
+                }
+                bail!("command JSON numbers must be integers");
+            }
+            serde_json::Value::String(value) => Ok(Self::String(value.clone())),
+            serde_json::Value::Array(values) => {
+                values.iter().map(Self::from_json).collect::<Result<Vec<_>>>().map(Self::Array)
+            }
+            serde_json::Value::Object(values) => {
+                let values = values
+                    .iter()
+                    .map(|(key, value)| Ok((key.clone(), Self::from_json(value)?)))
+                    .collect::<Result<BTreeMap<_, _>>>()?;
+                Ok(Self::Object(values))
+            }
+        }
+    }
+
+    /// Render a scalar as one process argument or environment value.
+    ///
+    /// Composite values and null are rejected rather than relying on ambiguous
+    /// serialization or an implicit empty-string convention.
+    pub fn to_process_arg(&self) -> Result<String> {
+        match self {
+            Self::Null => bail!("command values must not be null"),
+            Self::Bool(value) => Ok(value.to_string()),
+            Self::Int(value) => Ok(value.to_string()),
+            Self::Uint(value) => Ok(value.to_string()),
+            Self::Address(value) => Ok(value.to_string()),
+            Self::Bytes(value) => Ok(value.to_string()),
+            Self::Bytes32(value) => Ok(value.to_string()),
+            Self::String(value) => Ok(value.clone()),
+            Self::Array(_) => bail!("command values must be scalars, not arrays"),
+            Self::Object(_) => bail!("command values must be scalars, not objects"),
+        }
+    }
+
     /// Convert a plain YAML value to a typed runtime value.
     ///
     /// Strings intentionally remain strings; address and byte coercion requires an
@@ -609,6 +660,57 @@ mod tests {
         assert_eq!(extended.get("saved").unwrap(), &RuntimeValue::Bool(true));
         assert!(extended.with_root("saved", RuntimeValue::Bool(false)).is_err());
         assert!(extended.with_root("bad.root", RuntimeValue::Null).is_err());
+    }
+
+    #[test]
+    fn converts_integer_json_recursively() {
+        let json = serde_json::json!({
+            "enabled": true,
+            "count": 7,
+            "maximum": u64::MAX,
+            "delta": -2,
+            "items": [null, "0x1234"]
+        });
+        assert_eq!(
+            RuntimeValue::from_json(&json).unwrap(),
+            object([
+                ("count", RuntimeValue::Uint(U256::from(7))),
+                ("delta", RuntimeValue::Int(I256::try_from(-2_i64).unwrap())),
+                ("enabled", RuntimeValue::Bool(true)),
+                (
+                    "items",
+                    RuntimeValue::Array(vec![
+                        RuntimeValue::Null,
+                        RuntimeValue::String("0x1234".to_string()),
+                    ]),
+                ),
+                ("maximum", RuntimeValue::Uint(U256::from(u64::MAX))),
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_floating_point_json() {
+        let error =
+            RuntimeValue::from_json(&serde_json::json!({ "amount": 1.5 })).unwrap_err().to_string();
+        assert!(error.contains("must be integers"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn renders_only_command_scalars() {
+        assert_eq!(RuntimeValue::Bool(true).to_process_arg().unwrap(), "true");
+        assert_eq!(RuntimeValue::Uint(U256::from(42)).to_process_arg().unwrap(), "42");
+        assert_eq!(
+            RuntimeValue::Address(Address::repeat_byte(0x11)).to_process_arg().unwrap(),
+            Address::repeat_byte(0x11).to_string()
+        );
+        assert_eq!(
+            RuntimeValue::Bytes(Bytes::from_static(&[0xde, 0xad])).to_process_arg().unwrap(),
+            "0xdead"
+        );
+        assert!(RuntimeValue::Null.to_process_arg().is_err());
+        assert!(RuntimeValue::Array(vec![]).to_process_arg().is_err());
+        assert!(object([]).to_process_arg().is_err());
     }
 
     #[tokio::test]

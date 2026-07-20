@@ -95,6 +95,8 @@ async fn routes_sender_authenticated_requests_separately_from_queries() {
                 failure_policy: FailurePolicy::Continue,
                 transaction_rate: 0,
                 max_rpc_in_flight: 2,
+                allow_commands: false,
+                max_command_in_flight: 4,
                 sample_instances: 1,
             },
         ),

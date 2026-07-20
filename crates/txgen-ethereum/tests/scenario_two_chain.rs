@@ -138,6 +138,8 @@ async fn executes_two_chain_roundtrip_with_backfilled_events() {
         failure_policy: FailurePolicy::Continue,
         transaction_rate: 0,
         max_rpc_in_flight: 4,
+        allow_commands: false,
+        max_command_in_flight: 4,
         sample_instances: 1,
     };
 
@@ -198,6 +200,8 @@ async fn execute_seeded_roundtrip(seed: u64) -> (Vec<Bytes>, Vec<Bytes>) {
             failure_policy: FailurePolicy::Continue,
             transaction_rate: 0,
             max_rpc_in_flight: 4,
+            allow_commands: false,
+            max_command_in_flight: 4,
             sample_instances: 0,
         },
     )
@@ -261,6 +265,8 @@ scenario:
         failure_policy: FailurePolicy::Continue,
         transaction_rate: 0,
         max_rpc_in_flight: 2,
+        allow_commands: false,
+        max_command_in_flight: 4,
         sample_instances: 2,
     };
     let report = tokio::time::timeout(
@@ -349,6 +355,8 @@ scenario:
         failure_policy: FailurePolicy::Continue,
         transaction_rate: 0,
         max_rpc_in_flight: 2,
+        allow_commands: false,
+        max_command_in_flight: 4,
         sample_instances: 1,
     };
     let reverted = execute_scenario::<EthereumAdapter>(
@@ -417,6 +425,8 @@ scenario:
             failure_policy: FailurePolicy::Continue,
             transaction_rate: 0,
             max_rpc_in_flight: 2,
+            allow_commands: false,
+            max_command_in_flight: 4,
             sample_instances: 0,
         },
     )

@@ -1,4 +1,5 @@
 use super::{
+    command,
     error::StepError,
     report::{
         unix_ms, ChainReportConfig, InstanceFailure, InstanceOutcome, ScenarioAccumulator,
@@ -92,6 +93,10 @@ pub struct ScenarioExecutionConfig {
     pub transaction_rate: u64,
     /// Maximum in-flight RPC submissions per chain.
     pub max_rpc_in_flight: usize,
+    /// Whether scenarios may execute local commands.
+    pub allow_commands: bool,
+    /// Maximum local commands running concurrently across all instances.
+    pub max_command_in_flight: usize,
     /// Number of individual lifecycle records included in the report.
     pub sample_instances: usize,
 }
@@ -108,6 +113,8 @@ impl Default for ScenarioExecutionConfig {
             failure_policy: FailurePolicy::Continue,
             transaction_rate: 0,
             max_rpc_in_flight: 100,
+            allow_commands: false,
+            max_command_in_flight: 4,
             sample_instances: 0,
         }
     }
@@ -136,6 +143,9 @@ impl ScenarioExecutionConfig {
         if self.max_rpc_in_flight == 0 {
             bail!("maximum in-flight RPC submissions must be greater than zero");
         }
+        if self.max_command_in_flight == 0 {
+            bail!("maximum in-flight commands must be greater than zero");
+        }
         Ok(())
     }
 }
@@ -153,6 +163,18 @@ where
 {
     configuration.validate()?;
     spec.validate()?;
+    if spec.has_commands() && !configuration.allow_commands {
+        bail!(
+            "scenario contains command steps; pass --allow-commands or set ScenarioExecutionConfig::allow_commands"
+        );
+    }
+    if configuration.allow_commands {
+        for step in &spec.scenario.steps {
+            if let StepAction::Command(command) = &step.action {
+                command::preflight(command)?;
+            }
+        }
+    }
     let engine = Arc::new(ScenarioEngine::<A>::initialize(spec, configuration.clone()).await?);
     engine.run(configuration).await
 }
@@ -162,6 +184,7 @@ struct ScenarioEngine<A: NetworkAdapter> {
     chains: BTreeMap<String, Arc<ChainRuntime<A>>>,
     bindings: BTreeMap<String, BindingRuntime>,
     default_step_timeout: Duration,
+    command_semaphore: Arc<Semaphore>,
 }
 
 impl<A> ScenarioEngine<A>
@@ -220,8 +243,9 @@ where
 
         let default_step_timeout =
             config.step_timeout.or(spec.scenario.timeout).unwrap_or(FALLBACK_STEP_TIMEOUT);
+        let command_semaphore = Arc::new(Semaphore::new(config.max_command_in_flight));
 
-        Ok(Self { spec, chains, bindings, default_step_timeout })
+        Ok(Self { spec, chains, bindings, default_step_timeout, command_semaphore })
     }
 
     async fn run(self: Arc<Self>, config: ScenarioExecutionConfig) -> Result<ScenarioReport> {
@@ -331,6 +355,8 @@ where
                 .unwrap_or(u64::MAX),
             transaction_rate_per_chain: config.transaction_rate,
             maximum_rpc_in_flight_per_chain: config.max_rpc_in_flight,
+            commands_enabled: config.allow_commands,
+            maximum_commands_in_flight: config.max_command_in_flight,
             seed: config.seed,
             failure_policy: config.failure_policy.as_str().to_string(),
         };
@@ -380,9 +406,9 @@ where
             let step_started = Instant::now();
             let timeout = step.timeout.unwrap_or(self.default_step_timeout);
             let deadline = TokioInstant::now() + timeout;
-            let result = if matches!(&step.action, StepAction::Submit(_)) {
-                // Submit handles its own deadline so a timed-out RPC cannot outlive
-                // the instance and release its account lease while still running.
+            let result = if matches!(&step.action, StepAction::Submit(_) | StepAction::Command(_)) {
+                // Submit and command steps handle their own deadlines so timed-out
+                // work cannot outlive the instance and release its account lease.
                 self.execute_step(step, &context, &mut rng, deadline).await
             } else {
                 match tokio::time::timeout_at(
@@ -511,13 +537,25 @@ where
         rng: &mut StdRng,
         deadline: TokioInstant,
     ) -> Result<RuntimeValue, StepError> {
-        let chain = self
-            .chains
-            .get(step.action.chain())
-            .ok_or_else(|| StepError::new("configuration_error", "unknown chain"))?;
         match &step.action {
-            StepAction::Checkpoint(_) => chain.checkpoint().await,
+            StepAction::Command(command_step) => {
+                let _permit =
+                    match tokio::time::timeout_at(deadline, self.command_semaphore.acquire()).await
+                    {
+                        Ok(Ok(permit)) => permit,
+                        Ok(Err(_)) => {
+                            return Err(StepError::new(
+                                "configuration_error",
+                                "command concurrency limiter is closed",
+                            ));
+                        }
+                        Err(_) => return Err(StepError::timeout()),
+                    };
+                command::execute_command(command_step, context, deadline).await
+            }
+            StepAction::Checkpoint(checkpoint) => self.chain(&checkpoint.chain)?.checkpoint().await,
             StepAction::Submit(submit) => {
+                let chain = self.chain(&submit.chain)?;
                 let submit_rng = rng.clone();
                 let (value, next_rng) = chain
                     .execute_submit(submit.clone(), context.clone(), submit_rng, deadline)
@@ -526,6 +564,7 @@ where
                 Ok(value)
             }
             StepAction::WaitReceipt(wait_receipt) => {
+                let chain = self.chain(&wait_receipt.chain)?;
                 let hash = expression_hash(&wait_receipt.transaction_hash, context)
                     .map_err(StepError::expression)?;
                 let sender = wait_receipt
@@ -550,6 +589,7 @@ where
                 Ok(receipt.value)
             }
             StepAction::WaitLog(wait_log) => {
+                let chain = self.chain(&wait_log.chain)?;
                 let abi = chain
                     .artifacts
                     .get(&wait_log.abi)
@@ -565,6 +605,10 @@ where
                 .await
             }
         }
+    }
+
+    fn chain(&self, name: &str) -> Result<&Arc<ChainRuntime<A>>, StepError> {
+        self.chains.get(name).ok_or_else(|| StepError::new("configuration_error", "unknown chain"))
     }
 }
 
@@ -1541,17 +1585,20 @@ fn validate_workload_references(
     chains: &BTreeMap<String, ChainInput>,
 ) -> Result<()> {
     for (index, step) in spec.scenario.steps.iter().enumerate() {
-        let chain = &chains[step.action.chain()];
         match &step.action {
-            StepAction::Submit(submit) if !chain.spec.templates.contains_key(&submit.template) => {
-                bail!(
-                    "scenario step {} references missing template '{}' on chain '{}'",
-                    index + 1,
-                    submit.template,
-                    submit.chain
-                );
+            StepAction::Submit(submit) => {
+                let chain = &chains[submit.chain.as_str()];
+                if !chain.spec.templates.contains_key(&submit.template) {
+                    bail!(
+                        "scenario step {} references missing template '{}' on chain '{}'",
+                        index + 1,
+                        submit.template,
+                        submit.chain
+                    );
+                }
             }
             StepAction::WaitLog(wait_log) => {
+                let chain = &chains[wait_log.chain.as_str()];
                 let abi = chain.artifacts.get(&wait_log.abi).wrap_err_with(|| {
                     format!(
                         "scenario step {} references missing ABI artifact '{}' on chain '{}'",
@@ -1711,6 +1758,8 @@ mod tests {
         let config = ScenarioExecutionConfig { max_in_flight: 0, ..Default::default() };
         assert!(config.validate().is_err());
         let config = ScenarioExecutionConfig { starts_per_second: f64::NAN, ..Default::default() };
+        assert!(config.validate().is_err());
+        let config = ScenarioExecutionConfig { max_command_in_flight: 0, ..Default::default() };
         assert!(config.validate().is_err());
     }
 

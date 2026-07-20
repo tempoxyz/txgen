@@ -1,4 +1,4 @@
-use super::value::{collect_variable_paths, RuntimeValue};
+use super::value::{collect_variable_paths, eval_expression, RuntimeContext, RuntimeValue};
 use alloy_dyn_abi::DynSolType;
 use alloy_primitives::{Address, B256, U256};
 use eyre::{bail, Result, WrapErr};
@@ -17,6 +17,7 @@ pub struct ScenarioSpec {
     /// Scenario schema version. Only version 1 is currently supported.
     pub version: u64,
     /// Named chain runtimes used by steps.
+    #[serde(default)]
     pub chains: BTreeMap<String, ChainDef>,
     /// The workflow executed for each scenario instance.
     pub scenario: ScenarioDef,
@@ -205,6 +206,8 @@ pub struct StepDef {
 #[derive(Debug, Clone)]
 #[expect(clippy::large_enum_variant)]
 pub enum StepAction {
+    /// Run an explicitly configured local command and capture its output.
+    Command(CommandStep),
     /// Capture the current canonical chain cursor.
     Checkpoint(CheckpointStep),
     /// Materialize, sign, and submit a workload template.
@@ -213,6 +216,33 @@ pub enum StepAction {
     WaitReceipt(WaitReceiptStep),
     /// Backfill and poll for the first matching event log.
     WaitLog(WaitLogStep),
+}
+
+/// Run a local executable with arguments and environment values resolved at runtime.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandStep {
+    /// Executable name or path. Bare names are resolved through the command runner's PATH.
+    pub program: PathBuf,
+    /// Runtime expressions rendered as individual process arguments.
+    #[serde(default)]
+    pub args: Vec<serde_yaml::Value>,
+    /// Explicit child environment. Values are runtime expressions rendered as scalars.
+    #[serde(default)]
+    pub env: BTreeMap<String, serde_yaml::Value>,
+    /// Optional working directory.
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    /// Expected stdout representation.
+    pub stdout: CommandStdout,
+}
+
+/// Supported command stdout representations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandStdout {
+    /// Parse stdout as exactly one JSON value.
+    Json,
 }
 
 /// Capture a chain cursor.
@@ -326,7 +356,7 @@ impl<'de> Deserialize<'de> for StepDef {
 
         if mapping.len() != 1 {
             return Err(serde::de::Error::custom(
-                "scenario step must contain exactly one of `checkpoint`, `submit`, `wait_receipt`, or `wait_log`",
+                "scenario step must contain exactly one of `command`, `checkpoint`, `submit`, `wait_receipt`, or `wait_log`",
             ));
         }
 
@@ -335,6 +365,9 @@ impl<'de> Deserialize<'de> for StepDef {
             .as_str()
             .ok_or_else(|| serde::de::Error::custom("scenario step action must be a string"))?;
         let action = match kind {
+            "command" => serde_yaml::from_value(value)
+                .map(StepAction::Command)
+                .map_err(serde::de::Error::custom)?,
             "checkpoint" => serde_yaml::from_value(value)
                 .map(StepAction::Checkpoint)
                 .map_err(serde::de::Error::custom)?,
@@ -350,7 +383,7 @@ impl<'de> Deserialize<'de> for StepDef {
             other => {
                 return Err(serde::de::Error::unknown_variant(
                     other,
-                    &["checkpoint", "submit", "wait_receipt", "wait_log"],
+                    &["command", "checkpoint", "submit", "wait_receipt", "wait_log"],
                 ))
             }
         };
@@ -360,12 +393,24 @@ impl<'de> Deserialize<'de> for StepDef {
 }
 
 impl ScenarioSpec {
+    /// Return whether any scenario step executes a local command.
+    pub fn has_commands(&self) -> bool {
+        self.scenario.steps.iter().any(|step| matches!(&step.action, StepAction::Command(_)))
+    }
+
     /// Read, environment-expand, parse, validate, and path-resolve a scenario file.
     pub fn load(path: &Path) -> Result<Self> {
         let yaml = std::fs::read_to_string(path)
             .wrap_err_with(|| format!("failed to read scenario file: {}", path.display()))?;
         let mut spec = Self::parse(&yaml)?;
         let base = path.parent().unwrap_or_else(|| Path::new("."));
+        let command_base = if base.is_absolute() {
+            base.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .wrap_err("failed to resolve the scenario command directory")?
+                .join(base)
+        };
         for chain in spec.chains.values_mut() {
             if chain.workload.is_relative() {
                 chain.workload = base.join(&chain.workload);
@@ -374,6 +419,15 @@ impl ScenarioSpec {
                 auth.sender_header.map.is_relative()
             {
                 auth.sender_header.map = base.join(&auth.sender_header.map);
+            }
+        }
+        for step in &mut spec.scenario.steps {
+            let StepAction::Command(command) = &mut step.action else { continue };
+            if command.cwd.as_ref().is_some_and(|cwd| cwd.is_relative()) {
+                command.cwd = command.cwd.take().map(|cwd| command_base.join(cwd));
+            }
+            if command.program.is_relative() && is_path_like_program(&command.program) {
+                command.program = command_base.join(&command.program);
             }
         }
         Ok(spec)
@@ -393,10 +447,6 @@ impl ScenarioSpec {
         if self.version != 1 {
             bail!("unsupported scenario version {}; expected version 1", self.version);
         }
-        if self.chains.is_empty() {
-            bail!("scenario must define at least one chain");
-        }
-
         for (name, chain) in &self.chains {
             validate_name(name, "chain")?;
             if chain.network.trim().is_empty() {
@@ -526,12 +576,43 @@ impl ScenarioSpec {
             bail!("{label} timeout must be greater than zero");
         }
 
-        let chain = step.action.chain();
-        if !self.chains.contains_key(chain) {
+        if let Some(chain) = step.action.chain() &&
+            !self.chains.contains_key(chain)
+        {
             bail!("{label} references unknown chain '{chain}'");
         }
 
         match &step.action {
+            StepAction::Command(command) => {
+                if command.program.as_os_str().is_empty() {
+                    bail!("{label} has an empty program");
+                }
+                if command.cwd.as_ref().is_some_and(|cwd| cwd.as_os_str().is_empty()) {
+                    bail!("{label} has an empty working directory");
+                }
+                for (argument, value) in command.args.iter().enumerate() {
+                    validate_static_command_scalar(
+                        value,
+                        &label,
+                        &format!("argument {}", argument + 1),
+                    )?;
+                }
+                for (name, value) in &command.env {
+                    if name.trim().is_empty() {
+                        bail!("{label} contains an empty environment variable name");
+                    }
+                    if name.contains('=') || name.contains('\0') {
+                        bail!(
+                            "{label} environment variable name '{name}' contains an invalid character"
+                        );
+                    }
+                    validate_static_command_scalar(
+                        value,
+                        &label,
+                        &format!("environment variable '{name}'"),
+                    )?;
+                }
+            }
             StepAction::Checkpoint(_) => {}
             StepAction::Submit(submit) => {
                 if submit.template.trim().is_empty() {
@@ -555,8 +636,11 @@ impl ScenarioSpec {
                         &label,
                         "sender",
                     )?;
-                } else if self.chains[chain].request_auth.is_some() {
-                    bail!("{label} requires `sender` when chain '{chain}' uses request_auth");
+                } else if self.chains[wait.chain.as_str()].request_auth.is_some() {
+                    bail!(
+                        "{label} requires `sender` when chain '{}' uses request_auth",
+                        wait.chain
+                    );
                 }
             }
             StepAction::WaitLog(wait) => {
@@ -606,9 +690,12 @@ impl ScenarioSpec {
                         &label,
                         "sender",
                     )?;
-                } else if wait.from_block.is_none() && self.chains[chain].request_auth.is_some() {
+                } else if wait.from_block.is_none() &&
+                    self.chains[wait.chain.as_str()].request_auth.is_some()
+                {
                     bail!(
-                        "{label} requires `sender` for a transaction-hash-only wait when chain '{chain}' uses request_auth"
+                        "{label} requires `sender` for a transaction-hash-only wait when chain '{}' uses request_auth",
+                        wait.chain
                     );
                 }
                 for name in wait.where_value.keys() {
@@ -635,6 +722,7 @@ impl ScenarioSpec {
 impl StepDef {
     fn saved_kind(&self) -> SavedKind {
         match &self.action {
+            StepAction::Command(_) => SavedKind::Command,
             StepAction::Checkpoint(_) => SavedKind::Checkpoint,
             StepAction::Submit(step) => {
                 SavedKind::Submit { receipt: step.await_mode == Some(SubmitAwait::Receipt) }
@@ -649,6 +737,14 @@ impl StepDef {
         mut visit: impl FnMut(&serde_yaml::Value) -> Result<()>,
     ) -> Result<()> {
         match &self.action {
+            StepAction::Command(step) => {
+                for value in &step.args {
+                    visit(value)?;
+                }
+                for value in step.env.values() {
+                    visit(value)?;
+                }
+            }
             StepAction::Checkpoint(_) => {}
             StepAction::Submit(step) => visit(&step.with_value)?,
             StepAction::WaitReceipt(step) => {
@@ -683,6 +779,7 @@ impl StepAction {
     /// Stable operation name used in diagnostics and reports.
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Command(_) => "command",
             Self::Checkpoint(_) => "checkpoint",
             Self::Submit(_) => "submit",
             Self::WaitReceipt(_) => "wait_receipt",
@@ -691,12 +788,13 @@ impl StepAction {
     }
 
     /// Named chain selected by this operation.
-    pub fn chain(&self) -> &str {
+    pub fn chain(&self) -> Option<&str> {
         match self {
-            Self::Checkpoint(step) => &step.chain,
-            Self::Submit(step) => &step.chain,
-            Self::WaitReceipt(step) => &step.chain,
-            Self::WaitLog(step) => &step.chain,
+            Self::Command(_) => None,
+            Self::Checkpoint(step) => Some(&step.chain),
+            Self::Submit(step) => Some(&step.chain),
+            Self::WaitReceipt(step) => Some(&step.chain),
+            Self::WaitLog(step) => Some(&step.chain),
         }
     }
 }
@@ -709,6 +807,7 @@ enum AvailableRoot {
 
 #[derive(Debug, Clone, Copy)]
 enum SavedKind {
+    Command,
     Checkpoint,
     Submit { receipt: bool },
     Receipt,
@@ -751,6 +850,7 @@ fn validate_account_path(root: &str, tail: Option<&str>) -> Result<()> {
 fn validate_saved_path(root: &str, kind: SavedKind, tail: Option<&str>) -> Result<()> {
     let Some(tail) = tail else { return Ok(()) };
     let valid = match kind {
+        SavedKind::Command => true,
         SavedKind::Checkpoint => {
             matches!(tail, "chain" | "block_number" | "block_hash" | "captured_at")
         }
@@ -902,6 +1002,7 @@ fn static_reference_type(
             "pool" | "ref.pool" => Some(StaticValueType::String),
             _ => None,
         },
+        AvailableRoot::Saved(SavedKind::Command) => None,
         AvailableRoot::Saved(SavedKind::Checkpoint) => match tail {
             "chain" => Some(StaticValueType::String),
             "block_number" | "captured_at" => Some(StaticValueType::Uint),
@@ -955,6 +1056,30 @@ fn validate_optional_duration(value: Option<Duration>, label: &str, field: &str)
     Ok(())
 }
 
+fn validate_static_command_scalar(
+    expression: &serde_yaml::Value,
+    label: &str,
+    field: &str,
+) -> Result<()> {
+    if collect_variable_paths(expression)?.is_empty() {
+        eval_expression(expression, &RuntimeContext::empty())
+            .and_then(|value| value.to_process_arg())
+            .wrap_err_with(|| format!("{label} {field} must resolve to a scalar value"))?;
+    }
+    Ok(())
+}
+
+pub(super) fn is_path_like_program(program: &Path) -> bool {
+    if program.is_absolute() {
+        return true;
+    }
+    if !matches!(program.components().next(), Some(std::path::Component::Normal(_))) {
+        return !program.as_os_str().is_empty();
+    }
+    let program = program.to_string_lossy();
+    program.contains(std::path::MAIN_SEPARATOR) || (cfg!(windows) && program.contains('/'))
+}
+
 fn validate_name(name: &str, context: &str) -> Result<()> {
     if name.trim().is_empty() {
         bail!("{context} name must not be empty");
@@ -989,6 +1114,34 @@ fn parse_duration_value(value: serde_yaml::Value) -> Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const COMMAND_ONLY: &str = r#"
+version: 1
+scenario:
+  name: encrypt
+  bindings:
+    user:
+      account:
+        pool: users
+        select: lease
+  steps:
+    - command:
+        program: ./bin/encrypt-deposit
+        args:
+          - --recipient
+          - { var: user.address }
+        env:
+          RECIPIENT: { var: user.address }
+        cwd: ./helpers
+        stdout: json
+      save: encrypted
+      timeout: 10s
+    - command:
+        program: consume-output
+        args:
+          - { var: encrypted.payload.ciphertext }
+        stdout: json
+"#;
 
     const BASE: &str = r#"
 version: 1
@@ -1056,6 +1209,111 @@ scenario:
             spec.scenario.bindings["user"],
             BindingDef::Account(AccountBindingDef { select: AccountSelection::Lease, .. })
         ));
+    }
+
+    #[test]
+    fn parses_chainless_commands_and_dynamic_saved_paths() {
+        let spec = ScenarioSpec::parse(COMMAND_ONLY).unwrap();
+        assert!(spec.chains.is_empty());
+        assert!(spec.has_commands());
+        assert_eq!(spec.scenario.steps[0].action.chain(), None);
+
+        let StepAction::Command(command) = &spec.scenario.steps[0].action else {
+            panic!("expected command step");
+        };
+        assert_eq!(command.program, PathBuf::from("./bin/encrypt-deposit"));
+        assert_eq!(command.args.len(), 2);
+        assert_eq!(command.env.len(), 1);
+        assert_eq!(command.cwd.as_deref(), Some(Path::new("./helpers")));
+        assert_eq!(command.stdout, CommandStdout::Json);
+    }
+
+    #[test]
+    fn command_arguments_and_environment_validate_references() {
+        let forward = COMMAND_ONLY.replace("{ var: user.address }", "{ var: later.output }") +
+            r#"
+    - command:
+        program: later
+        stdout: json
+      save: later
+"#;
+        let error = ScenarioSpec::parse(&forward).unwrap_err().to_string();
+        assert!(error.contains("forward reference"), "unexpected error: {error}");
+
+        let unknown = COMMAND_ONLY.replacen(
+            "RECIPIENT: { var: user.address }",
+            "RECIPIENT: { var: missing.value }",
+            1,
+        );
+        let error = ScenarioSpec::parse(&unknown).unwrap_err().to_string();
+        assert!(error.contains("unknown runtime root 'missing'"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn command_output_has_unknown_static_type() {
+        let yaml = r#"
+version: 1
+chains:
+  l1: { network: ethereum, rpc_url: http://rpc.invalid, workload: ./workload.yml }
+scenario:
+  name: dynamic-command-output
+  steps:
+    - command:
+        program: derive-hash
+        stdout: json
+      save: derived
+    - wait_receipt:
+        chain: l1
+        transaction_hash: { var: derived.nested.tx_hash }
+"#;
+        ScenarioSpec::parse(yaml).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_command_configuration() {
+        let empty_program =
+            COMMAND_ONLY.replacen("program: ./bin/encrypt-deposit", "program: ''", 1);
+        assert!(ScenarioSpec::parse(&empty_program)
+            .unwrap_err()
+            .to_string()
+            .contains("empty program"));
+
+        let empty_cwd = COMMAND_ONLY.replacen("cwd: ./helpers", "cwd: ''", 1);
+        assert!(ScenarioSpec::parse(&empty_cwd)
+            .unwrap_err()
+            .to_string()
+            .contains("empty working directory"));
+
+        let composite_argument =
+            COMMAND_ONLY.replacen("          - --recipient", "          - [not, scalar]", 1);
+        assert!(ScenarioSpec::parse(&composite_argument)
+            .unwrap_err()
+            .to_string()
+            .contains("must resolve to a scalar value"));
+
+        let empty_env = COMMAND_ONLY.replacen(
+            "RECIPIENT: { var: user.address }",
+            "'': { var: user.address }",
+            1,
+        );
+        assert!(ScenarioSpec::parse(&empty_env)
+            .unwrap_err()
+            .to_string()
+            .contains("empty environment variable name"));
+
+        let invalid_env = COMMAND_ONLY.replacen(
+            "RECIPIENT: { var: user.address }",
+            "'BAD=NAME': { var: user.address }",
+            1,
+        );
+        assert!(ScenarioSpec::parse(&invalid_env)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid character"));
+
+        let unknown_field =
+            COMMAND_ONLY.replacen("stdout: json", "stdout: json\n        shell: true", 1);
+        assert!(ScenarioSpec::parse(&unknown_field).is_err());
     }
 
     #[test]
@@ -1342,6 +1600,34 @@ scenario:
             spec.chains["zone"].request_auth.as_ref().unwrap().sender_header.map,
             dir.join("./zone-auth.json")
         );
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn load_resolves_command_paths_relative_to_scenario_file() {
+        let unique = format!(
+            "txgen-command-schema-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scenario.yml");
+        std::fs::write(&path, COMMAND_ONLY).unwrap();
+
+        let spec = ScenarioSpec::load(&path).unwrap();
+        let StepAction::Command(path_command) = &spec.scenario.steps[0].action else {
+            panic!("expected command step");
+        };
+        assert_eq!(path_command.program, dir.join("./bin/encrypt-deposit"));
+        assert_eq!(path_command.cwd.as_deref(), Some(dir.join("./helpers").as_path()));
+
+        let StepAction::Command(bare_command) = &spec.scenario.steps[1].action else {
+            panic!("expected command step");
+        };
+        assert_eq!(bare_command.program, PathBuf::from("consume-output"));
 
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();
