@@ -156,12 +156,23 @@ txgen-ethereum generate -s workload.yaml -n 1000 | bench send --rpc-url http://l
 bench send -i txs.ndjson --rpc-url http://localhost:8545 \
   --report json:report.json \
   -m build-sha=abcdef -m build-profile=perf
+
+# Sender-scoped authentication with a separate unrestricted query RPC
+bench send -i txs.ndjson \
+  --rpc-url http://submit.example:8544 \
+  --query-rpc-url http://query.example:8546 \
+  --sender-header-name X-Authorization-Token \
+  --sender-header-map /run/secrets/sender-auth.json
 ```
 
 | Flag | Description |
 |------|-------------|
 | `-i, --input <PATH>` | Input NDJSON file (default: stdin) |
 | `--rpc-url <URL>` | RPC endpoint URLs, comma-separated or repeated (default: `http://localhost:8545`) |
+| `--query-rpc-url <URL>` | Optional RPC endpoint for block, txpool, and other aggregate queries |
+| `--sender-header-name <NAME>` | HTTP header populated from the sender map for sender-scoped requests |
+| `--sender-header-map <PATH>` | JSON file mapping logical transaction senders to secret header values |
+| `--sender-header-reload-interval <DUR>` | How often to check the sender-header map for an atomic replacement (default: 1s) |
 | `--tps <N>` | Target transactions per second (0 = unlimited) |
 | `--max-concurrent <N>` | Maximum concurrent requests (default: 100) |
 | `--retries <N>` | Retry failed transaction submissions N times (0 = never retry, omitted = retry forever) |
@@ -176,7 +187,30 @@ bench send -i txs.ndjson --rpc-url http://localhost:8545 \
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 0, set >0 to enable) |
 
-**Required RPC methods:** `eth_sendRawTransaction`, `eth_getTransactionReceipt` (setup and inclusion waits), `eth_getBlockByNumber`, `txpool_status` (for `--drain-timeout`)
+**Required RPC methods:** `eth_sendRawTransaction`, `eth_getTransactionReceipt` (setup and inclusion waits), `eth_blockNumber`, `eth_getBlockByNumber`, `txpool_status` (for `--drain-timeout`)
+
+##### Per-sender HTTP authentication
+
+`bench send` can select an HTTP credential from the transaction's logical on-chain sender. The sender-header map is a JSON object whose keys are 20-byte addresses. Values are inserted into the header named by `--sender-header-name`:
+
+```json
+{
+  "0x1111111111111111111111111111111111111111": "example-only-value-for-sender-1",
+  "0x2222222222222222222222222222222222222222": "example-only-value-for-sender-2"
+}
+```
+
+The values above are deliberately fake. `--sender-header-name` and `--sender-header-map` must be supplied together. Treat a real map as a secret: keep it out of process arguments and benchmark metadata, restrict its filesystem permissions, and replace it atomically rather than editing it in place. Bench warns when the map is readable by group or other users on supported platforms. It normalizes address keys and validates the complete replacement before activating it. A malformed replacement produces a sanitized warning and leaves the last valid map active.
+
+Each authenticated transaction must have a `sender` field in its NDJSON record and a matching entry in the map. Selection never uses `submission_keys` or `inclusion_keys`. Standard and sponsored transactions use the transaction sender; Tempo keychain transactions use the authorized user, not the access key. Missing sender metadata or a missing mapping fails before the request is submitted. Legacy NDJSON without `sender` remains accepted when sender authentication is disabled.
+
+Authentication headers are constructed per request while the RPC providers share one HTTP client and connection pool. Submission retries retain the selected header. Receipt polling for setup transactions and inclusion waits stays on the selected submission RPC and uses the same sender context.
+
+When `--query-rpc-url` is set, initial and final block-number reads, block statistics, and `txpool_status` drain checks use that endpoint without sender credentials. Aggregate queries never select a sender mapping. Without a query URL, these operations retain the existing behavior of using the first `--rpc-url` provider.
+
+Txgen consumes already-generated credential values; it does not encode, sign, or renew them. Generation-time nonce requests made by `txgen-ethereum generate --rpc` or `txgen-tempo generate --rpc` are not authenticated by these `bench send` options. Use an unrestricted RPC for nonce prefetching, or generate with suitable offline nonce configuration.
+
+For a private Tempo Zone RPC, every authenticated transaction therefore needs an externally generated token mapped to its logical sender.
 
 #### `bench send-blocks`
 
@@ -377,6 +411,7 @@ Transactions are output as NDJSON with scheduling keys split by release policy:
   "phase": "workload",
   "id": "transfer",
   "raw": "0x02f86c01...",
+  "sender": "0x1111111111111111111111111111111111111111",
   "submission_keys": [
     "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc"
   ],
@@ -389,10 +424,13 @@ Transactions are output as NDJSON with scheduling keys split by release policy:
 | `phase` | `setup` or `workload`; missing phase is treated as `workload` by `bench` |
 | `id` | Optional diagnostic identifier |
 | `raw` | RLP-encoded signed transaction (EIP-2718 envelope) |
+| `sender` | Logical on-chain transaction sender used for request-scoped authentication |
 | `submission_keys` | 20-byte ordering constraints released after RPC submission succeeds |
 | `inclusion_keys` | 20-byte ordering constraints released after the transaction is included in a block |
 
 **Scheduling rule:** Transactions that share any scheduling key must be sent sequentially until that key's release condition is met. Normal transactions carry their natural nonce-lane key in `submission_keys`, because the chain enforces nonce order after admission. Sequence steps on the same nonce lane are submitted back-to-back; txgen only adds synthetic `inclusion_keys` at cross-lane sequence boundaries where nonce order cannot guarantee execution order.
+
+The `sender` is independent of scheduling metadata. Txgen emits it for newly generated transactions. Older NDJSON may omit it and can still be sent without sender authentication.
 
 ## Workload Specification
 
@@ -1011,15 +1049,16 @@ Summary of which RPC methods are required by each feature:
 | RPC Method | Required By |
 |------------|-------------|
 | `eth_getTransactionCount` | `txgen-ethereum generate --rpc`, `txgen-tempo generate --rpc` |
-| `eth_sendRawTransaction` | `bench send` |
-| `eth_getTransactionReceipt` | `bench send` (setup and inclusion waits) |
-| `eth_getBlockByNumber` | `bench send` (per-block stats collection) |
+| `eth_sendRawTransaction` | `bench send` (submission RPC, optionally sender-authenticated) |
+| `eth_getTransactionReceipt` | `bench send` (sender-scoped submission RPC for setup and inclusion waits) |
+| `eth_blockNumber` | `bench send` (query RPC when configured; benchmark block range) |
+| `eth_getBlockByNumber` | `bench send` (query RPC when configured; per-block stats collection) |
 | `debug_getRawBlock` | `txgen extract`, `txgen-ethereum extract-big-blocks` |
 | `eth_getBlockAccessListByBlockNumber` | `txgen extract --bal`, `txgen-ethereum extract-big-blocks --bal` |
 | `reth_newPayload` | `bench send-blocks` |
 | `reth_forkchoiceUpdated` | `bench send-blocks` |
 | `testing_buildBlockV1` | `bench send-blocks --reorg` |
-| `txpool_status` | `bench send` (pool drain wait) |
+| `txpool_status` | `bench send` (query RPC when configured; pool drain wait) |
 
 > **Note:** `debug_*` methods require a node with the debug namespace enabled (typically archive nodes). `reth_*` methods are custom reth Engine API extensions.
 

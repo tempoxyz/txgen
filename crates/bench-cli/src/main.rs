@@ -28,6 +28,30 @@ pub struct SendArgs {
     #[arg(long = "rpc-url", value_delimiter = ',', default_values_t = vec!["http://localhost:8545".to_string()])]
     pub rpc_urls: Vec<String>,
 
+    /// Optional RPC endpoint for aggregate block and txpool queries.
+    ///
+    /// Transaction submission and sender-scoped receipt polling continue to
+    /// use --rpc-url. When omitted, aggregate queries use the first --rpc-url.
+    #[arg(long)]
+    pub query_rpc_url: Option<String>,
+
+    /// HTTP header populated from --sender-header-map for sender-scoped requests.
+    ///
+    /// Must be supplied together with --sender-header-map.
+    #[arg(long)]
+    pub sender_header_name: Option<String>,
+
+    /// JSON file mapping logical transaction sender addresses to secret header values.
+    ///
+    /// Must be supplied together with --sender-header-name. Values are loaded
+    /// from this file so they do not appear in process arguments.
+    #[arg(long)]
+    pub sender_header_map: Option<PathBuf>,
+
+    /// Interval between checks for an atomically replaced sender-header map.
+    #[arg(long, default_value = "1s", value_parser = humantime::parse_duration)]
+    pub sender_header_reload_interval: Duration,
+
     /// Maximum transactions submitted per second (0 = unlimited).
     ///
     /// Controls throughput via a token bucket. Provides backpressure to the
@@ -283,14 +307,59 @@ fn parse_wait_for_persistence(s: &str) -> Result<bench_core::WaitForPersistence,
     }
 }
 
+fn tracing_env_filter() -> tracing_subscriber::EnvFilter {
+    let mut filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive(tracing::Level::INFO.into());
+
+    // Authenticated RPC servers may reflect credentials in response bodies or
+    // error messages. These Alloy targets trace raw bodies/errors, so cap their
+    // verbosity even when RUST_LOG requests a target-specific trace level.
+    for directive in [
+        "alloy_transport_http::reqwest_transport=debug",
+        "alloy_transport_http::hyper_transport=debug",
+        "alloy_transport::layers::retry=debug",
+        "alloy_json_rpc::result=debug",
+    ] {
+        filter =
+            filter.add_directive(directive.parse().expect("static tracing directive is valid"));
+    }
+    filter
+}
+
+fn allow_diagnostic_event(metadata: &tracing::Metadata<'_>) -> bool {
+    if *metadata.level() != tracing::Level::TRACE {
+        return true;
+    }
+
+    // These dependencies emit raw HTTP bodies or errors at TRACE. A separate
+    // event-level filter is required because span-specific EnvFilter directives
+    // can override target-only verbosity caps.
+    !matches!(
+        metadata.target(),
+        "alloy_transport_http::reqwest_transport" |
+            "alloy_transport_http::hyper_transport" |
+            "alloy_transport::layers::retry" |
+            "alloy_json_rpc::result"
+    )
+}
+
+fn init_tracing() {
+    use tracing_subscriber::{
+        filter::{filter_fn, FilterExt},
+        layer::SubscriberExt,
+        util::SubscriberInitExt,
+        Layer,
+    };
+
+    let filter = tracing_env_filter().and(filter_fn(allow_diagnostic_event));
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(filter))
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .init();
+    init_tracing();
 
     let cli = Cli::parse();
 

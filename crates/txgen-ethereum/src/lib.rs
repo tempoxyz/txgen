@@ -104,14 +104,11 @@ fn resolve_call_data(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::SignableTransaction;
-    use alloy_eips::eip2718::Encodable2718;
-    use alloy_network::{NetworkTransactionBuilder, TxSignerSync};
     use rand::{rngs::StdRng, SeedableRng};
     use std::collections::HashMap;
     use txgen_core::{
         AccountManager, AccountPoolDef, AccountRef, ArtifactManager, GasConfig, GenValue,
-        NonceTracker, SelectMode,
+        NonceTracker, SelectMode, TxPhase,
     };
 
     const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -151,17 +148,23 @@ mod tests {
         let adapter = EthereumAdapter;
         let tx_req = adapter.build_request(template, &mut ctx).unwrap();
 
-        let mut unsigned = tx_req.request.build_unsigned().unwrap();
-        let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index).unwrap();
-        let sig = signer.sign_transaction_sync(&mut unsigned).unwrap();
-        let signed = unsigned.into_signed(sig);
-        let envelope =
-            <alloy_consensus::TxEnvelope as From<alloy_consensus::Signed<_>>>::from(signed);
-        let raw = Bytes::from(envelope.encoded_2718());
+        let signer =
+            ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index).unwrap().clone();
+        let expected_sender = signer.address();
+        let generated = txgen_cli::sign_standard_request::<Ethereum>(
+            "transfer".to_string(),
+            TxPhase::Workload,
+            tx_req.request,
+            signer,
+            tx_req.key,
+            Vec::new(),
+        )
+        .unwrap();
 
         // Verify we got a non-empty transaction
-        assert!(!raw.is_empty());
+        assert!(!generated.raw.is_empty());
         // EIP-1559 transactions start with 0x02
-        assert_eq!(raw[0], 0x02);
+        assert_eq!(generated.raw[0], 0x02);
+        assert_eq!(generated.sender, Some(expected_sender));
     }
 }

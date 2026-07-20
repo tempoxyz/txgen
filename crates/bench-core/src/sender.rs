@@ -4,14 +4,16 @@
 //! - Respecting scheduling key ordering (shared key = sequential, disjoint keys = parallel)
 //! - Applying rate limiting
 
-use crate::metrics::MetricsCollector;
-use alloy_network::{primitives::ReceiptResponse, AnyNetwork};
-use alloy_primitives::Bytes;
+use crate::{metrics::MetricsCollector, RequestAuthProvider, RpcRequestContext};
+use alloy_network::{primitives::ReceiptResponse, AnyNetwork, AnyTransactionReceipt};
+use alloy_primitives::{Address, Bytes, TxHash};
 use alloy_provider::{DynProvider, Provider};
-use eyre::Result;
+use eyre::{Context, Result};
 use rand::seq::IndexedRandom;
+use reqwest::header::HeaderMap;
 use std::{
     collections::{HashSet, VecDeque},
+    fmt,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -50,11 +52,43 @@ const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
 const PENDING_BACKLOG_FACTOR: usize = 4;
 
+/// A submission RPC provider and the identity exposed to request authentication.
+#[derive(Clone)]
+pub struct RpcEndpoint {
+    identity: Arc<str>,
+    provider: DynProvider<AnyNetwork>,
+}
+
+impl RpcEndpoint {
+    /// Create an endpoint with an opaque identity and provider.
+    pub fn new(identity: impl Into<Arc<str>>, provider: DynProvider<AnyNetwork>) -> Self {
+        Self { identity: identity.into(), provider }
+    }
+
+    /// Return this endpoint's authentication identity.
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// Return the Alloy provider for this endpoint.
+    pub fn provider(&self) -> &DynProvider<AnyNetwork> {
+        &self.provider
+    }
+}
+
+impl fmt::Debug for RpcEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RpcEndpoint").field("identity", &self.identity).finish_non_exhaustive()
+    }
+}
+
 /// A transaction to be sent.
 struct PendingTx {
+    queue_id: u64,
     phase: TxPhase,
     id: Option<String>,
     raw: Bytes,
+    sender: Option<Address>,
     submission_keys: SchedulingKeys,
     inclusion_keys: SchedulingKeys,
 }
@@ -67,7 +101,8 @@ impl PendingTx {
 
 /// Transaction sender.
 pub struct Sender {
-    providers: Vec<DynProvider<AnyNetwork>>,
+    endpoints: Vec<RpcEndpoint>,
+    request_auth: Option<Arc<dyn RequestAuthProvider>>,
     metrics: Arc<MetricsCollector>,
     semaphore: Arc<Semaphore>,
     /// Transactions waiting for all of their scheduling keys to become free.
@@ -83,6 +118,12 @@ pub struct Sender {
     /// Maximum number of transactions buffered internally before applying
     /// backpressure to the transaction source.
     max_buffered: usize,
+    /// Monotonic identity used to remove a newly queued transaction if
+    /// dispatch preparation reports an error.
+    next_queue_id: u64,
+    /// Authentication failures discovered after the `send` call's own
+    /// transaction was already dispatched. These are reported by `flush`.
+    deferred_errors: VecDeque<eyre::Report>,
 }
 
 impl Sender {
@@ -92,6 +133,22 @@ impl Sender {
         config: SenderConfig,
         metrics: Arc<MetricsCollector>,
     ) -> Self {
+        let endpoints = providers
+            .into_iter()
+            .enumerate()
+            .map(|(index, provider)| RpcEndpoint::new(format!("rpc-{index}"), provider))
+            .collect();
+        Self::new_with_request_auth(endpoints, config, metrics, None)
+    }
+
+    /// Create a sender with request-scoped authentication.
+    pub fn new_with_request_auth(
+        endpoints: Vec<RpcEndpoint>,
+        config: SenderConfig,
+        metrics: Arc<MetricsCollector>,
+        request_auth: Option<Arc<dyn RequestAuthProvider>>,
+    ) -> Self {
+        assert!(!endpoints.is_empty(), "sender requires at least one RPC endpoint");
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
 
         let rate_limiter = if config.rate_limit > 0 {
@@ -104,7 +161,8 @@ impl Sender {
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
 
         Self {
-            providers,
+            endpoints,
+            request_auth,
             metrics,
             semaphore,
             pending: VecDeque::new(),
@@ -114,6 +172,8 @@ impl Sender {
             worker_tasks: JoinSet::new(),
             rate_limiter,
             max_buffered,
+            next_queue_id: 0,
+            deferred_errors: VecDeque::new(),
         }
     }
 
@@ -123,26 +183,82 @@ impl Sender {
     /// are sent sequentially, while transactions with disjoint key sets can be
     /// sent in parallel.
     pub async fn send(&mut self, tx: GeneratedTx) -> Result<()> {
-        self.wait_for_buffer_capacity().await;
+        if let Some(error) = self.deferred_errors.pop_front() {
+            // A previous call dispatched its own transaction before discovering
+            // an older authentication failure. Report that failure before
+            // accepting more work, and cancel everything that has not reached
+            // the wire so a missing nonce cannot be skipped implicitly.
+            self.deferred_errors.clear();
+            self.pending.clear();
+            return Err(error);
+        }
 
-        let GeneratedTx { phase, id, raw, submission_keys, inclusion_keys } = tx;
+        self.wait_for_buffer_capacity().await?;
+
+        let queue_id = self.next_queue_id;
+        self.next_queue_id = self
+            .next_queue_id
+            .checked_add(1)
+            .ok_or_else(|| eyre::eyre!("sender transaction queue identity overflowed"))?;
+        let GeneratedTx { phase, id, raw, sender, submission_keys, inclusion_keys } = tx;
         let (submission_keys, inclusion_keys) =
             normalize_key_sets(submission_keys, inclusion_keys)?;
-        self.pending.push_back(PendingTx { phase, id, raw, submission_keys, inclusion_keys });
-        self.pump().await;
+        self.pending.push_back(PendingTx {
+            queue_id,
+            phase,
+            id,
+            raw,
+            sender,
+            submission_keys,
+            inclusion_keys,
+        });
+        if let Err(failure) = self.pump().await {
+            let current_is_pending =
+                self.pending.iter().any(|pending| pending.queue_id == queue_id);
+            self.pending.clear();
+
+            if failure.queue_id == queue_id {
+                return Err(failure.error);
+            }
+
+            // `pump` removes the transaction whose authentication failed. If
+            // the error came from an older queued transaction, also retract the
+            // transaction accepted by this call so retrying it cannot later
+            // produce a duplicate submission.
+            if current_is_pending {
+                return Err(failure.error);
+            }
+
+            // The transaction accepted by this call is already on the wire, so
+            // returning `Err` would invite an unsafe retry. Defer the unrelated
+            // older failure until `flush` instead.
+            self.deferred_errors.push_back(failure.error);
+        }
 
         Ok(())
     }
 
     /// Wait for all pending transactions to complete.
-    pub async fn flush(&mut self) {
-        self.pump().await;
+    pub async fn flush(&mut self) -> Result<()> {
+        let mut first_error = self.deferred_errors.pop_front();
+        self.deferred_errors.clear();
+        if first_error.is_some() {
+            self.pending.clear();
+        } else if let Err(failure) = self.pump().await {
+            self.pending.clear();
+            first_error = Some(failure.error);
+        }
 
         while !self.pending.is_empty() || !self.active_keys.is_empty() {
             match self.completion_rx.recv().await {
                 Some(keys) => {
                     self.release_keys(&keys);
-                    self.pump().await;
+                    if first_error.is_none() &&
+                        let Err(failure) = self.pump().await
+                    {
+                        self.pending.clear();
+                        first_error = Some(failure.error);
+                    }
                 }
                 None => break,
             }
@@ -152,6 +268,11 @@ impl Sender {
             if let Err(err) = result {
                 tracing::warn!(%err, "sender worker task failed");
             }
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -176,9 +297,12 @@ impl Sender {
         }
     }
 
-    async fn wait_for_buffer_capacity(&mut self) {
+    async fn wait_for_buffer_capacity(&mut self) -> Result<()> {
         while self.pending.len() >= self.max_buffered {
-            self.pump().await;
+            if let Err(failure) = self.pump().await {
+                self.pending.clear();
+                return Err(failure.error);
+            }
             if self.pending.len() < self.max_buffered {
                 break;
             }
@@ -188,9 +312,10 @@ impl Sender {
                 None => break,
             }
         }
+        Ok(())
     }
 
-    async fn pump(&mut self) {
+    async fn pump(&mut self) -> std::result::Result<(), DispatchPreparationError> {
         loop {
             self.drain_completions();
 
@@ -210,10 +335,36 @@ impl Sender {
                 continue;
             }
 
+            // Resolve authentication immediately before dispatch so queued
+            // transactions observe a freshly reloaded sender map. Do this while
+            // the transaction is still queued so any error is propagated and no
+            // HTTP request is made.
+            let endpoint = self
+                .endpoints
+                .choose(&mut rand::rng())
+                .expect("sender has at least one endpoint")
+                .clone();
+            let pending = self.pending.get(index).expect("pending index exists");
+            let id = pending.id.as_deref().unwrap_or("<unnamed>").to_string();
+            let submission_headers = match self
+                .headers_for(&endpoint, "eth_sendRawTransaction", pending.sender, None)
+                .wrap_err_with(|| format!("failed to authenticate transaction {id}"))
+            {
+                Ok(headers) => headers,
+                Err(error) => {
+                    // A failed `send`/`flush` must not leave this transaction
+                    // queued for an implicit later submission.
+                    let pending = self.pending.remove(index).expect("pending index exists");
+                    return Err(DispatchPreparationError { queue_id: pending.queue_id, error });
+                }
+            };
+
             let pending = self.pending.remove(index).expect("pending index exists");
             self.activate_keys(&pending);
-            self.dispatch(pending, permit);
+            self.dispatch(pending, endpoint, submission_headers, permit);
         }
+
+        Ok(())
     }
 
     fn next_ready_index(&self) -> Option<usize> {
@@ -240,15 +391,54 @@ impl Sender {
         }
     }
 
-    fn dispatch(&mut self, pending: PendingTx, permit: OwnedSemaphorePermit) {
-        let providers = self.providers.clone();
+    fn headers_for(
+        &self,
+        endpoint: &RpcEndpoint,
+        method: &str,
+        sender: Option<Address>,
+        tx_hash: Option<TxHash>,
+    ) -> Result<HeaderMap> {
+        let headers = match &self.request_auth {
+            Some(auth) => auth.headers_for(&RpcRequestContext {
+                endpoint: endpoint.identity(),
+                method,
+                sender,
+                tx_hash,
+            }),
+            None => Ok(HeaderMap::new()),
+        }?;
+        Ok(mark_headers_sensitive(headers))
+    }
+
+    fn dispatch(
+        &mut self,
+        pending: PendingTx,
+        endpoint: RpcEndpoint,
+        submission_headers: HeaderMap,
+        permit: OwnedSemaphorePermit,
+    ) {
         let metrics = self.metrics.clone();
         let completion_tx = self.completion_tx.clone();
+        let request_auth = self.request_auth.clone();
 
         self.worker_tasks.spawn(async move {
-            submit_tx(pending, providers, metrics, permit, completion_tx).await;
+            submit_tx(
+                pending,
+                endpoint,
+                submission_headers,
+                request_auth,
+                metrics,
+                permit,
+                completion_tx,
+            )
+            .await;
         });
     }
+}
+
+struct DispatchPreparationError {
+    queue_id: u64,
+    error: eyre::Report,
 }
 
 fn max_buffered_transactions(config: &SenderConfig, limiter: Option<&RateLimiter>) -> usize {
@@ -277,7 +467,9 @@ fn normalize_key_sets(
 
 async fn submit_tx(
     pending: PendingTx,
-    providers: Vec<DynProvider<AnyNetwork>>,
+    endpoint: RpcEndpoint,
+    submission_headers: HeaderMap,
+    request_auth: Option<Arc<dyn RequestAuthProvider>>,
     metrics: Arc<MetricsCollector>,
     permit: OwnedSemaphorePermit,
     completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
@@ -290,18 +482,18 @@ async fn submit_tx(
 
     metrics.record_sent();
 
-    // Pick a random provider for this request.
-    // SAFETY: `providers` is guaranteed to be non-empty by construction.
-    let provider = providers.choose(&mut rand::rng()).unwrap();
-
     let start = Instant::now();
-    let tx_hash = match provider.send_raw_transaction(&pending.raw).await {
-        Ok(pending_tx) => {
+    let tx_hash = match send_raw_transaction(&endpoint, &pending.raw, submission_headers).await {
+        Ok(tx_hash) => {
             metrics.record_success(start.elapsed());
-            *pending_tx.tx_hash()
+            tx_hash
         }
         Err(e) => {
-            tracing::warn!(error = %e, "Failed to send transaction");
+            if request_auth.is_some() {
+                tracing::warn!("Failed to send authenticated transaction");
+            } else {
+                tracing::warn!(error = %e, "Failed to send transaction");
+            }
             metrics.record_failure();
             drop(permit);
             release_keys(&completion_tx, release_all_keys());
@@ -317,19 +509,40 @@ async fn submit_tx(
         return;
     }
 
-    match wait_for_receipt(provider, tx_hash).await {
+    match wait_for_receipt(&endpoint, pending.sender, tx_hash, request_auth.as_deref()).await {
         Ok(true) => {}
         Ok(false) => {
             tracing::error!(id = pending.id.as_deref(), phase = ?pending.phase, %tx_hash, "Transaction reverted");
             metrics.record_failure();
         }
         Err(e) => {
-            tracing::error!(error = %e, %tx_hash, "Failed waiting for transaction receipt");
+            if request_auth.is_some() {
+                tracing::error!(%tx_hash, "Failed waiting for authenticated transaction receipt");
+            } else {
+                tracing::error!(error = %e, %tx_hash, "Failed waiting for transaction receipt");
+            }
             metrics.record_failure();
         }
     }
 
     release_keys(&completion_tx, pending.inclusion_keys);
+}
+
+async fn send_raw_transaction(
+    endpoint: &RpcEndpoint,
+    raw: &Bytes,
+    headers: HeaderMap,
+) -> alloy_transport::TransportResult<TxHash> {
+    let encoded = format!("0x{}", hex::encode(raw));
+    endpoint
+        .provider()
+        .client()
+        .request::<_, TxHash>("eth_sendRawTransaction", (encoded,))
+        .map_meta(|mut meta| {
+            meta.headers_mut().extend(headers);
+            meta
+        })
+        .await
 }
 
 fn release_keys(completion_tx: &mpsc::UnboundedSender<SchedulingKeys>, keys: SchedulingKeys) {
@@ -339,13 +552,35 @@ fn release_keys(completion_tx: &mpsc::UnboundedSender<SchedulingKeys>, keys: Sch
 }
 
 async fn wait_for_receipt(
-    provider: &DynProvider<AnyNetwork>,
-    tx_hash: alloy_primitives::TxHash,
+    endpoint: &RpcEndpoint,
+    sender: Option<Address>,
+    tx_hash: TxHash,
+    request_auth: Option<&dyn RequestAuthProvider>,
 ) -> Result<bool> {
     let deadline = tokio::time::Instant::now() + RECEIPT_TIMEOUT;
 
     loop {
-        if let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? {
+        let headers = match request_auth {
+            Some(auth) => auth
+                .headers_for(&RpcRequestContext {
+                    endpoint: endpoint.identity(),
+                    method: "eth_getTransactionReceipt",
+                    sender,
+                    tx_hash: Some(tx_hash),
+                })
+                .map(mark_headers_sensitive)?,
+            None => HeaderMap::new(),
+        };
+        let receipt = endpoint
+            .provider()
+            .client()
+            .request::<_, Option<AnyTransactionReceipt>>("eth_getTransactionReceipt", (tx_hash,))
+            .map_meta(|mut meta| {
+                meta.headers_mut().extend(headers);
+                meta
+            })
+            .await?;
+        if let Some(receipt) = receipt {
             return Ok(receipt.status());
         }
 
@@ -355,6 +590,13 @@ async fn wait_for_receipt(
 
         tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
     }
+}
+
+fn mark_headers_sensitive(mut headers: HeaderMap) -> HeaderMap {
+    for value in headers.values_mut() {
+        value.set_sensitive(true);
+    }
+    headers
 }
 
 const RATE_LIMITER_MAX_BURST: Duration = Duration::from_millis(10);
@@ -458,5 +700,15 @@ mod tests {
         let config = SenderConfig { rate_limit: 100_000, max_concurrent: 100 };
         let limiter = RateLimiter::new(config.rate_limit);
         assert_eq!(max_buffered_transactions(&config, Some(&limiter)), 2_000);
+    }
+
+    #[test]
+    fn authentication_headers_are_marked_sensitive_at_the_request_boundary() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-test-auth", "fixture-sensitive-value".parse().unwrap());
+
+        let headers = mark_headers_sensitive(headers);
+
+        assert!(!format!("{headers:?}").contains("fixture-sensitive-value"));
     }
 }
