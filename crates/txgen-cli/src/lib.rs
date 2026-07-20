@@ -69,8 +69,11 @@ pub async fn run_command<A: NetworkAdapter + 'static>(adapter: A, command: Comma
 where
     <A::Network as Network>::TransactionRequest: Send + 'static,
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
-    <A::Network as Network>::TxEnvelope:
-        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718 + Decodable + Transaction,
+    <A::Network as Network>::TxEnvelope: From<Signed<<A::Network as Network>::UnsignedTx>>
+        + Encodable2718
+        + Decodable
+        + Transaction
+        + alloy_consensus::transaction::SignerRecoverable,
     <A::Network as Network>::Header: Decodable + BlockHeader + Sealable,
 {
     match command {
