@@ -32,8 +32,9 @@ struct Cli {
     command: Command,
 }
 
+/// Chain-agnostic txgen subcommands shared by each network-specific binary.
 #[derive(Subcommand)]
-enum Command {
+pub enum Command {
     /// Generate transactions from a workload spec
     Generate(GenerateArgs),
     /// List all addresses from a workload spec (for funding)
@@ -60,7 +61,22 @@ where
     <A::Network as Network>::Header: Decodable + BlockHeader + Sealable,
 {
     let cli = Cli::parse();
-    match cli.command {
+    run_command(adapter, cli.command).await
+}
+
+/// Run one chain-agnostic txgen subcommand with the supplied network adapter.
+pub async fn run_command<A: NetworkAdapter + 'static>(adapter: A, command: Command) -> Result<()>
+where
+    <A::Network as Network>::TransactionRequest: Send + 'static,
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope: From<Signed<<A::Network as Network>::UnsignedTx>>
+        + Encodable2718
+        + Decodable
+        + Transaction
+        + alloy_consensus::transaction::SignerRecoverable,
+    <A::Network as Network>::Header: Decodable + BlockHeader + Sealable,
+{
+    match command {
         Command::Generate(args) => run_generate(adapter, args).await,
         Command::Addresses(args) => run_addresses(args),
         Command::Extract(args) => run_extract::<A::Network>(args).await,
