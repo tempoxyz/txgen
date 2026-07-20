@@ -207,6 +207,8 @@ pub struct StepDef {
 pub enum StepAction {
     /// Capture the current canonical chain cursor.
     Checkpoint(CheckpointStep),
+    /// Invoke an action supplied by the selected network adapter.
+    Invoke(InvokeStep),
     /// Materialize, sign, and submit a workload template.
     Submit(SubmitStep),
     /// Wait for a transaction receipt.
@@ -221,6 +223,19 @@ pub enum StepAction {
 pub struct CheckpointStep {
     /// Named chain to inspect.
     pub chain: String,
+}
+
+/// Invoke an action supplied by a network adapter.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvokeStep {
+    /// Named chain whose adapter executes the action.
+    pub chain: String,
+    /// Adapter-defined action name.
+    pub action: String,
+    /// Named action arguments resolved against the scenario runtime context.
+    #[serde(default, rename = "with")]
+    pub with_value: BTreeMap<String, serde_yaml::Value>,
 }
 
 /// Submit a named workload template.
@@ -326,7 +341,7 @@ impl<'de> Deserialize<'de> for StepDef {
 
         if mapping.len() != 1 {
             return Err(serde::de::Error::custom(
-                "scenario step must contain exactly one of `checkpoint`, `submit`, `wait_receipt`, or `wait_log`",
+                "scenario step must contain exactly one of `checkpoint`, `invoke`, `submit`, `wait_receipt`, or `wait_log`",
             ));
         }
 
@@ -337,6 +352,9 @@ impl<'de> Deserialize<'de> for StepDef {
         let action = match kind {
             "checkpoint" => serde_yaml::from_value(value)
                 .map(StepAction::Checkpoint)
+                .map_err(serde::de::Error::custom)?,
+            "invoke" => serde_yaml::from_value(value)
+                .map(StepAction::Invoke)
                 .map_err(serde::de::Error::custom)?,
             "submit" => serde_yaml::from_value(value)
                 .map(StepAction::Submit)
@@ -350,7 +368,7 @@ impl<'de> Deserialize<'de> for StepDef {
             other => {
                 return Err(serde::de::Error::unknown_variant(
                     other,
-                    &["checkpoint", "submit", "wait_receipt", "wait_log"],
+                    &["checkpoint", "invoke", "submit", "wait_receipt", "wait_log"],
                 ))
             }
         };
@@ -533,6 +551,16 @@ impl ScenarioSpec {
 
         match &step.action {
             StepAction::Checkpoint(_) => {}
+            StepAction::Invoke(invoke) => {
+                if invoke.action.trim().is_empty() {
+                    bail!("{label} has an empty action name");
+                }
+                for name in invoke.with_value.keys() {
+                    if name.trim().is_empty() {
+                        bail!("{label} contains an empty argument name");
+                    }
+                }
+            }
             StepAction::Submit(submit) => {
                 if submit.template.trim().is_empty() {
                     bail!("{label} has an empty template name");
@@ -636,6 +664,7 @@ impl StepDef {
     fn saved_kind(&self) -> SavedKind {
         match &self.action {
             StepAction::Checkpoint(_) => SavedKind::Checkpoint,
+            StepAction::Invoke(_) => SavedKind::Invoke,
             StepAction::Submit(step) => {
                 SavedKind::Submit { receipt: step.await_mode == Some(SubmitAwait::Receipt) }
             }
@@ -650,6 +679,11 @@ impl StepDef {
     ) -> Result<()> {
         match &self.action {
             StepAction::Checkpoint(_) => {}
+            StepAction::Invoke(step) => {
+                for value in step.with_value.values() {
+                    visit(value)?;
+                }
+            }
             StepAction::Submit(step) => visit(&step.with_value)?,
             StepAction::WaitReceipt(step) => {
                 visit(&step.transaction_hash)?;
@@ -684,6 +718,7 @@ impl StepAction {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Checkpoint(_) => "checkpoint",
+            Self::Invoke(_) => "invoke",
             Self::Submit(_) => "submit",
             Self::WaitReceipt(_) => "wait_receipt",
             Self::WaitLog(_) => "wait_log",
@@ -694,6 +729,7 @@ impl StepAction {
     pub fn chain(&self) -> &str {
         match self {
             Self::Checkpoint(step) => &step.chain,
+            Self::Invoke(step) => &step.chain,
             Self::Submit(step) => &step.chain,
             Self::WaitReceipt(step) => &step.chain,
             Self::WaitLog(step) => &step.chain,
@@ -710,6 +746,7 @@ enum AvailableRoot {
 #[derive(Debug, Clone, Copy)]
 enum SavedKind {
     Checkpoint,
+    Invoke,
     Submit { receipt: bool },
     Receipt,
     Log,
@@ -754,6 +791,7 @@ fn validate_saved_path(root: &str, kind: SavedKind, tail: Option<&str>) -> Resul
         SavedKind::Checkpoint => {
             matches!(tail, "chain" | "block_number" | "block_hash" | "captured_at")
         }
+        SavedKind::Invoke => true,
         SavedKind::Submit { receipt } => {
             if (tail == "receipt" || tail.starts_with("receipt.")) && !receipt {
                 bail!("saved submit result '{root}' has no receipt because the step does not await one");
@@ -908,6 +946,7 @@ fn static_reference_type(
             "block_hash" => Some(StaticValueType::Bytes32),
             _ => None,
         },
+        AvailableRoot::Saved(SavedKind::Invoke) => None,
         AvailableRoot::Saved(SavedKind::Submit { .. }) => match tail {
             "chain" | "template" | "id" | "receipt.chain" => Some(StaticValueType::String),
             "sender" => Some(StaticValueType::Address),
@@ -1056,6 +1095,57 @@ scenario:
             spec.scenario.bindings["user"],
             BindingDef::Account(AccountBindingDef { select: AccountSelection::Lease, .. })
         ));
+    }
+
+    #[test]
+    fn parses_adapter_invoke_and_saved_output_references() {
+        let yaml = BASE.replacen(
+            "    - checkpoint:\n        chain: zone\n      save: zone_before",
+            r#"    - invoke:
+        chain: l1
+        action: prepare_encrypted_deposit
+        with:
+          portalAddress: "0x0000000000000000000000000000000000000001"
+          recipient: { var: user.address }
+          zoneId: 9
+      save: prepared
+      timeout: 10s
+    - checkpoint:
+        chain: zone
+      save: zone_before"#,
+            1,
+        );
+        let yaml = yaml.replacen(
+            "depositHash: { var: deposit.tx_hash }",
+            "depositHash: { var: prepared.encrypted.ephemeralPubkeyX }",
+            1,
+        );
+        let spec = ScenarioSpec::parse(&yaml).unwrap();
+
+        let StepAction::Invoke(invoke) = &spec.scenario.steps[0].action else {
+            panic!("expected invoke step");
+        };
+        assert_eq!(invoke.action, "prepare_encrypted_deposit");
+        assert_eq!(invoke.with_value.len(), 3);
+        assert_eq!(spec.scenario.steps[0].timeout, Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn rejects_invalid_adapter_invoke() {
+        let empty_action = BASE.replacen(
+            "checkpoint:\n        chain: zone",
+            "invoke:\n        chain: zone\n        action: ''",
+            1,
+        );
+        let error = ScenarioSpec::parse(&empty_action).unwrap_err().to_string();
+        assert!(error.contains("empty action name"), "unexpected error: {error}");
+
+        let unknown_field = BASE.replacen(
+            "checkpoint:\n        chain: zone",
+            "invoke:\n        chain: zone\n        action: custom\n        unexpected: true",
+            1,
+        );
+        assert!(ScenarioSpec::parse(&unknown_field).is_err());
     }
 
     #[test]

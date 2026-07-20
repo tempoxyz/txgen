@@ -21,7 +21,7 @@ pub use generate::{
     fetch_pending_protocol_nonces, fetch_protocol_nonces, materialize_and_sign_template,
     materialize_setup, materialize_setup_online, sign_standard_request, GenerateArgs,
     GenerateContext, MaterializedSetup, MaterializedTx, NetworkAdapter, RequestSignContext,
-    TxRequest,
+    ScenarioActionContext, TxRequest,
 };
 use scenario::run_scenario_command;
 pub use scenario::{ScenarioArgs, ScenarioRunArgs};
