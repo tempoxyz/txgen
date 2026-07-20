@@ -87,7 +87,7 @@ impl RuntimeContext {
                     })?
                 }
                 _ => {
-                    bail!("runtime variable '{path}' traverses through scalar field '{part}'")
+                    bail!("runtime variable '{path}' traverses through scalar field '{part}'");
                 }
             };
         }
@@ -114,7 +114,7 @@ impl RuntimeValue {
                 if let Some(value) = value.as_u64() {
                     return Ok(Self::Uint(U256::from(value)));
                 }
-                bail!("runtime numeric literals must be integers")
+                bail!("runtime numeric literals must be integers");
             }
             serde_yaml::Value::String(value) => Ok(Self::String(value.clone())),
             serde_yaml::Value::Sequence(values) => {
@@ -206,7 +206,9 @@ impl RuntimeValue {
     /// Infer a Solidity value for deterministic packed encoding.
     pub fn infer_dyn_sol(&self) -> Result<DynSolValue> {
         match self {
-            Self::Null => bail!("cannot infer a Solidity type for null"),
+            Self::Null => {
+                bail!("cannot infer a Solidity type for null");
+            }
             Self::Bool(value) => Ok(DynSolValue::Bool(*value)),
             Self::Int(value) => Ok(DynSolValue::Int(*value, 256)),
             Self::Uint(value) => Ok(DynSolValue::Uint(*value, 256)),
@@ -219,7 +221,9 @@ impl RuntimeValue {
                 .map(Self::infer_dyn_sol)
                 .collect::<Result<Vec<_>>>()
                 .map(DynSolValue::Array),
-            Self::Object(_) => bail!("cannot infer a Solidity type for an object"),
+            Self::Object(_) => {
+                bail!("cannot infer a Solidity type for an object");
+            }
         }
     }
 
@@ -227,13 +231,13 @@ impl RuntimeValue {
     pub fn coerce_dyn_sol(&self, expected: &DynSolType) -> Result<DynSolValue> {
         match (self, expected) {
             (Self::Bytes(value), DynSolType::FixedBytes(size)) if value.len() != *size => {
-                bail!("fixed bytes value has length {}, expected {}", value.len(), size)
+                bail!("fixed bytes value has length {}, expected {}", value.len(), size);
             }
             (Self::Bytes32(_), DynSolType::FixedBytes(size)) if *size != 32 => {
-                bail!("bytes32 value cannot be coerced to bytes{size}")
+                bail!("bytes32 value cannot be coerced to bytes{size}");
             }
             (Self::Array(values), DynSolType::FixedArray(_, size)) if values.len() != *size => {
-                bail!("fixed array value has length {}, expected {}", values.len(), size)
+                bail!("fixed array value has length {}, expected {}", values.len(), size);
             }
             _ => {}
         }
@@ -273,12 +277,16 @@ impl RuntimeValue {
                 .iter()
                 .map(|value| match value {
                     Self::Uint(value) if *value <= U256::from(u8::MAX) => Ok(value.to::<u8>()),
-                    _ => bail!("keccak256 byte arrays must contain uint8 values"),
+                    _ => {
+                        bail!("keccak256 byte arrays must contain uint8 values");
+                    }
                 })
                 .collect(),
-            _ => bail!(
-                "keccak256 requires bytes, bytes32, address, string, or a uint8 array; use ABI encoding for typed values"
-            ),
+            _ => {
+                bail!(
+                    "keccak256 requires bytes, bytes32, address, string, or a uint8 array; use ABI encoding for typed values"
+                );
+            }
         }
     }
 }
@@ -494,9 +502,11 @@ fn encode_packed(operand: &serde_yaml::Value, context: &RuntimeContext) -> Resul
                 .collect::<Result<Vec<_>>>()?;
             Ok(DynSolValue::Tuple(values).abi_encode_packed())
         }
-        _ => bail!(
-            "packed ABI expression must be `{{ types: [...], values: [...] }}` or an inferred value list"
-        ),
+        _ => {
+            bail!(
+                "packed ABI expression must be `{{ types: [...], values: [...] }}` or an inferred value list"
+            );
+        }
     }
 }
 

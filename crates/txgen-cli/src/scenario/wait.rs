@@ -538,7 +538,9 @@ fn resolve_event<'a>(abi: &'a JsonAbi, name_or_signature: &str) -> Result<&'a Ev
     match events.as_slice() {
         [event] => Ok(event),
         [] => unreachable!("JsonAbi::event returned an empty overload list"),
-        _ => bail!("event name '{name_or_signature}' is overloaded; use an exact signature"),
+        _ => {
+            bail!("event name '{name_or_signature}' is overloaded; use an exact signature");
+        }
     }
 }
 
