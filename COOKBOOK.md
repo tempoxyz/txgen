@@ -161,6 +161,42 @@ bench send --input txs.ndjson --rpc-url http://localhost:8545 --tps 0
 
 By default, failed transaction submissions are retried forever. Use `--retries N` to cap retries, or `--retries 0` to disable retries entirely.
 
+## Send with per-sender HTTP credentials
+
+Private RPCs can require a different HTTP credential for each on-chain sender. Put those values in a JSON file rather than command-line arguments. This example contains placeholders only:
+
+```json
+{
+  "0x1111111111111111111111111111111111111111": "example-only-value-for-sender-1",
+  "0x2222222222222222222222222222222222222222": "example-only-value-for-sender-2"
+}
+```
+
+Save the map in a restricted location such as `/run/secrets/sender-auth.json`, then run:
+
+```bash
+chmod 600 /run/secrets/sender-auth.json
+
+bench send \
+  --input txs.ndjson \
+  --rpc-url http://submit.example:8544 \
+  --query-rpc-url http://query.example:8546 \
+  --sender-header-name X-Authorization-Token \
+  --sender-header-map /run/secrets/sender-auth.json \
+  --sender-header-reload-interval 30s \
+  --tps 5000
+```
+
+Each NDJSON transaction must include its logical `sender`, and every sender must have a map entry. The header is chosen from that field, never from scheduling keys. For Tempo keychain transactions this is the authorized user rather than the access key; for sponsored transactions it is the transaction sender rather than the sponsor.
+
+`eth_sendRawTransaction`, its retries, and sender-scoped receipt polling use the submission RPC and the matching sender credential. Global block and txpool queries use `--query-rpc-url` without sender credentials. Aggregate queries never select a sender mapping. If the query URL is omitted, they use the first submission provider as before.
+
+For a soak test, have the external credential coordinator write a complete replacement file and atomically rename it over the configured map. Bench periodically reloads valid replacements and keeps the last valid map when a replacement is malformed. It never generates, signs, or renews credential values itself.
+
+For a private Tempo Zone RPC, every authenticated transaction needs an externally generated token for its logical sender.
+
+These options apply only to `bench send`. They do not authenticate nonce RPC calls made during `txgen-ethereum generate --rpc` or `txgen-tempo generate --rpc`; use the unrestricted query endpoint for generation-time nonce prefetching, or generate with suitable offline nonce configuration.
+
 ## Run a timed stress test
 
 Generate workload transactions for a wall-clock duration instead of a count:

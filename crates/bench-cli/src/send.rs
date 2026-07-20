@@ -12,11 +12,11 @@ use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     collect_block_stats, parse_reporters, start_scrapers, trim_trailing_empty_blocks,
     ConsoleReporter, FileSource, FinalReport, GeneratedTx, MetricsCollector, ProgressState,
-    Reporter, RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, StdinSource,
-    TxPhase, TxSource,
+    Reporter, RequestAuthProvider, RpcEndpoint, RunClock, RunStats, SampleStore, ScraperConfig,
+    Sender, SenderConfig, SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 pub async fn execute(args: SendArgs) -> Result<()> {
     tracing::info!(
@@ -44,38 +44,89 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     let providers = args
         .rpc_urls
         .iter()
-        .map(|url| {
-            let url = url.parse().context("failed to parse RPC URL")?;
-            let client = RpcClient::builder()
-                .layer(retry_layer.clone())
-                .http_with_client(http_client.clone(), url);
-            Ok(ProviderBuilder::new_with_network::<AnyNetwork>().connect_client(client).erased())
-        })
+        .map(|url| build_provider(url, &http_client, &retry_layer))
         .collect::<Result<Vec<_>>>()?;
+    let endpoints = args
+        .rpc_urls
+        .iter()
+        .zip(providers.iter().cloned())
+        .map(|(url, provider)| RpcEndpoint::new(url.clone(), provider))
+        .collect::<Vec<_>>();
+    let query_provider = match args.query_rpc_url.as_deref() {
+        Some(url) => build_provider(url, &http_client, &retry_layer)
+            .wrap_err("failed to build query RPC provider")?,
+        None => providers[0].clone(),
+    };
+    let request_auth = build_request_auth(&args)?;
 
     match &args.input {
         Some(path) => {
             let mut source = FileSource::new(path).wrap_err("failed to open input file")?;
-            execute_source(&args, &metadata, providers, &mut source, &scraper_configs).await
+            execute_source(
+                &args,
+                &metadata,
+                endpoints,
+                query_provider,
+                request_auth,
+                &mut source,
+                &scraper_configs,
+            )
+            .await
         }
         None => {
             let mut source = StdinSource::new();
-            execute_source(&args, &metadata, providers, &mut source, &scraper_configs).await
+            execute_source(
+                &args,
+                &metadata,
+                endpoints,
+                query_provider,
+                request_auth,
+                &mut source,
+                &scraper_configs,
+            )
+            .await
         }
+    }
+}
+
+fn build_provider(
+    url: &str,
+    http_client: &reqwest::Client,
+    retry_layer: &RetryBackoffLayer,
+) -> Result<DynProvider<AnyNetwork>> {
+    let parsed = url.parse().context("failed to parse RPC URL")?;
+    let client = RpcClient::builder()
+        .layer(retry_layer.clone())
+        .http_with_client(http_client.clone(), parsed);
+    Ok(ProviderBuilder::new_with_network::<AnyNetwork>().connect_client(client).erased())
+}
+
+fn build_request_auth(args: &SendArgs) -> Result<Option<Arc<dyn RequestAuthProvider>>> {
+    match (&args.sender_header_name, &args.sender_header_map) {
+        (None, None) => Ok(None),
+        (Some(header_name), Some(path)) => Ok(Some(Arc::new(SenderHeaderAuthProvider::from_file(
+            header_name,
+            path,
+            args.sender_header_reload_interval,
+        )?))),
+        (Some(_), None) => bail!("--sender-header-name requires --sender-header-map"),
+        (None, Some(_)) => bail!("--sender-header-map requires --sender-header-name"),
     }
 }
 
 async fn execute_source<S: TxSource>(
     args: &SendArgs,
     metadata: &HashMap<String, String>,
-    providers: Vec<DynProvider<AnyNetwork>>,
+    endpoints: Vec<RpcEndpoint>,
+    query_provider: DynProvider<AnyNetwork>,
+    request_auth: Option<Arc<dyn RequestAuthProvider>>,
     source: &mut S,
     scraper_configs: &[ScraperConfig],
 ) -> Result<()> {
     let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
-    let query_provider = &providers[0];
 
-    let first_workload = run_setup_phase(args, source, &providers, &config).await?;
+    let first_workload =
+        run_setup_phase(args, source, &endpoints, request_auth.clone(), &config).await?;
 
     let clock = if let Some(start) = args.metrics_align {
         RunClock::new_with_start_unix_ms(start)
@@ -100,7 +151,8 @@ async fn execute_source<S: TxSource>(
         Vec::new()
     };
 
-    let mut sender = Sender::new(providers.clone(), config.clone(), metrics.clone());
+    let mut sender =
+        Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth);
 
     let mut reporters = parse_reporters(&args.reports, "send", metadata)?;
     if reporters.is_empty() {
@@ -118,7 +170,7 @@ async fn execute_source<S: TxSource>(
 
     send_workload_from_source(source, &mut sender, &metrics, &config, &mut reporters).await?;
 
-    sender.flush().await;
+    sender.flush().await?;
 
     let (sent, success, failed) = metrics.counts();
     tracing::info!(sent, success, failed, "Bench send completed; starting post-processing");
@@ -126,7 +178,7 @@ async fn execute_source<S: TxSource>(
     // Wait for the txpool to drain so all transactions are included in blocks
     // before we collect block stats. The scraper and block poller keep running.
     if args.drain_timeout > 0 {
-        wait_for_pool_drain(query_provider, args.drain_timeout).await?;
+        wait_for_pool_drain(&query_provider, args.drain_timeout).await?;
         tracing::info!("Txpool drain completed");
     } else {
         tracing::info!(reason = "--drain-timeout=0", "Skipped txpool drain");
@@ -174,7 +226,7 @@ async fn execute_source<S: TxSource>(
     if end_block > start_block {
         let block_range_start = start_block + 1;
         let mut block_stats =
-            collect_block_stats(query_provider, block_range_start, end_block).await?;
+            collect_block_stats(&query_provider, block_range_start, end_block).await?;
         tracing::info!(
             start = block_range_start,
             end = end_block,
@@ -235,12 +287,18 @@ async fn execute_source<S: TxSource>(
 async fn run_setup_phase<S: TxSource>(
     args: &SendArgs,
     source: &mut S,
-    providers: &[DynProvider<AnyNetwork>],
+    endpoints: &[RpcEndpoint],
+    request_auth: Option<Arc<dyn RequestAuthProvider>>,
     config: &SenderConfig,
 ) -> Result<Option<GeneratedTx>> {
     let setup_clock = RunClock::new();
     let setup_metrics = MetricsCollector::new_with_latencies(setup_clock, false);
-    let mut setup_sender = Sender::new(providers.to_vec(), config.clone(), setup_metrics.clone());
+    let mut setup_sender = Sender::new_with_request_auth(
+        endpoints.to_vec(),
+        config.clone(),
+        setup_metrics.clone(),
+        request_auth,
+    );
     let mut setup_seen = 0u64;
 
     while let Some(tx) = source.next_tx().await? {
@@ -280,7 +338,7 @@ async fn finish_setup_phase(
     }
 
     tracing::info!(setup_txs = setup_seen, "Waiting for setup transactions");
-    setup_sender.flush().await;
+    setup_sender.flush().await?;
 
     let (_, _, failed) = setup_metrics.counts();
     if failed > 0 {

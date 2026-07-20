@@ -196,6 +196,7 @@ where
     <N as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <N as Network>::TxEnvelope: From<Signed<<N as Network>::UnsignedTx>> + Encodable2718,
 {
+    let sender = signer.address();
     let mut unsigned = request
         .build_unsigned()
         .map_err(|e| eyre::eyre!("failed to build unsigned tx from template '{name}': {e}"))?;
@@ -212,6 +213,7 @@ where
         phase,
         id: Some(name),
         raw,
+        sender: Some(sender),
         submission_keys: vec![SchedulingKey::from(key)],
         inclusion_keys,
     })

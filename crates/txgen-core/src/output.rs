@@ -1,4 +1,4 @@
-use alloy_primitives::Bytes;
+use alloy_primitives::{Address, Bytes};
 use eyre::Result;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -25,6 +25,12 @@ pub struct GeneratedTx {
     pub id: Option<String>,
     /// RLP-encoded signed transaction (EIP-2718 envelope).
     pub raw: Bytes,
+    /// Logical on-chain sender recovered from the signed transaction.
+    ///
+    /// Generated transactions always populate this field. It remains optional so
+    /// bench can continue to consume legacy NDJSON streams that predate sender
+    /// metadata.
+    pub sender: Option<Address>,
     /// Scheduling keys released once the transaction is accepted by the RPC endpoint.
     ///
     /// Use these for constraints that the chain enforces after submission, such as
@@ -45,6 +51,8 @@ struct OutputTx<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<&'a str>,
     raw: &'a Bytes,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sender: Option<&'a Address>,
     submission_keys: &'a [SchedulingKey],
     inclusion_keys: &'a [SchedulingKey],
 }
@@ -67,6 +75,7 @@ impl<W: Write> NdjsonWriter<W> {
             phase: tx.phase,
             id: tx.id.as_deref(),
             raw: &tx.raw,
+            sender: tx.sender.as_ref(),
             submission_keys: &tx.submission_keys,
             inclusion_keys: &tx.inclusion_keys,
         };
@@ -122,6 +131,7 @@ mod tests {
             phase: TxPhase::Workload,
             id: None,
             raw: Bytes::from(vec![0x02, 0xf8, 0x70]),
+            sender: Some(Address::repeat_byte(0x11)),
             submission_keys: vec![SchedulingKey::from([0xab; 20])],
             inclusion_keys: vec![SchedulingKey::from([0xcd; 20])],
         };
@@ -132,6 +142,7 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("\"phase\":\"workload\""));
         assert!(output.contains("\"raw\":\"0x02f870\""));
+        assert!(output.contains("\"sender\":\"0x1111111111111111111111111111111111111111\""));
         assert!(
             output.contains("\"submission_keys\":[\"0xabababababababababababababababababababab\"]")
         );
@@ -150,6 +161,7 @@ mod tests {
             phase: TxPhase::Workload,
             id: None,
             raw: Bytes::from(vec![0x00]),
+            sender: Some(Address::ZERO),
             submission_keys: vec![SchedulingKey::from([0x00; 20])],
             inclusion_keys: Vec::new(),
         };
