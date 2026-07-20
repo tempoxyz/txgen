@@ -83,6 +83,52 @@ txgen-ethereum addresses -s workload.yaml -f shell   # space-separated for xargs
 
 **Required RPC methods:** None (offline)
 
+#### `auth-token-map` (Tempo only)
+
+Generate a Zone private-RPC authorization-token map for the exact logical signers in one account pool. The command loads the pool through the normal `WorkloadSpec` environment expansion and account derivation paths, including the existing `[start, end)` range semantics.
+
+```bash
+# Generate a one-shot map
+txgen-tempo auth-token-map \
+  --spec zones-workload.yml \
+  --pool users \
+  --zone-id 71 \
+  --chain-id 421700071 \
+  --ttl-secs 600 \
+  --output /run/secrets/zone-auth-tokens.json
+
+# Refresh the complete map before its tokens expire
+txgen-tempo auth-token-map \
+  --spec zones-workload.yml \
+  --pool users \
+  --zone-id 71 \
+  --chain-id 421700071 \
+  --ttl-secs 600 \
+  --refresh-before-secs 30 \
+  --watch \
+  --output /run/secrets/zone-auth-tokens.json
+```
+
+| Flag | Description |
+|------|-------------|
+| `--spec <PATH>` | Workload specification file (YAML); `${ENV_VAR}` values are expanded before parsing |
+| `--pool <NAME>` | Non-empty logical/root signer pool to include |
+| `--zone-id <ID>` | Nonzero Zone ID encoded in every token |
+| `--chain-id <ID>` | Chain ID encoded in every token |
+| `--ttl-secs <N>` | Token lifetime in seconds (default: 600; maximum: 2,592,000, or 30 days) |
+| `--refresh-before-secs <N>` | Refresh lead time, which must be less than the TTL (default: 30) |
+| `--watch` | Keep running and atomically replace the complete map before expiry |
+| `--output <PATH>` | Secret output file |
+| `--force` | Replace an existing output in one-shot mode |
+
+The compact JSON output is a flat, address-sorted map from normalized lowercase `0x`-prefixed logical sender addresses to 188-character lowercase hex tokens without a `0x` prefix. Every token in one refresh shares the same issue and expiry timestamps. Keychain workloads use the root account pool: access keys do not receive separate entries because the root account token authenticates the logical sender.
+
+Treat the output as a secret. Write it to a runtime secret directory rather than the repository; on Unix, txgen creates replacement files with mode `0600` and atomically renames them so readers do not observe partial content. It does not print the map, mnemonic, private keys, signatures, or tokens. One-shot mode rejects an existing output unless `--force` is supplied, while watch mode retains the last valid file if a refresh fails. A typical 1,000-account map is about 236 KB (230.5 KiB).
+
+The 30-day TTL limit is the protocol maximum; a remote Zone node may enforce a smaller maximum. This command only derives accounts and writes tokens locally—it does not submit RPC requests or distribute the map.
+
+**Required RPC methods:** None (offline)
+
 #### `extract`
 
 Extract raw RLP-encoded blocks from an archive node as NDJSON. Use `--bal` to attach RLP-encoded block access lists for replaying EIP-7928/Amsterdam payloads.
