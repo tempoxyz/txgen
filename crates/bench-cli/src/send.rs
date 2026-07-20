@@ -109,8 +109,8 @@ fn build_request_auth(args: &SendArgs) -> Result<Option<Arc<dyn RequestAuthProvi
             path,
             args.sender_header_reload_interval,
         )?))),
-        (Some(_), None) => bail!("--sender-header-name requires --sender-header-map"),
-        (None, Some(_)) => bail!("--sender-header-map requires --sender-header-name"),
+        (Some(_), None) => Err(eyre::eyre!("--sender-header-name requires --sender-header-map")),
+        (None, Some(_)) => Err(eyre::eyre!("--sender-header-map requires --sender-header-name")),
     }
 }
 
