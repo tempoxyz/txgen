@@ -10,6 +10,7 @@ mod addresses;
 mod bal;
 mod extract;
 mod generate;
+pub mod scenario;
 
 use addresses::run_addresses;
 pub use addresses::AddressesArgs;
@@ -17,9 +18,13 @@ use extract::{run_extract, run_extract_big_blocks};
 pub use extract::{ExtractArgs, ExtractBigBlocksArgs, ExtractFormat};
 use generate::run_generate;
 pub use generate::{
-    fetch_protocol_nonces, sign_standard_request, GenerateArgs, GenerateContext, NetworkAdapter,
-    RequestSignContext, TxRequest,
+    fetch_pending_protocol_nonces, fetch_protocol_nonces, materialize_and_sign_template,
+    materialize_setup, materialize_setup_online, sign_standard_request, GenerateArgs,
+    GenerateContext, MaterializedSetup, MaterializedTx, NetworkAdapter, RequestSignContext,
+    TxRequest,
 };
+use scenario::run_scenario_command;
+pub use scenario::{ScenarioArgs, ScenarioRunArgs};
 
 // ---------------------------------------------------------------------------
 // Private CLI plumbing
@@ -42,13 +47,15 @@ enum Command {
     Extract(ExtractArgs),
     /// Generate synthetic big-block payloads from source blocks
     ExtractBigBlocks(ExtractBigBlocksArgs),
+    /// Run an asynchronous multi-chain transaction scenario
+    Scenario(ScenarioArgs),
 }
 
 // ---------------------------------------------------------------------------
 // Public entrypoint
 // ---------------------------------------------------------------------------
 
-pub async fn run<A: NetworkAdapter + 'static>(adapter: A) -> Result<()>
+pub async fn run<A: NetworkAdapter + Default + 'static>(adapter: A) -> Result<()>
 where
     <A::Network as Network>::TransactionRequest: Send + 'static,
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
@@ -65,5 +72,6 @@ where
         Command::Addresses(args) => run_addresses(args),
         Command::Extract(args) => run_extract::<A::Network>(args).await,
         Command::ExtractBigBlocks(args) => run_extract_big_blocks::<A::Network>(args).await,
+        Command::Scenario(args) => run_scenario_command::<A>(args).await,
     }
 }

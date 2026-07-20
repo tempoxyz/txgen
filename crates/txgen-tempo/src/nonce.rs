@@ -28,9 +28,30 @@ pub async fn prefetch_parallel_nonces<P: Provider<Ethereum> + Clone + Send + Syn
     spec: &txgen_core::WorkloadSpec,
     nonces: &mut txgen_core::NonceTracker,
 ) -> Result<()> {
+    prefetch_parallel_nonces_with_state(provider, accounts, spec, nonces, false).await
+}
+
+pub(crate) async fn prefetch_pending_parallel_nonces<
+    P: Provider<Ethereum> + Clone + Send + Sync,
+>(
+    provider: &P,
+    accounts: &txgen_core::AccountManager,
+    spec: &txgen_core::WorkloadSpec,
+    nonces: &mut txgen_core::NonceTracker,
+) -> Result<()> {
+    prefetch_parallel_nonces_with_state(provider, accounts, spec, nonces, true).await
+}
+
+async fn prefetch_parallel_nonces_with_state<P: Provider<Ethereum> + Clone + Send + Sync>(
+    provider: &P,
+    accounts: &txgen_core::AccountManager,
+    spec: &txgen_core::WorkloadSpec,
+    nonces: &mut txgen_core::NonceTracker,
+    pending: bool,
+) -> Result<()> {
     use crate::compute_parallel_scheduling_key;
 
-    let nonce_keys = collect_prefetchable_parallel_nonce_keys(spec);
+    let nonce_keys = collect_prefetchable_parallel_nonce_keys(spec, pending);
 
     if nonce_keys.is_empty() {
         return Ok(());
@@ -45,7 +66,7 @@ pub async fn prefetch_parallel_nonces<P: Provider<Ethereum> + Clone + Send + Syn
     for (pool_name, addresses) in accounts.all_addresses() {
         for address in addresses {
             for &nonce_key in &nonce_keys {
-                let nonce = fetch_parallel_lane_nonce(provider, address, nonce_key)
+                let nonce = fetch_parallel_lane_nonce(provider, address, nonce_key, pending)
                     .await
                     .wrap_err_with(|| format!("pool {pool_name} lane {nonce_key} ({address})"))?;
                 let scheduling_key = compute_parallel_scheduling_key(address, nonce_key);
@@ -70,13 +91,16 @@ pub(crate) async fn fetch_lane_nonce<P: Provider<Ethereum>>(
     provider: &P,
     address: Address,
     nonce_key: U256,
+    pending: bool,
 ) -> Result<u64> {
     if nonce_key.is_zero() {
-        provider.get_transaction_count(address).await.wrap_err("failed to fetch protocol nonce")
+        let request = provider.get_transaction_count(address);
+        let request = if pending { request.pending() } else { request.latest() };
+        request.await.wrap_err("failed to fetch protocol nonce")
     } else if nonce_key == TEMPO_EXPIRING_NONCE_KEY {
         Ok(0)
     } else {
-        fetch_parallel_lane_nonce(provider, address, nonce_key).await
+        fetch_parallel_lane_nonce(provider, address, nonce_key, pending).await
     }
 }
 
@@ -88,12 +112,14 @@ async fn fetch_parallel_lane_nonce<P: Provider<Ethereum>>(
     provider: &P,
     address: Address,
     nonce_key: U256,
+    pending: bool,
 ) -> Result<u64> {
     let storage_key = compute_nonce_storage_key(address, nonce_key);
-    let storage_value =
-        provider.get_storage_at(NONCE_PRECOMPILE, storage_key).await.wrap_err_with(|| {
-            format!("failed to fetch parallel nonce for {address} lane {nonce_key}")
-        })?;
+    let request = provider.get_storage_at(NONCE_PRECOMPILE, storage_key);
+    let request = if pending { request.pending() } else { request.latest() };
+    let storage_value = request.await.wrap_err_with(|| {
+        format!("failed to fetch parallel nonce for {address} lane {nonce_key}")
+    })?;
     Ok(storage_value.to::<u64>())
 }
 
@@ -104,8 +130,16 @@ async fn fetch_parallel_lane_nonce<P: Provider<Ethereum>>(
 /// cannot be known ahead of time.
 fn collect_prefetchable_parallel_nonce_keys(
     spec: &txgen_core::WorkloadSpec,
+    include_all_templates: bool,
 ) -> std::collections::HashSet<U256> {
     let mut nonce_keys = std::collections::HashSet::new();
+
+    if include_all_templates {
+        for value in spec.templates.values() {
+            collect_nonce_key_from_template_value(value.clone(), &mut nonce_keys);
+        }
+        return nonce_keys;
+    }
 
     for entry in &spec.mix {
         match &entry.item {
@@ -262,7 +296,7 @@ mix:
         )
         .unwrap();
 
-        let nonce_keys = collect_prefetchable_parallel_nonce_keys(&spec);
+        let nonce_keys = collect_prefetchable_parallel_nonce_keys(&spec, false);
         assert_eq!(nonce_keys.len(), 1);
         assert!(nonce_keys.contains(&U256::from(42)));
     }

@@ -4,7 +4,7 @@ use alloy_network::{Ethereum, TransactionBuilder};
 use alloy_primitives::{Bytes, TxKind, U256};
 use alloy_rpc_types_eth::TransactionRequest;
 use eyre::Result;
-use txgen_cli::{GenerateContext, NetworkAdapter, TxRequest};
+use txgen_cli::{NetworkAdapter, TxRequest};
 use txgen_core::BuildContext;
 
 pub use template::{EthTxType, EthereumTemplate};
@@ -12,12 +12,17 @@ pub use template::{EthTxType, EthereumTemplate};
 /// Ethereum network adapter for transaction generation.
 ///
 /// Supports legacy, EIP-2930, and EIP-1559 transaction types.
+#[derive(Default)]
 pub struct EthereumAdapter;
 
 impl NetworkAdapter for EthereumAdapter {
     type Template = EthereumTemplate;
     type Network = Ethereum;
     type SignContext = ();
+
+    fn network_name() -> &'static str {
+        "ethereum"
+    }
 
     fn build_request(
         &self,
@@ -69,15 +74,14 @@ impl NetworkAdapter for EthereumAdapter {
     }
 
     #[allow(clippy::manual_async_fn)]
-    fn prefetch_nonces<'a>(
+    fn prepare_nonces<'a>(
         &'a self,
-        ctx: &'a mut GenerateContext,
+        _spec: &'a txgen_core::WorkloadSpec,
+        accounts: &'a txgen_core::AccountManager,
+        nonces: &'a mut txgen_core::NonceTracker,
         rpc: &'a str,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        async move {
-            let (accounts, nonces) = ctx.accounts_and_nonces();
-            txgen_cli::fetch_protocol_nonces(accounts, nonces, rpc).await
-        }
+        async move { txgen_cli::fetch_pending_protocol_nonces(accounts, nonces, rpc).await }
     }
 }
 
@@ -108,10 +112,15 @@ mod tests {
     use alloy_eips::eip2718::Encodable2718;
     use alloy_network::{NetworkTransactionBuilder, TxSignerSync};
     use rand::{rngs::StdRng, SeedableRng};
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use txgen_cli::{materialize_setup, materialize_setup_online};
     use txgen_core::{
-        AccountManager, AccountPoolDef, AccountRef, ArtifactManager, GasConfig, GenValue,
-        NonceTracker, SelectMode,
+        AccountManager, AccountPoolDef, AccountRef, AddressPoolManager, ArtifactManager, GasConfig,
+        GenValue, NonceTracker, SelectMode, WorkloadSpec,
     };
 
     const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -163,5 +172,101 @@ mod tests {
         assert!(!raw.is_empty());
         // EIP-1559 transactions start with 0x02
         assert_eq!(raw[0], 0x02);
+    }
+
+    #[tokio::test]
+    async fn online_setup_matches_existing_generate_materialization() {
+        let spec: WorkloadSpec = serde_yaml::from_str(&format!(
+            r#"
+chain_id: 1
+accounts:
+  users:
+    mnemonic: "{TEST_MNEMONIC}"
+    range: [0, 1]
+setup:
+  steps:
+    - id: first
+      tx:
+        type: eip1559
+        from: {{ pool: users, select: {{ index: 0 }} }}
+        to: "0x0000000000000000000000000000000000000001"
+        value: 1
+        gas_limit: 21000
+    - id: second
+      tx:
+        type: eip1559
+        from: {{ pool: users, select: {{ index: 0 }} }}
+        to: {{ var: setup.first.sender }}
+        value: 2
+        gas_limit: 21000
+"#
+        ))
+        .unwrap();
+        let accounts = AccountManager::from_spec(&spec.accounts).unwrap();
+        let address_pools = AddressPoolManager::empty();
+        let artifacts = ArtifactManager::empty();
+
+        let generated = {
+            let mut nonces = NonceTracker::new();
+            let mut rng = StdRng::seed_from_u64(99);
+            let mut context = BuildContext::new_with_address_pools(
+                spec.chain_id,
+                &spec.gas,
+                &accounts,
+                &address_pools,
+                &artifacts,
+                &mut nonces,
+                &mut rng,
+            );
+            materialize_setup(&mut EthereumAdapter, &spec, &mut context).unwrap()
+        };
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let online = {
+            let mut nonces = NonceTracker::new();
+            let mut rng = StdRng::seed_from_u64(99);
+            let mut context = BuildContext::new_with_address_pools(
+                spec.chain_id,
+                &spec.gas,
+                &accounts,
+                &address_pools,
+                &artifacts,
+                &mut nonces,
+                &mut rng,
+            );
+            materialize_setup_online(
+                &mut EthereumAdapter,
+                &spec,
+                &mut context,
+                Duration::from_secs(1),
+                {
+                    let observed = observed.clone();
+                    move |transaction| {
+                        let observed = observed.clone();
+                        async move {
+                            observed
+                                .lock()
+                                .unwrap()
+                                .push(transaction.id.clone().expect("setup transaction id"));
+                            Ok(transaction)
+                        }
+                    }
+                },
+            )
+            .await
+            .unwrap()
+        };
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec!["setup.first".to_string(), "setup.second".to_string()]
+        );
+        assert_eq!(generated.transactions.len(), online.transactions.len());
+        for (generated, online) in generated.transactions.iter().zip(&online.transactions) {
+            assert_eq!(generated.id, online.id);
+            assert_eq!(generated.raw, online.raw);
+            assert_eq!(generated.submission_keys, online.submission_keys);
+            assert_eq!(generated.inclusion_keys, online.inclusion_keys);
+        }
     }
 }

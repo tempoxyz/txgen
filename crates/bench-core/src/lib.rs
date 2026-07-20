@@ -40,6 +40,8 @@ pub use reth_api::{
 };
 pub use sample::{Sample, SampleArchive, SampleStore};
 pub use scraper::{start_scrapers, SampleCallback, ScraperConfig, ScraperHandle};
-pub use sender::{Sender, SenderConfig};
+pub use sender::{
+    RpcSubmission, RpcSubmitError, RpcSubmitFailureKind, RpcSubmitter, Sender, SenderConfig,
+};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource};
 pub use txgen_core::{GeneratedTx, TxPhase};

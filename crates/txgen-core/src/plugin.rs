@@ -4,8 +4,8 @@ use rand::rngs::StdRng;
 use std::sync::OnceLock;
 
 use crate::{
-    AccountManager, AccountRef, AddressPoolManager, ArtifactManager, GasConfig, NonceTracker,
-    SelectMode,
+    AccountManager, AccountRef, AddressPoolManager, ArtifactManager, GasConfig, NonceReservation,
+    NonceTracker, SelectMode,
 };
 
 /// Result of selecting a signer from a pool.
@@ -37,6 +37,8 @@ pub struct BuildContext<'a> {
 
     /// Nonce tracker for ordering.
     pub nonces: &'a mut NonceTracker,
+
+    nonce_reservations: Vec<NonceReservation>,
 
     /// Random number generator.
     pub rng: &'a mut StdRng,
@@ -78,12 +80,42 @@ impl<'a> BuildContext<'a> {
         nonces: &'a mut NonceTracker,
         rng: &'a mut StdRng,
     ) -> Self {
-        Self { chain_id, gas, accounts, address_pools, artifacts, nonces, rng }
+        Self {
+            chain_id,
+            gas,
+            accounts,
+            address_pools,
+            artifacts,
+            nonces,
+            rng,
+            nonce_reservations: Vec::new(),
+        }
     }
 
     /// Get the next nonce for a scheduling key.
     pub fn next_nonce(&mut self, key: [u8; 20]) -> u64 {
-        self.nonces.next(key)
+        let nonce = self.nonces.next(key);
+        self.nonce_reservations.push(NonceReservation { key, nonce });
+        nonce
+    }
+
+    /// Commit and return nonce values consumed since the previous drain.
+    pub fn take_nonce_reservations(&mut self) -> Vec<NonceReservation> {
+        std::mem::take(&mut self.nonce_reservations)
+    }
+
+    /// Rewind nonce values consumed since the previous drain.
+    ///
+    /// Reservations are unwound in reverse order so multiple uses of one lane
+    /// are restored correctly. Returns false if external mutation made a
+    /// reservation unsafe to rewind.
+    pub fn rollback_nonce_reservations(&mut self) -> bool {
+        let reservations = std::mem::take(&mut self.nonce_reservations);
+        let mut restored = true;
+        for reservation in reservations.into_iter().rev() {
+            restored &= self.nonces.rewind(reservation.key, reservation.nonce);
+        }
+        restored
     }
 
     /// Create a value resolver for this context.

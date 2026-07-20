@@ -6,17 +6,18 @@
 
 use crate::metrics::MetricsCollector;
 use alloy_network::{primitives::ReceiptResponse, AnyNetwork};
-use alloy_primitives::Bytes;
+use alloy_primitives::{Bytes, TxHash};
 use alloy_provider::{DynProvider, Provider};
+use alloy_transport::RpcError;
 use eyre::Result;
 use rand::seq::IndexedRandom;
 use std::{
     collections::{HashSet, VecDeque},
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
-    sync::{mpsc, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
 };
 use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey, TxPhase};
@@ -39,6 +40,404 @@ pub struct SenderConfig {
 impl Default for SenderConfig {
     fn default() -> Self {
         Self { rate_limit: 0, max_concurrent: 100 }
+    }
+}
+
+impl SenderConfig {
+    /// Validate configuration shared by transaction submission clients.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_concurrent == 0 {
+            eyre::bail!("max_concurrent must be greater than zero");
+        }
+
+        Ok(())
+    }
+}
+
+/// Result returned after an RPC endpoint accepts a raw transaction.
+#[derive(Debug, Clone, Copy)]
+pub struct RpcSubmission {
+    /// Hash returned by `eth_sendRawTransaction`.
+    pub tx_hash: TxHash,
+    /// Time spent awaiting RPC acceptance, measured with a monotonic clock.
+    pub acceptance_latency: Duration,
+    /// Wall-clock time at which the RPC submission started.
+    pub submitted_at: SystemTime,
+}
+
+/// Point at which an individual RPC submission failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcSubmitFailureKind {
+    /// The request was not sent, so its nonce can be safely reused.
+    BeforeSend,
+    /// The node returned a JSON-RPC rejection.
+    Rejected,
+    /// The transport failed after dispatch and acceptance is unknown.
+    Ambiguous,
+}
+
+/// Classified failure from [`RpcSubmitter::submit_classified`].
+#[derive(Debug)]
+pub struct RpcSubmitError {
+    kind: RpcSubmitFailureKind,
+    timed_out: bool,
+    diagnostic: String,
+}
+
+impl RpcSubmitError {
+    /// Submission failure category used for nonce recovery.
+    pub const fn kind(&self) -> RpcSubmitFailureKind {
+        self.kind
+    }
+
+    /// Whether the submission failed because its caller-supplied deadline elapsed.
+    pub const fn is_timeout(&self) -> bool {
+        self.timed_out
+    }
+
+    fn before_send(error: impl std::fmt::Display) -> Self {
+        Self {
+            kind: RpcSubmitFailureKind::BeforeSend,
+            timed_out: false,
+            diagnostic: error.to_string(),
+        }
+    }
+
+    fn deadline(kind: RpcSubmitFailureKind, diagnostic: &'static str) -> Self {
+        Self { kind, timed_out: true, diagnostic: diagnostic.to_string() }
+    }
+
+    fn from_transport(error: alloy_transport::TransportError) -> Self {
+        let kind = match &error {
+            RpcError::ErrorResp(_) => RpcSubmitFailureKind::Rejected,
+            RpcError::UnsupportedFeature(_) |
+            RpcError::LocalUsageError(_) |
+            RpcError::SerError(_) => RpcSubmitFailureKind::BeforeSend,
+            RpcError::NullResp | RpcError::DeserError { .. } | RpcError::Transport(_) => {
+                RpcSubmitFailureKind::Ambiguous
+            }
+        };
+        Self { kind, timed_out: false, diagnostic: error.to_string() }
+    }
+}
+
+impl std::fmt::Display for RpcSubmitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.diagnostic)
+    }
+}
+
+impl std::error::Error for RpcSubmitError {}
+
+/// Cloneable client for submitting individual transactions through bench's
+/// concurrency and transaction-rate controls.
+///
+/// Clones share the same semaphore and token bucket. Separately constructed
+/// clients have independent rate limits, allowing scenario-instance start rate
+/// limiting to remain separate from transaction submission rate limiting.
+/// Generated transactions are ordered using the same submission and inclusion
+/// key semantics as [`Sender`]. Raw submissions bypass key ordering.
+#[derive(Clone)]
+pub struct RpcSubmitter {
+    providers: Arc<[DynProvider<AnyNetwork>]>,
+    semaphore: Arc<Semaphore>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+    ordering: Arc<RpcOrdering>,
+}
+
+impl RpcSubmitter {
+    /// Create an RPC submitter backed by one or more interchangeable providers.
+    pub fn new(providers: Vec<DynProvider<AnyNetwork>>, config: SenderConfig) -> Result<Self> {
+        if providers.is_empty() {
+            eyre::bail!("at least one RPC provider is required");
+        }
+        config.validate()?;
+
+        let rate_limiter =
+            (config.rate_limit > 0).then(|| Arc::new(RateLimiter::new(config.rate_limit)));
+
+        Ok(Self {
+            providers: providers.into(),
+            semaphore: Arc::new(Semaphore::new(config.max_concurrent)),
+            rate_limiter,
+            ordering: Arc::new(RpcOrdering::default()),
+        })
+    }
+
+    /// Submit a generated transaction and wait until an RPC endpoint accepts it.
+    pub async fn submit(&self, tx: &GeneratedTx) -> Result<RpcSubmission> {
+        self.submit_classified(tx).await.map_err(Into::into)
+    }
+
+    /// Submit a generated transaction while retaining whether an error happened
+    /// before dispatch, was an RPC rejection, or had an ambiguous transport outcome.
+    pub async fn submit_classified(
+        &self,
+        tx: &GeneratedTx,
+    ) -> std::result::Result<RpcSubmission, RpcSubmitError> {
+        self.submit_classified_inner(tx, None).await
+    }
+
+    /// Submit a generated transaction before an absolute deadline.
+    ///
+    /// Expiry while waiting for ordering, rate, or concurrency capacity is
+    /// classified as [`RpcSubmitFailureKind::BeforeSend`]. Expiry after the raw
+    /// RPC starts is classified as [`RpcSubmitFailureKind::Ambiguous`].
+    pub async fn submit_classified_until(
+        &self,
+        tx: &GeneratedTx,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<RpcSubmission, RpcSubmitError> {
+        self.submit_classified_inner(tx, Some(deadline)).await
+    }
+
+    async fn submit_classified_inner(
+        &self,
+        tx: &GeneratedTx,
+        deadline: Option<tokio::time::Instant>,
+    ) -> std::result::Result<RpcSubmission, RpcSubmitError> {
+        let order = self
+            .ordering
+            .clone()
+            .enqueue(tx.submission_keys.clone(), tx.inclusion_keys.clone())
+            .map_err(RpcSubmitError::before_send)?;
+        let mut order = match deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline, order.acquire()).await.map_err(|_| {
+                    RpcSubmitError::deadline(
+                        RpcSubmitFailureKind::BeforeSend,
+                        "submission deadline elapsed before dispatch",
+                    )
+                })?
+            }
+            None => order.acquire().await,
+        };
+        let permit = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, self.acquire_permit())
+                .await
+                .map_err(|_| {
+                    RpcSubmitError::deadline(
+                        RpcSubmitFailureKind::BeforeSend,
+                        "submission deadline elapsed before dispatch",
+                    )
+                })?
+                .map_err(RpcSubmitError::before_send)?,
+            None => self.acquire_permit().await.map_err(RpcSubmitError::before_send)?,
+        };
+
+        // SAFETY: construction rejects an empty provider list.
+        let provider = self.providers.choose(&mut rand::rng()).expect("providers are non-empty");
+        let submission = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, submit_raw_rpc(provider, &tx.raw))
+                .await
+                .map_err(|_| {
+                    RpcSubmitError::deadline(
+                        RpcSubmitFailureKind::Ambiguous,
+                        "submission deadline elapsed after RPC dispatch; acceptance is unknown",
+                    )
+                })?
+                .map_err(RpcSubmitError::from_transport)?,
+            None => {
+                submit_raw_rpc(provider, &tx.raw).await.map_err(RpcSubmitError::from_transport)?
+            }
+        };
+        drop(permit);
+
+        order.release_submission_keys();
+        if let Some(inclusion_release) = order.take_inclusion_keys() {
+            let provider = provider.clone();
+            let tx_hash = submission.tx_hash;
+            tokio::spawn(async move {
+                let _ = wait_for_receipt(&provider, tx_hash).await;
+                drop(inclusion_release);
+            });
+        }
+
+        Ok(submission)
+    }
+
+    /// Submit raw EIP-2718 transaction bytes and wait for RPC acceptance.
+    pub async fn submit_raw(&self, raw: &Bytes) -> Result<RpcSubmission> {
+        let _permit = self.acquire_permit().await?;
+
+        // SAFETY: construction rejects an empty provider list.
+        let provider = self.providers.choose(&mut rand::rng()).expect("providers are non-empty");
+        Ok(submit_raw_rpc(provider, raw).await?)
+    }
+
+    async fn acquire_permit(&self) -> Result<OwnedSemaphorePermit> {
+        loop {
+            let permit = self
+                .semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| eyre::eyre!("RPC submitter semaphore closed"))?;
+
+            if let Some(limiter) = &self.rate_limiter &&
+                let Some(delay) = limiter.try_acquire_or_delay().await
+            {
+                drop(permit);
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            return Ok(permit);
+        }
+    }
+}
+
+#[derive(Default)]
+struct RpcOrdering {
+    state: StdMutex<RpcOrderingState>,
+    notify: Notify,
+}
+
+#[derive(Default)]
+struct RpcOrderingState {
+    next_id: u64,
+    pending: VecDeque<RpcPendingOrder>,
+    active_keys: HashSet<SchedulingKey>,
+}
+
+struct RpcPendingOrder {
+    id: u64,
+    submission_keys: SchedulingKeys,
+    inclusion_keys: SchedulingKeys,
+}
+
+impl RpcPendingOrder {
+    fn scheduling_keys(&self) -> impl Iterator<Item = &SchedulingKey> {
+        self.submission_keys.iter().chain(self.inclusion_keys.iter())
+    }
+}
+
+impl RpcOrdering {
+    fn enqueue(
+        self: Arc<Self>,
+        submission_keys: SchedulingKeys,
+        inclusion_keys: SchedulingKeys,
+    ) -> Result<RpcOrderTicket> {
+        let (submission_keys, inclusion_keys) =
+            normalize_key_sets(submission_keys, inclusion_keys)?;
+        let mut state = self.state.lock().expect("RPC ordering mutex poisoned");
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1);
+        state.pending.push_back(RpcPendingOrder {
+            id,
+            submission_keys: submission_keys.clone(),
+            inclusion_keys: inclusion_keys.clone(),
+        });
+        drop(state);
+        self.notify.notify_waiters();
+
+        Ok(RpcOrderTicket { ordering: self, id, submission_keys, inclusion_keys, acquired: false })
+    }
+
+    fn try_acquire(&self, id: u64) -> bool {
+        let mut state = self.state.lock().expect("RPC ordering mutex poisoned");
+        let Some(index) = next_ready_order_index(&state.pending, &state.active_keys) else {
+            return false;
+        };
+        if state.pending[index].id != id {
+            return false;
+        }
+
+        let pending = state.pending.remove(index).expect("pending RPC order exists");
+        state.active_keys.extend(pending.scheduling_keys().copied());
+        true
+    }
+
+    fn cancel_pending(&self, id: u64) {
+        let mut state = self.state.lock().expect("RPC ordering mutex poisoned");
+        if let Some(index) = state.pending.iter().position(|pending| pending.id == id) {
+            state.pending.remove(index);
+        }
+        drop(state);
+        self.notify.notify_waiters();
+    }
+
+    fn release(&self, keys: &[SchedulingKey]) {
+        let mut state = self.state.lock().expect("RPC ordering mutex poisoned");
+        for key in keys {
+            state.active_keys.remove(key);
+        }
+        drop(state);
+        self.notify.notify_waiters();
+    }
+}
+
+fn next_ready_order_index(
+    pending: &VecDeque<RpcPendingOrder>,
+    active_keys: &HashSet<SchedulingKey>,
+) -> Option<usize> {
+    let mut blocked_keys = active_keys.clone();
+    for (index, pending) in pending.iter().enumerate() {
+        if pending.scheduling_keys().any(|key| blocked_keys.contains(key)) {
+            blocked_keys.extend(pending.scheduling_keys().copied());
+        } else {
+            return Some(index);
+        }
+    }
+    None
+}
+
+struct RpcOrderTicket {
+    ordering: Arc<RpcOrdering>,
+    id: u64,
+    submission_keys: SchedulingKeys,
+    inclusion_keys: SchedulingKeys,
+    acquired: bool,
+}
+
+impl RpcOrderTicket {
+    async fn acquire(mut self) -> Self {
+        loop {
+            let ordering = Arc::clone(&self.ordering);
+            let notified = ordering.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if ordering.try_acquire(self.id) {
+                self.acquired = true;
+                return self;
+            }
+            notified.await;
+        }
+    }
+
+    fn release_submission_keys(&mut self) {
+        self.ordering.release(&self.submission_keys);
+        self.submission_keys.clear();
+    }
+
+    fn take_inclusion_keys(&mut self) -> Option<RpcInclusionRelease> {
+        if self.inclusion_keys.is_empty() {
+            return None;
+        }
+        let keys = std::mem::take(&mut self.inclusion_keys);
+        Some(RpcInclusionRelease { ordering: self.ordering.clone(), keys })
+    }
+}
+
+impl Drop for RpcOrderTicket {
+    fn drop(&mut self) {
+        if self.acquired {
+            self.ordering.release(&self.submission_keys);
+            self.ordering.release(&self.inclusion_keys);
+        } else {
+            self.ordering.cancel_pending(self.id);
+        }
+    }
+}
+
+struct RpcInclusionRelease {
+    ordering: Arc<RpcOrdering>,
+    keys: SchedulingKeys,
+}
+
+impl Drop for RpcInclusionRelease {
+    fn drop(&mut self) {
+        self.ordering.release(&self.keys);
     }
 }
 
@@ -294,11 +693,10 @@ async fn submit_tx(
     // SAFETY: `providers` is guaranteed to be non-empty by construction.
     let provider = providers.choose(&mut rand::rng()).unwrap();
 
-    let start = Instant::now();
-    let tx_hash = match provider.send_raw_transaction(&pending.raw).await {
-        Ok(pending_tx) => {
-            metrics.record_success(start.elapsed());
-            *pending_tx.tx_hash()
+    let tx_hash = match submit_raw_rpc(provider, &pending.raw).await {
+        Ok(submission) => {
+            metrics.record_success(submission.acceptance_latency);
+            submission.tx_hash
         }
         Err(e) => {
             tracing::warn!(error = %e, "Failed to send transaction");
@@ -330,6 +728,21 @@ async fn submit_tx(
     }
 
     release_keys(&completion_tx, pending.inclusion_keys);
+}
+
+async fn submit_raw_rpc(
+    provider: &DynProvider<AnyNetwork>,
+    raw: &Bytes,
+) -> alloy_transport::TransportResult<RpcSubmission> {
+    let submitted_at = SystemTime::now();
+    let start = Instant::now();
+    let pending_tx = provider.send_raw_transaction(raw).await?;
+
+    Ok(RpcSubmission {
+        tx_hash: *pending_tx.tx_hash(),
+        acceptance_latency: start.elapsed(),
+        submitted_at,
+    })
 }
 
 fn release_keys(completion_tx: &mpsc::UnboundedSender<SchedulingKeys>, keys: SchedulingKeys) {
@@ -417,12 +830,129 @@ impl RateLimiterState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_provider::ProviderBuilder;
+    use alloy_transport::mock::Asserter;
+
+    fn mocked_provider(asserter: Asserter) -> DynProvider<AnyNetwork> {
+        ProviderBuilder::new_with_network::<AnyNetwork>().connect_mocked_client(asserter).erased()
+    }
 
     #[test]
     fn test_sender_config_default() {
         let config = SenderConfig::default();
         assert_eq!(config.rate_limit, 0);
         assert_eq!(config.max_concurrent, 100);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_sender_config_rejects_zero_concurrency() {
+        let config = SenderConfig { rate_limit: 0, max_concurrent: 0 };
+        assert!(config.validate().is_err());
+
+        let provider = mocked_provider(Asserter::new());
+        assert!(RpcSubmitter::new(vec![provider], config).is_err());
+    }
+
+    #[test]
+    fn test_rpc_submitter_rejects_empty_provider_list() {
+        let result = RpcSubmitter::new(Vec::new(), SenderConfig::default());
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_rpc_submitter_returns_acceptance_result() {
+        let asserter = Asserter::new();
+        let tx_hash = TxHash::repeat_byte(0x42);
+        asserter.push_success(&tx_hash);
+
+        let submitter = RpcSubmitter::new(
+            vec![mocked_provider(asserter.clone())],
+            SenderConfig { rate_limit: 0, max_concurrent: 1 },
+        )
+        .unwrap();
+
+        let submission =
+            submitter.submit_raw(&Bytes::from_static(&[0x02, 0xf8, 0x70])).await.unwrap();
+
+        assert_eq!(submission.tx_hash, tx_hash);
+        assert!(submission.submitted_at.duration_since(std::time::UNIX_EPOCH).is_ok());
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deadline_while_rate_limited_is_classified_before_send() {
+        let asserter = Asserter::new();
+        asserter.push_success(&TxHash::repeat_byte(0x42));
+        let submitter = RpcSubmitter::new(
+            vec![mocked_provider(asserter.clone())],
+            SenderConfig { rate_limit: 1, max_concurrent: 1 },
+        )
+        .unwrap();
+        let transaction = GeneratedTx {
+            phase: TxPhase::Workload,
+            id: None,
+            raw: Bytes::from_static(&[0x02, 0xf8, 0x70]),
+            submission_keys: vec![SchedulingKey::from([0x11; 20])],
+            inclusion_keys: Vec::new(),
+        };
+
+        submitter.submit_classified(&transaction).await.unwrap();
+        let error = submitter
+            .submit_classified_until(
+                &transaction,
+                tokio::time::Instant::now() + Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), RpcSubmitFailureKind::BeforeSend);
+        assert!(error.is_timeout());
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rpc_ordering_serializes_shared_keys_and_allows_disjoint_keys() {
+        let ordering = Arc::new(RpcOrdering::default());
+        let shared = SchedulingKey::from([0x11; 20]);
+        let disjoint = SchedulingKey::from([0x22; 20]);
+
+        let mut first = ordering.clone().enqueue(vec![shared], Vec::new()).unwrap().acquire().await;
+        let second = ordering.clone().enqueue(vec![shared], Vec::new()).unwrap();
+        let disjoint_ticket = ordering.clone().enqueue(vec![disjoint], Vec::new()).unwrap();
+
+        let disjoint_ticket =
+            tokio::time::timeout(Duration::from_millis(50), disjoint_ticket.acquire())
+                .await
+                .expect("disjoint key should be dispatched");
+        let mut second_task = tokio::spawn(second.acquire());
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut second_task).await.is_err());
+
+        first.release_submission_keys();
+        let second = tokio::time::timeout(Duration::from_millis(50), second_task)
+            .await
+            .expect("shared key should be released")
+            .unwrap();
+        drop(second);
+        drop(disjoint_ticket);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_queued_order_unblocks_later_conflicts() {
+        let ordering = Arc::new(RpcOrdering::default());
+        let first_key = SchedulingKey::from([0x11; 20]);
+        let second_key = SchedulingKey::from([0x22; 20]);
+
+        let first = ordering.clone().enqueue(vec![first_key], Vec::new()).unwrap().acquire().await;
+        let blocked = ordering.clone().enqueue(vec![first_key, second_key], Vec::new()).unwrap();
+        let later = ordering.clone().enqueue(vec![second_key], Vec::new()).unwrap();
+
+        drop(blocked);
+        let later = tokio::time::timeout(Duration::from_millis(50), later.acquire())
+            .await
+            .expect("cancelled queue entry should not retain its keys");
+        drop(later);
+        drop(first);
     }
 
     #[test]
@@ -447,6 +977,17 @@ mod tests {
         let state = limiter.state.lock().await;
         assert!(state.tokens <= 9.0, "tokens: {}", state.tokens);
         assert!(state.tokens > 8.0, "tokens: {}", state.tokens);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiters_have_independent_token_buckets() {
+        let first = RateLimiter::new(1);
+        let second = RateLimiter::new(1);
+
+        assert_eq!(first.try_acquire_or_delay().await, None);
+        assert_eq!(second.try_acquire_or_delay().await, None);
+        assert!(first.try_acquire_or_delay().await.is_some());
+        assert!(second.try_acquire_or_delay().await.is_some());
     }
 
     #[test]

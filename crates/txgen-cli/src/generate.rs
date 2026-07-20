@@ -144,6 +144,41 @@ pub struct TxRequest<R, C = ()> {
     pub sign_context: C,
 }
 
+/// One network-adapter template materialized, signed, and ready for submission.
+///
+/// This is the reusable online counterpart to the NDJSON generation path. It
+/// deliberately contains no signer material and is safe to pass to reporting
+/// and submission layers.
+#[derive(Debug)]
+pub struct MaterializedTx {
+    /// Signed transaction plus scheduling metadata used by bench senders.
+    pub generated: GeneratedTx,
+    /// Sender selected while materializing the template.
+    pub sender: Address,
+    /// Hash of the signed EIP-2718 payload.
+    pub tx_hash: B256,
+    /// Nonce populated by the adapter, when present.
+    pub nonce: Option<u64>,
+    /// Tracker entries consumed while building this transaction.
+    pub nonce_reservations: Vec<txgen_core::NonceReservation>,
+    /// Contract creation address, when the request creates a contract and has a nonce.
+    pub created_address: Option<Address>,
+}
+
+/// Setup transactions and substitutions materialized from one workload spec.
+pub struct MaterializedSetup {
+    /// Signed setup transactions in workload order.
+    pub transactions: Vec<GeneratedTx>,
+    bindings: std::collections::HashMap<String, ResolvedBinding>,
+}
+
+impl MaterializedSetup {
+    /// Resolve `chain_id` and `setup.<step>.*` references in a transaction template.
+    pub fn resolve_template(&self, value: serde_yaml::Value) -> Result<serde_yaml::Value> {
+        substitute_vars(value, &self.bindings)
+    }
+}
+
 /// Converts an adapter-built request into the raw transaction emitted by txgen.
 ///
 /// The default implementation signs with the selected account. Adapters can
@@ -217,6 +252,279 @@ where
     })
 }
 
+/// Parse, build, sign, and encode one already-materialized adapter template.
+///
+/// Callers are responsible for applying overlays and resolving any outer
+/// runtime expressions before invoking this function. Network-specific signing
+/// behavior (including Tempo keychain and sponsor signatures) remains owned by
+/// the adapter's [`RequestSignContext`].
+pub fn materialize_and_sign_template<A: NetworkAdapter>(
+    adapter: &A,
+    name: &str,
+    value: serde_yaml::Value,
+    phase: TxPhase,
+    inclusion_keys: &[SchedulingKey],
+    ctx: &mut BuildContext<'_>,
+) -> Result<MaterializedTx>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let result = (|| -> Result<_> {
+        let template: A::Template = serde_yaml::from_value(value)
+            .wrap_err_with(|| format!("failed to parse template '{name}'"))?;
+        let tx_req = adapter
+            .build_request(template, ctx)
+            .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
+        let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?;
+        let sender = signer.address();
+        let nonce = tx_req.request.nonce();
+        let created_address = match (tx_req.request.kind(), nonce) {
+            (Some(TxKind::Create), Some(nonce)) => Some(sender.create(nonce)),
+            _ => None,
+        };
+
+        let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context } = tx_req;
+        let generated = sign_context.sign_request(
+            name.to_string(),
+            phase,
+            request,
+            signer.clone(),
+            key,
+            dedup_scheduling_keys(inclusion_keys.iter().copied()),
+        )?;
+        let tx_hash = keccak256(&generated.raw);
+        Ok((generated, sender, tx_hash, nonce, created_address))
+    })();
+
+    match result {
+        Ok((generated, sender, tx_hash, nonce, created_address)) => {
+            let nonce_reservations = ctx.take_nonce_reservations();
+            Ok(MaterializedTx {
+                generated,
+                sender,
+                tx_hash,
+                nonce,
+                nonce_reservations,
+                created_address,
+            })
+        }
+        Err(error) => {
+            if !ctx.rollback_nonce_reservations() {
+                return Err(error.wrap_err("failed to rewind nonce state after materialization"));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Materialize a workload's setup section for direct online submission.
+pub fn materialize_setup<A: NetworkAdapter>(
+    adapter: &mut A,
+    spec: &WorkloadSpec,
+    ctx: &mut BuildContext<'_>,
+) -> Result<MaterializedSetup>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let mut encoded = Vec::new();
+    let bindings = {
+        let mut writer = NdjsonWriter::new(&mut encoded);
+        let bindings = emit_setup(adapter, spec, ctx, &mut writer)?;
+        writer.flush()?;
+        bindings
+    };
+    let transactions = std::str::from_utf8(&encoded)
+        .wrap_err("setup transaction stream was not UTF-8")?
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<bench_core::SourceTx>(line)
+                .wrap_err("failed to parse materialized setup transaction")?
+                .into_generated_tx()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(MaterializedSetup { transactions, bindings })
+}
+
+/// Materialize setup transactions after asynchronously preparing adapter state.
+///
+/// Scenario execution uses this path because an online adapter may need to read
+/// a nonce lane selected by a setup template before its synchronous
+/// [`NetworkAdapter::build_request`] implementation can reserve that nonce.
+/// Each signed transaction is passed to `submit` before the following setup
+/// transaction is materialized, keeping relative-expiry fields fresh and
+/// preserving ordered setup side effects. Adapter preparation for each
+/// transaction is bounded by `prepare_timeout`.
+pub async fn materialize_setup_online<A, F, Fut>(
+    adapter: &mut A,
+    spec: &WorkloadSpec,
+    ctx: &mut BuildContext<'_>,
+    prepare_timeout: Duration,
+    mut submit: F,
+) -> Result<MaterializedSetup>
+where
+    A: NetworkAdapter,
+    F: FnMut(GeneratedTx) -> Fut,
+    Fut: std::future::Future<Output = Result<GeneratedTx>>,
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let mut transactions = Vec::new();
+    let mut bindings = std::collections::HashMap::new();
+    bindings.insert("chain_id".to_string(), ResolvedBinding::U64(ctx.chain_id));
+
+    let Some(setup) = &spec.setup else {
+        return Ok(MaterializedSetup { transactions, bindings });
+    };
+
+    let setup_key = compute_setup_key();
+    let mut output =
+        OnlineSetupOutput { prepare_timeout, transactions: &mut transactions, submit: &mut submit };
+    for step in &setup.steps {
+        materialize_setup_step_online(adapter, step, &mut bindings, setup_key, ctx, &mut output)
+            .await
+            .wrap_err_with(|| format!("failed to materialize setup step '{}'", step.id))?;
+    }
+
+    Ok(MaterializedSetup { transactions, bindings })
+}
+
+struct OnlineSetupOutput<'a, F> {
+    prepare_timeout: Duration,
+    transactions: &'a mut Vec<GeneratedTx>,
+    submit: &'a mut F,
+}
+
+async fn materialize_setup_step_online<A, F, Fut>(
+    adapter: &mut A,
+    step: &SetupStep,
+    setup_bindings: &mut std::collections::HashMap<String, ResolvedBinding>,
+    setup_key: SchedulingKey,
+    ctx: &mut BuildContext<'_>,
+    output: &mut OnlineSetupOutput<'_, F>,
+) -> Result<()>
+where
+    A: NetworkAdapter,
+    F: FnMut(GeneratedTx) -> Fut,
+    Fut: std::future::Future<Output = Result<GeneratedTx>>,
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let has_deploy = step.deploy.is_some();
+    let has_tx = step.tx.is_some();
+    let has_keychain_authorize_pool = step.keychain_authorize_pool.is_some();
+    let action_count =
+        usize::from(has_deploy) + usize::from(has_tx) + usize::from(has_keychain_authorize_pool);
+    if action_count != 1 {
+        bail!("setup step must set exactly one of `deploy`, `tx`, or `keychain_authorize_pool`");
+    }
+
+    let local_bindings = resolve_sequence_bindings(&step.bindings, ctx, setup_bindings)?;
+    if let Some(keychain_authorize_pool) = &step.keychain_authorize_pool {
+        let materialized = substitute_vars(keychain_authorize_pool.clone(), &local_bindings)?;
+        let templates = adapter
+            .expand_setup_extension(&step.id, "keychain_authorize_pool", materialized, ctx)?
+            .ok_or_else(|| {
+                eyre::eyre!("adapter does not support setup step `keychain_authorize_pool`")
+            })?;
+        if templates.is_empty() {
+            bail!("setup step `keychain_authorize_pool` produced no transactions");
+        }
+        for (idx, value) in templates.into_iter().enumerate() {
+            let inclusion_key = compute_setup_extension_key(&step.id, idx);
+            let (generated, _) = materialize_setup_value_online(
+                adapter,
+                &format!("setup.{}[{idx}]", step.id),
+                value,
+                &[inclusion_key],
+                ctx,
+                output.prepare_timeout,
+            )
+            .await?;
+            output.transactions.push((output.submit)(generated).await?);
+        }
+        return Ok(());
+    }
+
+    let (generated, info) = if let Some(deploy) = &step.deploy {
+        let materialized = substitute_vars(deploy.clone(), &local_bindings)?;
+        let value = build_deploy_template_value(materialized, ctx)?;
+        let result = materialize_setup_value_online(
+            adapter,
+            &format!("setup.{}", step.id),
+            value,
+            &[setup_key],
+            ctx,
+            output.prepare_timeout,
+        )
+        .await?;
+        if result.1.created_address.is_none() {
+            bail!("deploy setup step did not produce a contract creation transaction");
+        }
+        result
+    } else {
+        let tx = step.tx.as_ref().expect("checked exactly one setup action");
+        let materialized = substitute_vars(tx.clone(), &local_bindings)?;
+        materialize_setup_value_online(
+            adapter,
+            &format!("setup.{}", step.id),
+            materialized,
+            &[setup_key],
+            ctx,
+            output.prepare_timeout,
+        )
+        .await?
+    };
+    output.transactions.push((output.submit)(generated).await?);
+
+    setup_bindings.insert(
+        format!("setup.{}", step.id),
+        ResolvedBinding::SetupTx {
+            address: info.created_address,
+            tx_hash: info.tx_hash,
+            sender: info.sender,
+            nonce: info.nonce,
+        },
+    );
+
+    Ok(())
+}
+
+async fn materialize_setup_value_online<A: NetworkAdapter>(
+    adapter: &A,
+    name: &str,
+    value: serde_yaml::Value,
+    inclusion_keys: &[SchedulingKey],
+    ctx: &mut BuildContext<'_>,
+    prepare_timeout: Duration,
+) -> Result<(GeneratedTx, EmittedTxInfo)>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    tokio::time::timeout(prepare_timeout, adapter.prepare_request(&value, ctx))
+        .await
+        .map_err(|_| eyre::eyre!("timed out preparing request from template '{name}'"))?
+        .wrap_err_with(|| format!("failed to prepare request from template '{name}'"))?;
+    let materialized =
+        materialize_and_sign_template(adapter, name, value, TxPhase::Setup, inclusion_keys, ctx)?;
+    let nonce =
+        materialized.nonce.ok_or_else(|| eyre::eyre!("template '{name}' did not set a nonce"))?;
+    let info = EmittedTxInfo {
+        sender: materialized.sender,
+        nonce,
+        tx_hash: materialized.tx_hash,
+        created_address: materialized.created_address,
+    };
+    Ok((materialized.generated, info))
+}
+
 /// Trait for network-specific transaction generation.
 ///
 /// Each network (Ethereum, Tempo, etc.) implements this trait to map
@@ -232,12 +540,28 @@ pub trait NetworkAdapter: Send + Sync {
     /// Extra per-request state needed by the signing worker.
     type SignContext: RequestSignContext<Self::Network>;
 
+    /// Stable network name used by scenario chain definitions.
+    fn network_name() -> &'static str;
+
     /// Map a template to a network-specific transaction request.
     fn build_request(
         &self,
         template: Self::Template,
         ctx: &mut BuildContext<'_>,
     ) -> Result<TxRequest<<Self::Network as Network>::TransactionRequest, Self::SignContext>>;
+
+    /// Prepare asynchronous state needed before synchronous request building.
+    ///
+    /// Ordinary adapters need no hook. Online adapters can use it to populate
+    /// lazily selected nonce lanes without blocking a runtime thread inside
+    /// [`Self::build_request`].
+    fn prepare_request<'a>(
+        &'a self,
+        _value: &'a serde_yaml::Value,
+        _ctx: &'a mut BuildContext<'_>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async { Ok(()) }
+    }
 
     /// Expand an adapter-specific setup step into ordinary transaction templates.
     ///
@@ -252,15 +576,34 @@ pub trait NetworkAdapter: Send + Sync {
         Ok(None)
     }
 
-    /// Prefetch nonces from the chain before generation.
+    /// Prepare one chain's nonce state before online transaction materialization.
     ///
-    /// Called when `--rpc` is provided. Default is no-op.
+    /// The default handles protocol nonces through `eth_getTransactionCount`.
+    /// Adapters may additionally populate network-specific nonce lanes and retain
+    /// chain-local RPC state used for lazy nonce reads.
+    fn prepare_nonces<'a>(
+        &'a self,
+        _spec: &'a WorkloadSpec,
+        accounts: &'a AccountManager,
+        nonces: &'a mut NonceTracker,
+        rpc: &'a str,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move { fetch_pending_protocol_nonces(accounts, nonces, rpc).await }
+    }
+
+    /// Prefetch nonces from the chain before ordinary generation.
+    ///
+    /// Called when `--rpc` is provided. The legacy generation path reads the
+    /// latest mined nonce, while online scenarios use pending nonce state.
     fn prefetch_nonces<'a>(
         &'a self,
-        _ctx: &'a mut GenerateContext,
-        _rpc: &'a str,
+        ctx: &'a mut GenerateContext,
+        rpc: &'a str,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        async { Ok(()) }
+        async move {
+            let (accounts, nonces) = ctx.accounts_and_nonces();
+            fetch_protocol_nonces(accounts, nonces, rpc).await
+        }
     }
 }
 
@@ -297,6 +640,24 @@ pub async fn fetch_protocol_nonces(
     nonces: &mut NonceTracker,
     rpc_url: &str,
 ) -> Result<()> {
+    fetch_protocol_nonces_with_state(accounts, nonces, rpc_url, false).await
+}
+
+/// Fetch pending protocol nonces for online transaction submission.
+pub async fn fetch_pending_protocol_nonces(
+    accounts: &AccountManager,
+    nonces: &mut NonceTracker,
+    rpc_url: &str,
+) -> Result<()> {
+    fetch_protocol_nonces_with_state(accounts, nonces, rpc_url, true).await
+}
+
+async fn fetch_protocol_nonces_with_state(
+    accounts: &AccountManager,
+    nonces: &mut NonceTracker,
+    rpc_url: &str,
+    pending: bool,
+) -> Result<()> {
     let provider =
         alloy_provider::ProviderBuilder::<_, _, alloy_provider::network::Ethereum>::new()
             .connect_http(rpc_url.parse().wrap_err("invalid RPC URL")?);
@@ -305,15 +666,14 @@ pub async fn fetch_protocol_nonces(
         let total = addresses.len();
         eprintln!("fetching nonces for {} ({} accounts)...", pool_name, total);
         for (idx, address) in addresses.iter().enumerate() {
-            let nonce = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                Provider::get_transaction_count(&provider, *address),
-            )
-            .await
-            .wrap_err_with(|| format!("timeout fetching nonce for {}[{}]", pool_name, idx))?
-            .wrap_err_with(|| {
-                format!("failed to fetch nonce for {}[{}] ({})", pool_name, idx, address)
-            })?;
+            let request = Provider::get_transaction_count(&provider, *address);
+            let request = if pending { request.pending() } else { request.latest() };
+            let nonce = tokio::time::timeout(std::time::Duration::from_secs(10), request)
+                .await
+                .wrap_err_with(|| format!("timeout fetching nonce for {}[{}]", pool_name, idx))?
+                .wrap_err_with(|| {
+                    format!("failed to fetch nonce for {}[{}] ({})", pool_name, idx, address)
+                })?;
 
             let scheduling_key = address.0 .0;
             nonces.reset(scheduling_key, nonce);
@@ -808,11 +1168,25 @@ fn prepare_signing_job<A: NetworkAdapter>(
     let template: A::Template = serde_yaml::from_value(value)
         .wrap_err_with(|| format!("failed to parse template '{name}'"))?;
 
-    let tx_req = adapter
+    let tx_req = match adapter
         .build_request(template, ctx)
-        .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
+        .wrap_err_with(|| format!("failed to build request from template '{name}'"))
+    {
+        Ok(tx_req) => tx_req,
+        Err(error) => {
+            let _ = ctx.rollback_nonce_reservations();
+            return Err(error);
+        }
+    };
 
-    let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?.clone();
+    let signer = match ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index) {
+        Ok(signer) => signer.clone(),
+        Err(error) => {
+            let _ = ctx.rollback_nonce_reservations();
+            return Err(error);
+        }
+    };
+    let _ = ctx.take_nonce_reservations();
 
     Ok(SigningJob {
         sequence,
@@ -951,45 +1325,23 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    let template: A::Template = serde_yaml::from_value(value)
-        .wrap_err_with(|| format!("failed to parse template '{name}'"))?;
-
-    let tx_req = adapter
-        .build_request(template, ctx)
-        .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
-
-    let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?;
-    let captured = if phase == TxPhase::Setup {
-        let sender = signer.address();
-        let nonce = tx_req
-            .request
-            .nonce()
+    let materialized =
+        materialize_and_sign_template(adapter, name, value, phase, inclusion_keys, ctx)?;
+    let info = if phase == TxPhase::Setup {
+        let nonce = materialized
+            .nonce
             .ok_or_else(|| eyre::eyre!("template '{name}' did not set a nonce"))?;
-        let created_address =
-            matches!(tx_req.request.kind(), Some(TxKind::Create)).then(|| sender.create(nonce));
-        Some((sender, nonce, created_address))
+        Some(EmittedTxInfo {
+            sender: materialized.sender,
+            nonce,
+            tx_hash: materialized.tx_hash,
+            created_address: materialized.created_address,
+        })
     } else {
         None
     };
 
-    let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context } = tx_req;
-    let generated = sign_context.sign_request(
-        name.to_string(),
-        phase,
-        request,
-        signer.clone(),
-        key,
-        dedup_scheduling_keys(inclusion_keys.iter().copied()),
-    )?;
-    let raw = generated.raw.clone();
-    let info = captured.map(|(sender, nonce, created_address)| EmittedTxInfo {
-        sender,
-        nonce,
-        tx_hash: keccak256(&raw),
-        created_address,
-    });
-
-    writer.write(&generated)?;
+    writer.write(&materialized.generated)?;
     Ok(info)
 }
 
