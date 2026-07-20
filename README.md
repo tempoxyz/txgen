@@ -12,7 +12,8 @@ For end-to-end workflow examples, see the [txgen Cookbook](COOKBOOK.md).
 - **Chain-agnostic**: Plugin architecture supports multiple chains (Ethereum, Tempo)
 - **Deterministic**: Seed-based RNG for reproducible transaction generation
 - **Flexible**: YAML specs with weighted template mixing, value generators, and account pools
-- **Fast**: Generates transactions without network I/O
+- **Multi-chain scenarios**: Run correlated submit, receipt, and event workflows from one command
+- **Fast generation**: Generate transaction streams without network I/O
 
 ## Installation
 
@@ -30,7 +31,7 @@ cargo build --release
 
 ## CLI Tools
 
-The workspace provides three binaries: `txgen-ethereum` and `txgen-tempo` for transaction generation, and `bench` for benchmarking. Each txgen binary is a standalone chain-specific generator.
+The workspace provides three binaries: `txgen-ethereum` and `txgen-tempo` for chain-specific transaction workflows, and `bench` for benchmarking. Transaction generation remains offline; `txgen-tempo scenario run` connects directly to every chain named by a scenario.
 
 ### `txgen-ethereum` / `txgen-tempo`
 
@@ -65,6 +66,40 @@ txgen-ethereum generate -s workload.yaml -n 1000 -o transactions.ndjson
 | `--seed <SEED>` | RNG seed for reproducibility |
 
 **Required RPC methods:** `eth_getTransactionCount` (only when `--rpc` is provided)
+
+#### `scenario run`
+
+Run an asynchronous, multi-chain transaction workflow from one process. A scenario references existing workload templates for transaction construction and adds checkpoints, receipt waits, event waits, cross-step values, concurrency controls, and journey-level reporting. It does not replace the workload specification or change the `generate` output format.
+
+```bash
+txgen-tempo scenario run \
+  --scenario scenario.yaml \
+  --count 100 \
+  --starts-per-second 5 \
+  --max-in-flight 20 \
+  --tx-rate 50 \
+  --max-rpc-in-flight 100 \
+  --seed 42 \
+  --failure-policy continue \
+  --report scenario-report.json
+```
+
+| Flag | Description |
+|------|-------------|
+| `--scenario <PATH>` | Versioned scenario YAML file |
+| `--count <N>` | Maximum scenario instances to start; defaults to `1` when `--duration` is omitted |
+| `--duration <DUR>` | Stop starting instances after this run duration; in-flight instances are then completed |
+| `--starts-per-second <RATE>` | New scenario journeys started per second, not transaction TPS (`0`, the default, is unlimited) |
+| `--max-in-flight <N>` | Maximum active scenario instances (default: `1`) |
+| `--step-timeout <DUR>` | Override the scenario's default step timeout; an explicit timeout on a step remains more specific |
+| `--seed <SEED>` | Deterministic binding and workload seed |
+| `--failure-policy <POLICY>` | `continue` (default) or `fail-fast` |
+| `--tx-rate <TPS>` | Separate per-chain transaction-submission limit across scenario instances (`0` = unlimited) |
+| `--max-rpc-in-flight <N>` | Upper bound on simultaneous transaction-submission RPC calls per chain (default: `100`) |
+| `--report <PATH>` | JSON report path; the report is written to stdout when omitted |
+| `--sample-instances <N>` | Include up to `N` sanitized instance lifecycle records in the report (default: `0`) |
+
+When both `--count` and `--duration` are present, txgen stops starting journeys at the first limit. See [Scenario Specification](#scenario-specification) for the schema, step results, expressions, and execution semantics.
 
 #### `addresses`
 
@@ -447,6 +482,254 @@ bench send -i txs.ndjson \
   --report prometheus:https://prometheus.example.com \
   -m scenario=tip20-10k -m run_id=$(uuidgen)
 ```
+
+## Scenario Specification
+
+Scenarios describe complete journeys across asynchronous RPC boundaries. Each named chain points to an ordinary txgen workload spec; `submit` selects a template from that workload and applies the same deep-merge behavior used by workload sequences. Existing workload specs, templates, `generate` commands, and NDJSON formats remain valid.
+
+Scenario files use `version: 1`. Environment references such as `${ORIGIN_RPC_URL}` are expanded before parsing. A relative `workload` path is resolved from the directory containing the scenario file. Paths inside that workload, including ABI artifacts, remain relative to the workload file.
+
+Each binary supplies one network adapter for the whole run: every chain in a `txgen-tempo` scenario must use `network: tempo`, and every chain in a `txgen-ethereum` scenario must use `network: ethereum`. The endpoints may still represent independent chains with different chain IDs and workload files. Named chains must use distinct normalized RPC URLs so they cannot maintain conflicting nonce state for one endpoint.
+
+Before starting measured instances, the runner checks every chain ID and pending nonce source, then materializes every workload setup without submission. Only after those checks succeed does it materialize, submit, and confirm each setup transaction just in time, retaining `setup.<id>.*` bindings for scenario templates. A setup failure aborts initialization. Initialization RPC operations and each setup transaction have a five-minute safety timeout. Point a scenario at a workload without setup steps when the target chain is already prepared.
+
+### Schema v1
+
+This generic example sends a message on one chain, observes its delivery on another chain, submits an acknowledgement, and observes the acknowledgement back on the first chain. The ABI names, event names, addresses, and templates are supplied by the referenced workloads; the engine itself has no application-specific assumptions.
+
+```yaml
+version: 1
+
+chains:
+  origin:
+    network: tempo
+    rpc_url: ${ORIGIN_RPC_URL}
+    chain_id: auto
+    workload: ./origin-workload.yaml
+
+  destination:
+    network: tempo
+    rpc_url: ${DESTINATION_RPC_URL}
+    chain_id: auto
+    workload: ./destination-workload.yaml
+
+scenario:
+  name: message-roundtrip
+  timeout: 45s
+
+  bindings:
+    user:
+      account:
+        pool: users
+        select: lease
+
+  steps:
+    - checkpoint:
+        chain: destination
+      save: destination_before_message
+
+    - submit:
+        chain: origin
+        template: publish_message
+        with:
+          from: { var: user.ref }
+      save: publish
+
+    - wait_receipt:
+        chain: origin
+        transaction_hash: { var: publish.tx_hash }
+        confirmations: 1
+      save: publish_receipt
+
+    - wait_log:
+        chain: origin
+        transaction_hash: { var: publish.tx_hash }
+        abi: Relay
+        event: MessagePublished
+      save: message_published
+
+    - wait_log:
+        chain: destination
+        from_block: { var: destination_before_message.block_number }
+        address: ${DESTINATION_RELAY_ADDRESS}
+        abi: Relay
+        event: MessageDelivered
+        where:
+          messageId: { var: message_published.args.messageId }
+        poll_interval: 250ms
+        confirmations: 2
+        max_block_range: 1000
+      save: message_delivered
+      timeout: 2m
+
+    - checkpoint:
+        chain: origin
+      save: origin_before_acknowledgement
+
+    - submit:
+        chain: destination
+        template: acknowledge_message
+        with:
+          from: { var: user.ref }
+          call:
+            args:
+              - { var: message_delivered.args.messageId }
+        await: receipt
+      save: acknowledgement
+
+    - wait_log:
+        chain: origin
+        from_block: { var: origin_before_acknowledgement.block_number }
+        address: ${ORIGIN_RELAY_ADDRESS}
+        abi: Relay
+        event: AcknowledgementRecorded
+        where:
+          acknowledgementId:
+            keccak256_packed:
+              types: [bytes32, bytes32]
+              values:
+                - { var: message_delivered.args.messageId }
+                - { var: acknowledgement.tx_hash }
+      save: acknowledgement_recorded
+```
+
+`chain_id: auto` queries the endpoint and uses the returned chain ID for signing. An explicit integer may be used instead and is validated against the endpoint. When one account binding is used to submit on multiple chains, its named pool must derive the same ordered addresses in each consuming workload.
+
+### Steps
+
+Every step selects one named chain. `save` and `timeout` are sibling keys of the step action, as shown above.
+
+#### `checkpoint`
+
+Captures the chain's current canonical block cursor. Use it immediately before an action that will cause an event on another chain, then pass its `block_number` to `wait_log`. This closes the gap between transaction submission and registration of the event wait.
+
+```yaml
+- checkpoint:
+    chain: destination
+  save: before_delivery
+```
+
+#### `submit`
+
+Loads a named template from the selected chain's workload, deep-merges `with`, resolves runtime expressions, signs with that chain's adapter, and submits it through the in-process sender. The step completes after RPC acceptance and exposes the transaction hash. Set `await: receipt` to keep the step open until a successful receipt is observed; a reverted receipt fails the step.
+
+```yaml
+- submit:
+    chain: origin
+    template: publish_message
+    with:
+      from: { var: user.ref }
+    await: receipt
+  save: publish
+```
+
+#### `wait_receipt`
+
+Polls for a supplied transaction hash. By default a reverted receipt fails the step; set `allow_revert: true` only when a revert is an expected result. The defaults are a `500ms` poll interval and zero additional confirmations.
+
+```yaml
+- wait_receipt:
+    chain: origin
+    transaction_hash: { var: publish.tx_hash }
+    poll_interval: 250ms
+    confirmations: 2
+  save: publish_receipt
+```
+
+#### `wait_log`
+
+Loads an ABI artifact from the selected chain's workload and resolves `event` by name or exact signature. It decodes indexed and unindexed arguments, then returns the first canonical match in block-number/log-index order.
+
+A log wait must provide `from_block` or `transaction_hash`. Optional `address`, `transaction_hash`, and `where` fields narrow the match. Each `where` entry compares one decoded argument to a resolved, typed runtime value. The defaults are a `500ms` poll interval, zero additional confirmations, and at most 1,000 blocks per `eth_getLogs` request. The waiter backfills from the starting cursor before polling new blocks, honors confirmations, and discards removed or reorged candidates when the provider exposes that information.
+
+```yaml
+- wait_log:
+    chain: destination
+    from_block: { var: before_delivery.block_number }
+    address: ${DESTINATION_RELAY_ADDRESS}
+    abi: Relay
+    event: "MessageDelivered(bytes32,address)"
+    where:
+      messageId: { var: message_published.args.messageId }
+    max_block_range: 1000
+  save: delivered
+```
+
+### Saved values
+
+`save: <name>` adds an immutable typed result to the current scenario instance. Saved values are not shared between concurrent instances, and a name cannot be reused. References to a later step are rejected before execution where they can be identified statically.
+
+| Step | Saved fields |
+|------|--------------|
+| `checkpoint` | `chain`, `block_number`, optional `block_hash`, `captured_at` |
+| `submit` | `chain`, `template`/`id`, `sender`, `tx_hash`, `submitted_at`, `acceptance_latency`, optional `receipt` |
+| `submit.receipt` | `chain`, `transaction_hash`, `block_hash`, `block_number`, `status`, `gas_used`, `observed_at` |
+| `wait_receipt` | `chain`, `transaction_hash`, `block_hash`, `block_number`, `status`, `gas_used`, `observed_at` |
+| `wait_log` | `chain`, `address`, `transaction_hash`, `block_hash`, `block_number`, `log_index`, `event`, typed `args`, `first_observed_at` |
+
+The compatibility aliases `tx_hash`, `contract_address`, `event_name`, and `observed_at` may be used where applicable. Saved results and reports never include private keys, mnemonics, authorization headers, or other signer secrets.
+
+`captured_at`, `submitted_at`, `observed_at`, and `first_observed_at` are Unix timestamps in milliseconds. `acceptance_latency` is an integer number of milliseconds.
+
+### Runtime expressions
+
+Use `{ var: path.to.value }` anywhere a step accepts a runtime expression. Account bindings expose `<name>.ref` for a workload `from`/`sponsor` field and `<name>.address` for an address value. Step results expose the fields listed above.
+
+```yaml
+from: { var: user.ref }
+transaction_hash: { var: publish.tx_hash }
+messageId: { var: delivered.args.messageId }
+```
+
+The initial deterministic transformations are:
+
+```yaml
+# Hash raw bytes, a string, bytes32, an address, or a uint8 array.
+digest:
+  keccak256: { var: delivered.args.payload }
+
+# Solidity abi.encode(...).
+encoded:
+  abi_encode:
+    types: [address, uint256]
+    values:
+      - { var: user.address }
+      - 100
+
+# Solidity abi.encodePacked(...).
+packed:
+  abi_encode_packed:
+    types: [address, bytes32]
+    values:
+      - { var: user.address }
+      - { var: delivered.args.messageId }
+
+# keccak256(abi.encodePacked(...)).
+correlation:
+  keccak256_packed:
+    types: [address, bytes32]
+    values:
+      - { var: user.address }
+      - { var: delivered.args.messageId }
+```
+
+`abi_encode_packed` and `keccak256_packed` also accept an inferred list, for example `keccak256_packed: [{ var: user.address }, { var: publish.tx_hash }]`. Prefer the typed form when integer widths or another Solidity type distinction matters. Transformations are deterministic; arbitrary scripting is not supported.
+
+### Rate, concurrency, leases, and failures
+
+`--starts-per-second` controls journeys: a value of `5` starts at most five new scenario instances per second, regardless of how many transactions each instance submits. `--max-in-flight` limits whole instances. These controls are independent from `--tx-rate` and `--max-rpc-in-flight`, which limit individual transaction submissions on each chain across all active instances.
+
+An account binding with `select: lease` holds one pool account for the entire instance and returns it on success, failure, timeout, or cancellation. Two active instances do not receive the same leased account. `select: random` and `select: { index: N }` retain their non-exclusive workload-style behavior.
+
+The effective timeout for a step is its explicit sibling `timeout`, otherwise the CLI `--step-timeout` override when supplied, otherwise `scenario.timeout`, and finally five minutes when none is configured. A timeout fails that instance and is counted separately in the report. If transaction acceptance is still unknown at a submit deadline, further submissions on that chain are disabled to avoid reusing an uncertain nonce. Receipt reverts fail unless explicitly allowed. Under `continue`, later instances continue to start after a failure. Under `fail-fast`, the runner stops starting new instances after the first failure while allowing instances that already started to finish. A scenario counts as completed successfully only after every required submit and wait step succeeds.
+
+The seed controls deterministic account/template/value choices. Each instance has isolated saved values, timing, failure state, and leases, so concurrent completion order cannot leak data between journeys.
+
+### JSON report
+
+The scenario runner writes one JSON report to `--report`, or to stdout when no path is supplied. It includes the configured scenario name and execution configuration; started, completed, failed, and timed-out instance counts; completed scenarios per second; observed maximum in-flight instances; per-step success/failure counts and latency distributions; completed-journey latency; and failures grouped by stage and sanitized error class. `--sample-instances` optionally retains a bounded number of secret-free lifecycle records and safe failure details for debugging. Counts, minima, maxima, and means are exact; percentile estimates use a deterministic reservoir capped at 65,536 observations per distribution so duration-based runs use bounded memory.
+
+Latency distributions use monotonic elapsed time. Wall-clock timestamps are included only for correlation with external chain and node data. Transaction acceptance alone never marks a journey successful.
 
 ## Output Format
 
@@ -1094,11 +1377,15 @@ Summary of which RPC methods are required by each feature:
 
 | RPC Method | Required By |
 |------------|-------------|
-| `eth_getTransactionCount` | `txgen-ethereum generate --rpc`, `txgen-tempo generate --rpc` |
-| `eth_sendRawTransaction` | `bench send` (submission RPC, optionally sender-authenticated) |
-| `eth_getTransactionReceipt` | `bench send` (sender-scoped submission RPC for setup and inclusion waits) |
-| `eth_blockNumber` | `bench send` (query RPC when configured; benchmark block range) |
-| `eth_getBlockByNumber` | `bench send` (query RPC when configured; per-block stats collection) |
+| `eth_chainId` | `scenario run` (`chain_id: auto` and explicit-ID validation) |
+| `eth_getTransactionCount` | `txgen-ethereum generate --rpc`, `txgen-tempo generate --rpc`, `scenario run` (pending nonce initialization) |
+| `eth_getStorageAt` | `txgen-tempo scenario run` (Tempo parallel nonce lanes) |
+| `eth_sendRawTransaction` | `bench send` (submission RPC, optionally sender-authenticated), `scenario run` (workload setup and `submit`) |
+| `eth_getTransactionByHash` | `scenario run` (reconcile a rejected or uncertain submission) |
+| `eth_getTransactionReceipt` | `bench send` (sender-scoped submission RPC for setup and inclusion waits), `scenario run` (workload setup, `submit await: receipt`, `wait_receipt`, and transaction-hash `wait_log`) |
+| `eth_blockNumber` | `bench send` (query RPC when configured; benchmark block range), `scenario run` (`checkpoint`, confirmations, and block-range log polling) |
+| `eth_getBlockByNumber` | `bench send` (query RPC when configured; per-block stats collection), `scenario run` (`checkpoint`) |
+| `eth_getLogs` | `scenario run` (block-range `wait_log`) |
 | `debug_getRawBlock` | `txgen extract`, `txgen-ethereum extract-big-blocks` |
 | `eth_getBlockAccessListByBlockNumber` | `txgen extract --bal`, `txgen-ethereum extract-big-blocks --bal` |
 | `reth_newPayload` | `bench send-blocks` |
