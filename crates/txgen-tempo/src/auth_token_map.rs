@@ -538,7 +538,7 @@ fn create_temporary_file(output: &Path, parent: &Path) -> Result<(PathBuf, File)
         }
     }
 
-    bail!("failed to allocate a unique temporary output file in {}", parent.display())
+    bail!("failed to allocate a unique temporary output file in {}", parent.display());
 }
 
 struct TemporaryFileGuard {
