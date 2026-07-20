@@ -264,12 +264,14 @@ scenario:
     - wait_receipt:
         chain: alpha
         transaction_hash: { var: request.tx_hash }
+        sender: { var: request.sender }
       save: request_receipt
 
     # Decode the correlation ID from the transaction's own event.
     - wait_log:
         chain: alpha
         transaction_hash: { var: request.tx_hash }
+        sender: { var: request.sender }
         abi: RelayEvents
         event: RequestPublished
       save: request_published
@@ -315,6 +317,8 @@ scenario:
       save: response_observed
       timeout: 90s
 ```
+
+For a private Zone, keep `rpc_url` as the authenticated submission endpoint, add an unauthenticated `query_rpc_url`, and configure `request_auth.sender_header` with `name`, `map`, and optional `reload_interval`. The sender field above selects the credential for standalone receipt-based waits; submit steps select it from the materialized transaction automatically.
 
 Run many independent instances with bounded journey and RPC concurrency:
 

@@ -534,9 +534,9 @@ bench send -i txs.ndjson \
 
 Scenarios describe complete journeys across asynchronous RPC boundaries. Each named chain points to an ordinary txgen workload spec; `submit` selects a template from that workload and applies the same deep-merge behavior used by workload sequences. Existing workload specs, templates, `generate` commands, and NDJSON formats remain valid.
 
-Scenario files use `version: 1`. Environment references such as `${ORIGIN_RPC_URL}` are expanded before parsing. A relative `workload` path is resolved from the file that declares the chain; because included fragment libraries cannot declare chains, that is the root scenario file. Paths inside that workload, including ABI artifacts, remain relative to the workload file.
+Scenario files use `version: 1`. Environment references such as `${ORIGIN_RPC_URL}` are expanded before parsing. Relative `workload` and request-auth map paths are resolved from the file that declares the chain; because included fragment libraries cannot declare chains, that is the root scenario file. Paths inside a workload, including ABI artifacts, remain relative to the workload file.
 
-Each binary supplies one network adapter for the whole run: every chain in a `txgen-tempo` scenario must use `network: tempo`, and every chain in a `txgen-ethereum` scenario must use `network: ethereum`. The endpoints may still represent independent chains with different chain IDs and workload files. Named chains must use distinct normalized RPC URLs so they cannot maintain conflicting nonce state for one endpoint.
+Each binary supplies one network adapter for the whole run: every chain in a `txgen-tempo` scenario must use `network: tempo`, and every chain in a `txgen-ethereum` scenario must use `network: ethereum`. The endpoints may still represent independent chains with different chain IDs and workload files. Named chains must use distinct normalized submission RPC URLs so they cannot maintain conflicting nonce state for one endpoint.
 
 Before starting measured instances, the runner checks every chain ID and pending nonce source, then materializes every workload setup without submission. Only after those checks succeed does it materialize, submit, and confirm each setup transaction just in time, retaining `setup.<id>.*` bindings for scenario templates. A setup failure aborts initialization. Initialization RPC operations and each setup transaction have a five-minute safety timeout. Point a scenario at a workload without setup steps when the target chain is already prepared.
 
@@ -641,6 +641,32 @@ scenario:
 ```
 
 `chain_id: auto` queries the endpoint and uses the returned chain ID for signing. An explicit integer may be used instead and is validated against the endpoint. When one account binding is used to submit on multiple chains, its named pool must derive the same ordered addresses in each consuming workload.
+
+`rpc_url` is the submission endpoint. `query_rpc_url` optionally selects a separate unauthenticated endpoint for chain ID and nonce initialization, checkpoints, confirmation heights, and log queries; it defaults to `rpc_url`. A chain can authenticate sender-scoped submission traffic with the same sender map used by `bench send`:
+
+```yaml
+chains:
+  zone:
+    network: tempo
+    rpc_url: ${ZONE_SUBMISSION_RPC_URL}
+    query_rpc_url: ${ZONE_QUERY_RPC_URL}
+    request_auth:
+      sender_header:
+        name: X-Authorization-Token
+        map: ./zone-sender-auth.json
+        reload_interval: 1s
+    chain_id: auto
+    workload: ./zone-workload.yaml
+```
+
+The selected header is attached only to `eth_sendRawTransaction` and sender-scoped transaction/receipt lookups on the submission endpoint. It is recomputed for each request so atomically replaced maps can take effect. `submit await: receipt` already carries its materialized sender; standalone `wait_receipt` and transaction-hash-only `wait_log` steps must supply `sender`, commonly from the saved submit result:
+
+```yaml
+- wait_receipt:
+    chain: zone
+    transaction_hash: { var: publish.tx_hash }
+    sender: { var: publish.sender }
+```
 
 ### Reusable fragments and composition
 
@@ -898,6 +924,7 @@ Polls for a supplied transaction hash. By default a reverted receipt fails the s
 - wait_receipt:
     chain: origin
     transaction_hash: { var: publish.tx_hash }
+    sender: { var: publish.sender }
     poll_interval: 250ms
     confirmations: 2
   save: publish_receipt
@@ -989,7 +1016,7 @@ correlation:
 
 An account binding with `select: lease` holds one pool account for the entire instance and returns it on success, failure, timeout, or cancellation. Two active instances do not receive the same leased account. `select: random` and `select: { index: N }` retain their non-exclusive workload-style behavior.
 
-The effective timeout for a step is its explicit sibling `timeout`, otherwise the CLI `--step-timeout` override when supplied, otherwise `scenario.timeout`, and finally five minutes when none is configured. A timeout fails that instance and is counted separately in the report. If transaction acceptance is still unknown at a submit deadline, further submissions on that chain are disabled to avoid reusing an uncertain nonce. Receipt reverts fail unless explicitly allowed. Under `continue`, later instances continue to start after a failure. Under `fail-fast`, the runner stops starting new instances after the first failure while allowing instances that already started to finish. A scenario counts as completed successfully only after every required submit and wait step succeeds.
+The effective timeout for a step is its explicit sibling `timeout`, otherwise the CLI `--step-timeout` override when supplied, otherwise `scenario.timeout`, and finally five minutes when none is configured. A timeout fails that instance and is counted separately in the report. If transaction acceptance is still unknown at a submit deadline, further submissions on that chain are disabled to avoid reusing an uncertain nonce. Receipt reverts fail unless explicitly allowed. Under `continue`, later instances continue to start after a failure. Under `fail-fast`, the runner stops starting new instances after the first failure while allowing instances that already started to finish. A scenario counts as completed successfully only after every required submit and wait step succeeds, and the command exits nonzero after writing its report when any instance failed or timed out.
 
 The seed controls deterministic account/template/value choices. Each instance has isolated saved values, timing, failure state, and leases, so concurrent completion order cannot leak data between journeys.
 
@@ -1658,11 +1685,11 @@ Summary of which RPC methods are required by each feature:
 | RPC Method | Required By |
 |------------|-------------|
 | `eth_chainId` | `scenario run` (`chain_id: auto` and explicit-ID validation) |
-| `eth_getTransactionCount` | `txgen-ethereum generate --rpc`, `txgen-tempo generate --rpc`, `scenario run` (pending nonce initialization) |
+| `eth_getTransactionCount` | `txgen-ethereum generate --rpc`, `txgen-tempo generate --rpc`, `scenario run` (query RPC; pending nonce initialization) |
 | `eth_getStorageAt` | `txgen-tempo scenario run` (Tempo parallel nonce lanes) |
-| `eth_sendRawTransaction` | `bench send` (submission RPC, optionally sender-authenticated), `scenario run` (workload setup and `submit`) |
-| `eth_getTransactionByHash` | `scenario run` (reconcile a rejected or uncertain submission) |
-| `eth_getTransactionReceipt` | `bench send` (sender-scoped submission RPC for setup and inclusion waits), `scenario run` (workload setup, `submit await: receipt`, `wait_receipt`, and transaction-hash `wait_log`) |
+| `eth_sendRawTransaction` | `bench send`, `scenario run` (workload setup and `submit`), optionally sender-authenticated |
+| `eth_getTransactionByHash` | `scenario run` (sender-scoped submission RPC; reconcile a rejected or uncertain submission) |
+| `eth_getTransactionReceipt` | `bench send`, `scenario run` (workload setup, `submit await: receipt`, `wait_receipt`, and transaction-hash `wait_log`), optionally sender-authenticated |
 | `eth_blockNumber` | `bench send` (query RPC when configured; benchmark block range), `scenario run` (`checkpoint`, confirmations, and block-range log polling) |
 | `eth_getBlockByNumber` | `bench send` (query RPC when configured; per-block stats collection), `scenario run` (`checkpoint`) |
 | `eth_getLogs` | `scenario run` (block-range `wait_log`) |
