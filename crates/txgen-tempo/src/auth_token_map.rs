@@ -351,23 +351,7 @@ fn shutdown_signal() -> Result<ShutdownFuture> {
         }))
     }
 
-    #[cfg(windows)]
-    {
-        use tokio::signal::windows;
-
-        let mut ctrl_c = windows::ctrl_c().wrap_err("failed to register the Ctrl-C handler")?;
-        let mut ctrl_break =
-            windows::ctrl_break().wrap_err("failed to register the Ctrl-Break handler")?;
-        Ok(Box::pin(async move {
-            tokio::select! {
-                _ = ctrl_c.recv() => {}
-                _ = ctrl_break.recv() => {}
-            }
-            Ok(())
-        }))
-    }
-
-    #[cfg(all(not(unix), not(windows)))]
+    #[cfg(not(unix))]
     {
         Ok(Box::pin(async {
             tokio::signal::ctrl_c().await.wrap_err("failed to listen for Ctrl-C")?;
@@ -441,34 +425,10 @@ where
 }
 
 fn publish_temporary(temporary: &Path, output: &Path, replace_existing: bool) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        use std::{iter, os::windows::ffi::OsStrExt};
-        use windows_sys::Win32::Storage::FileSystem::{
-            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-        };
-
-        let temporary_wide =
-            temporary.as_os_str().encode_wide().chain(iter::once(0)).collect::<Vec<_>>();
-        let output_wide = output.as_os_str().encode_wide().chain(iter::once(0)).collect::<Vec<_>>();
-        let flags =
-            MOVEFILE_WRITE_THROUGH | if replace_existing { MOVEFILE_REPLACE_EXISTING } else { 0 };
-        // SAFETY: Both paths are owned, NUL-terminated UTF-16 buffers that remain alive for the
-        // duration of the call. The flags request a same-volume move with optional replacement.
-        if unsafe { MoveFileExW(temporary_wide.as_ptr(), output_wide.as_ptr(), flags) } == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        if replace_existing {
-            fs::rename(temporary, output)
-        } else {
-            rename_without_replacement(temporary, output)
-        }
+    if replace_existing {
+        fs::rename(temporary, output)
+    } else {
+        rename_without_replacement(temporary, output)
     }
 }
 
@@ -479,7 +439,7 @@ fn rename_without_replacement(temporary: &Path, output: &Path) -> io::Result<()>
     renameat_with(CWD, temporary, CWD, output, RenameFlags::NOREPLACE).map_err(Into::into)
 }
 
-#[cfg(not(any(target_os = "linux", target_vendor = "apple", target_os = "redox", windows)))]
+#[cfg(not(any(target_os = "linux", target_vendor = "apple", target_os = "redox")))]
 fn rename_without_replacement(temporary: &Path, output: &Path) -> io::Result<()> {
     // The destination link appears atomically and `hard_link` fails if it already exists. Both
     // paths are in the same directory, so they necessarily reside on the same filesystem.

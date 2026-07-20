@@ -41,6 +41,3 @@ eyre.workspace = true
 hex.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 zeroize.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true

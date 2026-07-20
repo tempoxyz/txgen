@@ -5799,7 +5799,6 @@ dependencies = [
  "tokio",
  "txgen-cli",
  "txgen-core",
- "windows-sys 0.61.2",
  "zeroize",
 ]
 
