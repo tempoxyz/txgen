@@ -5,11 +5,13 @@ use super::{
     value::{coerce_event_filter, eval_expression, RuntimeContext, RuntimeValue},
 };
 use alloy_dyn_abi::{DynSolType, DynSolValue, EventExt, Specifier};
+use alloy_eips::BlockNumberOrTag;
 use alloy_json_abi::{Event, JsonAbi};
 use alloy_network::{primitives::ReceiptResponse, AnyNetwork, AnyTransactionReceipt};
 use alloy_primitives::{keccak256, Address, TxHash, B256, U256};
 use alloy_provider::{DynProvider, Provider};
 use alloy_rpc_types_eth::{Filter, Log};
+use bench_core::RpcSubmitter;
 use eyre::{bail, Result, WrapErr};
 use std::{collections::BTreeMap, time::Duration};
 
@@ -23,15 +25,19 @@ pub(crate) struct ReceiptResult {
 }
 
 pub(crate) async fn wait_for_receipt(
-    provider: &DynProvider<AnyNetwork>,
+    query_provider: &DynProvider<AnyNetwork>,
+    submitter: &RpcSubmitter,
     chain: &str,
+    sender: Option<Address>,
     transaction_hash: TxHash,
     poll_interval: Duration,
     confirmations: u64,
 ) -> Result<ReceiptResult, StepError> {
     loop {
-        let receipt =
-            provider.get_transaction_receipt(transaction_hash).await.map_err(StepError::rpc)?;
+        let receipt = submitter
+            .get_transaction_receipt(sender, transaction_hash)
+            .await
+            .map_err(StepError::rpc)?;
         let Some(receipt) = receipt else {
             tokio::time::sleep(poll_interval).await;
             continue;
@@ -41,12 +47,14 @@ pub(crate) async fn wait_for_receipt(
             tokio::time::sleep(poll_interval).await;
             continue;
         };
-        wait_for_confirmations(provider, block_number, confirmations, poll_interval).await?;
+        wait_for_confirmations(query_provider, block_number, confirmations, poll_interval).await?;
 
         // Re-fetch after the confirmation wait. A receipt that vanished or moved
         // was reorged and must not be exposed through an immutable save.
-        let canonical =
-            provider.get_transaction_receipt(transaction_hash).await.map_err(StepError::rpc)?;
+        let canonical = submitter
+            .get_transaction_receipt(sender, transaction_hash)
+            .await
+            .map_err(StepError::rpc)?;
         let Some(canonical) = canonical else {
             continue;
         };
@@ -55,9 +63,40 @@ pub(crate) async fn wait_for_receipt(
         {
             continue;
         }
+        if !receipt_is_canonical_on_query(query_provider, &canonical).await? {
+            tokio::time::sleep(poll_interval).await;
+            continue;
+        }
 
         return Ok(receipt_runtime_value(chain, &canonical));
     }
+}
+
+async fn receipt_is_canonical_on_query(
+    provider: &DynProvider<AnyNetwork>,
+    receipt: &AnyTransactionReceipt,
+) -> Result<bool, StepError> {
+    let (Some(block_number), Some(receipt_block_hash)) =
+        (receipt.block_number(), receipt.block_hash())
+    else {
+        return Ok(false);
+    };
+    let block = provider
+        .client()
+        .request::<_, Option<serde_json::Value>>(
+            "eth_getBlockByNumber",
+            (BlockNumberOrTag::Number(block_number), false),
+        )
+        .await
+        .map_err(StepError::rpc)?;
+    let Some(block) = block else { return Ok(false) };
+    let block_hash = block
+        .get("hash")
+        .cloned()
+        .ok_or_else(|| StepError::rpc("query RPC block response omitted its hash"))?;
+    let block_hash: B256 = serde_json::from_value(block_hash)
+        .map_err(|_| StepError::rpc("query RPC block response had an invalid hash"))?;
+    Ok(block_hash == receipt_block_hash)
 }
 
 fn receipt_runtime_value(chain: &str, receipt: &AnyTransactionReceipt) -> ReceiptResult {
@@ -103,7 +142,8 @@ async fn wait_for_confirmations(
 }
 
 pub(crate) async fn wait_for_log(
-    provider: &DynProvider<AnyNetwork>,
+    query_provider: &DynProvider<AnyNetwork>,
+    submitter: &RpcSubmitter,
     chain: &str,
     abi: &JsonAbi,
     step: &WaitLogStep,
@@ -123,6 +163,12 @@ pub(crate) async fn wait_for_log(
         .map(|value| expression_hash(value, context))
         .transpose()
         .map_err(StepError::expression)?;
+    let sender = step
+        .sender
+        .as_ref()
+        .map(|value| expression_address(value, context))
+        .transpose()
+        .map_err(StepError::expression)?;
     let from_block = step
         .from_block
         .as_ref()
@@ -137,13 +183,17 @@ pub(crate) async fn wait_for_log(
             StepError::missing("wait_log requires a start block or transaction hash")
         })?;
         return wait_for_transaction_log(
-            provider,
-            chain,
-            transaction_hash,
-            address,
-            &matcher,
-            poll_interval,
-            confirmations,
+            query_provider,
+            submitter,
+            TransactionLogWait {
+                chain,
+                sender,
+                transaction_hash,
+                address,
+                matcher: &matcher,
+                poll_interval,
+                confirmations,
+            },
         )
         .await;
     }
@@ -152,7 +202,7 @@ pub(crate) async fn wait_for_log(
     let mut cursor = start_block;
     let max_range = step.max_block_range.unwrap_or(DEFAULT_MAX_BLOCK_RANGE);
     loop {
-        let head = provider.get_block_number().await.map_err(StepError::rpc)?;
+        let head = query_provider.get_block_number().await.map_err(StepError::rpc)?;
         let Some(safe_head) = head.checked_sub(confirmations) else {
             tokio::time::sleep(poll_interval).await;
             continue;
@@ -161,7 +211,7 @@ pub(crate) async fn wait_for_log(
         while cursor <= safe_head {
             let end = bounded_range_end(cursor, safe_head, max_range);
             let filter = matcher.rpc_filter(cursor, end, address);
-            let mut logs = provider.get_logs(&filter).await.map_err(StepError::rpc)?;
+            let mut logs = query_provider.get_logs(&filter).await.map_err(StepError::rpc)?;
             sort_logs(&mut logs);
             let first_observed_at = unix_ms(std::time::SystemTime::now());
 
@@ -185,7 +235,7 @@ pub(crate) async fn wait_for_log(
                     .ok_or_else(|| StepError::missing("matching log omitted block_number"))?;
                 let canonical_start = canonical_recheck_start(start_block, cursor);
                 if let Some((canonical, canonical_decoded)) = find_first_canonical_log(
-                    provider,
+                    query_provider,
                     &matcher,
                     address,
                     transaction_hash,
@@ -263,18 +313,35 @@ async fn find_first_canonical_log(
     }
 }
 
-async fn wait_for_transaction_log(
-    provider: &DynProvider<AnyNetwork>,
-    chain: &str,
+struct TransactionLogWait<'a> {
+    chain: &'a str,
+    sender: Option<Address>,
     transaction_hash: TxHash,
     address: Option<Address>,
-    matcher: &EventMatcher,
+    matcher: &'a EventMatcher,
     poll_interval: Duration,
     confirmations: u64,
+}
+
+async fn wait_for_transaction_log(
+    query_provider: &DynProvider<AnyNetwork>,
+    submitter: &RpcSubmitter,
+    request: TransactionLogWait<'_>,
 ) -> Result<RuntimeValue, StepError> {
+    let TransactionLogWait {
+        chain,
+        sender,
+        transaction_hash,
+        address,
+        matcher,
+        poll_interval,
+        confirmations,
+    } = request;
     loop {
-        let receipt =
-            provider.get_transaction_receipt(transaction_hash).await.map_err(StepError::rpc)?;
+        let receipt = submitter
+            .get_transaction_receipt(sender, transaction_hash)
+            .await
+            .map_err(StepError::rpc)?;
         let Some(receipt) = receipt else {
             tokio::time::sleep(poll_interval).await;
             continue;
@@ -283,14 +350,20 @@ async fn wait_for_transaction_log(
             tokio::time::sleep(poll_interval).await;
             continue;
         };
-        wait_for_confirmations(provider, block_number, confirmations, poll_interval).await?;
+        wait_for_confirmations(query_provider, block_number, confirmations, poll_interval).await?;
 
-        let canonical =
-            provider.get_transaction_receipt(transaction_hash).await.map_err(StepError::rpc)?;
+        let canonical = submitter
+            .get_transaction_receipt(sender, transaction_hash)
+            .await
+            .map_err(StepError::rpc)?;
         let Some(canonical) = canonical else { continue };
         if canonical.block_hash() != receipt.block_hash() ||
             canonical.block_number() != receipt.block_number()
         {
+            continue;
+        }
+        if !receipt_is_canonical_on_query(query_provider, &canonical).await? {
+            tokio::time::sleep(poll_interval).await;
             continue;
         }
 
@@ -588,7 +661,10 @@ fn log_runtime_value(
     ]))
 }
 
-fn expression_address(value: &serde_yaml::Value, context: &RuntimeContext) -> Result<Address> {
+pub(crate) fn expression_address(
+    value: &serde_yaml::Value,
+    context: &RuntimeContext,
+) -> Result<Address> {
     match eval_expression(value, context)?.coerce_dyn_sol(&DynSolType::Address)? {
         DynSolValue::Address(value) => Ok(value),
         _ => unreachable!("address coercion returned another type"),
@@ -627,9 +703,14 @@ mod tests {
     use alloy_primitives::{Bytes, LogData};
     use alloy_provider::ProviderBuilder;
     use alloy_transport::mock::Asserter;
+    use bench_core::SenderConfig;
 
     fn mocked_provider(asserter: Asserter) -> DynProvider<AnyNetwork> {
         ProviderBuilder::new_with_network::<AnyNetwork>().connect_mocked_client(asserter).erased()
+    }
+
+    fn mock_submitter(provider: &DynProvider<AnyNetwork>) -> RpcSubmitter {
+        RpcSubmitter::new(vec![provider.clone()], SenderConfig::default()).unwrap()
     }
 
     fn event_abi() -> JsonAbi {
@@ -810,11 +891,13 @@ mod tests {
         asserter.push_success(&vec![log.clone()]);
         asserter.push_success(&vec![log]);
         let provider = mocked_provider(asserter.clone());
+        let submitter = mock_submitter(&provider);
         let step = WaitLogStep {
             chain: "chain_a".to_string(),
             from_block: Some(serde_yaml::Value::Number(serde_yaml::Number::from(4))),
             address: None,
             transaction_hash: None,
+            sender: None,
             abi: "events".to_string(),
             event: "Moved".to_string(),
             where_value: BTreeMap::new(),
@@ -823,10 +906,16 @@ mod tests {
             max_block_range: Some(100),
         };
 
-        let saved =
-            wait_for_log(&provider, "chain_a", &event_abi(), &step, &RuntimeContext::empty())
-                .await
-                .unwrap();
+        let saved = wait_for_log(
+            &provider,
+            &submitter,
+            "chain_a",
+            &event_abi(),
+            &step,
+            &RuntimeContext::empty(),
+        )
+        .await
+        .unwrap();
         let RuntimeValue::Object(saved) = saved else { panic!("expected object") };
         assert_eq!(saved["block_number"], RuntimeValue::Uint(U256::from(4)));
         assert!(asserter.read_q().is_empty());
@@ -847,11 +936,13 @@ mod tests {
         asserter.push_success(&vec![later.clone()]);
         asserter.push_success(&vec![later, earlier]);
         let provider = mocked_provider(asserter.clone());
+        let submitter = mock_submitter(&provider);
         let step = WaitLogStep {
             chain: "chain_a".to_string(),
             from_block: Some(serde_yaml::Value::Number(serde_yaml::Number::from(0))),
             address: None,
             transaction_hash: None,
+            sender: None,
             abi: "events".to_string(),
             event: "Moved".to_string(),
             where_value: BTreeMap::new(),
@@ -860,10 +951,16 @@ mod tests {
             max_block_range: Some(100),
         };
 
-        let saved =
-            wait_for_log(&provider, "chain_a", &event_abi(), &step, &RuntimeContext::empty())
-                .await
-                .unwrap();
+        let saved = wait_for_log(
+            &provider,
+            &submitter,
+            "chain_a",
+            &event_abi(),
+            &step,
+            &RuntimeContext::empty(),
+        )
+        .await
+        .unwrap();
         let RuntimeValue::Object(saved) = saved else { panic!("expected object") };
         assert_eq!(saved["block_number"], RuntimeValue::Uint(U256::from(5)));
         assert!(asserter.read_q().is_empty());
@@ -874,11 +971,13 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&0u64);
         let provider = mocked_provider(asserter.clone());
+        let submitter = mock_submitter(&provider);
         let step = WaitLogStep {
             chain: "chain_a".to_string(),
             from_block: Some(serde_yaml::Value::Number(serde_yaml::Number::from(0))),
             address: None,
             transaction_hash: None,
+            sender: None,
             abi: "events".to_string(),
             event: "Moved".to_string(),
             where_value: BTreeMap::new(),
@@ -889,7 +988,14 @@ mod tests {
 
         assert!(tokio::time::timeout(
             Duration::from_millis(10),
-            wait_for_log(&provider, "chain_a", &event_abi(), &step, &RuntimeContext::empty(),),
+            wait_for_log(
+                &provider,
+                &submitter,
+                "chain_a",
+                &event_abi(),
+                &step,
+                &RuntimeContext::empty(),
+            ),
         )
         .await
         .is_err());
@@ -906,11 +1012,13 @@ mod tests {
         asserter.push_success(&vec![log.clone()]);
         asserter.push_success(&vec![log]);
         let provider = mocked_provider(asserter.clone());
+        let submitter = mock_submitter(&provider);
         let step = WaitLogStep {
             chain: "chain_a".to_string(),
             from_block: Some(serde_yaml::Value::Number(serde_yaml::Number::from(4))),
             address: None,
             transaction_hash: None,
+            sender: None,
             abi: "events".to_string(),
             event: "Moved".to_string(),
             where_value: BTreeMap::new(),
@@ -919,10 +1027,16 @@ mod tests {
             max_block_range: Some(100),
         };
 
-        let saved =
-            wait_for_log(&provider, "chain_a", &event_abi(), &step, &RuntimeContext::empty())
-                .await
-                .unwrap();
+        let saved = wait_for_log(
+            &provider,
+            &submitter,
+            "chain_a",
+            &event_abi(),
+            &step,
+            &RuntimeContext::empty(),
+        )
+        .await
+        .unwrap();
         let RuntimeValue::Object(saved) = saved else { panic!("expected object") };
         assert_eq!(saved["block_number"], RuntimeValue::Uint(U256::from(4)));
         assert!(asserter.read_q().is_empty());
@@ -953,9 +1067,14 @@ mod tests {
         asserter.push_success(&receipt);
         asserter.push_success(&4u64);
         asserter.push_success(&receipt);
+        asserter.push_success(&serde_json::json!({ "hash": block_hash }));
+        let provider = mocked_provider(asserter);
+        let submitter = mock_submitter(&provider);
         let result = wait_for_receipt(
-            &mocked_provider(asserter),
+            &provider,
+            &submitter,
             "chain_a",
+            None,
             transaction_hash,
             Duration::from_millis(1),
             0,
@@ -969,11 +1088,47 @@ mod tests {
             asserter.push_success(&Option::<serde_json::Value>::None);
         }
         let provider = mocked_provider(asserter);
+        let submitter = mock_submitter(&provider);
         assert!(tokio::time::timeout(
             Duration::from_millis(10),
-            wait_for_receipt(&provider, "chain_a", transaction_hash, Duration::from_millis(1), 0,),
+            wait_for_receipt(
+                &provider,
+                &submitter,
+                "chain_a",
+                None,
+                transaction_hash,
+                Duration::from_millis(1),
+                0,
+            ),
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn receipt_canonicality_uses_the_query_block_hash() {
+        let transaction_hash = B256::repeat_byte(0x44);
+        let receipt: AnyTransactionReceipt = serde_json::from_value(serde_json::json!({
+            "status": "0x1",
+            "cumulativeGasUsed": "0x5208",
+            "logs": [],
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "type": "0x2",
+            "transactionHash": transaction_hash,
+            "transactionIndex": "0x0",
+            "blockHash": B256::repeat_byte(0x33),
+            "blockNumber": "0x4",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x1",
+            "from": Address::repeat_byte(0x11),
+            "to": Address::repeat_byte(0x22),
+            "contractAddress": null
+        }))
+        .unwrap();
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!({ "hash": B256::repeat_byte(0x99) }));
+        let provider = mocked_provider(asserter);
+
+        assert!(!receipt_is_canonical_on_query(&provider, &receipt).await.unwrap());
     }
 }

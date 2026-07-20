@@ -168,5 +168,8 @@ where
             writer.flush()?;
         }
     }
+    if report.failed > 0 {
+        bail!("scenario completed with {} failed instance(s)", report.failed);
+    }
     Ok(())
 }
