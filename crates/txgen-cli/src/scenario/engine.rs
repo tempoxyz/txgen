@@ -26,7 +26,10 @@ use alloy_network::{
 };
 use alloy_primitives::{keccak256, Address, TxHash, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
-use bench_core::{RpcSubmission, RpcSubmitFailureKind, RpcSubmitter, SenderConfig};
+use bench_core::{
+    RequestAuthProvider, RpcEndpoint, RpcSubmission, RpcSubmitFailureKind, RpcSubmitter,
+    SenderConfig, SenderHeaderAuthProvider,
+};
 use eyre::{bail, Result, WrapErr};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{
@@ -546,9 +549,17 @@ where
             StepAction::WaitReceipt(wait_receipt) => {
                 let hash = expression_hash(&wait_receipt.transaction_hash, context)
                     .map_err(StepError::expression)?;
+                let sender = wait_receipt
+                    .sender
+                    .as_ref()
+                    .map(|value| wait::expression_address(value, context))
+                    .transpose()
+                    .map_err(StepError::expression)?;
                 let receipt = wait::wait_for_receipt(
-                    &chain.provider,
+                    &chain.query_provider,
+                    &chain.submitter,
                     &chain.name,
+                    sender,
                     hash,
                     wait_receipt.poll_interval.unwrap_or(DEFAULT_POLL_INTERVAL),
                     wait_receipt.confirmations.unwrap_or(0),
@@ -564,7 +575,15 @@ where
                     .artifacts
                     .get(&wait_log.abi)
                     .map_err(|error| StepError::abi(error.to_string()))?;
-                wait::wait_for_log(&chain.provider, &chain.name, abi, wait_log, context).await
+                wait::wait_for_log(
+                    &chain.query_provider,
+                    &chain.submitter,
+                    &chain.name,
+                    abi,
+                    wait_log,
+                    context,
+                )
+                .await
             }
         }
     }
@@ -611,13 +630,14 @@ struct ChainRuntime<A: NetworkAdapter> {
     submit_prepare_gate: Mutex<()>,
     submission_lanes: Arc<SubmissionLanes>,
     submission_ambiguous: AtomicBool,
-    provider: DynProvider<AnyNetwork>,
+    query_provider: DynProvider<AnyNetwork>,
     submitter: RpcSubmitter,
 }
 
 struct ChainInput {
     workload_path: PathBuf,
-    rpc_url: url::Url,
+    submission_rpc_url: url::Url,
+    query_rpc_url: url::Url,
     spec: WorkloadSpec,
     accounts: AccountManager,
     address_pools: AddressPoolManager,
@@ -627,7 +647,7 @@ struct ChainInput {
 struct PreparedChain<A: NetworkAdapter> {
     name: String,
     chain_id: u64,
-    rpc_url: String,
+    query_rpc_url: String,
     workload_path: PathBuf,
     spec: WorkloadSpec,
     accounts: AccountManager,
@@ -635,7 +655,7 @@ struct PreparedChain<A: NetworkAdapter> {
     artifacts: ArtifactManager,
     adapter: A,
     nonces: NonceTracker,
-    provider: DynProvider<AnyNetwork>,
+    query_provider: DynProvider<AnyNetwork>,
     submitter: RpcSubmitter,
 }
 
@@ -676,7 +696,7 @@ fn load_chain_inputs<A: NetworkAdapter>(
     spec: &ScenarioSpec,
 ) -> Result<BTreeMap<String, ChainInput>> {
     let mut inputs = BTreeMap::new();
-    let mut endpoints = BTreeMap::<String, String>::new();
+    let mut submission_endpoints = BTreeMap::<String, String>::new();
     for (name, definition) in &spec.chains {
         if definition.network != A::network_name() {
             bail!(
@@ -685,14 +705,17 @@ fn load_chain_inputs<A: NetworkAdapter>(
                 A::network_name()
             );
         }
-        let rpc_url = url::Url::parse(&definition.rpc_url)
-            .map_err(|_| eyre::eyre!("chain '{name}' has an invalid RPC URL"))?;
-        if !matches!(rpc_url.scheme(), "http" | "https") {
-            bail!("chain '{name}' RPC URL must use http or https");
-        }
-        if let Some(existing) = endpoints.insert(rpc_url.to_string(), name.clone()) {
+        let submission_rpc_url = parse_rpc_url(name, "rpc_url", &definition.rpc_url)?;
+        let query_rpc_url = parse_rpc_url(
+            name,
+            "query_rpc_url",
+            definition.query_rpc_url.as_deref().unwrap_or(&definition.rpc_url),
+        )?;
+        if let Some(existing) =
+            submission_endpoints.insert(submission_rpc_url.to_string(), name.clone())
+        {
             bail!(
-                "chains '{existing}' and '{name}' resolve to the same RPC endpoint; aliases would maintain conflicting nonce state"
+                "chains '{existing}' and '{name}' resolve to the same submission RPC endpoint; aliases would maintain conflicting nonce state"
             );
         }
         let workload = WorkloadSpec::load(&definition.workload).wrap_err_with(|| {
@@ -710,7 +733,8 @@ fn load_chain_inputs<A: NetworkAdapter>(
             name.clone(),
             ChainInput {
                 workload_path: definition.workload.clone(),
-                rpc_url,
+                submission_rpc_url,
+                query_rpc_url,
                 spec: workload,
                 accounts,
                 address_pools,
@@ -719,6 +743,22 @@ fn load_chain_inputs<A: NetworkAdapter>(
         );
     }
     Ok(inputs)
+}
+
+fn parse_rpc_url(chain: &str, field: &str, value: &str) -> Result<url::Url> {
+    let mut url = url::Url::parse(value)
+        .map_err(|_| eyre::eyre!("chain '{chain}' has an invalid {field}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("chain '{chain}' {field} must use http or https");
+    }
+    if url.fragment().is_some() {
+        bail!("chain '{chain}' {field} must not include a URL fragment");
+    }
+    let default_port = if url.scheme() == "http" { 80 } else { 443 };
+    if url.port_or_known_default() == Some(default_port) {
+        url.set_port(None).map_err(|_| eyre::eyre!("chain '{chain}' has an invalid {field}"))?;
+    }
+    Ok(url)
 }
 
 impl<A> PreparedChain<A>
@@ -737,7 +777,7 @@ where
         let mut nonces = NonceTracker::new();
         tokio::time::timeout(
             FALLBACK_STEP_TIMEOUT,
-            adapter.prepare_nonces(&self.spec, &self.accounts, &mut nonces, &self.rpc_url),
+            adapter.prepare_nonces(&self.spec, &self.accounts, &mut nonces, &self.query_rpc_url),
         )
         .await
         .map_err(|_| eyre::eyre!("setup validation nonce preparation timed out"))??;
@@ -751,12 +791,19 @@ where
             &mut nonces,
             &mut rng,
         );
+        let submitter = self.submitter.clone();
         let setup = materialize_setup_online(
             &mut adapter,
             &self.spec,
             &mut context,
             FALLBACK_STEP_TIMEOUT,
-            |transaction| async move { Ok(transaction) },
+            move |transaction| {
+                let submitter = submitter.clone();
+                async move {
+                    submitter.validate_submission_auth(transaction.sender)?;
+                    Ok(transaction)
+                }
+            },
         )
         .await?;
 
@@ -779,7 +826,7 @@ where
             .map_err(|_| {
                 eyre::eyre!("{label} template '{}' preparation timed out", submit.template)
             })??;
-            materialize_and_sign_template(
+            let transaction = materialize_and_sign_template(
                 &adapter,
                 &submit.template,
                 value,
@@ -790,6 +837,14 @@ where
             .wrap_err_with(|| {
                 format!("{label} has an invalid static overlay for template '{}'", submit.template)
             })?;
+            self.submitter.validate_submission_auth(Some(transaction.sender)).wrap_err_with(
+                || {
+                    format!(
+                        "{label} has no submission authentication for template '{}'",
+                        submit.template
+                    )
+                },
+            )?;
         }
         Ok(())
     }
@@ -798,7 +853,7 @@ where
         let Self {
             name,
             chain_id,
-            rpc_url: _,
+            query_rpc_url: _,
             workload_path,
             spec,
             accounts,
@@ -806,7 +861,7 @@ where
             artifacts,
             mut adapter,
             mut nonces,
-            provider,
+            query_provider,
             submitter,
         } = self;
         let setup = {
@@ -828,7 +883,7 @@ where
                 |transaction| {
                     submit_setup_transaction(
                         submitter.clone(),
-                        provider.clone(),
+                        query_provider.clone(),
                         name.clone(),
                         transaction,
                     )
@@ -852,7 +907,7 @@ where
             submit_prepare_gate: Mutex::new(()),
             submission_lanes: Arc::new(SubmissionLanes::default()),
             submission_ambiguous: AtomicBool::new(false),
-            provider,
+            query_provider,
             submitter,
         })
     }
@@ -872,13 +927,26 @@ where
         transaction_rate: u64,
         max_rpc_in_flight: usize,
     ) -> Result<PreparedChain<A>> {
-        let ChainInput { workload_path, rpc_url, spec, accounts, address_pools, artifacts } = input;
-        let provider =
-            ProviderBuilder::new_with_network::<AnyNetwork>().connect_http(rpc_url).erased();
-        let rpc_chain_id = tokio::time::timeout(FALLBACK_STEP_TIMEOUT, provider.get_chain_id())
-            .await
-            .map_err(|_| eyre::eyre!("chain ID query timed out for chain '{name}'"))?
-            .map_err(|_| eyre::eyre!("failed to query chain ID for chain '{name}'"))?;
+        let ChainInput {
+            workload_path,
+            submission_rpc_url,
+            query_rpc_url,
+            spec,
+            accounts,
+            address_pools,
+            artifacts,
+        } = input;
+        let submission_provider = ProviderBuilder::new_with_network::<AnyNetwork>()
+            .connect_http(submission_rpc_url)
+            .erased();
+        let query_provider = ProviderBuilder::new_with_network::<AnyNetwork>()
+            .connect_http(query_rpc_url.clone())
+            .erased();
+        let rpc_chain_id =
+            tokio::time::timeout(FALLBACK_STEP_TIMEOUT, query_provider.get_chain_id())
+                .await
+                .map_err(|_| eyre::eyre!("chain ID query timed out for chain '{name}'"))?
+                .map_err(|_| eyre::eyre!("failed to query chain ID for chain '{name}'"))?;
         let chain_id = match definition.chain_id {
             ChainId::Auto => rpc_chain_id,
             ChainId::Explicit(expected) if expected == rpc_chain_id => expected,
@@ -893,19 +961,35 @@ where
         let mut nonces = NonceTracker::new();
         tokio::time::timeout(
             FALLBACK_STEP_TIMEOUT,
-            adapter.prepare_nonces(&spec, &accounts, &mut nonces, &definition.rpc_url),
+            adapter.prepare_nonces(&spec, &accounts, &mut nonces, query_rpc_url.as_str()),
         )
         .await
         .map_err(|_| eyre::eyre!("nonce preparation timed out for chain '{name}'"))?
         .map_err(|_| eyre::eyre!("failed to prepare nonce state for chain '{name}'"))?;
-        let submitter = RpcSubmitter::new(
-            vec![provider.clone()],
+        let request_auth: Option<Arc<dyn RequestAuthProvider>> = definition
+            .request_auth
+            .as_ref()
+            .map(|auth| {
+                SenderHeaderAuthProvider::from_file(
+                    &auth.sender_header.name,
+                    &auth.sender_header.map,
+                    auth.sender_header.reload_interval.unwrap_or(Duration::from_secs(1)),
+                )
+                .map(|provider| Arc::new(provider) as Arc<dyn RequestAuthProvider>)
+            })
+            .transpose()
+            .wrap_err_with(|| {
+                format!("failed to configure request authentication for chain '{name}'")
+            })?;
+        let submitter = RpcSubmitter::new_with_request_auth(
+            vec![RpcEndpoint::new(format!("{name}-submission"), submission_provider)],
             SenderConfig { rate_limit: transaction_rate, max_concurrent: max_rpc_in_flight },
+            request_auth,
         )?;
         Ok(PreparedChain {
             name: name.to_string(),
             chain_id,
-            rpc_url: definition.rpc_url.clone(),
+            query_rpc_url: query_rpc_url.to_string(),
             workload_path,
             spec,
             accounts,
@@ -913,7 +997,7 @@ where
             artifacts,
             adapter,
             nonces,
-            provider,
+            query_provider,
             submitter,
         })
     }
@@ -942,7 +1026,10 @@ where
                     RpcSubmitFailureKind::Rejected | RpcSubmitFailureKind::Ambiguous => {
                         let lookup = tokio::time::timeout_at(
                             deadline,
-                            self.provider.get_transaction_by_hash(materialized.tx_hash),
+                            self.submitter.transaction_exists(
+                                Some(materialized.sender),
+                                materialized.tx_hash,
+                            ),
                         )
                         .await;
                         match lookup {
@@ -957,9 +1044,10 @@ where
                         }
                     }
                 };
-                if lookup.as_ref().is_some_and(|result| {
-                    result.as_ref().is_ok_and(|transaction| transaction.is_some())
-                }) {
+                if lookup
+                    .as_ref()
+                    .is_some_and(|result| result.as_ref().is_ok_and(|transaction| *transaction))
+                {
                     RpcSubmission {
                         tx_hash: materialized.tx_hash,
                         acceptance_latency: attempt_started.elapsed(),
@@ -997,7 +1085,7 @@ where
                     self.submission_ambiguous.store(true, Ordering::Release);
                     let classification = if error.kind() == RpcSubmitFailureKind::Rejected &&
                         lookup.as_ref().is_some_and(|result| {
-                            result.as_ref().is_ok_and(|transaction| transaction.is_none())
+                            result.as_ref().is_ok_and(|transaction| !*transaction)
                         }) {
                         "submission_rejected"
                     } else {
@@ -1020,8 +1108,10 @@ where
             let receipt = tokio::time::timeout_at(
                 deadline,
                 wait::wait_for_receipt(
-                    &self.provider,
+                    &self.query_provider,
+                    &self.submitter,
                     &self.name,
+                    Some(materialized.sender),
                     submission.tx_hash,
                     DEFAULT_POLL_INTERVAL,
                     0,
@@ -1193,9 +1283,9 @@ where
     }
 
     async fn checkpoint(&self) -> Result<RuntimeValue, StepError> {
-        let block_number = self.provider.get_block_number().await.map_err(StepError::rpc)?;
+        let block_number = self.query_provider.get_block_number().await.map_err(StepError::rpc)?;
         let block = self
-            .provider
+            .query_provider
             .get_block_by_number(BlockNumberOrTag::Number(block_number))
             .await
             .map_err(StepError::rpc)?;
@@ -1218,12 +1308,13 @@ async fn lock_before_deadline<T>(
 
 async fn submit_setup_transaction(
     submitter: RpcSubmitter,
-    provider: DynProvider<AnyNetwork>,
+    query_provider: DynProvider<AnyNetwork>,
     chain_name: String,
     transaction: txgen_core::GeneratedTx,
 ) -> Result<txgen_core::GeneratedTx> {
     let deadline = TokioInstant::now() + FALLBACK_STEP_TIMEOUT;
     let expected_hash = keccak256(&transaction.raw);
+    let sender = transaction.sender;
     let submission = match submitter.submit_classified_until(&transaction, deadline).await {
         Ok(submission) => submission,
         Err(error) if error.kind() == RpcSubmitFailureKind::BeforeSend => {
@@ -1234,7 +1325,7 @@ async fn submit_setup_transaction(
         Err(error) => {
             let found = tokio::time::timeout_at(
                 deadline,
-                provider.get_transaction_by_hash(expected_hash),
+                submitter.transaction_exists(sender, expected_hash),
             )
             .await
             .map_err(|_| {
@@ -1247,7 +1338,7 @@ async fn submit_setup_transaction(
                     "setup submission outcome is unknown on chain '{chain_name}' because transaction lookup failed"
                 )
             })?;
-            if found.is_none() {
+            if !found {
                 return Err(eyre::eyre!(
                     "setup transaction was rejected or has an unknown acceptance outcome on chain '{chain_name}': {error}"
                 ));
@@ -1265,8 +1356,10 @@ async fn submit_setup_transaction(
     let receipt = tokio::time::timeout_at(
         deadline,
         wait::wait_for_receipt(
-            &provider,
+            &query_provider,
+            &submitter,
             &chain_name,
+            sender,
             submission.tx_hash,
             DEFAULT_POLL_INTERVAL,
             0,
@@ -1626,6 +1719,14 @@ mod tests {
         assert!(config.validate().is_err());
         let config = ScenarioExecutionConfig { starts_per_second: f64::NAN, ..Default::default() };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rpc_urls_reject_fragments_and_normalize_default_ports() {
+        let explicit = parse_rpc_url("x", "rpc_url", "http://EXAMPLE.com:80/rpc").unwrap();
+        let implicit = parse_rpc_url("x", "rpc_url", "http://example.com/rpc").unwrap();
+        assert_eq!(explicit, implicit);
+        assert!(parse_rpc_url("x", "rpc_url", "https://example.com/rpc#alias").is_err());
     }
 
     #[test]

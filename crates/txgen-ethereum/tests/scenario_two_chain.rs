@@ -468,7 +468,7 @@ async fn handle_rpc(State(state): State<RpcState>, Json(request): Json<Value>) -
             let bridge = state.bridge.lock().expect("bridge state lock");
             json!(quantity(bridge.chain(state.chain).head))
         }
-        "eth_getBlockByNumber" => Value::Null,
+        "eth_getBlockByNumber" => block_value(START_BLOCK, B256::repeat_byte(0x55)),
         "eth_sendRawTransaction" => {
             let raw = params
                 .get(0)
@@ -540,6 +540,30 @@ fn receipt_value(transaction_hash: B256, status: bool) -> Value {
         "from": Address::repeat_byte(0x11),
         "to": Address::repeat_byte(0x22),
         "contractAddress": null
+    })
+}
+
+fn block_value(number: u64, hash: B256) -> Value {
+    json!({
+        "hash": hash,
+        "parentHash": B256::ZERO,
+        "sha3Uncles": B256::ZERO,
+        "miner": Address::ZERO,
+        "stateRoot": B256::ZERO,
+        "transactionsRoot": B256::ZERO,
+        "receiptsRoot": B256::ZERO,
+        "logsBloom": format!("0x{}", "00".repeat(256)),
+        "difficulty": "0x0",
+        "number": quantity(number),
+        "gasLimit": "0x1c9c380",
+        "gasUsed": "0x0",
+        "timestamp": "0x0",
+        "extraData": "0x",
+        "mixHash": B256::ZERO,
+        "nonce": "0x0000000000000000",
+        "baseFeePerGas": "0x0",
+        "transactions": [],
+        "uncles": []
     })
 }
 
