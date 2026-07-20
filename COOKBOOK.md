@@ -18,6 +18,7 @@ Use `txgen-ethereum` for standard Ethereum transactions and `txgen-tempo` for Te
 - [Send to destination-only address pools](#send-to-destination-only-address-pools)
 - [Send a fixed number of synthetic transactions](#send-a-fixed-number-of-synthetic-transactions)
 - [Run a timed stress test](#run-a-timed-stress-test)
+- [Run a generic two-chain scenario](#run-a-generic-two-chain-scenario)
 - [Replay historical blocks through Engine API](#replay-historical-blocks-through-engine-api)
 - [Replay blocks with Block Access Lists](#replay-blocks-with-block-access-lists)
 - [Pace block replay](#pace-block-replay)
@@ -215,6 +216,130 @@ txgen-tempo generate \
 ```
 
 Setup transactions are emitted before the timer starts. If both `--count` and `--duration` are provided, generation stops at whichever limit is reached first.
+
+## Run a generic two-chain scenario
+
+Use `scenario run` when a journey must cross an asynchronous chain boundary and later steps depend on receipts or decoded events. The runner materializes workload templates, signs them, submits them, waits, and writes one journey-level report; there is no separate `generate | bench send` pipeline to coordinate.
+
+Assume `alpha-workload.yaml` and `beta-workload.yaml` each define a `users` account pool, a `RelayEvents` ABI artifact, and the transaction templates named below. Save this scenario next to those workload files:
+
+```yaml
+version: 1
+
+chains:
+  alpha:
+    network: tempo
+    rpc_url: ${ALPHA_RPC_URL}
+    chain_id: auto
+    workload: ./alpha-workload.yaml
+  beta:
+    network: tempo
+    rpc_url: ${BETA_RPC_URL}
+    chain_id: auto
+    workload: ./beta-workload.yaml
+
+scenario:
+  name: generic-request-roundtrip
+  timeout: 30s
+  bindings:
+    caller:
+      account:
+        pool: users
+        select: lease
+
+  steps:
+    # Capture beta before publishing so the later wait can backfill safely.
+    - checkpoint:
+        chain: beta
+      save: beta_before_request
+
+    - submit:
+        chain: alpha
+        template: send_request
+        with:
+          from: { var: caller.ref }
+      save: request
+
+    - wait_receipt:
+        chain: alpha
+        transaction_hash: { var: request.tx_hash }
+      save: request_receipt
+
+    # Decode the correlation ID from the transaction's own event.
+    - wait_log:
+        chain: alpha
+        transaction_hash: { var: request.tx_hash }
+        abi: RelayEvents
+        event: RequestPublished
+      save: request_published
+
+    # The event may already exist when this step begins; the checkpoint makes
+    # the initial eth_getLogs backfill include it.
+    - wait_log:
+        chain: beta
+        from_block: { var: beta_before_request.block_number }
+        address: ${BETA_RELAY_ADDRESS}
+        abi: RelayEvents
+        event: RequestObserved
+        where:
+          requestId: { var: request_published.args.requestId }
+        confirmations: 2
+        max_block_range: 1000
+      save: request_observed
+      timeout: 90s
+
+    - checkpoint:
+        chain: alpha
+      save: alpha_before_response
+
+    - submit:
+        chain: beta
+        template: send_response
+        with:
+          from: { var: caller.ref }
+          call:
+            args:
+              - { var: request_observed.args.requestId }
+        await: receipt
+      save: response
+
+    - wait_log:
+        chain: alpha
+        from_block: { var: alpha_before_response.block_number }
+        address: ${ALPHA_RELAY_ADDRESS}
+        abi: RelayEvents
+        event: ResponseObserved
+        where:
+          requestId: { var: request_observed.args.requestId }
+      save: response_observed
+      timeout: 90s
+```
+
+Run many independent instances with bounded journey and RPC concurrency:
+
+```bash
+export ALPHA_RPC_URL=http://127.0.0.1:8545
+export BETA_RPC_URL=http://127.0.0.1:9545
+export ALPHA_RELAY_ADDRESS=0x1111111111111111111111111111111111111111
+export BETA_RELAY_ADDRESS=0x2222222222222222222222222222222222222222
+
+txgen-tempo scenario run \
+  --scenario ./generic-roundtrip.yaml \
+  --count 500 \
+  --starts-per-second 10 \
+  --max-in-flight 40 \
+  --tx-rate 100 \
+  --max-rpc-in-flight 100 \
+  --step-timeout 45s \
+  --seed 7 \
+  --failure-policy continue \
+  --sample-instances 5 \
+  --report generic-roundtrip-report.json
+```
+
+`--starts-per-second 10` means ten new end-to-end journeys per second; it does not mean ten transactions per second. `--tx-rate` is the separate per-chain transaction-submission limit. The leased `caller` account remains exclusive to one active journey and is returned even when that journey fails or times out.
+
+Use `--duration 10m` instead of, or together with, `--count`. When both are set, new starts stop at the first limit and active instances finish. `--failure-policy fail-fast` stops new starts after the first failed instance while allowing already-started instances to finish. See [Scenario Specification](README.md#scenario-specification) for every step, saved field, expression, timeout rule, and report field.
 
 ## Replay historical blocks through Engine API
 
