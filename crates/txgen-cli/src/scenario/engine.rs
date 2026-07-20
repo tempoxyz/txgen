@@ -870,7 +870,7 @@ where
             ChainId::Explicit(expected) => {
                 bail!(
                     "chain '{name}' expected chain ID {expected}, but its RPC reported {rpc_chain_id}"
-                )
+                );
             }
         };
 
@@ -1455,7 +1455,7 @@ fn validate_workload_references(
                     index + 1,
                     submit.template,
                     submit.chain
-                )
+                );
             }
             StepAction::WaitLog(wait_log) => {
                 let abi = chain.artifacts.get(&wait_log.abi).wrap_err_with(|| {

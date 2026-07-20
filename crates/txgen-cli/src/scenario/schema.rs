@@ -386,7 +386,7 @@ impl ScenarioSpec {
             validate_runtime_root(name, "binding")?;
             match binding {
                 BindingDef::Account(account) if account.pool.trim().is_empty() => {
-                    bail!("account binding '{name}' has an empty pool")
+                    bail!("account binding '{name}' has an empty pool");
                 }
                 BindingDef::Account(_) => {}
             }
@@ -725,7 +725,7 @@ fn validate_saved_path(root: &str, kind: SavedKind, tail: Option<&str>) -> Resul
     if valid {
         Ok(())
     } else {
-        bail!("saved step result '{root}' has no field '{tail}'")
+        bail!("saved step result '{root}' has no field '{tail}'");
     }
 }
 
