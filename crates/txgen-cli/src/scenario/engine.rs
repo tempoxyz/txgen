@@ -178,6 +178,49 @@ struct ScenarioEngine<A: NetworkAdapter> {
     chains: BTreeMap<String, Arc<ChainRuntime<A>>>,
     bindings: BTreeMap<String, BindingRuntime>,
     default_step_timeout: Duration,
+    progress: Arc<ScenarioRuntimeProgress>,
+}
+
+#[derive(Default)]
+struct ScenarioRuntimeProgress {
+    active_steps: StdMutex<BTreeMap<String, u64>>,
+}
+
+impl ScenarioRuntimeProgress {
+    fn enter(self: &Arc<Self>, step: &str) -> ScenarioStepGuard {
+        let mut active_steps = self.active_steps.lock().expect("scenario progress mutex poisoned");
+        *active_steps.entry(step.to_string()).or_default() += 1;
+        ScenarioStepGuard { progress: self.clone(), step: step.to_string() }
+    }
+
+    fn active_steps(&self) -> String {
+        let active_steps = self.active_steps.lock().expect("scenario progress mutex poisoned");
+        if active_steps.is_empty() {
+            "none".to_string()
+        } else {
+            active_steps
+                .iter()
+                .map(|(step, count)| format!("{step}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    }
+}
+
+struct ScenarioStepGuard {
+    progress: Arc<ScenarioRuntimeProgress>,
+    step: String,
+}
+
+impl Drop for ScenarioStepGuard {
+    fn drop(&mut self) {
+        let mut active_steps = self.progress.active_steps.lock().expect("scenario progress mutex poisoned");
+        let count = active_steps.get_mut(&self.step).expect("active scenario step must exist");
+        *count -= 1;
+        if *count == 0 {
+            active_steps.remove(&self.step);
+        }
+    }
 }
 
 impl<A> ScenarioEngine<A>
@@ -260,7 +303,13 @@ where
             config.step_timeout.or(spec.scenario.timeout).unwrap_or(FALLBACK_STEP_TIMEOUT);
 
         eprintln!("scenario initialization completed: elapsed={:?}", started.elapsed());
-        Ok(Self { spec, chains, bindings, default_step_timeout })
+        Ok(Self {
+            spec,
+            chains,
+            bindings,
+            default_step_timeout,
+            progress: Arc::new(ScenarioRuntimeProgress::default()),
+        })
     }
 
     async fn run(self: Arc<Self>, config: ScenarioExecutionConfig) -> Result<ScenarioReport> {
@@ -292,6 +341,7 @@ where
                     in_flight,
                     maximum_in_flight,
                     run_start.elapsed(),
+                    &self.progress,
                 );
                 last_progress = Instant::now();
             }
@@ -365,6 +415,7 @@ where
                         in_flight,
                         maximum_in_flight,
                         run_start.elapsed(),
+                        &self.progress,
                     );
                     last_progress = Instant::now();
                 }
@@ -414,7 +465,14 @@ where
             failure_policy: config.failure_policy.as_str().to_string(),
         };
 
-        log_scenario_progress(&outcomes, next_instance, in_flight, maximum_in_flight, elapsed);
+        log_scenario_progress(
+            &outcomes,
+            next_instance,
+            in_flight,
+            maximum_in_flight,
+            elapsed,
+            &self.progress,
+        );
         eprintln!("scenario execution completed: elapsed={elapsed:?}");
         Ok(ScenarioReport::build(
             self.spec.scenario.name.clone(),
@@ -459,6 +517,7 @@ where
         for (index, step) in self.spec.scenario.steps.iter().enumerate() {
             let name = step_name(index, step);
             let kind = step.action.name().to_string();
+            let _step_guard = self.progress.enter(&name);
             let step_started = Instant::now();
             let timeout = step.timeout.unwrap_or(self.default_step_timeout);
             let deadline = TokioInstant::now() + timeout;
@@ -1655,10 +1714,12 @@ fn log_scenario_progress(
     in_flight: usize,
     maximum_in_flight: usize,
     elapsed: Duration,
+    progress: &ScenarioRuntimeProgress,
 ) {
     let (completed, failed, timed_out) = outcomes.counts();
     eprintln!(
-        "scenario execution progress: started={started} completed={completed} failed={failed} timed_out={timed_out} in_flight={in_flight} maximum_in_flight={maximum_in_flight} elapsed={elapsed:?}",
+        "scenario execution progress: started={started} completed={completed} failed={failed} timed_out={timed_out} in_flight={in_flight} maximum_in_flight={maximum_in_flight} active_steps={} elapsed={elapsed:?}",
+        progress.active_steps(),
     );
 }
 
