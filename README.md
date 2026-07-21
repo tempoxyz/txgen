@@ -31,7 +31,7 @@ cargo build --release
 
 ## CLI Tools
 
-The workspace provides three binaries: `txgen-ethereum` and `txgen-tempo` for chain-specific transaction workflows, and `bench` for benchmarking. Transaction generation remains offline; `txgen-tempo scenario run` connects directly to every chain named by a scenario.
+The workspace provides three binaries: `txgen-ethereum` and `txgen-tempo` for chain-specific transaction workflows, and `bench` for benchmarking. Transaction generation remains offline; `scenario run` connects directly to every chain named by a scenario, while `scenario validate` and `scenario render` perform offline checks only.
 
 ### `txgen-ethereum` / `txgen-tempo`
 
@@ -100,6 +100,32 @@ txgen-tempo scenario run \
 | `--sample-instances <N>` | Include up to `N` sanitized instance lifecycle records in the report (default: `0`) |
 
 When both `--count` and `--duration` are present, txgen stops starting journeys at the first limit. See [Scenario Specification](#scenario-specification) for the schema, step results, expressions, and execution semantics.
+
+#### `scenario validate`
+
+Resolve and statically validate a scenario without connecting to its RPC endpoints:
+
+```bash
+txgen-tempo scenario validate --scenario scenario.yaml
+```
+
+Validation expands included fragments first, then loads the referenced workload and ABI files and checks chains, bindings, templates, events, filters, saves, forward references, and statically known types. A valid document prints a success message and exits with status zero; invalid input reports its composition or validation context and exits nonzero. Remote chain IDs, nonces, and deployed state are checked only by `scenario run`.
+
+#### `scenario render`
+
+Validate a scenario and print its deterministic, fully expanded YAML form:
+
+```bash
+# Print to stdout.
+txgen-tempo scenario render --scenario scenario.yaml
+
+# Write to a file instead.
+txgen-tempo scenario render \
+  --scenario scenario.yaml \
+  --output rendered.yaml
+```
+
+The rendered document contains ordinary inline steps with resolved workload paths: top-level `include` and `fragments` declarations are removed, fragment `use` steps are replaced in place, and fragment-authored `{ param: name }` expressions are substituted. Literal keys with those names in ordinary application data are preserved. Omitting `--output` writes YAML to stdout. Composition provenance is intentionally not serialized, so loading the rendered file later treats its steps as ordinary inline steps and cannot reproduce the original fragment metadata in reports or errors. Rendering is offline, but environment references are expanded while loading, so rendered RPC URLs may contain credentials and should be handled accordingly.
 
 #### `addresses`
 
@@ -407,7 +433,7 @@ bench send -i txs.ndjson \
 
 Scenarios describe complete journeys across asynchronous RPC boundaries. Each named chain points to an ordinary txgen workload spec; `submit` selects a template from that workload and applies the same deep-merge behavior used by workload sequences. Existing workload specs, templates, `generate` commands, and NDJSON formats remain valid.
 
-Scenario files use `version: 1`. Environment references such as `${ORIGIN_RPC_URL}` are expanded before parsing. A relative `workload` path is resolved from the directory containing the scenario file. Paths inside that workload, including ABI artifacts, remain relative to the workload file.
+Scenario files use `version: 1`. Environment references such as `${ORIGIN_RPC_URL}` are expanded before parsing. A relative `workload` path is resolved from the file that declares the chain; because included fragment libraries cannot declare chains, that is the root scenario file. Paths inside that workload, including ABI artifacts, remain relative to the workload file.
 
 Each binary supplies one network adapter for the whole run: every chain in a `txgen-tempo` scenario must use `network: tempo`, and every chain in a `txgen-ethereum` scenario must use `network: ethereum`. The endpoints may still represent independent chains with different chain IDs and workload files. Named chains must use distinct normalized RPC URLs so they cannot maintain conflicting nonce state for one endpoint.
 
@@ -515,6 +541,195 @@ scenario:
 
 `chain_id: auto` queries the endpoint and uses the returned chain ID for signing. An explicit integer may be used instead and is validated against the endpoint. When one account binding is used to submit on multiple chains, its named pool must derive the same ordered addresses in each consuming workload.
 
+### Reusable fragments and composition
+
+A scenario document may add top-level `include` and `fragments` sections. Both are optional, so existing version 1 documents with one inline `scenario.steps` list parse and run as before. The root document may contain `version`, `include`, `fragments`, `chains`, and `scenario`. An included document is a fragment library and may contain only `version`, `include`, and `fragments`; an included file cannot replace or contribute `chains` or the root `scenario`.
+
+Includes are traversed depth-first in their listed order. Each include path is relative to the file that declares it, not the process working directory or the root scenario. Canonical paths are used to detect a file reached again on the active include stack; that is an include cycle. Reaching the same file again after its earlier traversal completed is not silently deduplicated: it is traversed again, and any repeated fragment contribution is reported as a duplicate declaration. Fragment names must be unique across the complete include graph and the root document, and there is no implicit precedence or override mechanism. Include cycles, missing files, and a non-version-1 `version` in any document are errors.
+
+Each fragment defines typed parameters, optional typed outputs, and an ordered list containing normal steps or nested fragment uses:
+
+```yaml
+fragments:
+  submit-and-confirm:
+    parameters:
+      chain: string
+      sender: account_ref
+      recipient: address
+      amount: u256
+    outputs:
+      submission: submit
+      receipt: receipt
+    steps:
+      - submit:
+          chain: { param: chain }
+          template: transfer
+          with:
+            from: { param: sender }
+            call:
+              args:
+                - { param: recipient }
+                - { param: amount }
+        save: submission
+
+      - wait_receipt:
+          chain: { param: chain }
+          transaction_hash: { var: submission.tx_hash }
+        save: receipt
+```
+
+Supported parameter types are:
+
+| Type | Accepted value |
+|------|----------------|
+| `string` | A string literal or string-valued runtime expression |
+| `account_ref` | An account reference such as `{ var: user.ref }` |
+| `address` | An address literal or address-valued runtime expression |
+| `u256` | An unsigned integer literal or compatible runtime expression |
+| `bytes` | A variable-length byte string or compatible runtime expression |
+| `bytes32` | A 32-byte value or compatible runtime expression |
+| `bool` | A Boolean literal or Boolean-valued runtime expression |
+| `value` | Any supported YAML value or txgen runtime expression |
+
+Parameter substitution uses the exact single-key form `{ param: name }`; it replaces that whole YAML node. Parameters are not interpolated into strings. Arguments may be literals, environment-expanded values, runtime references, or other supported txgen value expressions. Every fragment use must provide exactly the declared keys in `with`: missing and unknown parameters are rejected, and statically knowable values must match their declared types. A parameter does not make a normally static schema field dynamic; values substituted into fields such as `chain`, `template`, `abi`, or `event` must resolve during expansion rather than at runtime.
+
+Use a fragment anywhere an inline step is allowed:
+
+```yaml
+- use: submit-and-confirm
+  as: first_transfer
+  with:
+    chain: primary
+    sender: { var: user.ref }
+    recipient: { var: user.address }
+    amount: 1
+```
+
+`as` is required. It must be one valid, non-dotted name segment and must be unique within its containing scenario or fragment. The same fragment may be used repeatedly under different aliases. Its local saves are placed below the alias, so `submission` and `receipt` above become `first_transfer.submission` and `first_transfer.receipt`. Fragment-authored `{ var: submission.tx_hash }` references resolve to the local save before caller-supplied parameter values are injected; a runtime expression passed through `with` therefore keeps the caller's scope. A nested use adds another segment: an inner alias `confirm` under an outer alias `batch` produces names such as `batch.confirm.receipt`. Report provenance uses the local save as the local step name when present and a deterministic action/index-derived name for an unsaved step.
+
+An `outputs` entry names a save declared by the fragment and its required result kind. The supported result kinds are `checkpoint`, `submit`, `receipt`, and `log`; expansion rejects missing output saves and result-kind mismatches. Local saves omitted from `outputs` remain private: callers may reference only declared outputs below the instance alias. A parent fragment must likewise re-export a nested output before its own caller can access it. Fragment uses may nest to any acyclic depth, while direct and indirect fragment recursion is rejected with the use chain.
+
+Expansion is deterministic and occurs before the existing chain, binding, save, forward-reference, template, ABI, event-filter, and type validation. Duplicate aliases, expanded saves, and invalid names are therefore checked together with surrounding inline steps. Errors identify the declaring source file and, when applicable, the fragment, instance alias, local step, and expanded step index.
+
+Composition stops on missing include files or fragment names, include cycles, fragment recursion, missing or unknown parameters, duplicate fragment names or aliases, conflicting expanded saves, invalid output declarations, and unresolved parameter or variable references. Fragment dependency and output contracts are checked even when a fragment is not instantiated by the root scenario. These errors are reported before execution begins.
+
+#### Complete multi-file example
+
+This layout keeps the entry point and workload together while the fragment library uses a nested relative include:
+
+```text
+scenario.yaml
+primary-workload.yaml
+fragments/
+  common.yaml
+  transfers.yaml
+```
+
+`fragments/common.yaml` declares one fragment and includes another file relative to itself:
+
+```yaml
+version: 1
+include:
+  - transfers.yaml
+
+fragments:
+  capture-head:
+    parameters:
+      chain: string
+    outputs:
+      cursor: checkpoint
+    steps:
+      - checkpoint:
+          chain: { param: chain }
+        save: cursor
+```
+
+`fragments/transfers.yaml` contains the reusable transaction pair:
+
+```yaml
+version: 1
+
+fragments:
+  submit-and-confirm:
+    parameters:
+      chain: string
+      sender: account_ref
+      recipient: address
+      amount: u256
+    outputs:
+      submission: submit
+      receipt: receipt
+    steps:
+      - submit:
+          chain: { param: chain }
+          template: transfer
+          with:
+            from: { param: sender }
+            call:
+              args:
+                - { param: recipient }
+                - { param: amount }
+        save: submission
+
+      - wait_receipt:
+          chain: { param: chain }
+          transaction_hash: { var: submission.tx_hash }
+        save: receipt
+```
+
+`scenario.yaml` instantiates the same fragment twice, combines those uses with another fragment, and then references an exported result from a later inline step:
+
+```yaml
+version: 1
+
+include:
+  - fragments/common.yaml
+
+chains:
+  primary:
+    network: tempo
+    rpc_url: "${RPC_URL}"
+    chain_id: auto
+    workload: ./primary-workload.yaml
+
+scenario:
+  name: composed-transfers
+  timeout: 5m
+  bindings:
+    user:
+      account:
+        pool: users
+        select: lease
+  steps:
+    - use: capture-head
+      as: before_transfers
+      with:
+        chain: primary
+
+    - use: submit-and-confirm
+      as: first_transfer
+      with:
+        chain: primary
+        sender: { var: user.ref }
+        recipient: { var: user.address }
+        amount: 1
+
+    - use: submit-and-confirm
+      as: second_transfer
+      with:
+        chain: primary
+        sender: { var: user.ref }
+        recipient: { var: user.address }
+        amount: 2
+
+    - wait_receipt:
+        chain: primary
+        transaction_hash: { var: first_transfer.receipt.transaction_hash }
+      save: first_transfer_rechecked
+```
+
+The expanded order is the `capture-head` step, both steps from `first_transfer`, both steps from `second_transfer`, and the final inline receipt wait. The corresponding fragment saves are `before_transfers.cursor`, `first_transfer.submission`, `first_transfer.receipt`, `second_transfer.submission`, and `second_transfer.receipt`.
+
 ### Steps
 
 Every step selects one named chain. `save` and `timeout` are sibling keys of the step action, as shown above.
@@ -577,7 +792,7 @@ A log wait must provide `from_block` or `transaction_hash`. Optional `address`, 
 
 ### Saved values
 
-`save: <name>` adds an immutable typed result to the current scenario instance. Saved values are not shared between concurrent instances, and a name cannot be reused. References to a later step are rejected before execution where they can be identified statically.
+`save: <name>` adds an immutable typed result to the current scenario instance. Saved values are not shared between concurrent instances, and a name cannot be reused. References to a later step are rejected before execution where they can be identified statically. Fragment-local save names remain simple names in their declarations; expansion qualifies them with the complete instance alias path so callers can use expressions such as `{ var: first_transfer.receipt.block_number }`.
 
 | Step | Saved fields |
 |------|--------------|
@@ -648,6 +863,8 @@ The seed controls deterministic account/template/value choices. Each instance ha
 ### JSON report
 
 The scenario runner writes one JSON report to `--report`, or to stdout when no path is supplied. It includes the configured scenario name and execution configuration; started, completed, failed, and timed-out instance counts; completed scenarios per second; observed maximum in-flight instances; per-step success/failure counts and latency distributions; completed-journey latency; and failures grouped by stage and sanitized error class. `--sample-instances` optionally retains a bounded number of secret-free lifecycle records and safe failure details for debugging. Counts, minima, maxima, and means are exact; percentile estimates use a deterministic reservoir capped at 65,536 observations per distribution so duration-based runs use bounded memory.
+
+Steps expanded from fragments carry an optional `provenance` object in aggregate step reports, failure records, and sampled lifecycle steps. It records `source_file`, `fragment`, `instance_alias`, `local_step_name`, and the zero-based `local_step_index`. Inline steps omit it. Consumers can group latency by fragment and local step across instances, or include the alias to compare individual fragment uses. Because `scenario render` omits this source metadata, a later run of rendered YAML reports those flattened steps as inline steps.
 
 Latency distributions use monotonic elapsed time. Wall-clock timestamps are included only for correlation with external chain and node data. Transaction acceptance alone never marks a journey successful.
 

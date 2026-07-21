@@ -53,11 +53,19 @@ impl RuntimeContext {
     pub fn with_root(&self, name: impl Into<String>, value: RuntimeValue) -> Result<Self> {
         let name = name.into();
         validate_root_name(&name)?;
-        if self.roots.contains_key(&name) {
-            bail!("runtime root '{name}' already exists");
-        }
+        self.with_path(name, value)
+    }
+
+    /// Return a new context containing one additional value at a dotted save path.
+    ///
+    /// Missing namespace objects are created as needed. Existing leaves and namespace/value
+    /// collisions are rejected, while the original context remains unchanged.
+    pub fn with_path(&self, path: impl Into<String>, value: RuntimeValue) -> Result<Self> {
+        let path = path.into();
+        validate_variable_path(&path)?;
+        let parts = path.split('.').collect::<Vec<_>>();
         let mut roots = (*self.roots).clone();
-        roots.insert(name, value);
+        insert_runtime_path(&mut roots, &parts, value, &path, 0)?;
         Ok(Self { roots: Arc::new(roots) })
     }
 
@@ -545,6 +553,31 @@ fn validate_root_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn insert_runtime_path(
+    values: &mut BTreeMap<String, RuntimeValue>,
+    parts: &[&str],
+    value: RuntimeValue,
+    full_path: &str,
+    depth: usize,
+) -> Result<()> {
+    let name = parts[0];
+    if parts.len() == 1 {
+        if values.contains_key(name) {
+            bail!("runtime save path '{full_path}' already exists");
+        }
+        values.insert(name.to_string(), value);
+        return Ok(());
+    }
+
+    let entry =
+        values.entry(name.to_string()).or_insert_with(|| RuntimeValue::Object(BTreeMap::new()));
+    let RuntimeValue::Object(children) = entry else {
+        let prefix = full_path.split('.').take(depth + 1).collect::<Vec<_>>().join(".");
+        bail!("runtime save path '{full_path}' conflicts with existing value '{prefix}'");
+    };
+    insert_runtime_path(children, &parts[1..], value, full_path, depth + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,6 +642,30 @@ mod tests {
         assert_eq!(extended.get("saved").unwrap(), &RuntimeValue::Bool(true));
         assert!(extended.with_root("saved", RuntimeValue::Bool(false)).is_err());
         assert!(extended.with_root("bad.root", RuntimeValue::Null).is_err());
+    }
+
+    #[test]
+    fn namespaced_saves_create_immutable_objects_and_reject_collisions() {
+        let original = RuntimeContext::empty();
+        let first = original
+            .with_path("transfer.submission", RuntimeValue::Bytes32(B256::repeat_byte(1)))
+            .unwrap();
+        let second = first.with_path("transfer.receipt", RuntimeValue::Bool(true)).unwrap();
+
+        assert!(original.get("transfer").is_err());
+        assert!(first.get("transfer.receipt").is_err());
+        assert_eq!(
+            second.get("transfer.submission").unwrap(),
+            &RuntimeValue::Bytes32(B256::repeat_byte(1))
+        );
+        assert_eq!(second.get("transfer.receipt").unwrap(), &RuntimeValue::Bool(true));
+        assert!(second.with_path("transfer.receipt", RuntimeValue::Bool(false)).is_err());
+        assert!(second.with_path("transfer", RuntimeValue::Null).is_err());
+        assert!(RuntimeContext::empty()
+            .with_root("transfer", RuntimeValue::Null)
+            .unwrap()
+            .with_path("transfer.receipt", RuntimeValue::Bool(true))
+            .is_err());
     }
 
     #[tokio::test]

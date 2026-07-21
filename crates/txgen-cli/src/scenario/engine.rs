@@ -154,6 +154,24 @@ where
     engine.run(configuration).await
 }
 
+/// Validate a resolved scenario and all local workload, template, ABI, event, and binding
+/// references without contacting any RPC endpoint.
+pub fn validate_scenario_offline<A: NetworkAdapter>(spec: &ScenarioSpec) -> Result<()> {
+    spec.validate()?;
+    load_validated_scenario_inputs::<A>(spec, 0)?;
+    Ok(())
+}
+
+fn load_validated_scenario_inputs<A: NetworkAdapter>(
+    spec: &ScenarioSpec,
+    seed: u64,
+) -> Result<(BTreeMap<String, ChainInput>, BTreeMap<String, BindingRuntime>)> {
+    let chain_inputs = load_chain_inputs::<A>(spec)?;
+    validate_workload_references(spec, &chain_inputs)?;
+    let bindings = build_binding_runtimes(spec, &chain_inputs, seed)?;
+    Ok((chain_inputs, bindings))
+}
+
 struct ScenarioEngine<A: NetworkAdapter> {
     spec: ScenarioSpec,
     chains: BTreeMap<String, Arc<ChainRuntime<A>>>,
@@ -169,9 +187,7 @@ where
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
     async fn initialize(spec: ScenarioSpec, config: ScenarioExecutionConfig) -> Result<Self> {
-        let mut chain_inputs = load_chain_inputs::<A>(&spec)?;
-        validate_workload_references(&spec, &chain_inputs)?;
-        let bindings = build_binding_runtimes(&spec, &chain_inputs, config.seed)?;
+        let (mut chain_inputs, bindings) = load_validated_scenario_inputs::<A>(&spec, config.seed)?;
 
         let mut prepared_chains = BTreeMap::new();
         for (name, definition) in &spec.chains {
@@ -304,7 +320,9 @@ where
             .steps
             .iter()
             .enumerate()
-            .map(|(index, step)| (step_name(index, step), step.action.name().to_string()))
+            .map(|(index, step)| {
+                (step_name(index, step), step.action.name().to_string(), step.provenance.clone())
+            })
             .collect::<Vec<_>>();
         let chain_configuration = self
             .chains
@@ -362,6 +380,7 @@ where
                     failure: Some(InstanceFailure {
                         step_index: 0,
                         step_name: "bindings".to_string(),
+                        failure_provenance: None,
                         classification: error.classification.to_string(),
                         timed_out: false,
                         detail,
@@ -400,11 +419,12 @@ where
                         index,
                         name: name.clone(),
                         kind,
+                        provenance: step.provenance.clone(),
                         success: true,
                         latency,
                     });
                     if let Some(save) = &step.save {
-                        match context.with_root(save.clone(), value) {
+                        match context.with_path(save.clone(), value) {
                             Ok(next) => context = next,
                             Err(error) => {
                                 return failed_outcome(
@@ -413,7 +433,7 @@ where
                                     started,
                                     step_outcomes,
                                     index,
-                                    name,
+                                    step,
                                     StepError::new("context_error", error.to_string()),
                                 );
                             }
@@ -425,6 +445,7 @@ where
                         index,
                         name: name.clone(),
                         kind,
+                        provenance: step.provenance.clone(),
                         success: false,
                         latency,
                     });
@@ -434,7 +455,7 @@ where
                         started,
                         step_outcomes,
                         index,
-                        name,
+                        step,
                         error,
                     );
                 }
@@ -555,7 +576,7 @@ fn failed_outcome(
     started: Instant,
     steps: Vec<StepOutcome>,
     step_index: usize,
-    step_name: String,
+    step: &StepDef,
     error: StepError,
 ) -> InstanceOutcome {
     let detail = error.sanitized_detail();
@@ -567,7 +588,8 @@ fn failed_outcome(
         steps,
         failure: Some(InstanceFailure {
             step_index,
-            step_name,
+            step_name: step_name(step_index, step),
+            failure_provenance: step.provenance.clone(),
             classification: error.classification.to_string(),
             timed_out: error.classification == "timeout",
             detail,
@@ -739,6 +761,7 @@ where
         .await?;
 
         for (index, submit) in statically_replayable_submissions(scenario, &self.name)? {
+            let label = scenario.scenario.steps[index].diagnostic_label(index);
             let mut value = self
                 .spec
                 .templates
@@ -754,11 +777,7 @@ where
             )
             .await
             .map_err(|_| {
-                eyre::eyre!(
-                    "scenario step {} template '{}' preparation timed out",
-                    index + 1,
-                    submit.template
-                )
+                eyre::eyre!("{label} template '{}' preparation timed out", submit.template)
             })??;
             materialize_and_sign_template(
                 &adapter,
@@ -769,11 +788,7 @@ where
                 &mut context,
             )
             .wrap_err_with(|| {
-                format!(
-                    "scenario step {} has an invalid static overlay for template '{}'",
-                    index + 1,
-                    submit.template
-                )
+                format!("{label} has an invalid static overlay for template '{}'", submit.template)
             })?;
         }
         Ok(())
@@ -1447,12 +1462,12 @@ fn validate_workload_references(
     chains: &BTreeMap<String, ChainInput>,
 ) -> Result<()> {
     for (index, step) in spec.scenario.steps.iter().enumerate() {
+        let label = step.diagnostic_label(index);
         let chain = &chains[step.action.chain()];
         match &step.action {
             StepAction::Submit(submit) if !chain.spec.templates.contains_key(&submit.template) => {
                 bail!(
-                    "scenario step {} references missing template '{}' on chain '{}'",
-                    index + 1,
+                    "{label} references missing template '{}' on chain '{}'",
                     submit.template,
                     submit.chain
                 );
@@ -1460,21 +1475,16 @@ fn validate_workload_references(
             StepAction::WaitLog(wait_log) => {
                 let abi = chain.artifacts.get(&wait_log.abi).wrap_err_with(|| {
                     format!(
-                        "scenario step {} references missing ABI artifact '{}' on chain '{}'",
-                        index + 1,
-                        wait_log.abi,
-                        wait_log.chain
+                        "{label} references missing ABI artifact '{}' on chain '{}'",
+                        wait_log.abi, wait_log.chain
                     )
                 })?;
                 let filter_types =
                     wait::resolve_event_filter_types(abi, &wait_log.event, &wait_log.where_value)
                         .wrap_err_with(|| {
                         format!(
-                            "scenario step {} has an invalid event '{}' for ABI '{}' on chain '{}'",
-                            index + 1,
-                            wait_log.event,
-                            wait_log.abi,
-                            wait_log.chain
+                            "{label} has an invalid event '{}' for ABI '{}' on chain '{}'",
+                            wait_log.event, wait_log.abi, wait_log.chain
                         )
                     })?;
                 for (name, expression) in &wait_log.where_value {
@@ -1490,10 +1500,8 @@ fn validate_workload_references(
                         wait::validate_constant_event_filter(expression, filter_type)
                             .wrap_err_with(|| {
                                 format!(
-                                    "scenario step {} event filter '{}' is invalid for ABI type '{}'",
-                                    index + 1,
-                                    name,
-                                    filter_type.sol_type
+                                    "{label} event filter '{}' is invalid for ABI type '{}'",
+                                    name, filter_type.sol_type
                                 )
                             })?;
                     }
