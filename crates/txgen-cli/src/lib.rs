@@ -24,7 +24,7 @@ pub use generate::{
     ScenarioActionContext, TxRequest,
 };
 use scenario::run_scenario_command;
-pub use scenario::{ScenarioArgs, ScenarioRunArgs};
+pub use scenario::{ScenarioArgs, ScenarioRenderArgs, ScenarioRunArgs, ScenarioValidateArgs};
 
 // ---------------------------------------------------------------------------
 // Private CLI plumbing

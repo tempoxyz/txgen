@@ -1,14 +1,16 @@
-use super::value::{collect_variable_paths, RuntimeValue};
+use super::{
+    composition,
+    value::{collect_variable_paths, RuntimeValue},
+};
 use alloy_dyn_abi::DynSolType;
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, I256, U256};
 use eyre::{bail, Result, WrapErr};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     time::Duration,
 };
-use txgen_core::expand_env_vars;
 
 /// Versioned, chain-agnostic scenario document.
 #[derive(Debug, Clone, Deserialize)]
@@ -212,6 +214,23 @@ pub struct StepDef {
     pub save: Option<String>,
     /// Per-step timeout overriding [`ScenarioDef::timeout`].
     pub timeout: Option<Duration>,
+    /// Fragment expansion metadata, absent for ordinary inline v1 steps.
+    pub provenance: Option<StepProvenance>,
+}
+
+/// Source identity retained for a step expanded from a reusable fragment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StepProvenance {
+    /// File containing the fragment declaration.
+    pub source_file: String,
+    /// Declared fragment name.
+    pub fragment: String,
+    /// Complete instance alias, including parent aliases for nested uses.
+    pub instance_alias: String,
+    /// Unqualified fragment-local save name, or a deterministic generated name.
+    pub local_step_name: String,
+    /// Zero-based index of the concrete step in its declaring fragment.
+    pub local_step_index: usize,
 }
 
 /// Initial scenario step operations.
@@ -386,37 +405,19 @@ impl<'de> Deserialize<'de> for StepDef {
             }
         };
 
-        Ok(Self { action, save, timeout })
+        Ok(Self { action, save, timeout, provenance: None })
     }
 }
 
 impl ScenarioSpec {
     /// Read, environment-expand, parse, validate, and path-resolve a scenario file.
     pub fn load(path: &Path) -> Result<Self> {
-        let yaml = std::fs::read_to_string(path)
-            .wrap_err_with(|| format!("failed to read scenario file: {}", path.display()))?;
-        let mut spec = Self::parse(&yaml)?;
-        let base = path.parent().unwrap_or_else(|| Path::new("."));
-        for chain in spec.chains.values_mut() {
-            if chain.workload.is_relative() {
-                chain.workload = base.join(&chain.workload);
-            }
-            if let Some(auth) = &mut chain.request_auth &&
-                auth.sender_header.map.is_relative()
-            {
-                auth.sender_header.map = base.join(&auth.sender_header.map);
-            }
-        }
-        Ok(spec)
+        Ok(composition::load_scenario(path)?.spec)
     }
 
     /// Environment-expand, parse, and statically validate scenario YAML.
     pub fn parse(yaml: &str) -> Result<Self> {
-        let expanded =
-            expand_env_vars(yaml).wrap_err("failed to expand scenario environment variables")?;
-        let spec: Self = serde_yaml::from_str(&expanded).wrap_err("failed to parse scenario")?;
-        spec.validate()?;
-        Ok(spec)
+        Ok(composition::parse_scenario(yaml)?.spec)
     }
 
     /// Validate constraints and all statically knowable runtime references.
@@ -513,12 +514,32 @@ impl ScenarioSpec {
         let mut saves = BTreeMap::new();
         for (index, step) in self.scenario.steps.iter().enumerate() {
             let Some(save) = &step.save else { continue };
-            validate_runtime_root(save, "save")?;
-            if self.scenario.bindings.contains_key(save) {
-                bail!("step {} save '{save}' conflicts with a scenario binding", index + 1);
+            validate_save_path(save)?;
+            let root = save.split('.').next().expect("validated save path");
+            if self.scenario.bindings.contains_key(root) {
+                bail!(
+                    "{} save '{save}' conflicts with a scenario binding '{root}'",
+                    step.diagnostic_label(index)
+                );
             }
             if let Some(previous) = saves.insert(save.clone(), index) {
-                bail!("duplicate save name '{save}' at steps {} and {}", previous + 1, index + 1);
+                bail!(
+                    "duplicate save name '{save}' at {} and {}",
+                    self.scenario.steps[previous].diagnostic_label(previous),
+                    step.diagnostic_label(index)
+                );
+            }
+            if let Some((other, other_index)) = saves.iter().find(|(other, _)| {
+                other.as_str() != save &&
+                    (other.starts_with(&format!("{save}.")) ||
+                        save.starts_with(&format!("{other}.")))
+            }) {
+                bail!(
+                    "save path '{}' at {} conflicts with save path '{other}' at {}",
+                    save,
+                    step.diagnostic_label(index),
+                    self.scenario.steps[*other_index].diagnostic_label(*other_index)
+                );
             }
         }
         Ok(saves)
@@ -559,11 +580,59 @@ impl ScenarioSpec {
             static_type_can_coerce(actual, expected);
         if !compatible {
             bail!(
-                "scenario step {} event filter '{filter_name}' expects ABI type '{expected}', but its runtime expression has type {actual:?}",
-                step_index + 1
+                "{} event filter '{filter_name}' expects ABI type '{expected}', but its runtime expression has type {actual:?}",
+                self.scenario.steps[step_index].diagnostic_label(step_index)
             );
         }
         Ok(())
+    }
+
+    /// Validate one fragment argument in the caller's scope before its expanded steps run.
+    pub(crate) fn validate_parameter_argument(
+        &self,
+        step_index: usize,
+        expression: &serde_yaml::Value,
+        expected: &str,
+        label: &str,
+    ) -> Result<()> {
+        let saves = self.collect_saves()?;
+        let mut available = self
+            .scenario
+            .bindings
+            .keys()
+            .map(|name| (name.clone(), AvailableRoot::AccountBinding))
+            .collect::<BTreeMap<_, _>>();
+        for step in self.scenario.steps.iter().take(step_index) {
+            if let Some(save) = &step.save {
+                available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
+            }
+        }
+
+        let paths = collect_variable_paths(expression)
+            .map_err(|error| eyre::eyre!("invalid {label}: {error}"))?;
+        for path in &paths {
+            validate_reference(path, step_index, &saves, &available)
+                .map_err(|error| eyre::eyre!("invalid {label}: {error}"))?;
+        }
+        if expected == "value" {
+            return Ok(());
+        }
+
+        if let Some(actual) = expression_static_type(expression, &available)
+            .wrap_err_with(|| format!("invalid {label}"))?
+        {
+            if parameter_type_accepts(expected, actual) {
+                return Ok(());
+            }
+            bail!("{label} expects parameter type '{expected}', but its value has type {actual:?}");
+        }
+        if !paths.is_empty() {
+            // Decoded event arguments and other dynamically shaped values are checked at runtime.
+            return Ok(());
+        }
+
+        validate_literal_parameter(expression, expected)
+            .wrap_err_with(|| format!("{label} expects parameter type '{expected}'"))
     }
 
     fn validate_step(
@@ -573,7 +642,7 @@ impl ScenarioSpec {
         saves: &BTreeMap<String, usize>,
         available: &BTreeMap<String, AvailableRoot>,
     ) -> Result<()> {
-        let label = format!("step {} ({})", index + 1, step.action.name());
+        let label = step.diagnostic_label(index);
         if step.timeout == Some(Duration::ZERO) {
             bail!("{label} timeout must be greater than zero");
         }
@@ -695,6 +764,22 @@ impl ScenarioSpec {
 }
 
 impl StepDef {
+    /// Human-readable identity used by validation and preflight diagnostics.
+    pub(crate) fn diagnostic_label(&self, expanded_index: usize) -> String {
+        let Some(provenance) = &self.provenance else {
+            return format!("step {} ({})", expanded_index + 1, self.action.name());
+        };
+        let base = format!("expanded step {} ({})", expanded_index + 1, self.action.name());
+        format!(
+            "{base}, source '{}', fragment '{}', instance '{}', local step '{}' ({})",
+            provenance.source_file,
+            provenance.fragment,
+            provenance.instance_alias,
+            provenance.local_step_name,
+            provenance.local_step_index + 1
+        )
+    }
+
     fn saved_kind(&self) -> SavedKind {
         match &self.action {
             StepAction::Checkpoint(_) => SavedKind::Checkpoint,
@@ -793,13 +878,13 @@ fn validate_reference(
     saves: &BTreeMap<String, usize>,
     available: &BTreeMap<String, AvailableRoot>,
 ) -> Result<()> {
-    let (root, tail) = path.split_once('.').map_or((path, None), |(root, tail)| (root, Some(tail)));
-    let Some(kind) = available.get(root) else {
-        if let Some(save_step) = saves.get(root) &&
+    let Some((root, kind, tail)) = longest_path_match(path, available) else {
+        if let Some((save, save_step, _)) = longest_path_match(path, saves) &&
             *save_step >= current_step
         {
-            bail!("forward reference '{path}' targets save '{root}' from step {}", save_step + 1);
+            bail!("forward reference '{path}' targets save '{save}' from step {}", save_step + 1);
         }
+        let root = path.split('.').next().unwrap_or(path);
         bail!("unknown runtime root '{root}' in reference '{path}'");
     };
 
@@ -813,6 +898,23 @@ fn validate_reference(
         }
         AvailableRoot::Saved(kind) => validate_saved_path(root, *kind, tail),
     }
+}
+
+fn longest_path_match<'path, 'value, T>(
+    path: &'path str,
+    values: &'value BTreeMap<String, T>,
+) -> Option<(&'value str, &'value T, Option<&'path str>)> {
+    values
+        .iter()
+        .filter_map(|(candidate, value)| {
+            let tail = if path == candidate {
+                None
+            } else {
+                Some(path.strip_prefix(candidate)?.strip_prefix('.')?)
+            };
+            Some((candidate.as_str(), value, tail))
+        })
+        .max_by_key(|(candidate, _, _)| candidate.len())
 }
 
 fn validate_account_path(root: &str, tail: Option<&str>) -> Result<()> {
@@ -899,19 +1001,29 @@ fn validate_saved_path(root: &str, kind: SavedKind, tail: Option<&str>) -> Resul
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StaticValueType {
+    AccountRef,
     Address,
+    Bytes,
     Bytes32,
     Uint,
+    Int,
     Bool,
     String,
+    Object,
 }
 
 fn static_type_can_coerce(actual: StaticValueType, expected: &DynSolType) -> bool {
     let candidates = match actual {
+        StaticValueType::AccountRef => return false,
         StaticValueType::Address => vec![RuntimeValue::Address(Address::ZERO)],
+        StaticValueType::Bytes => vec![RuntimeValue::Bytes(Default::default())],
         StaticValueType::Bytes32 => vec![RuntimeValue::Bytes32(B256::ZERO)],
         StaticValueType::Uint => vec![RuntimeValue::Uint(U256::ZERO)],
+        StaticValueType::Int => {
+            vec![RuntimeValue::Int(I256::try_from(-1_i64).expect("negative i64 fits I256"))]
+        }
         StaticValueType::Bool => vec![RuntimeValue::Bool(false)],
+        StaticValueType::Object => return false,
         // A saved string's contents are not generally statically known. Cover
         // representative textual scalar encodings and reject only ABI shapes
         // that none of them can inhabit.
@@ -924,6 +1036,52 @@ fn static_type_can_coerce(actual: StaticValueType, expected: &DynSolType) -> boo
         ],
     };
     candidates.iter().any(|value| value.coerce_dyn_sol(expected).is_ok())
+}
+
+fn parameter_type_accepts(expected: &str, actual: StaticValueType) -> bool {
+    match expected {
+        "account_ref" => actual == StaticValueType::AccountRef,
+        "string" => actual == StaticValueType::String,
+        "address" => matches!(actual, StaticValueType::Address | StaticValueType::String),
+        "u256" => matches!(actual, StaticValueType::Uint | StaticValueType::String),
+        "bytes" => matches!(actual, StaticValueType::Bytes | StaticValueType::String),
+        "bytes32" => matches!(actual, StaticValueType::Bytes32 | StaticValueType::String),
+        "bool" => matches!(actual, StaticValueType::Bool | StaticValueType::String),
+        _ => false,
+    }
+}
+
+fn validate_literal_parameter(expression: &serde_yaml::Value, expected: &str) -> Result<()> {
+    if expected == "account_ref" {
+        let mapping = expression
+            .as_mapping()
+            .ok_or_else(|| eyre::eyre!("account_ref must be an account reference object"))?;
+        for key in mapping.keys() {
+            let key =
+                key.as_str().ok_or_else(|| eyre::eyre!("account_ref fields must be strings"))?;
+            if !matches!(key, "pool" | "select") {
+                bail!("account_ref contains unknown field '{key}'");
+            }
+        }
+        let account: txgen_core::AccountRef = serde_yaml::from_value(expression.clone())
+            .wrap_err("account_ref must contain a valid `pool` and `select`")?;
+        if account.pool.trim().is_empty() {
+            bail!("account_ref pool must not be empty");
+        }
+        return Ok(());
+    }
+
+    let value = RuntimeValue::from_yaml(expression)?;
+    match expected {
+        "string" if matches!(value, RuntimeValue::String(_)) => Ok(()),
+        "address" => value.coerce_dyn_sol(&DynSolType::Address).map(drop),
+        "u256" => value.coerce_dyn_sol(&DynSolType::Uint(256)).map(drop),
+        "bytes" => value.coerce_dyn_sol(&DynSolType::Bytes).map(drop),
+        "bytes32" => value.coerce_dyn_sol(&DynSolType::FixedBytes(32)).map(drop),
+        "bool" => value.coerce_dyn_sol(&DynSolType::Bool).map(drop),
+        "string" => bail!("value is not a string"),
+        other => bail!("unknown fragment parameter type '{other}'"),
+    }
 }
 
 fn validate_expression_type(
@@ -951,7 +1109,15 @@ fn expression_static_type(
     let serde_yaml::Value::Mapping(mapping) = expression else {
         return Ok(match expression {
             serde_yaml::Value::Bool(_) => Some(StaticValueType::Bool),
-            serde_yaml::Value::Number(_) => Some(StaticValueType::Uint),
+            serde_yaml::Value::Number(value) if value.as_u64().is_some() => {
+                Some(StaticValueType::Uint)
+            }
+            serde_yaml::Value::Number(value) if value.as_i64().is_some() => {
+                Some(StaticValueType::Int)
+            }
+            serde_yaml::Value::Number(_) => {
+                bail!("runtime numeric literals must be integers");
+            }
             _ => None,
         });
     };
@@ -966,6 +1132,9 @@ fn expression_static_type(
     if mapping.contains_key(key("keccak256")) || mapping.contains_key(key("keccak256_packed")) {
         return Ok(Some(StaticValueType::Bytes32));
     }
+    if mapping.contains_key(key("abi_encode")) || mapping.contains_key(key("abi_encode_packed")) {
+        return Ok(Some(StaticValueType::Bytes));
+    }
     Ok(None)
 }
 
@@ -973,16 +1142,20 @@ fn static_reference_type(
     path: &str,
     available: &BTreeMap<String, AvailableRoot>,
 ) -> Option<StaticValueType> {
-    let (root, tail) = path.split_once('.').map_or((path, ""), |(root, tail)| (root, tail));
-    match available.get(root)? {
+    let (_, root, tail) = longest_path_match(path, available)?;
+    let tail = tail.unwrap_or("");
+    match root {
         AvailableRoot::AccountBinding => match tail {
+            "" | "ref.select" => Some(StaticValueType::Object),
             "address" => Some(StaticValueType::Address),
             "index" | "ref.select.index" => Some(StaticValueType::Uint),
             "pool" | "ref.pool" => Some(StaticValueType::String),
+            "ref" => Some(StaticValueType::AccountRef),
             _ => None,
         },
         AvailableRoot::Bytes32Binding => tail.is_empty().then_some(StaticValueType::Bytes32),
         AvailableRoot::Saved(SavedKind::Checkpoint) => match tail {
+            "" => Some(StaticValueType::Object),
             "chain" => Some(StaticValueType::String),
             "block_number" | "captured_at" => Some(StaticValueType::Uint),
             "block_hash" => Some(StaticValueType::Bytes32),
@@ -990,6 +1163,7 @@ fn static_reference_type(
         },
         AvailableRoot::Saved(SavedKind::Invoke) => None,
         AvailableRoot::Saved(SavedKind::Submit { .. }) => match tail {
+            "" | "receipt" => Some(StaticValueType::Object),
             "chain" | "template" | "id" | "receipt.chain" => Some(StaticValueType::String),
             "sender" => Some(StaticValueType::Address),
             "tx_hash" | "receipt.transaction_hash" | "receipt.tx_hash" | "receipt.block_hash" => {
@@ -1004,6 +1178,7 @@ fn static_reference_type(
             _ => None,
         },
         AvailableRoot::Saved(SavedKind::Receipt) => match tail {
+            "" => Some(StaticValueType::Object),
             "chain" => Some(StaticValueType::String),
             "transaction_hash" | "tx_hash" | "block_hash" => Some(StaticValueType::Bytes32),
             "block_number" | "gas_used" | "observed_at" => Some(StaticValueType::Uint),
@@ -1011,6 +1186,7 @@ fn static_reference_type(
             _ => None,
         },
         AvailableRoot::Saved(SavedKind::Log) => match tail {
+            "" | "args" => Some(StaticValueType::Object),
             "chain" | "event" | "event_name" => Some(StaticValueType::String),
             "address" | "contract_address" => Some(StaticValueType::Address),
             "transaction_hash" | "tx_hash" | "block_hash" => Some(StaticValueType::Bytes32),
@@ -1047,6 +1223,14 @@ fn validate_runtime_root(name: &str, context: &str) -> Result<()> {
     validate_name(name, context)?;
     if name.contains('.') {
         bail!("{context} name '{name}' must not contain '.'");
+    }
+    Ok(())
+}
+
+fn validate_save_path(path: &str) -> Result<()> {
+    validate_name(path, "save")?;
+    if path.split('.').any(str::is_empty) {
+        bail!("save path '{path}' contains an empty component");
     }
     Ok(())
 }
@@ -1298,6 +1482,30 @@ scenario:
         let yaml = BASE.replacen("save: deposit_receipt", "save: deposit", 1);
         let error = ScenarioSpec::parse(&yaml).unwrap_err().to_string();
         assert!(error.contains("duplicate save name 'deposit'"));
+    }
+
+    #[test]
+    fn validates_flattened_namespaced_saves_by_longest_prefix() {
+        let yaml = BASE
+            .replacen("save: deposit\n", "save: first_transfer.submission\n", 1)
+            .replace("deposit.tx_hash", "first_transfer.submission.tx_hash")
+            .replace("deposit.receipt", "first_transfer.submission.receipt")
+            .replacen("save: deposit_receipt", "save: first_transfer.receipt", 1);
+        let spec = ScenarioSpec::parse(&yaml).unwrap();
+        assert_eq!(spec.scenario.steps[1].save.as_deref(), Some("first_transfer.submission"));
+        assert_eq!(spec.scenario.steps[2].save.as_deref(), Some("first_transfer.receipt"));
+    }
+
+    #[test]
+    fn rejects_save_leaf_and_namespace_collisions() {
+        let yaml = BASE
+            .replace("save: zone_before", "save: transfer")
+            .replace("zone_before.block_number", "transfer.block_number")
+            .replacen("save: deposit\n", "save: transfer.submission\n", 1)
+            .replace("deposit.tx_hash", "transfer.submission.tx_hash")
+            .replace("deposit.receipt", "transfer.submission.receipt");
+        let error = ScenarioSpec::parse(&yaml).unwrap_err().to_string();
+        assert!(error.contains("conflicts with save path"), "unexpected error: {error}");
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::{io::Write, path::PathBuf, time::Duration};
 
 use crate::NetworkAdapter;
 
+mod composition;
 mod engine;
 mod error;
 mod report;
@@ -17,7 +18,9 @@ pub mod schema;
 pub mod value;
 mod wait;
 
-pub use engine::{execute_scenario, FailurePolicy, ScenarioExecutionConfig};
+pub use engine::{
+    execute_scenario, validate_scenario_offline, FailurePolicy, ScenarioExecutionConfig,
+};
 pub use report::{
     ChainReportConfig, FailureReport, InstanceLifecycle, LatencyDistribution, LifecycleStep,
     ScenarioReport, ScenarioReportConfig, StepReport,
@@ -39,6 +42,30 @@ pub struct ScenarioArgs {
 enum ScenarioCommand {
     /// Execute a versioned multi-chain scenario.
     Run(ScenarioRunArgs),
+    /// Resolve and validate a scenario without contacting RPC endpoints.
+    Validate(ScenarioValidateArgs),
+    /// Resolve, validate, and emit a flattened scenario document.
+    Render(ScenarioRenderArgs),
+}
+
+/// Controls for `scenario validate`.
+#[derive(Debug, Args)]
+pub struct ScenarioValidateArgs {
+    /// Scenario YAML file.
+    #[arg(long)]
+    pub scenario: PathBuf,
+}
+
+/// Controls for `scenario render`.
+#[derive(Debug, Args)]
+pub struct ScenarioRenderArgs {
+    /// Scenario YAML file.
+    #[arg(long)]
+    pub scenario: PathBuf,
+
+    /// Write flattened YAML to this path instead of stdout.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
 }
 
 /// Controls for `scenario run`.
@@ -117,7 +144,49 @@ where
 {
     match args.command {
         ScenarioCommand::Run(args) => run_scenario::<A>(args).await,
+        ScenarioCommand::Validate(args) => validate_scenario::<A>(args),
+        ScenarioCommand::Render(args) => render_scenario::<A>(args),
     }
+}
+
+fn validate_scenario<A: NetworkAdapter>(args: ScenarioValidateArgs) -> Result<()> {
+    let resolved = composition::load_scenario(&args.scenario)?;
+    validate_scenario_offline::<A>(&resolved.spec)?;
+    println!(
+        "scenario '{}' is valid ({} expanded steps)",
+        resolved.spec.scenario.name,
+        resolved.spec.scenario.steps.len()
+    );
+    Ok(())
+}
+
+fn render_scenario<A: NetworkAdapter>(args: ScenarioRenderArgs) -> Result<()> {
+    let scenario_path = std::fs::canonicalize(&args.scenario).wrap_err_with(|| {
+        format!("failed to resolve scenario file: {}", args.scenario.display())
+    })?;
+    let resolved = composition::load_scenario(&scenario_path)?;
+    validate_scenario_offline::<A>(&resolved.spec)?;
+    let mut rendered = serde_yaml::to_string(&resolved.rendered)?;
+    if !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    match args.output {
+        Some(path) => {
+            let file = std::fs::File::create(&path).wrap_err_with(|| {
+                format!("failed to create rendered scenario: {}", path.display())
+            })?;
+            let mut writer = std::io::BufWriter::new(file);
+            writer.write_all(rendered.as_bytes())?;
+            writer.flush()?;
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut writer = stdout.lock();
+            writer.write_all(rendered.as_bytes())?;
+            writer.flush()?;
+        }
+    }
+    Ok(())
 }
 
 async fn run_scenario<A>(args: ScenarioRunArgs) -> Result<()>
