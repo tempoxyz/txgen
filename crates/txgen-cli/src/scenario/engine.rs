@@ -157,6 +157,19 @@ where
     engine.run(configuration).await
 }
 
+/// Validate a scenario and its local workload assets without contacting an RPC endpoint.
+///
+/// This covers schema references, account pools, templates, ABI artifacts, event filters, and
+/// adapter-specific actions. It deliberately does not materialize transactions or query nonce
+/// state, so callers can reject malformed scenarios before provisioning a benchmark topology.
+pub fn validate_scenario_static<A: NetworkAdapter>(spec: &ScenarioSpec) -> Result<()> {
+    spec.validate()?;
+    let chain_inputs = load_chain_inputs::<A>(spec)?;
+    validate_workload_references::<A>(spec, &chain_inputs)?;
+    build_binding_runtimes(spec, &chain_inputs, 0)?;
+    Ok(())
+}
+
 struct ScenarioEngine<A: NetworkAdapter> {
     spec: ScenarioSpec,
     chains: BTreeMap<String, Arc<ChainRuntime<A>>>,

@@ -17,7 +17,7 @@ pub mod schema;
 pub mod value;
 mod wait;
 
-pub use engine::{execute_scenario, FailurePolicy, ScenarioExecutionConfig};
+pub use engine::{execute_scenario, validate_scenario_static, FailurePolicy, ScenarioExecutionConfig};
 pub use report::{
     ChainReportConfig, FailureReport, InstanceLifecycle, LatencyDistribution, LifecycleStep,
     ScenarioReport, ScenarioReportConfig, StepReport,
@@ -39,6 +39,16 @@ pub struct ScenarioArgs {
 enum ScenarioCommand {
     /// Execute a versioned multi-chain scenario.
     Run(ScenarioRunArgs),
+    /// Validate a scenario and its local workload assets without contacting RPC endpoints.
+    Validate(ScenarioValidateArgs),
+}
+
+/// Input for offline scenario validation.
+#[derive(Debug, Args)]
+pub struct ScenarioValidateArgs {
+    /// Scenario YAML file.
+    #[arg(long)]
+    pub scenario: PathBuf,
 }
 
 /// Controls for `scenario run`.
@@ -117,7 +127,15 @@ where
 {
     match args.command {
         ScenarioCommand::Run(args) => run_scenario::<A>(args).await,
+        ScenarioCommand::Validate(args) => validate_scenario::<A>(args),
     }
+}
+
+fn validate_scenario<A: NetworkAdapter>(args: ScenarioValidateArgs) -> Result<()> {
+    let spec = ScenarioSpec::load(&args.scenario)?;
+    validate_scenario_static::<A>(&spec)?;
+    println!("scenario validation passed: {}", args.scenario.display());
+    Ok(())
 }
 
 async fn run_scenario<A>(args: ScenarioRunArgs) -> Result<()>
