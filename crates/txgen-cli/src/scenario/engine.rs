@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     materialize_and_sign_template, materialize_setup_online, MaterializedSetup, MaterializedTx,
-    NetworkAdapter,
+    NetworkAdapter, ScenarioActionContext,
 };
 use alloy_consensus::{SignableTransaction, Signed};
 use alloy_dyn_abi::{DynSolType, DynSolValue};
@@ -167,7 +167,7 @@ fn load_validated_scenario_inputs<A: NetworkAdapter>(
     seed: u64,
 ) -> Result<(BTreeMap<String, ChainInput>, BTreeMap<String, BindingRuntime>)> {
     let chain_inputs = load_chain_inputs::<A>(spec)?;
-    validate_workload_references(spec, &chain_inputs)?;
+    validate_workload_references::<A>(spec, &chain_inputs)?;
     let bindings = build_binding_runtimes(spec, &chain_inputs, seed)?;
     Ok((chain_inputs, bindings))
 }
@@ -535,6 +535,36 @@ where
             .ok_or_else(|| StepError::new("configuration_error", "unknown chain"))?;
         match &step.action {
             StepAction::Checkpoint(_) => chain.checkpoint().await,
+            StepAction::Invoke(invoke) => {
+                let arguments =
+                    serde_yaml::to_value(&invoke.with_value).map_err(StepError::expression)?;
+                let arguments =
+                    materialize_yaml(&arguments, context).map_err(StepError::expression)?;
+                let output = chain
+                    .adapter
+                    .invoke_scenario_action(
+                        &invoke.action,
+                        &arguments,
+                        ScenarioActionContext {
+                            chain: &chain.name,
+                            chain_id: chain.chain_id,
+                            query_provider: &chain.provider,
+                        },
+                    )
+                    .await
+                    .map_err(|error| StepError::new("invoke_error", error.to_string()))?;
+                let RuntimeValue::Object(mut output) = RuntimeValue::from_yaml(&output)
+                    .map_err(|error| StepError::new("invoke_error", error.to_string()))?
+                else {
+                    return Err(StepError::new(
+                        "invoke_error",
+                        "scenario action returned a non-object value",
+                    ));
+                };
+                output.insert("chain".to_string(), RuntimeValue::String(chain.name.clone()));
+                output.insert("action".to_string(), RuntimeValue::String(invoke.action.clone()));
+                Ok(RuntimeValue::Object(output))
+            }
             StepAction::Submit(submit) => {
                 let submit_rng = rng.clone();
                 let (value, next_rng) = chain
@@ -1457,7 +1487,7 @@ fn binding_submit_chains(spec: &ScenarioSpec, binding: &str) -> Result<Vec<Strin
     Ok(chains)
 }
 
-fn validate_workload_references(
+fn validate_workload_references<A: NetworkAdapter>(
     spec: &ScenarioSpec,
     chains: &BTreeMap<String, ChainInput>,
 ) -> Result<()> {
@@ -1465,6 +1495,20 @@ fn validate_workload_references(
         let label = step.diagnostic_label(index);
         let chain = &chains[step.action.chain()];
         match &step.action {
+            StepAction::Invoke(invoke)
+                if !A::scenario_actions().contains(&invoke.action.as_str()) =>
+            {
+                let supported = if A::scenario_actions().is_empty() {
+                    "none".to_string()
+                } else {
+                    A::scenario_actions().join(", ")
+                };
+                bail!(
+                    "{label} references unsupported '{}' action '{}' (supported actions: {supported})",
+                    A::network_name(),
+                    invoke.action
+                );
+            }
             StepAction::Submit(submit) if !chain.spec.templates.contains_key(&submit.template) => {
                 bail!(
                     "{label} references missing template '{}' on chain '{}'",

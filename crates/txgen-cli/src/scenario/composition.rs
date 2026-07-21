@@ -656,7 +656,8 @@ fn validate_fragment_definition(
     for (output, output_kind) in &fragment.outputs {
         validate_path(output, "fragment output")
             .wrap_err_with(|| format!("invalid fragment '{name}' declared in '{source_file}'"))?;
-        if !matches!(output_kind.as_str(), "checkpoint" | "submit" | "receipt" | "log") {
+        if !matches!(output_kind.as_str(), "checkpoint" | "invoke" | "submit" | "receipt" | "log")
+        {
             bail!(
                 "fragment '{name}' in '{source_file}' output '{output}' has unknown type '{output_kind}'"
             );
@@ -882,11 +883,11 @@ fn concrete_action<'a>(value: &'a serde_yaml::Value, label: &str) -> Result<&'a 
         .collect::<Vec<_>>();
     if actions.len() != 1 {
         bail!(
-            "{label} scenario step must contain exactly one of `checkpoint`, `submit`, `wait_receipt`, or `wait_log`"
+            "{label} scenario step must contain exactly one of `checkpoint`, `invoke`, `submit`, `wait_receipt`, or `wait_log`"
         );
     }
     let action = actions[0];
-    if !matches!(action, "checkpoint" | "submit" | "wait_receipt" | "wait_log") {
+    if !matches!(action, "checkpoint" | "invoke" | "submit" | "wait_receipt" | "wait_log") {
         bail!("{label} has unknown scenario step action '{action}'");
     }
     Ok(action)
@@ -895,6 +896,7 @@ fn concrete_action<'a>(value: &'a serde_yaml::Value, label: &str) -> Result<&'a 
 fn output_kind_for_action(action: &str) -> &str {
     match action {
         "checkpoint" => "checkpoint",
+        "invoke" => "invoke",
         "submit" => "submit",
         "wait_receipt" => "receipt",
         "wait_log" => "log",
@@ -1147,6 +1149,34 @@ scenario:
         assert_eq!(first.fragment, "mark");
         assert_eq!(first.instance_alias, "first");
         assert_eq!(first.local_step_name, "point");
+    }
+
+    #[test]
+    fn expands_adapter_invoke_fragment_outputs() {
+        let yaml = r#"
+version: 1
+chains:
+  primary: { network: tempo, rpc_url: http://primary.invalid, workload: ./workload.yml }
+fragments:
+  prepare:
+    outputs: { result: invoke }
+    steps:
+      - invoke:
+          chain: primary
+          action: prepare_encrypted_deposit
+          with: { recipient: 0x0000000000000000000000000000000000000001 }
+        save: result
+scenario:
+  name: invoke
+  steps:
+    - { use: prepare, as: deposit }
+"#;
+        let resolved = parse_scenario(yaml).unwrap();
+        assert_eq!(resolved.spec.scenario.steps[0].save.as_deref(), Some("deposit.result"));
+        assert!(matches!(
+            &resolved.spec.scenario.steps[0].action,
+            super::super::schema::StepAction::Invoke(_)
+        ));
     }
 
     #[test]
