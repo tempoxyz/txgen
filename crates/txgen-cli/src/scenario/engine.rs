@@ -49,6 +49,7 @@ use txgen_core::{
 };
 
 const FALLBACK_STEP_TIMEOUT: Duration = Duration::from_secs(300);
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Failure behavior after one scenario instance fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,10 +188,18 @@ where
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
     async fn initialize(spec: ScenarioSpec, config: ScenarioExecutionConfig) -> Result<Self> {
+        let started = Instant::now();
+        eprintln!(
+            "scenario initialization started: scenario={} chains={}",
+            spec.scenario.name,
+            spec.chains.len(),
+        );
         let (mut chain_inputs, bindings) = load_validated_scenario_inputs::<A>(&spec, config.seed)?;
 
         let mut prepared_chains = BTreeMap::new();
         for (name, definition) in &spec.chains {
+            let chain_started = Instant::now();
+            eprintln!("scenario chain preparation started: chain={name}");
             let input = chain_inputs
                 .remove(name)
                 .expect("every scenario chain was loaded during preflight");
@@ -201,12 +210,18 @@ where
                 config.transaction_rate,
                 config.max_rpc_in_flight,
             )
-            .await
-            .wrap_err_with(|| format!("failed to preflight scenario chain '{name}'"))?;
+                .await
+                .wrap_err_with(|| format!("failed to preflight scenario chain '{name}'"))?;
+            eprintln!(
+                "scenario chain preparation completed: chain={name} elapsed={:?}",
+                chain_started.elapsed(),
+            );
             prepared_chains.insert(name.clone(), chain);
         }
 
         for (name, prepared) in &prepared_chains {
+            let chain_started = Instant::now();
+            eprintln!("scenario static validation started: chain={name}");
             prepared
                 .validate_setup_and_static_submissions(
                     &spec,
@@ -216,6 +231,10 @@ where
                 .wrap_err_with(|| {
                     format!("failed to validate setup and templates for chain '{name}'")
                 })?;
+            eprintln!(
+                "scenario static validation completed: chain={name} elapsed={:?}",
+                chain_started.elapsed(),
+            );
         }
 
         // All remote chain IDs and initial nonce state are checked before the
@@ -223,17 +242,24 @@ where
         // materialized once without submission to catch later-step errors.
         let mut chains = BTreeMap::new();
         for (name, prepared) in prepared_chains {
+            let chain_started = Instant::now();
+            eprintln!("scenario chain initialization started: chain={name}");
             let chain =
                 prepared
                     .initialize(instance_seed(config.seed, stable_hash(&name)))
                     .await
                     .wrap_err_with(|| format!("failed to initialize scenario chain '{name}'"))?;
+            eprintln!(
+                "scenario chain initialization completed: chain={name} elapsed={:?}",
+                chain_started.elapsed(),
+            );
             chains.insert(name, Arc::new(chain));
         }
 
         let default_step_timeout =
             config.step_timeout.or(spec.scenario.timeout).unwrap_or(FALLBACK_STEP_TIMEOUT);
 
+        eprintln!("scenario initialization completed: elapsed={:?}", started.elapsed());
         Ok(Self { spec, chains, bindings, default_step_timeout })
     }
 
@@ -248,8 +274,27 @@ where
         let mut in_flight = 0usize;
         let mut maximum_in_flight = 0usize;
         let mut stop_starting = false;
+        let mut last_progress = run_start;
+        eprintln!(
+            "scenario execution started: scenario={} count={:?} duration={:?} starts_per_second={} max_in_flight={}",
+            self.spec.scenario.name,
+            config.count,
+            config.duration,
+            config.starts_per_second,
+            config.max_in_flight,
+        );
 
         loop {
+            if last_progress.elapsed() >= PROGRESS_LOG_INTERVAL {
+                log_scenario_progress(
+                    &outcomes,
+                    next_instance,
+                    in_flight,
+                    maximum_in_flight,
+                    run_start.elapsed(),
+                );
+                last_progress = Instant::now();
+            }
             let count_available = config.count.is_none_or(|count| next_instance < count);
             let time_available =
                 config.duration.is_none_or(|duration| run_start.elapsed() < duration);
@@ -302,13 +347,27 @@ where
             if in_flight == 0 {
                 break;
             }
-            if let Some(joined) = tasks.join_next().await {
-                let outcome = joined.wrap_err("scenario instance task failed")?;
-                in_flight -= 1;
-                if outcome.failure.is_some() && config.failure_policy == FailurePolicy::FailFast {
-                    stop_starting = true;
+            tokio::select! {
+                joined = tasks.join_next() => {
+                    if let Some(joined) = joined {
+                        let outcome = joined.wrap_err("scenario instance task failed")?;
+                        in_flight -= 1;
+                        if outcome.failure.is_some() && config.failure_policy == FailurePolicy::FailFast {
+                            stop_starting = true;
+                        }
+                        outcomes.record(outcome);
+                    }
                 }
-                outcomes.record(outcome);
+                _ = tokio::time::sleep(PROGRESS_LOG_INTERVAL.saturating_sub(last_progress.elapsed())) => {
+                    log_scenario_progress(
+                        &outcomes,
+                        next_instance,
+                        in_flight,
+                        maximum_in_flight,
+                        run_start.elapsed(),
+                    );
+                    last_progress = Instant::now();
+                }
             }
         }
 
@@ -355,6 +414,8 @@ where
             failure_policy: config.failure_policy.as_str().to_string(),
         };
 
+        log_scenario_progress(&outcomes, next_instance, in_flight, maximum_in_flight, elapsed);
+        eprintln!("scenario execution completed: elapsed={elapsed:?}");
         Ok(ScenarioReport::build(
             self.spec.scenario.name.clone(),
             report_configuration,
@@ -1586,6 +1647,19 @@ fn start_delay(
         delay = delay.min(remaining);
     }
     (!delay.is_zero()).then_some(delay)
+}
+
+fn log_scenario_progress(
+    outcomes: &ScenarioAccumulator,
+    started: u64,
+    in_flight: usize,
+    maximum_in_flight: usize,
+    elapsed: Duration,
+) {
+    let (completed, failed, timed_out) = outcomes.counts();
+    eprintln!(
+        "scenario execution progress: started={started} completed={completed} failed={failed} timed_out={timed_out} in_flight={in_flight} maximum_in_flight={maximum_in_flight} elapsed={elapsed:?}",
+    );
 }
 
 fn instance_seed(seed: u64, instance: u64) -> u64 {
