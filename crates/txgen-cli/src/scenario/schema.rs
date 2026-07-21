@@ -96,6 +96,8 @@ pub struct ScenarioDef {
 pub enum BindingDef {
     /// Select an account and expose `<binding>.ref` and `<binding>.address`.
     Account(AccountBindingDef),
+    /// Generate a deterministic, per-instance bytes32 correlation value.
+    Bytes32(Bytes32BindingDef),
 }
 
 impl<'de> Deserialize<'de> for BindingDef {
@@ -114,7 +116,10 @@ impl<'de> Deserialize<'de> for BindingDef {
             Some("account") => {
                 serde_yaml::from_value(value).map(Self::Account).map_err(serde::de::Error::custom)
             }
-            Some(other) => Err(serde::de::Error::unknown_variant(other, &["account"])),
+            Some("bytes32") => {
+                serde_yaml::from_value(value).map(Self::Bytes32).map_err(serde::de::Error::custom)
+            }
+            Some(other) => Err(serde::de::Error::unknown_variant(other, &["account", "bytes32"])),
             None => Err(serde::de::Error::custom("scenario binding type must be a string")),
         }
     }
@@ -128,6 +133,14 @@ pub struct AccountBindingDef {
     pub pool: String,
     /// Account selection behavior.
     pub select: AccountSelection,
+}
+
+/// Configuration for a random bytes32 scenario binding.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Bytes32BindingDef {
+    /// The number of random bytes. bytes32 bindings require exactly 32.
+    pub random_bytes: u8,
 }
 
 /// Account selection behavior for a scenario binding.
@@ -395,13 +408,26 @@ impl ScenarioSpec {
                     bail!("account binding '{name}' has an empty pool");
                 }
                 BindingDef::Account(_) => {}
+                BindingDef::Bytes32(binding) if binding.random_bytes != 32 => {
+                    bail!(
+                        "bytes32 binding '{name}' requires random_bytes: 32 (got {})",
+                        binding.random_bytes
+                    );
+                }
+                BindingDef::Bytes32(_) => {}
             }
         }
 
         let saves = self.collect_saves()?;
         let mut available = BTreeMap::new();
-        for name in self.scenario.bindings.keys() {
-            available.insert(name.clone(), AvailableRoot::AccountBinding);
+        for (name, binding) in &self.scenario.bindings {
+            available.insert(
+                name.clone(),
+                match binding {
+                    BindingDef::Account(_) => AvailableRoot::AccountBinding,
+                    BindingDef::Bytes32(_) => AvailableRoot::Bytes32Binding,
+                },
+            );
         }
 
         for (index, step) in self.scenario.steps.iter().enumerate() {
@@ -460,8 +486,16 @@ impl ScenarioSpec {
         let mut available = self
             .scenario
             .bindings
-            .keys()
-            .map(|name| (name.clone(), AvailableRoot::AccountBinding))
+            .iter()
+            .map(|(name, binding)| {
+                (
+                    name.clone(),
+                    match binding {
+                        BindingDef::Account(_) => AvailableRoot::AccountBinding,
+                        BindingDef::Bytes32(_) => AvailableRoot::Bytes32Binding,
+                    },
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         for step in self.scenario.steps.iter().take(step_index) {
             if let Some(save) = &step.save {
@@ -705,6 +739,7 @@ impl StepAction {
 #[derive(Debug, Clone, Copy)]
 enum AvailableRoot {
     AccountBinding,
+    Bytes32Binding,
     Saved(SavedKind),
 }
 
@@ -734,6 +769,12 @@ fn validate_reference(
 
     match kind {
         AvailableRoot::AccountBinding => validate_account_path(root, tail),
+        AvailableRoot::Bytes32Binding => {
+            if tail.is_some() {
+                bail!("bytes32 binding '{root}' has no fields");
+            }
+            Ok(())
+        }
         AvailableRoot::Saved(kind) => validate_saved_path(root, *kind, tail),
     }
 }
@@ -994,6 +1035,7 @@ fn static_reference_type(
             "ref" => Some(StaticValueType::AccountRef),
             _ => None,
         },
+        AvailableRoot::Bytes32Binding => tail.is_empty().then_some(StaticValueType::Bytes32),
         AvailableRoot::Saved(SavedKind::Checkpoint) => match tail {
             "" => Some(StaticValueType::Object),
             "chain" => Some(StaticValueType::String),
@@ -1160,6 +1202,45 @@ scenario:
             spec.scenario.bindings["user"],
             BindingDef::Account(AccountBindingDef { select: AccountSelection::Lease, .. })
         ));
+    }
+
+    #[test]
+    fn parses_bytes32_correlation_binding() {
+        let yaml = BASE.replacen(
+            "  bindings:\n    user:",
+            "  bindings:\n    action_id:\n      bytes32: { random_bytes: 32 }\n    user:",
+            1,
+        );
+        let spec = ScenarioSpec::parse(&yaml).unwrap();
+        assert!(matches!(
+            spec.scenario.bindings["action_id"],
+            BindingDef::Bytes32(Bytes32BindingDef { random_bytes: 32 })
+        ));
+    }
+
+    #[test]
+    fn validates_bytes32_correlation_binding_reference() {
+        let yaml = BASE.replacen(
+            "  bindings:\n    user:",
+            "  bindings:\n    action_id:\n      bytes32: { random_bytes: 32 }\n    user:",
+            1,
+        );
+        let yaml = yaml.replacen(
+            "depositHash: { var: deposit.tx_hash }",
+            "depositHash: { var: action_id }",
+            1,
+        );
+        ScenarioSpec::parse(&yaml).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_bytes32_correlation_binding() {
+        let yaml = BASE.replacen(
+            "  bindings:\n    user:",
+            "  bindings:\n    action_id:\n      bytes32: { random_bytes: 31 }\n    user:",
+            1,
+        );
+        assert!(ScenarioSpec::parse(&yaml).is_err());
     }
 
     #[test]
