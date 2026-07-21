@@ -471,19 +471,178 @@ fn encode_typed_abi(
     for (index, (type_name, expression)) in
         definition.types.iter().zip(&definition.values).enumerate()
     {
-        let sol_type = DynSolType::parse(type_name)
+        let sol_type = parse_abi_type(type_name)
             .wrap_err_with(|| format!("invalid Solidity type {index} ('{type_name}')"))?;
         let value = eval_expression(expression, context)
             .wrap_err_with(|| format!("failed to evaluate ABI value {index}"))?;
         values.push(
             value
                 .coerce_dyn_sol(&sol_type)
-                .wrap_err_with(|| format!("failed to coerce ABI value {index} as '{type_name}'"))?,
+                // Do not retain the coercion source: alloy includes the JSON value in
+                // type-mismatch diagnostics, and ABI expression values can be secret.
+                .map_err(|_| eyre::eyre!("failed to coerce ABI value {index} as '{type_name}'"))?,
         );
     }
 
     let tuple = DynSolValue::Tuple(values);
     Ok(if packed { tuple.abi_encode_packed() } else { tuple.abi_encode_params() })
+}
+
+/// Parse a Solidity ABI type, preserving names on tuple members.
+///
+/// `DynSolType::parse` accepts canonical ABI type strings but intentionally
+/// rejects Solidity declarations such as `(uint256 amount,address recipient)`.
+/// Runtime expressions use those declarations to map YAML objects onto tuple
+/// fields, so named tuples are represented as `CustomStruct` values while
+/// unnamed tuples retain the usual positional representation.
+fn parse_abi_type(type_name: &str) -> Result<DynSolType> {
+    let mut parser = AbiTypeParser { input: type_name, offset: 0 };
+    let ty = parser.parse_type()?;
+    parser.skip_whitespace();
+    if !parser.is_eof() {
+        bail!("unexpected token at byte {}", parser.offset);
+    }
+    Ok(ty)
+}
+
+struct AbiTypeParser<'a> {
+    input: &'a str,
+    offset: usize,
+}
+
+impl AbiTypeParser<'_> {
+    fn parse_type(&mut self) -> Result<DynSolType> {
+        self.skip_whitespace();
+        let mut ty = if self.consume_byte(b'(') {
+            self.parse_tuple()?
+        } else {
+            let name = self.parse_identifier()?;
+            if name == "tuple" {
+                self.skip_whitespace();
+                if !self.consume_byte(b'(') {
+                    bail!("expected '(' after tuple at byte {}", self.offset);
+                }
+                self.parse_tuple()?
+            } else {
+                DynSolType::parse(name).wrap_err("invalid Solidity ABI type")?
+            }
+        };
+
+        loop {
+            self.skip_whitespace();
+            if !self.consume_byte(b'[') {
+                break;
+            }
+            self.skip_whitespace();
+            let start = self.offset;
+            while self.peek_byte().is_some_and(|byte| byte.is_ascii_digit()) {
+                self.offset += 1;
+            }
+            let length = if start == self.offset {
+                None
+            } else {
+                Some(
+                    self.input[start..self.offset]
+                        .parse::<usize>()
+                        .wrap_err("invalid fixed array length")?,
+                )
+            };
+            self.skip_whitespace();
+            if !self.consume_byte(b']') {
+                bail!("expected ']' at byte {}", self.offset);
+            }
+            ty = match length {
+                Some(0) => bail!("fixed array length must be greater than zero"),
+                Some(length) => DynSolType::FixedArray(Box::new(ty), length),
+                None => DynSolType::Array(Box::new(ty)),
+            };
+        }
+        Ok(ty)
+    }
+
+    fn parse_tuple(&mut self) -> Result<DynSolType> {
+        let mut members = Vec::new();
+        let mut names = Vec::new();
+        self.skip_whitespace();
+        if self.consume_byte(b')') {
+            return Ok(DynSolType::Tuple(members));
+        }
+
+        loop {
+            let member = self.parse_type()?;
+            self.skip_whitespace();
+            let name = self.try_parse_identifier().unwrap_or_default().to_string();
+            members.push(member);
+            names.push(name);
+            self.skip_whitespace();
+            if self.consume_byte(b')') {
+                break;
+            }
+            if !self.consume_byte(b',') {
+                bail!("expected ',' or ')' at byte {}", self.offset);
+            }
+            self.skip_whitespace();
+        }
+
+        let named = names.iter().any(|name| !name.is_empty());
+        if named && names.iter().any(String::is_empty) {
+            bail!("tuple members must either all be named or all be unnamed");
+        }
+        if named {
+            Ok(DynSolType::CustomStruct {
+                name: "tuple".to_string(),
+                prop_names: names,
+                tuple: members,
+            })
+        } else {
+            Ok(DynSolType::Tuple(members))
+        }
+    }
+
+    fn parse_identifier(&mut self) -> Result<&str> {
+        let offset = self.offset;
+        match self.try_parse_identifier() {
+            Some(identifier) => Ok(identifier),
+            None => bail!("expected Solidity type at byte {offset}"),
+        }
+    }
+
+    fn try_parse_identifier(&mut self) -> Option<&str> {
+        self.skip_whitespace();
+        let start = self.offset;
+        let first = self.peek_byte()?;
+        if !(first.is_ascii_alphabetic() || first == b'_') {
+            return None;
+        }
+        self.offset += 1;
+        while self.peek_byte().is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_') {
+            self.offset += 1;
+        }
+        Some(&self.input[start..self.offset])
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.peek_byte().is_some_and(|byte| byte.is_ascii_whitespace()) {
+            self.offset += 1;
+        }
+    }
+
+    fn consume_byte(&mut self, expected: u8) -> bool {
+        if self.peek_byte() == Some(expected) {
+            self.offset += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek_byte(&self) -> Option<u8> {
+        self.input.as_bytes().get(self.offset).copied()
+    }
+
+    fn is_eof(&self) -> bool {
+        self.offset == self.input.len()
+    }
 }
 
 fn encode_packed(operand: &serde_yaml::Value, context: &RuntimeContext) -> Result<Vec<u8>> {
@@ -698,6 +857,154 @@ abi_encode:
         ])
         .abi_encode_params();
         assert_eq!(actual, RuntimeValue::Bytes(Bytes::from(expected)));
+    }
+
+    #[test]
+    fn abi_encode_materializes_named_nested_callback_tuple() -> Result<()> {
+        let encrypted = object([
+            ("ephemeralPubkeyX", RuntimeValue::Bytes32(B256::repeat_byte(0x11))),
+            ("ephemeralPubkeyYParity", RuntimeValue::Uint(U256::from(1))),
+            ("ciphertext", RuntimeValue::Bytes(Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]))),
+            ("nonce", RuntimeValue::Bytes(Bytes::from_static(&[0x22; 12]))),
+            ("tag", RuntimeValue::Bytes(Bytes::from_static(&[0x33; 16]))),
+        ]);
+        let context = RuntimeContext::new(BTreeMap::from([
+            (
+                "encrypted_return".to_string(),
+                object([
+                    ("keyIndex", RuntimeValue::Uint(U256::from(7))),
+                    ("encrypted", encrypted.clone()),
+                ]),
+            ),
+            ("action_id".to_string(), RuntimeValue::Bytes32(B256::repeat_byte(0x55))),
+            (
+                "account".to_string(),
+                object([("address", RuntimeValue::Address(Address::repeat_byte(0x66)))]),
+            ),
+        ]))?;
+        let request: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+call:
+  function: requestWithdrawal
+  args:
+    - vault-id
+    - data:
+        abi_encode:
+          types:
+            - "tuple(uint8 flow,address outputToken,uint256 keyIndex,(bytes32 ephemeralPubkeyX,uint8 ephemeralPubkeyYParity,bytes ciphertext,bytes12 nonce,bytes16 tag) encrypted,uint128 minVaultAssets,uint128 minVaultShares,uint128 minOutputAmount,bytes32 actionId,address refundRecipient)"
+          values:
+            - flow: 0
+              outputToken: "0x4444444444444444444444444444444444444444"
+              keyIndex: { var: encrypted_return.keyIndex }
+              encrypted: { var: encrypted_return.encrypted }
+              minVaultAssets: 5
+              minVaultShares: 6
+              minOutputAmount: 0
+              actionId: { var: action_id }
+              refundRecipient: { var: account.address }
+    - "0x"
+"#,
+        )?;
+
+        // This is the same runtime materialization path used by a submit
+        // step: the resulting `data` string is directly usable as a bytes
+        // argument to requestWithdrawal.
+        let materialized = materialize_yaml(&request, &context)?;
+        let data: Bytes = materialized["call"]["args"][1]["data"]
+            .as_str()
+            .ok_or_else(|| eyre::eyre!("callback data was not materialized as bytes"))?
+            .parse()?;
+        // Solidity fixture: abi.encode(callback). Keep this golden vector
+        // independent of the dynamic ABI implementation under test.
+        let solidity_abi_encode = Bytes::from(hex::decode(concat!(
+            "0000000000000000000000000000000000000000000000000000000000000020",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000004444444444444444444444444444444444444444",
+            "0000000000000000000000000000000000000000000000000000000000000007",
+            "0000000000000000000000000000000000000000000000000000000000000120",
+            "0000000000000000000000000000000000000000000000000000000000000005",
+            "0000000000000000000000000000000000000000000000000000000000000006",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "5555555555555555555555555555555555555555555555555555555555555555",
+            "0000000000000000000000006666666666666666666666666666666666666666",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            "00000000000000000000000000000000000000000000000000000000000000a0",
+            "2222222222222222222222220000000000000000000000000000000000000000",
+            "3333333333333333333333333333333300000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000004",
+            "deadbeef00000000000000000000000000000000000000000000000000000000",
+        ))?);
+        assert!(data == solidity_abi_encode, "callback ABI encoding diverged from Solidity");
+
+        let callback_type = parse_abi_type(
+            "tuple(uint8 flow,address outputToken,uint256 keyIndex,(bytes32 ephemeralPubkeyX,uint8 ephemeralPubkeyYParity,bytes ciphertext,bytes12 nonce,bytes16 tag) encrypted,uint128 minVaultAssets,uint128 minVaultShares,uint128 minOutputAmount,bytes32 actionId,address refundRecipient)",
+        )?;
+        let decoded = callback_type.abi_decode_params(&data)?;
+        assert_eq!(
+            RuntimeValue::from_dyn_sol(&decoded)?,
+            object([
+                ("flow", RuntimeValue::Uint(U256::ZERO)),
+                ("outputToken", RuntimeValue::Address(Address::repeat_byte(0x44))),
+                ("keyIndex", RuntimeValue::Uint(U256::from(7))),
+                ("encrypted", encrypted),
+                ("minVaultAssets", RuntimeValue::Uint(U256::from(5))),
+                ("minVaultShares", RuntimeValue::Uint(U256::from(6))),
+                ("minOutputAmount", RuntimeValue::Uint(U256::ZERO)),
+                ("actionId", RuntimeValue::Bytes32(B256::repeat_byte(0x55))),
+                ("refundRecipient", RuntimeValue::Address(Address::repeat_byte(0x66))),
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn abi_encode_supports_named_tuple_arrays_and_booleans() -> Result<()> {
+        let expression: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+abi_encode:
+  types: ["tuple(uint16[] ids,bool approved,bytes4 tag)"]
+  values:
+    - ids: [1, 513]
+      approved: true
+      tag: "0xdeadbeef"
+"#,
+        )?;
+        let RuntimeValue::Bytes(encoded) = eval_expression(&expression, &RuntimeContext::empty())?
+        else {
+            panic!("abi_encode must produce bytes");
+        };
+        let decoded = parse_abi_type("tuple(uint16[] ids,bool approved,bytes4 tag)")?
+            .abi_decode_params(&encoded)?;
+        assert_eq!(
+            RuntimeValue::from_dyn_sol(&decoded)?,
+            object([
+                (
+                    "ids",
+                    RuntimeValue::Array(vec![
+                        RuntimeValue::Uint(U256::from(1)),
+                        RuntimeValue::Uint(U256::from(513)),
+                    ]),
+                ),
+                ("approved", RuntimeValue::Bool(true)),
+                ("tag", RuntimeValue::Bytes(Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]))),
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn abi_encode_coercion_errors_do_not_include_values() {
+        let expression: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+abi_encode:
+  types: ["tuple(bytes4 tag)"]
+  values: [{ tag: "not-secret-hex" }]
+"#,
+        )
+        .unwrap();
+        let error = eval_expression(&expression, &RuntimeContext::empty()).unwrap_err();
+        assert!(!error.to_string().contains("not-secret-hex"));
     }
 
     #[test]
