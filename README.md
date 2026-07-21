@@ -880,7 +880,7 @@ correlation:
       - { var: delivered.args.messageId }
 ```
 
-`abi_encode_packed` and `keccak256_packed` also accept an inferred list, for example `keccak256_packed: [{ var: user.address }, { var: publish.tx_hash }]`. Prefer the typed form when integer widths or another Solidity type distinction matters. Transformations are deterministic; arbitrary scripting is not supported.
+`abi_encode` supports Solidity tuple declarations with member names, including nested tuples and arrays; provide those values as YAML objects keyed by the member names. ABI expressions run only while an individual scenario instance materializes runtime expressions, after referenced values are available. `abi_encode_packed` and `keccak256_packed` also accept an inferred list, for example `keccak256_packed: [{ var: user.address }, { var: publish.tx_hash }]`. Prefer the typed form when integer widths or another Solidity type distinction matters. Transformations are deterministic; arbitrary scripting is not supported.
 
 ### Rate, concurrency, leases, and failures
 
