@@ -18,6 +18,8 @@ use bench_core::{
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+const SETUP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
 pub async fn execute(args: SendArgs) -> Result<()> {
     tracing::info!(
         input = args.input.as_ref().map(|p| p.display().to_string()).as_deref().unwrap_or("stdin"),
@@ -338,9 +340,42 @@ async fn finish_setup_phase(
     }
 
     tracing::info!(setup_txs = setup_seen, "Waiting for setup transactions");
-    setup_sender.flush().await?;
+    let mut progress = tokio::time::interval(SETUP_PROGRESS_INTERVAL);
+    progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick so progress is only reported after the
+    // setup phase has actually been waiting for an interval.
+    progress.tick().await;
 
-    let (_, _, failed) = setup_metrics.counts();
+    let flush = setup_sender.flush();
+    tokio::pin!(flush);
+    let flush_result = loop {
+        tokio::select! {
+            result = &mut flush => break result,
+            _ = progress.tick() => {
+                let (sent, success, failed) = setup_metrics.counts();
+                tracing::info!(
+                    setup_txs = setup_seen,
+                    sent,
+                    success,
+                    failed,
+                    in_flight = sent.saturating_sub(success + failed),
+                    elapsed = ?setup_metrics.elapsed_since_start(),
+                    "Setup transaction progress"
+                );
+            }
+        }
+    };
+    flush_result?;
+
+    let (sent, success, failed) = setup_metrics.counts();
+    tracing::info!(
+        setup_txs = setup_seen,
+        sent,
+        success,
+        failed,
+        elapsed = ?setup_metrics.elapsed_since_start(),
+        "Setup transactions completed"
+    );
     if failed > 0 {
         bail!("setup phase failed: {failed} setup transaction(s) failed or reverted");
     }
