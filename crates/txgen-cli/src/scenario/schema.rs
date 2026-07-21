@@ -1079,8 +1079,12 @@ fn validate_literal_parameter(expression: &serde_yaml::Value, expected: &str) ->
         "bytes" => value.coerce_dyn_sol(&DynSolType::Bytes).map(drop),
         "bytes32" => value.coerce_dyn_sol(&DynSolType::FixedBytes(32)).map(drop),
         "bool" => value.coerce_dyn_sol(&DynSolType::Bool).map(drop),
-        "string" => bail!("value is not a string"),
-        other => bail!("unknown fragment parameter type '{other}'"),
+        "string" => {
+            bail!("value is not a string");
+        }
+        other => {
+            bail!("unknown fragment parameter type '{other}'");
+        }
     }
 }
 
