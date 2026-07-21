@@ -1,3 +1,4 @@
+use super::schema::StepProvenance;
 use bench_core::compute_latency_stats;
 use serde::Serialize;
 use std::{
@@ -53,6 +54,8 @@ pub struct StepReport {
     pub index: usize,
     pub name: String,
     pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<StepProvenance>,
     pub success: u64,
     pub failed: u64,
     pub latency: LatencyDistribution,
@@ -91,6 +94,8 @@ impl LatencyDistribution {
 pub struct FailureReport {
     pub step_index: usize,
     pub step_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<StepProvenance>,
     pub classification: String,
     pub count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,6 +112,8 @@ pub struct InstanceLifecycle {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_step: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_provenance: Option<StepProvenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_classification: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_detail: Option<String>,
@@ -118,6 +125,8 @@ pub struct LifecycleStep {
     pub index: usize,
     pub name: String,
     pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<StepProvenance>,
     pub success: bool,
     pub latency_ms: f64,
 }
@@ -137,6 +146,7 @@ pub(crate) struct StepOutcome {
     pub index: usize,
     pub name: String,
     pub kind: String,
+    pub provenance: Option<StepProvenance>,
     pub success: bool,
     pub latency: Duration,
 }
@@ -145,6 +155,7 @@ pub(crate) struct StepOutcome {
 pub(crate) struct InstanceFailure {
     pub step_index: usize,
     pub step_name: String,
+    pub failure_provenance: Option<StepProvenance>,
     pub classification: String,
     pub timed_out: bool,
     pub detail: Option<String>,
@@ -201,6 +212,9 @@ fn reservoir_hash(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+type FailureKey = (usize, String, String);
+type FailureAggregate = (u64, Option<String>, Option<StepProvenance>);
+
 /// Bounded-memory aggregation of completed instance outcomes.
 pub(crate) struct ScenarioAccumulator {
     completed: u64,
@@ -210,7 +224,7 @@ pub(crate) struct ScenarioAccumulator {
     step_success: Vec<u64>,
     step_failed: Vec<u64>,
     total_scenario_latency: LatencyAccumulator,
-    failure_counts: BTreeMap<(usize, String, String), (u64, Option<String>)>,
+    failure_counts: BTreeMap<FailureKey, FailureAggregate>,
     sampled_instances: BTreeMap<u64, InstanceLifecycle>,
     sample_limit: usize,
 }
@@ -260,7 +274,7 @@ impl ScenarioAccumulator {
                     failure.step_name.clone(),
                     failure.classification.clone(),
                 ))
-                .or_insert_with(|| (0, failure.detail.clone()));
+                .or_insert_with(|| (0, failure.detail.clone(), failure.failure_provenance.clone()));
             entry.0 = entry.0.saturating_add(1);
         }
 
@@ -290,7 +304,7 @@ impl ScenarioReport {
         elapsed: Duration,
         started: u64,
         maximum_in_flight: usize,
-        step_definitions: &[(String, String)],
+        step_definitions: &[(String, String, Option<StepProvenance>)],
         accumulator: ScenarioAccumulator,
     ) -> Self {
         let ScenarioAccumulator {
@@ -308,10 +322,11 @@ impl ScenarioReport {
         let steps = step_definitions
             .iter()
             .enumerate()
-            .map(|(index, (name, kind))| StepReport {
+            .map(|(index, (name, kind, provenance))| StepReport {
                 index,
                 name: name.clone(),
                 kind: kind.clone(),
+                provenance: provenance.clone(),
                 success: step_success[index],
                 failed: step_failed[index],
                 latency: step_samples[index].distribution(),
@@ -319,8 +334,15 @@ impl ScenarioReport {
             .collect();
         let failures = failure_counts
             .into_iter()
-            .map(|((step_index, step_name, classification), (count, sample_detail))| {
-                FailureReport { step_index, step_name, classification, count, sample_detail }
+            .map(|((step_index, step_name, classification), (count, sample_detail, provenance))| {
+                FailureReport {
+                    step_index,
+                    step_name,
+                    provenance,
+                    classification,
+                    count,
+                    sample_detail,
+                }
             })
             .collect();
         let sampled_instances = sampled_instances.into_values().collect();
@@ -361,6 +383,7 @@ impl From<&InstanceOutcome> for InstanceLifecycle {
             elapsed_ms: duration_ms(outcome.elapsed),
             outcome: if failure.is_some() { "failed" } else { "completed" }.to_string(),
             failure_step: failure.map(|failure| failure.step_index),
+            failure_provenance: failure.and_then(|failure| failure.failure_provenance.clone()),
             failure_classification: failure.map(|failure| failure.classification.clone()),
             failure_detail: failure.and_then(|failure| failure.detail.clone()),
             steps: outcome
@@ -370,6 +393,7 @@ impl From<&InstanceOutcome> for InstanceLifecycle {
                     index: step.index,
                     name: step.name.clone(),
                     kind: step.kind.clone(),
+                    provenance: step.provenance.clone(),
                     success: step.success,
                     latency_ms: duration_ms_f64(step.latency),
                 })
@@ -409,6 +433,7 @@ mod tests {
                     index: 0,
                     name: "send".into(),
                     kind: "submit".into(),
+                    provenance: None,
                     success: true,
                     latency: Duration::from_millis(2),
                 }],
@@ -423,12 +448,14 @@ mod tests {
                     index: 0,
                     name: "send".into(),
                     kind: "submit".into(),
+                    provenance: None,
                     success: false,
                     latency: Duration::from_millis(5),
                 }],
                 failure: Some(InstanceFailure {
                     step_index: 0,
                     step_name: "send".into(),
+                    failure_provenance: None,
                     classification: "timeout".into(),
                     timed_out: true,
                     detail: Some("step timeout elapsed".into()),
@@ -458,7 +485,7 @@ mod tests {
             Duration::from_secs(1),
             2,
             2,
-            &[("send".into(), "submit".into())],
+            &[("send".into(), "submit".into(), None)],
             accumulator,
         );
         assert_eq!(report.completed, 1);
@@ -468,6 +495,167 @@ mod tests {
         assert_eq!(report.steps[0].failed, 1);
         assert_eq!(report.sampled_instances.len(), 1);
         assert_eq!(report.total_scenario_latency.samples, 1);
+
+        let serialized = serde_json::to_value(&report).unwrap();
+        assert!(serialized["steps"][0].get("provenance").is_none());
+        assert!(serialized["failures"][0].get("provenance").is_none());
+        assert!(serialized["sampled_instances"][0].get("failure_provenance").is_none());
+        assert!(serialized["sampled_instances"][0]["steps"][0].get("provenance").is_none());
+    }
+
+    #[test]
+    fn report_retains_expanded_step_provenance() {
+        let now = SystemTime::now();
+        let spec = super::super::schema::ScenarioSpec::parse(
+            r#"
+version: 1
+chains:
+  primary: { network: tempo, rpc_url: http://primary.invalid, workload: ./workload.yml }
+fragments:
+  capture:
+    outputs: { cursor: checkpoint }
+    steps:
+      - checkpoint: { chain: primary }
+        save: cursor
+scenario:
+  name: composed
+  steps:
+    - { use: capture, as: first }
+    - { use: capture, as: second }
+"#,
+        )
+        .unwrap();
+        let first_provenance = spec.scenario.steps[0].provenance.clone().unwrap();
+        assert_eq!(first_provenance.instance_alias, "first");
+        let provenance = spec.scenario.steps[1].provenance.clone().unwrap();
+        let outcome = InstanceOutcome {
+            instance: 0,
+            started_at_unix_ms: 1,
+            finished_at_unix_ms: 2,
+            elapsed: Duration::from_millis(10),
+            steps: vec![
+                StepOutcome {
+                    index: 0,
+                    name: "first.cursor".into(),
+                    kind: "checkpoint".into(),
+                    provenance: Some(first_provenance.clone()),
+                    success: true,
+                    latency: Duration::from_millis(1),
+                },
+                StepOutcome {
+                    index: 1,
+                    name: "second.cursor".into(),
+                    kind: "checkpoint".into(),
+                    provenance: Some(provenance.clone()),
+                    success: false,
+                    latency: Duration::from_millis(2),
+                },
+            ],
+            failure: Some(InstanceFailure {
+                step_index: 1,
+                step_name: "second.cursor".into(),
+                failure_provenance: Some(provenance.clone()),
+                classification: "timeout".into(),
+                timed_out: true,
+                detail: Some("step timeout elapsed".into()),
+            }),
+        };
+        let mut accumulator = ScenarioAccumulator::new(2, 1);
+        accumulator.record(outcome);
+        let report = ScenarioReport::build(
+            "composed".into(),
+            ScenarioReportConfig {
+                chains: Vec::new(),
+                requested_instances: Some(1),
+                run_duration_ms: None,
+                starts_per_second: 0.0,
+                maximum_in_flight: 1,
+                default_step_timeout_ms: 1_000,
+                transaction_rate_per_chain: 0,
+                maximum_rpc_in_flight_per_chain: 1,
+                seed: 1,
+                failure_policy: "continue".into(),
+            },
+            now,
+            now,
+            Duration::from_secs(1),
+            1,
+            1,
+            &[
+                ("first.cursor".into(), "checkpoint".into(), Some(first_provenance)),
+                ("second.cursor".into(), "checkpoint".into(), Some(provenance)),
+            ],
+            accumulator,
+        );
+
+        let serialized = serde_json::to_value(&report).unwrap();
+        for value in [
+            &serialized["steps"][1]["provenance"],
+            &serialized["failures"][0]["provenance"],
+            &serialized["sampled_instances"][0]["failure_provenance"],
+            &serialized["sampled_instances"][0]["steps"][1]["provenance"],
+        ] {
+            assert_eq!(value["source_file"], "<inline>");
+            assert_eq!(value["fragment"], "capture");
+            assert_eq!(value["instance_alias"], "second");
+            assert_eq!(value["local_step_name"], "cursor");
+            assert_eq!(value["local_step_index"], 0);
+        }
+    }
+
+    #[test]
+    fn binding_failure_does_not_inherit_first_step_provenance() {
+        let now = SystemTime::now();
+        let provenance = StepProvenance {
+            source_file: "fragments/transfers.yml".into(),
+            fragment: "submit-and-confirm".into(),
+            instance_alias: "first_transfer".into(),
+            local_step_name: "submission".into(),
+            local_step_index: 0,
+        };
+        let outcome = InstanceOutcome {
+            instance: 0,
+            started_at_unix_ms: 1,
+            finished_at_unix_ms: 2,
+            elapsed: Duration::from_millis(1),
+            steps: Vec::new(),
+            failure: Some(InstanceFailure {
+                step_index: 0,
+                step_name: "bindings".into(),
+                failure_provenance: None,
+                classification: "binding_error".into(),
+                timed_out: false,
+                detail: Some("account lease pool closed".into()),
+            }),
+        };
+        let mut accumulator = ScenarioAccumulator::new(1, 1);
+        accumulator.record(outcome);
+        let report = ScenarioReport::build(
+            "composed".into(),
+            ScenarioReportConfig {
+                chains: Vec::new(),
+                requested_instances: Some(1),
+                run_duration_ms: None,
+                starts_per_second: 0.0,
+                maximum_in_flight: 1,
+                default_step_timeout_ms: 1_000,
+                transaction_rate_per_chain: 0,
+                maximum_rpc_in_flight_per_chain: 1,
+                seed: 1,
+                failure_policy: "continue".into(),
+            },
+            now,
+            now,
+            Duration::from_secs(1),
+            1,
+            1,
+            &[("first_transfer.submission".into(), "submit".into(), Some(provenance))],
+            accumulator,
+        );
+
+        let serialized = serde_json::to_value(&report).unwrap();
+        assert!(serialized["failures"][0].get("provenance").is_none());
+        assert!(serialized["sampled_instances"][0].get("failure_provenance").is_none());
     }
 
     #[test]
