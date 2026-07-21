@@ -6,14 +6,14 @@ use crate::{
     SendArgs,
 };
 use alloy_network::AnyNetwork;
-use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
+use alloy_provider::{ext::TxPoolApi, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     collect_block_stats, parse_reporters, start_scrapers, trim_trailing_empty_blocks,
     ConsoleReporter, FileSource, FinalReport, GeneratedTx, MetricsCollector, ProgressState,
-    Reporter, RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, StdinSource,
-    TxPhase, TxSource,
+    Reporter, RpcEndpoint, RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig,
+    StdinSource, TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, time::Duration};
@@ -44,12 +44,14 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     let providers = args
         .rpc_urls
         .iter()
-        .map(|url| {
-            let url = url.parse().context("failed to parse RPC URL")?;
+        .map(|rpc_url| {
+            let url = rpc_url.parse().context("failed to parse RPC URL")?;
             let client = RpcClient::builder()
                 .layer(retry_layer.clone())
                 .http_with_client(http_client.clone(), url);
-            Ok(ProviderBuilder::new_with_network::<AnyNetwork>().connect_client(client).erased())
+            let provider =
+                ProviderBuilder::new_with_network::<AnyNetwork>().connect_client(client).erased();
+            Ok(RpcEndpoint::new(rpc_url.clone(), provider))
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -68,12 +70,12 @@ pub async fn execute(args: SendArgs) -> Result<()> {
 async fn execute_source<S: TxSource>(
     args: &SendArgs,
     metadata: &HashMap<String, String>,
-    providers: Vec<DynProvider<AnyNetwork>>,
+    providers: Vec<RpcEndpoint>,
     source: &mut S,
     scraper_configs: &[ScraperConfig],
 ) -> Result<()> {
     let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
-    let query_provider = &providers[0];
+    let query_provider = providers[0].provider();
 
     let first_workload = run_setup_phase(args, source, &providers, &config).await?;
 
@@ -100,7 +102,7 @@ async fn execute_source<S: TxSource>(
         Vec::new()
     };
 
-    let mut sender = Sender::new(providers.clone(), config.clone(), metrics.clone());
+    let mut sender = Sender::new_with_endpoints(providers.clone(), config.clone(), metrics.clone());
 
     let mut reporters = parse_reporters(&args.reports, "send", metadata)?;
     if reporters.is_empty() {
@@ -235,12 +237,13 @@ async fn execute_source<S: TxSource>(
 async fn run_setup_phase<S: TxSource>(
     args: &SendArgs,
     source: &mut S,
-    providers: &[DynProvider<AnyNetwork>],
+    providers: &[RpcEndpoint],
     config: &SenderConfig,
 ) -> Result<Option<GeneratedTx>> {
     let setup_clock = RunClock::new();
     let setup_metrics = MetricsCollector::new_with_latencies(setup_clock, false);
-    let mut setup_sender = Sender::new(providers.to_vec(), config.clone(), setup_metrics.clone());
+    let mut setup_sender =
+        Sender::new_with_endpoints(providers.to_vec(), config.clone(), setup_metrics.clone());
     let mut setup_seen = 0u64;
 
     while let Some(tx) = source.next_tx().await? {
@@ -286,6 +289,11 @@ async fn finish_setup_phase(
     if failed > 0 {
         bail!("setup phase failed: {failed} setup transaction(s) failed or reverted");
     }
+
+    setup_sender
+        .wait_for_setup_convergence(setup_seen)
+        .await
+        .wrap_err("setup RPC convergence barrier failed")?;
 
     Ok(())
 }
