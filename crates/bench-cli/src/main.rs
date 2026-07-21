@@ -308,22 +308,7 @@ fn parse_wait_for_persistence(s: &str) -> Result<bench_core::WaitForPersistence,
 }
 
 fn tracing_env_filter() -> tracing_subscriber::EnvFilter {
-    let mut filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive(tracing::Level::INFO.into());
-
-    // Authenticated RPC servers may reflect credentials in response bodies or
-    // error messages. These Alloy targets trace raw bodies/errors, so cap their
-    // verbosity even when RUST_LOG requests a target-specific trace level.
-    for directive in [
-        "alloy_transport_http::reqwest_transport=debug",
-        "alloy_transport_http::hyper_transport=debug",
-        "alloy_transport::layers::retry=debug",
-        "alloy_json_rpc::result=debug",
-    ] {
-        filter =
-            filter.add_directive(directive.parse().expect("static tracing directive is valid"));
-    }
-    filter
+    tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into())
 }
 
 fn allow_diagnostic_event(metadata: &tracing::Metadata<'_>) -> bool {
@@ -331,9 +316,8 @@ fn allow_diagnostic_event(metadata: &tracing::Metadata<'_>) -> bool {
         return true;
     }
 
-    // These dependencies emit raw HTTP bodies or errors at TRACE. A separate
-    // event-level filter is required because span-specific EnvFilter directives
-    // can override target-only verbosity caps.
+    // These dependencies emit raw HTTP bodies or errors at TRACE. This filter
+    // only suppresses those events; it never raises the configured log level.
     !matches!(
         metadata.target(),
         "alloy_transport_http::reqwest_transport" |
