@@ -635,6 +635,37 @@ Captures the chain's current canonical block cursor. Use it immediately before a
   save: before_delivery
 ```
 
+#### `invoke`
+
+Runs a query-only action supplied by the selected network adapter. `with` values may use runtime expressions, and the adapter's structured result can be saved and passed to later steps. Unsupported action names are rejected before any journey starts.
+
+The Tempo adapter provides `prepare_encrypted_deposit`, which is compatible with viem's `zone.encryptedDeposit.prepareRecipient`: it reads the current ZonePortal encryption key and creates a fresh secp256k1/AES-GCM payload for each invocation. Cryptographic material always comes from the operating system and is intentionally not controlled by the scenario seed. `portalAddress` is optional for Zone IDs known to viem; supply it for other deployments. `memo` is an optional `bytes32` and defaults to zero.
+
+```yaml
+- invoke:
+    chain: l1
+    action: prepare_encrypted_deposit
+    with:
+      recipient: { var: user.address }
+      zoneId: 9
+      portalAddress: ${ZONE_PORTAL_ADDRESS}
+  save: prepared
+
+- submit:
+    chain: l1
+    template: encrypted_deposit
+    with:
+      from: { var: user.ref }
+      call:
+        args:
+          - ${TOKEN_ADDRESS}
+          - 1000000
+          - { var: prepared.keyIndex }
+          - { var: prepared.encrypted }
+```
+
+The saved result contains viem's `chainId`, `encrypted`, `keyIndex`, `portalAddress`, and `zoneId` fields. `encrypted` contains `ciphertext`, `ephemeralPubkeyX`, `ephemeralPubkeyYParity`, `nonce`, and `tag` and can be used directly as the named tuple argument of `depositEncrypted`.
+
 #### `submit`
 
 Loads a named template from the selected chain's workload, deep-merges `with`, resolves runtime expressions, signs with that chain's adapter, and submits it through the in-process sender. The step completes after RPC acceptance and exposes the transaction hash. Set `await: receipt` to keep the step open until a successful receipt is observed; a reverted receipt fails the step.
@@ -689,6 +720,7 @@ A log wait must provide `from_block` or `transaction_hash`. Optional `address`, 
 | Step | Saved fields |
 |------|--------------|
 | `checkpoint` | `chain`, `block_number`, optional `block_hash`, `captured_at` |
+| `invoke` | adapter-defined result plus `chain` and `action` |
 | `submit` | `chain`, `template`/`id`, `sender`, `tx_hash`, `submitted_at`, `acceptance_latency`, optional `receipt` |
 | `submit.receipt` | `chain`, `transaction_hash`, `block_hash`, `block_number`, `status`, `gas_used`, `observed_at` |
 | `wait_receipt` | `chain`, `transaction_hash`, `block_hash`, `block_number`, `status`, `gas_used`, `observed_at` |
@@ -1116,6 +1148,14 @@ Call argument variables reuse normal txgen generators such as `choice` and
 `uniform`. The `var` and `if` expressions are local to the call argument block and let
 arguments depend on earlier resolved variables.
 
+Solidity tuple arguments may be written as a list in component order or as a mapping keyed by the component names in the ABI. Tuple arrays use a list of tuple values. For example:
+
+```yaml
+args:
+  - token: "0x..."
+    amount: 1000000
+```
+
 ### Setup Transactions
 
 Use `setup.steps` for deterministic transactions that prepare the chain before the measured workload, such as contract deployments and mint/configuration calls. `txgen` emits all setup transactions first with `phase: "setup"`; workload transactions are emitted afterwards with `phase: "workload"`.
@@ -1413,6 +1453,7 @@ Summary of which RPC methods are required by each feature:
 | `eth_blockNumber` | `bench send` (query RPC when configured; benchmark block range), `scenario run` (`checkpoint`, confirmations, and block-range log polling) |
 | `eth_getBlockByNumber` | `bench send` (query RPC when configured; per-block stats collection), `scenario run` (`checkpoint`) |
 | `eth_getLogs` | `scenario run` (block-range `wait_log`) |
+| `eth_call` | `txgen-tempo scenario run` (`prepare_encrypted_deposit` and other adapter `invoke` actions) |
 | `debug_getRawBlock` | `txgen extract`, `txgen-ethereum extract-big-blocks` |
 | `eth_getBlockAccessListByBlockNumber` | `txgen extract --bal`, `txgen-ethereum extract-big-blocks --bal` |
 | `reth_newPayload` | `bench send-blocks` |

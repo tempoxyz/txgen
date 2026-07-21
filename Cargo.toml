@@ -41,6 +41,12 @@ alloy-rlp = "0.3"
 tempo-alloy = "1"
 tempo-primitives = "1"
 
+# crypto
+aes-gcm = "0.10"
+hkdf = "0.12"
+k256 = { version = "0.13", features = ["ecdh"] }
+sha2 = "0.10"
+
 # misc
 futures = "0.3"
 hex = "0.4"

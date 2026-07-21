@@ -34,6 +34,12 @@ alloy-eips.workspace = true
 tempo-alloy.workspace = true
 tempo-primitives.workspace = true
 
+# crypto
+aes-gcm.workspace = true
+hkdf.workspace = true
+k256.workspace = true
+sha2.workspace = true
+
 # misc
 rand.workspace = true
 rustix.workspace = true
