@@ -27,6 +27,8 @@ fn default_signing_workers() -> usize {
     2
 }
 
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
 #[derive(Args)]
 #[command(group(
     ArgGroup::new("limit")
@@ -649,12 +651,26 @@ where
     let output = args.output.clone();
     let rpc = args.rpc.clone();
     let mut ctx = GenerateContext::from_args(&args)?;
+    let started = Instant::now();
+
+    eprintln!(
+        "starting transaction generation: output={} count={:?} duration={:?} signing_workers={}",
+        output.as_ref().map_or_else(|| "stdout".to_string(), |path| path.display().to_string()),
+        args.count,
+        args.duration,
+        args.signing_workers,
+    );
 
     if let Some(ref rpc) = rpc {
+        let nonce_prefetch_started = Instant::now();
+        eprintln!("starting nonce prefetch");
         adapter.prefetch_nonces(&mut ctx, rpc).await?;
+        eprintln!("nonce prefetch completed: elapsed={:?}", nonce_prefetch_started.elapsed());
     }
 
-    generate_loop(&mut adapter, &mut ctx, output)
+    generate_loop(&mut adapter, &mut ctx, output)?;
+    eprintln!("transaction generation completed: elapsed={:?}", started.elapsed());
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -692,10 +708,13 @@ async fn fetch_protocol_nonces_with_state(
     let provider =
         alloy_provider::ProviderBuilder::<_, _, alloy_provider::network::Ethereum>::new()
             .connect_http(rpc_url.parse().wrap_err("invalid RPC URL")?);
+    let state = if pending { "pending" } else { "latest" };
 
     for (pool_name, addresses) in accounts.all_addresses() {
         let total = addresses.len();
-        eprintln!("fetching nonces for {} ({} accounts)...", pool_name, total);
+        let started = Instant::now();
+        let mut last_progress = started;
+        eprintln!("fetching {state} nonces for {pool_name} ({total} accounts)...");
         for (idx, address) in addresses.iter().enumerate() {
             let request = Provider::get_transaction_count(&provider, *address);
             let request = if pending { request.pending() } else { request.latest() };
@@ -708,8 +727,20 @@ async fn fetch_protocol_nonces_with_state(
 
             let scheduling_key = address.0 .0;
             nonces.reset(scheduling_key, nonce);
+
+            if last_progress.elapsed() >= PROGRESS_LOG_INTERVAL {
+                eprintln!(
+                    "nonce prefetch progress: pool={pool_name} completed={} total={total} state={state} elapsed={:?}",
+                    idx + 1,
+                    started.elapsed(),
+                );
+                last_progress = Instant::now();
+            }
         }
-        eprintln!("fetched nonces for {} ({} accounts)", pool_name, total);
+        eprintln!(
+            "fetched {state} nonces for {pool_name} ({total} accounts): elapsed={:?}",
+            started.elapsed(),
+        );
     }
 
     Ok(())
@@ -878,11 +909,28 @@ where
         return Ok(bindings);
     };
 
+    let started = Instant::now();
+    let mut last_progress = started;
+    let total_steps = setup.steps.len();
+    eprintln!("starting setup generation: steps={total_steps}");
     let setup_key = compute_setup_key();
-    for step in &setup.steps {
+    for (idx, step) in setup.steps.iter().enumerate() {
         emit_setup_step(adapter, step, &mut bindings, setup_key, ctx, writer)
             .wrap_err_with(|| format!("failed to emit setup step '{}'", step.id))?;
+
+        if last_progress.elapsed() >= PROGRESS_LOG_INTERVAL {
+            eprintln!(
+                "setup generation progress: completed_steps={} total_steps={total_steps} elapsed={:?}",
+                idx + 1,
+                started.elapsed(),
+            );
+            last_progress = Instant::now();
+        }
     }
+    eprintln!(
+        "setup generation completed: steps={total_steps} elapsed={:?}",
+        started.elapsed(),
+    );
 
     Ok(bindings)
 }
@@ -1261,6 +1309,13 @@ where
     let mut written = 0u64;
     let mut sequence_instances = 0u64;
     let start = Instant::now();
+    let mut last_progress = start;
+
+    eprintln!(
+        "starting workload generation: count={:?} duration={:?} signing_workers={signing_workers}",
+        limit.count,
+        limit.duration,
+    );
 
     while limit.count.is_none_or(|count| written < count) {
         if limit.duration.is_some_and(|duration| start.elapsed() > duration) {
@@ -1335,10 +1390,23 @@ where
                 }
             }
         }
+
+        if last_progress.elapsed() >= PROGRESS_LOG_INTERVAL {
+            eprintln!(
+                "workload generation progress: prepared={written} signing_in_flight={} elapsed={:?}",
+                signing_pool.in_flight,
+                start.elapsed(),
+            );
+            last_progress = Instant::now();
+        }
     }
 
     signing_pool.finish(writer)?;
     writer.flush()?;
+    eprintln!(
+        "workload generation completed: prepared={written} elapsed={:?}",
+        start.elapsed(),
+    );
     Ok(written)
 }
 
