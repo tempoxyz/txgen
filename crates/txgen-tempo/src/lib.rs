@@ -750,6 +750,7 @@ fn sign_keychain_request(
         phase,
         id: Some(name),
         raw,
+        sender: Some(user_address),
         submission_keys: vec![SchedulingKey::from(key)],
         inclusion_keys,
     })
@@ -1184,13 +1185,14 @@ input: "0x"
         .unwrap();
 
         let tx_req = adapter.build_request(workload, &mut ctx).unwrap();
-        assert_eq!(
-            tx_req.request.key_id,
-            Some(derive_mnemonic_signer(TEST_MNEMONIC, 101).unwrap().address())
-        );
+        let user_address = accounts.get_by_index("users", 1).unwrap().address();
+        let access_key_address = derive_mnemonic_signer(TEST_MNEMONIC, 101).unwrap().address();
+        assert_eq!(tx_req.request.key_id, Some(access_key_address));
 
         let generated = sign_tempo_request(tx_req, &ctx, "keychain");
         assert_eq!(generated.raw[0], TEMPO_TX_TYPE_ID);
+        assert_eq!(generated.sender, Some(user_address));
+        assert_ne!(generated.sender, Some(access_key_address));
         assert_keychain_signature(&generated.raw);
     }
 
@@ -1232,24 +1234,22 @@ input: "0x"
         .unwrap();
 
         let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
+        let user_address = accounts.get_by_index("users", 0).unwrap().address();
+        let access_key_address = derive_mnemonic_signer(TEST_MNEMONIC, 200).unwrap().address();
         let signed_authorization = tx_req
             .request
             .key_authorization
             .as_ref()
             .expect("inline auth should attach a signed key_authorization");
-        assert_eq!(
-            signed_authorization.recover_signer().unwrap(),
-            accounts.get_by_index("users", 0).unwrap().address()
-        );
+        assert_eq!(signed_authorization.recover_signer().unwrap(), user_address);
         assert_eq!(signed_authorization.limits.as_ref().unwrap().len(), 1);
         assert!(signed_authorization.witness().is_some());
-        assert_eq!(
-            tx_req.request.key_id,
-            Some(derive_mnemonic_signer(TEST_MNEMONIC, 200).unwrap().address())
-        );
+        assert_eq!(tx_req.request.key_id, Some(access_key_address));
 
         let generated = sign_tempo_request(tx_req, &ctx, "inline_key_authorization");
         assert_eq!(generated.raw[0], TEMPO_TX_TYPE_ID);
+        assert_eq!(generated.sender, Some(user_address));
+        assert_ne!(generated.sender, Some(access_key_address));
         assert_keychain_signature(&generated.raw);
     }
 
@@ -1446,6 +1446,26 @@ input: "0x"
             first.fee_payer_signature, second.fee_payer_signature,
             "fee-payer signature must reflect the per-tx expiring uniqueness bump"
         );
+    }
+
+    #[test]
+    fn test_sponsored_transaction_uses_transaction_sender_metadata() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let transaction_sender = accounts.get_by_index("users", 0).unwrap().address();
+        let sponsor = accounts.get_by_index("users", 1).unwrap().address();
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let tx_req =
+            TempoAdapter::new().build_request(sponsored_expiring_template(), &mut ctx).unwrap();
+        let generated = sign_tempo_request(tx_req, &ctx, "sponsored");
+
+        assert_eq!(generated.sender, Some(transaction_sender));
+        assert_ne!(generated.sender, Some(sponsor));
     }
 
     #[test]
