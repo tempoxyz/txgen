@@ -1,5 +1,5 @@
 use super::schema::StepProvenance;
-use bench_core::{compute_latency_stats, ReceiptMetricGroup};
+use bench_core::{compute_latency_stats, ReceiptGasRecord, ReceiptMetricGroup};
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
@@ -27,6 +27,9 @@ pub struct ScenarioReport {
     /// Receipt-derived gas metrics grouped by chain, workload input, and scenario step.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub receipt_metrics: Vec<ReceiptMetricGroup>,
+    /// Per-transaction receipt gas records retained for detail reporters.
+    #[serde(skip)]
+    pub receipt_records: Vec<ReceiptGasRecord>,
     pub failures: Vec<FailureReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sampled_instances: Vec<InstanceLifecycle>,
@@ -316,6 +319,7 @@ impl ScenarioReport {
         maximum_in_flight: usize,
         step_definitions: &[(String, String, String, Option<StepProvenance>)],
         receipt_metrics: Vec<ReceiptMetricGroup>,
+        receipt_records: Vec<ReceiptGasRecord>,
         accumulator: ScenarioAccumulator,
     ) -> Self {
         let ScenarioAccumulator {
@@ -381,6 +385,7 @@ impl ScenarioReport {
             steps,
             total_scenario_latency: total_scenario_latency.distribution(),
             receipt_metrics,
+            receipt_records,
             failures,
             sampled_instances,
         }
@@ -515,6 +520,7 @@ mod tests {
             2,
             &[("send".into(), "primary".into(), "submit".into(), None)],
             receipt_metrics.into_metrics(),
+            Vec::new(),
             accumulator,
         );
         assert_eq!(report.completed, 1);
@@ -529,6 +535,7 @@ mod tests {
 
         let serialized = serde_json::to_value(&report).unwrap();
         assert_eq!(serialized["run_id"], report.run_id.to_string());
+        assert!(serialized.get("receipt_records").is_none());
         assert_eq!(serialized["steps"][0]["chain"], "primary");
         assert_eq!(serialized["receipt_metrics"][0]["labels"]["step"], "send");
         assert_eq!(serialized["receipt_metrics"][0]["fee_paid"]["p99"], 42_000.0);
@@ -626,6 +633,7 @@ scenario:
                 ("second.cursor".into(), "primary".into(), "checkpoint".into(), Some(provenance)),
             ],
             Vec::new(),
+            Vec::new(),
             accumulator,
         );
 
@@ -699,6 +707,7 @@ scenario:
                 "submit".into(),
                 Some(provenance),
             )],
+            Vec::new(),
             Vec::new(),
             accumulator,
         );

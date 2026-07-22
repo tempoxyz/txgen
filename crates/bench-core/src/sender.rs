@@ -1429,13 +1429,16 @@ mod tests {
         sender.flush().await.unwrap();
         drop(sender);
 
-        let groups = collector.finish().await;
+        let collection = collector.finish().await;
+        let groups = &collection.metrics;
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].labels["input"], "transfer");
         assert_eq!(groups[0].gas_used.count, 1);
         assert_eq!(groups[0].gas_used.min, Some(21_000.0));
         assert_eq!(groups[0].effective_gas_price.min, Some(2.0));
         assert_eq!(groups[0].fee_paid.min, Some(42_000.0));
+        assert_eq!(collection.records.len(), 1);
+        assert_eq!(collection.records[0].tx_hash, tx_hash);
         assert!(asserter.read_q().is_empty());
     }
 

@@ -13,6 +13,7 @@ pub mod clock;
 pub mod metrics;
 pub mod prometheus;
 pub mod prometheus_reporter;
+pub mod receipt_clickhouse;
 pub mod receipt_metrics;
 pub mod reporter;
 pub mod reth_api;
@@ -34,9 +35,14 @@ pub use prometheus_reporter::{
     PrometheusConfig, PrometheusForwarder, PrometheusForwarderHandle, PrometheusForwarderSummary,
     PrometheusReporter,
 };
+pub use receipt_clickhouse::{
+    insert_receipt_gas_records, insert_receipt_gas_records_with_default_batch_size,
+    DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE,
+};
 pub use receipt_metrics::{
-    ReceiptCollector, ReceiptCollectorHandle, ReceiptGasSample, ReceiptMetricDistribution,
-    ReceiptMetricGroup, ReceiptMetricLabels, ReceiptMetrics, ReceiptMetricsAccumulator,
+    ReceiptCollection, ReceiptCollector, ReceiptCollectorHandle, ReceiptGasRecord,
+    ReceiptGasSample, ReceiptMetricDistribution, ReceiptMetricGroup, ReceiptMetricLabels,
+    ReceiptMetrics, ReceiptMetricsAccumulator,
 };
 pub use reporter::{
     parse_reporters, ClickHouseConfig, ClickHouseReporter, ConsoleReporter, FinalReport,
