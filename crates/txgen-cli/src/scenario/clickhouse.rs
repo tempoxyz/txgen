@@ -1,5 +1,7 @@
 use super::ScenarioReport;
-use bench_core::ClickHouseClient;
+use bench_core::{
+    insert_receipt_gas_records, ClickHouseClient, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE,
+};
 use eyre::{bail, Result, WrapErr};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -62,6 +64,13 @@ impl ScenarioClickHouseReporter {
         self.client
             .insert_rows_synchronous("txgen_scenario_steps", &rows.steps)
             .wrap_err("failed to insert scenario step rows before publication")?;
+        insert_receipt_gas_records(
+            &self.client,
+            report.run_id,
+            &report.receipt_records,
+            DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE,
+        )
+        .wrap_err("failed to insert receipt gas rows before publication")?;
         self.client
             .insert_rows_synchronous("txgen_scenario_runs", &[rows.scenario])
             .wrap_err("failed to insert scenario aggregate row before publication")?;
@@ -325,6 +334,7 @@ mod tests {
                 p99_ms: 70.0,
             },
             receipt_metrics: Vec::new(),
+            receipt_records: Vec::new(),
             failures: Vec::new(),
             sampled_instances: Vec::new(),
         }

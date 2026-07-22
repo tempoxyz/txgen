@@ -1,7 +1,8 @@
 //! Receipt-based transaction gas metric collection and aggregation.
 
 use crate::sender::RpcSubmitter;
-use alloy_primitives::{Address, TxHash, U256};
+use alloy_network::primitives::ReceiptResponse;
+use alloy_primitives::{Address, TxHash, B256, U256};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -18,6 +19,39 @@ const RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Stable labels used to group receipt metrics by workload or scenario input.
 pub type ReceiptMetricLabels = BTreeMap<String, String>;
+
+/// Granular gas data retained for one confirmed transaction receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptGasRecord {
+    /// Hash of the confirmed transaction.
+    pub tx_hash: TxHash,
+    /// Transaction sender, when supplied.
+    pub sender: Option<Address>,
+    /// Workload or scenario labels supplied when the transaction was accepted.
+    pub labels: ReceiptMetricLabels,
+    /// Scenario instance that submitted the transaction, when applicable.
+    pub scenario_instance: Option<u64>,
+    /// Whether the outer transaction completed successfully.
+    pub success: bool,
+    /// Block number containing the transaction, when supplied by the receipt.
+    pub block_number: Option<u64>,
+    /// Block hash containing the transaction, when supplied by the receipt.
+    pub block_hash: Option<B256>,
+    /// Gas consumed by the outer transaction.
+    pub gas_used: U256,
+    /// Effective gas price, when the receipt supplied a fee field.
+    pub effective_gas_price: Option<U256>,
+}
+
+impl ReceiptGasRecord {
+    /// Calculate the transaction fee when an effective gas price is available.
+    ///
+    /// Valid Ethereum receipt field widths fit exactly in a `U256`. An
+    /// out-of-range RPC response is omitted instead of wrapping the fee.
+    pub fn fee_paid(&self) -> Option<U256> {
+        self.effective_gas_price.and_then(|price| self.gas_used.checked_mul(price))
+    }
+}
 
 /// Gas fields retained from a confirmed transaction receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +126,32 @@ pub struct ReceiptMetricGroup {
 /// Deterministically ordered receipt gas metric groups.
 pub type ReceiptMetrics = Vec<ReceiptMetricGroup>;
 
+/// Aggregated gas metrics and their underlying confirmed receipt records.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReceiptCollection {
+    /// Gas distributions grouped by workload or scenario labels.
+    pub metrics: ReceiptMetrics,
+    /// One granular record for every collected confirmed transaction receipt.
+    pub records: Vec<ReceiptGasRecord>,
+}
+
+impl ReceiptCollection {
+    fn from_records(records: Vec<ReceiptGasRecord>) -> Self {
+        let mut accumulator = ReceiptMetricsAccumulator::default();
+        for record in &records {
+            accumulator.record(
+                record.labels.clone(),
+                ReceiptGasSample {
+                    gas_used: record.gas_used,
+                    effective_gas_price: record.effective_gas_price,
+                },
+            );
+        }
+
+        Self { metrics: accumulator.into_metrics(), records }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ReceiptMetricSamples {
     gas_used: Vec<U256>,
@@ -141,7 +201,14 @@ struct ReceiptRequest {
     sender: Option<Address>,
     tx_hash: TxHash,
     labels: ReceiptMetricLabels,
+    scenario_instance: Option<u64>,
     tracked_at: tokio::time::Instant,
+}
+
+impl ReceiptRequest {
+    fn dedup_key(&self) -> (TxHash, ReceiptMetricLabels, Option<u64>) {
+        (self.tx_hash, self.labels.clone(), self.scenario_instance)
+    }
 }
 
 /// Cloneable handle used by submission paths to register accepted transactions.
@@ -159,6 +226,27 @@ impl ReceiptCollectorHandle {
             sender,
             tx_hash,
             labels,
+            scenario_instance: None,
+            tracked_at: tokio::time::Instant::now(),
+        });
+    }
+
+    /// Register an accepted scenario transaction for receipt collection.
+    ///
+    /// The instance is retained on the granular record and participates in
+    /// deduplication, but does not alter aggregate metric labels.
+    pub fn track_for_instance(
+        &self,
+        sender: Option<Address>,
+        tx_hash: TxHash,
+        labels: ReceiptMetricLabels,
+        scenario_instance: u64,
+    ) {
+        let _ = self.requests.send(ReceiptRequest {
+            sender,
+            tx_hash,
+            labels,
+            scenario_instance: Some(scenario_instance),
             tracked_at: tokio::time::Instant::now(),
         });
     }
@@ -168,7 +256,7 @@ impl ReceiptCollectorHandle {
 pub struct ReceiptCollector {
     handle: ReceiptCollectorHandle,
     finish: Option<oneshot::Sender<()>>,
-    task: JoinHandle<ReceiptMetrics>,
+    task: JoinHandle<ReceiptCollection>,
 }
 
 impl ReceiptCollector {
@@ -188,7 +276,7 @@ impl ReceiptCollector {
     }
 
     /// Stop accepting transactions, drain queued receipt polling, and aggregate results.
-    pub async fn finish(mut self) -> ReceiptMetrics {
+    pub async fn finish(mut self) -> ReceiptCollection {
         if let Some(finish) = self.finish.take() {
             let _ = finish.send(());
         }
@@ -198,7 +286,7 @@ impl ReceiptCollector {
             Ok(metrics) => metrics,
             Err(error) => {
                 tracing::warn!(%error, "receipt collector task failed");
-                Vec::new()
+                ReceiptCollection::default()
             }
         }
     }
@@ -209,8 +297,8 @@ async fn run_collector(
     mut finish: oneshot::Receiver<()>,
     submitter: RpcSubmitter,
     workers: usize,
-) -> ReceiptMetrics {
-    let mut accumulator = ReceiptMetricsAccumulator::default();
+) -> ReceiptCollection {
+    let mut records = Vec::new();
     let mut tasks = JoinSet::new();
     let mut seen = BTreeSet::new();
     let semaphore = Arc::new(Semaphore::new(workers));
@@ -227,12 +315,12 @@ async fn run_collector(
                 finishing = true;
             }
             result = tasks.join_next(), if !tasks.is_empty() => {
-                record_task_result(&mut accumulator, result);
+                record_task_result(&mut records, result);
             }
             request = receiver.recv(), if !finishing || !receiver.is_empty() => {
                 match request {
                     Some(request) => {
-                        if !seen.insert((request.tx_hash, request.labels.clone())) {
+                        if !seen.insert(request.dedup_key()) {
                             continue;
                         }
                         let submitter = submitter.clone();
@@ -247,15 +335,15 @@ async fn run_collector(
         }
     }
 
-    accumulator.into_metrics()
+    ReceiptCollection::from_records(records)
 }
 
 fn record_task_result(
-    accumulator: &mut ReceiptMetricsAccumulator,
-    result: Option<Result<Option<(ReceiptMetricLabels, ReceiptGasSample)>, tokio::task::JoinError>>,
+    records: &mut Vec<ReceiptGasRecord>,
+    result: Option<Result<Option<ReceiptGasRecord>, tokio::task::JoinError>>,
 ) {
     match result {
-        Some(Ok(Some((labels, sample)))) => accumulator.record(labels, sample),
+        Some(Ok(Some(record))) => records.push(record),
         Some(Ok(None)) | None => {}
         Some(Err(error)) => tracing::warn!(%error, "receipt polling task failed"),
     }
@@ -265,7 +353,7 @@ async fn collect_receipt(
     submitter: RpcSubmitter,
     request: ReceiptRequest,
     semaphore: Arc<Semaphore>,
-) -> Option<(ReceiptMetricLabels, ReceiptGasSample)> {
+) -> Option<ReceiptGasRecord> {
     let deadline = request.tracked_at + RECEIPT_TIMEOUT;
 
     loop {
@@ -285,13 +373,17 @@ async fn collect_receipt(
         drop(permit);
         match response {
             Ok(Ok(Some(receipt))) => {
-                return Some((
-                    request.labels,
-                    ReceiptGasSample {
-                        gas_used: receipt.gas_used,
-                        effective_gas_price: receipt.effective_gas_price,
-                    },
-                ));
+                return Some(ReceiptGasRecord {
+                    tx_hash: request.tx_hash,
+                    sender: request.sender,
+                    labels: request.labels,
+                    scenario_instance: request.scenario_instance,
+                    success: receipt.receipt.status(),
+                    block_number: receipt.receipt.block_number(),
+                    block_hash: receipt.receipt.block_hash(),
+                    gas_used: receipt.gas_used,
+                    effective_gas_price: receipt.effective_gas_price,
+                });
             }
             Ok(Ok(None)) => {}
             Ok(Err(error)) => {
@@ -328,6 +420,66 @@ mod tests {
 
     fn labels(input: &str) -> ReceiptMetricLabels {
         BTreeMap::from([("input".to_string(), input.to_string())])
+    }
+
+    fn granular_record(
+        input: &str,
+        scenario_instance: Option<u64>,
+        effective_gas_price: Option<U256>,
+    ) -> ReceiptGasRecord {
+        ReceiptGasRecord {
+            tx_hash: TxHash::repeat_byte(0x11),
+            sender: Some(Address::repeat_byte(0x22)),
+            labels: labels(input),
+            scenario_instance,
+            success: true,
+            block_number: Some(42),
+            block_hash: Some(B256::repeat_byte(0x33)),
+            gas_used: U256::from(21_000),
+            effective_gas_price,
+        }
+    }
+
+    #[test]
+    fn retains_granular_confirmed_receipt_fields() {
+        let record = granular_record("transfer", Some(7), Some(U256::from(2)));
+        let collection = ReceiptCollection::from_records(vec![record.clone()]);
+
+        assert_eq!(collection.records, vec![record.clone()]);
+        assert_eq!(record.fee_paid(), Some(U256::from(42_000)));
+        assert_eq!(collection.metrics.len(), 1);
+        assert_eq!(collection.metrics[0].labels, labels("transfer"));
+        assert_eq!(collection.metrics[0].gas_used.count, 1);
+        assert_eq!(collection.metrics[0].fee_paid.mean, Some(42_000.0));
+    }
+
+    #[test]
+    fn instance_is_retained_without_changing_aggregate_labels() {
+        let first = granular_record("transfer", Some(1), Some(U256::from(2)));
+        let mut second = granular_record("transfer", Some(2), Some(U256::from(3)));
+        second.tx_hash = TxHash::repeat_byte(0x44);
+
+        let collection = ReceiptCollection::from_records(vec![first, second]);
+
+        assert_eq!(collection.records[0].scenario_instance, Some(1));
+        assert_eq!(collection.records[1].scenario_instance, Some(2));
+        assert_eq!(collection.metrics.len(), 1);
+        assert_eq!(collection.metrics[0].labels, labels("transfer"));
+        assert_eq!(collection.metrics[0].gas_used.count, 2);
+    }
+
+    #[test]
+    fn deduplication_distinguishes_scenario_instances() {
+        let request = |scenario_instance| ReceiptRequest {
+            sender: Some(Address::repeat_byte(0x22)),
+            tx_hash: TxHash::repeat_byte(0x11),
+            labels: labels("transfer"),
+            scenario_instance,
+            tracked_at: tokio::time::Instant::now(),
+        };
+
+        assert_ne!(request(Some(1)).dedup_key(), request(Some(2)).dedup_key());
+        assert_eq!(request(Some(1)).dedup_key(), request(Some(1)).dedup_key());
     }
 
     #[test]

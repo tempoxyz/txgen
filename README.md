@@ -447,7 +447,7 @@ This uses the same Prometheus remote write payload and `PROMETHEUS_*` environmen
 
 ### ClickHouse Reporting
 
-The ClickHouse reporter stores common run metadata in `txgen_runs`. Bench runs additionally use `txgen_blocks` and `txgen_metric_samples`; scenario runs use `txgen_scenario_runs` and `txgen_scenario_steps` and do not write `txgen_blocks`. Block data is factual chain data, while metrics are point-in-time scrape snapshots with no block attribution. Bench reporting requires four metadata keys:
+The ClickHouse reporter stores common run metadata in `txgen_runs`. Bench runs additionally use `txgen_blocks` and `txgen_metric_samples`; scenario runs use `txgen_scenario_runs` and `txgen_scenario_steps` and do not write `txgen_blocks`. Both `send` and scenario runs write one exact outer-transaction gas row per confirmed tracked receipt to `txgen_receipt_gas`; `send-blocks` writes none. Block data is factual chain data, while metric samples are point-in-time scrape snapshots with no block attribution. Bench reporting requires four metadata keys:
 
 ```bash
 bench send -i txs.ndjson \
@@ -486,7 +486,7 @@ txgen-tempo scenario run \
 
 The scenario name, platform, and `mode=scenario` are derived from the finalized report; those metadata keys are reserved and conflicting user values are rejected. `git-sha` and `git-ref` are required metadata for the common `txgen_runs` row. Every destination receives the same client-generated `run_id`. JSON destinations are finalized before ClickHouse publication, so an upload error is returned without deleting a report file that was already written.
 
-Deploy migrations `006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sql` before enabling the scenario ClickHouse writer, including in the Zones workflow. Scenario publication requests synchronous acknowledgement for separate HTTP inserts of step rows, the aggregate scenario row, and finally `txgen_runs`. The last insert is the visibility marker: queries for complete scenario reports must begin at `txgen_runs` and join both scenario tables by `run_id`. An interrupted publication can leave child rows without a visible common run row.
+Deploy migrations `006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sql` before enabling the scenario ClickHouse writer, and deploy `008_txgen_receipt_gas.sql` before publishing receipt gas rows. Detail rows are synchronously acknowledged before `txgen_runs` is inserted as the visibility marker. Queries for complete benchmark or scenario reports must begin at `txgen_runs` and join detail tables by `run_id`; an interrupted publication can leave child rows without a visible common run row.
 
 The bench JSON report includes:
 - `samples` — point-in-time metric snapshots (internal + node), stored as a time series
@@ -1028,6 +1028,8 @@ The scenario runner accepts repeatable report destinations. A bare `--report rep
 The report includes the configured scenario name and execution configuration; started, completed, failed, and timed-out instance counts; completed scenarios per second; observed maximum in-flight instances; per-step chain, success/failure counts, and latency distributions; completed-journey latency; receipt gas metrics grouped by chain, input template, and scenario step; and failures grouped by stage and sanitized error class. `--sample-instances` optionally retains a bounded number of secret-free lifecycle records and safe failure details for debugging. Counts, minima, maxima, and means are exact; percentile estimates use a deterministic reservoir capped at 65,536 observations per distribution so duration-based runs use bounded memory.
 
 Receipt metrics come only from confirmed outer-transaction receipts; txgen does not trace or split gas across internal calls. Each distribution reports `count`, `min`, `mean`, `p50`, `p95`, and `p99`. When a receipt omits both `effectiveGasPrice` and legacy `gasPrice`, its gas usage is still counted while its effective-price and fee distributions remain empty.
+
+When ClickHouse reporting is configured, txgen also writes the exact transaction hash, sender, canonical labels, optional scenario instance, receipt status and block identity, gas used, optional effective gas price, and optional fee paid for each collected receipt to `txgen_receipt_gas`. These granular rows are intentionally omitted from JSON reports, which retain the compact aggregate distributions above.
 
 Steps expanded from fragments carry an optional `provenance` object in aggregate step reports, failure records, and sampled lifecycle steps. It records `source_file`, `fragment`, `instance_alias`, `local_step_name`, and the zero-based `local_step_index`. Inline steps omit it. Consumers can group latency by fragment and local step across instances, or include the alias to compare individual fragment uses. Because `scenario render` omits this source metadata, a later run of rendered YAML reports those flattened steps as inline steps.
 

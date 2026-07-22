@@ -27,7 +27,7 @@ use alloy_network::{
 use alloy_primitives::{keccak256, Address, TxHash, B256, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use bench_core::{
-    ReceiptCollector, ReceiptCollectorHandle, ReceiptMetricGroup, ReceiptMetricLabels,
+    ReceiptCollection, ReceiptCollector, ReceiptCollectorHandle, ReceiptMetricLabels,
     RequestAuthProvider, RpcEndpoint, RpcSubmission, RpcSubmitFailureKind, RpcSubmitter,
     SenderConfig, SenderHeaderAuthProvider,
 };
@@ -433,10 +433,19 @@ where
         let finished_at = SystemTime::now();
         let elapsed = run_start.elapsed();
         let mut receipt_metrics = Vec::new();
+        let mut receipt_records = Vec::new();
         for chain in self.chains.values() {
-            receipt_metrics.extend(chain.finish_receipt_metrics().await);
+            let receipts = chain.finish_receipts().await;
+            receipt_metrics.extend(receipts.metrics);
+            receipt_records.extend(receipts.records);
         }
         receipt_metrics.sort_by(|left, right| left.labels.cmp(&right.labels));
+        receipt_records.sort_by(|left, right| {
+            left.labels
+                .cmp(&right.labels)
+                .then_with(|| left.scenario_instance.cmp(&right.scenario_instance))
+                .then_with(|| left.tx_hash.cmp(&right.tx_hash))
+        });
         let step_definitions = self
             .spec
             .scenario
@@ -497,6 +506,7 @@ where
             maximum_in_flight,
             &step_definitions,
             receipt_metrics,
+            receipt_records,
             outcomes,
         ))
     }
@@ -538,11 +548,11 @@ where
             let result = if matches!(&step.action, StepAction::Submit(_)) {
                 // Submit handles its own deadline so a timed-out RPC cannot outlive
                 // the instance and release its account lease while still running.
-                self.execute_step(step, &name, &context, &mut rng, deadline).await
+                self.execute_step(instance, step, &name, &context, &mut rng, deadline).await
             } else {
                 match tokio::time::timeout_at(
                     deadline,
-                    self.execute_step(step, &name, &context, &mut rng, deadline),
+                    self.execute_step(instance, step, &name, &context, &mut rng, deadline),
                 )
                 .await
                 {
@@ -679,6 +689,7 @@ where
 
     async fn execute_step(
         &self,
+        instance: u64,
         step: &StepDef,
         step_name: &str,
         context: &RuntimeContext,
@@ -725,6 +736,7 @@ where
                 let submit_rng = rng.clone();
                 let (value, next_rng) = chain
                     .execute_submit(
+                        instance,
                         step_name,
                         submit.clone(),
                         context.clone(),
@@ -1199,6 +1211,7 @@ where
 
     async fn execute_submit(
         &self,
+        instance: u64,
         step_name: &str,
         submit: SubmitStep,
         context: RuntimeContext,
@@ -1219,6 +1232,7 @@ where
             Err(error) => {
                 if error.kind() == RpcSubmitFailureKind::Ambiguous {
                     self.track_receipt_metrics(
+                        instance,
                         step_name,
                         &submit.template,
                         materialized.sender,
@@ -1300,6 +1314,7 @@ where
             }
         };
         self.track_receipt_metrics(
+            instance,
             step_name,
             &submit.template,
             materialized.sender,
@@ -1358,7 +1373,7 @@ where
         ))
     }
 
-    async fn finish_receipt_metrics(&self) -> Vec<ReceiptMetricGroup> {
+    async fn finish_receipts(&self) -> ReceiptCollection {
         drop(
             self.receipt_collector_handle
                 .lock()
@@ -1368,12 +1383,13 @@ where
         let collector = self.receipt_collector.lock().await.take();
         match collector {
             Some(collector) => collector.finish().await,
-            None => Vec::new(),
+            None => ReceiptCollection::default(),
         }
     }
 
     fn track_receipt_metrics(
         &self,
+        instance: u64,
         step_name: &str,
         input: &str,
         sender: Address,
@@ -1382,7 +1398,7 @@ where
         let handle =
             self.receipt_collector_handle.lock().expect("receipt collector handle mutex poisoned");
         let Some(handle) = handle.as_ref() else { return };
-        handle.track(
+        handle.track_for_instance(
             Some(sender),
             tx_hash,
             ReceiptMetricLabels::from([
@@ -1390,6 +1406,7 @@ where
                 ("input".to_string(), input.to_string()),
                 ("step".to_string(), step_name.to_string()),
             ]),
+            instance,
         );
     }
 

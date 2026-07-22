@@ -8,7 +8,8 @@
 use crate::{
     clickhouse::ClickHouseClient,
     metrics::{BenchMetrics, BlockStats, RunStats, ThroughputSample, TimeSeriesMetrics},
-    receipt_metrics::ReceiptMetricGroup,
+    receipt_clickhouse::{insert_receipt_gas_records, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE},
+    receipt_metrics::{ReceiptGasRecord, ReceiptMetricGroup},
     sample::{Sample, SampleArchive},
 };
 use eyre::{bail, Context, Result};
@@ -41,6 +42,8 @@ pub struct FinalReport {
     pub blocks: Vec<BlockStats>,
     /// Receipt-derived gas metrics grouped by workload input labels.
     pub receipt_metrics: Vec<ReceiptMetricGroup>,
+    /// Receipt-derived gas details for ClickHouse publication.
+    pub receipt_records: Vec<ReceiptGasRecord>,
 }
 
 impl FinalReport {
@@ -674,10 +677,11 @@ impl ClickHouseConfig {
 
 /// ClickHouse reporter for benchmark result storage.
 ///
-/// Inserts into three tables:
+/// Inserts into four tables:
 /// - `txgen_runs` — run metadata
 /// - `txgen_blocks` — per-block chain facts
 /// - `txgen_metric_samples` — point-in-time metric snapshots
+/// - `txgen_receipt_gas` — per-transaction receipt gas details
 pub struct ClickHouseReporter {
     config: ClickHouseConfig,
     client: ClickHouseClient,
@@ -775,7 +779,7 @@ impl ClickHouseReporter {
         }
 
         let count = sample_rows.len();
-        self.client.insert_rows("txgen_metric_samples", &sample_rows)?;
+        self.client.insert_rows_synchronous("txgen_metric_samples", &sample_rows)?;
         Ok(count)
     }
 }
@@ -788,16 +792,14 @@ impl Reporter for ClickHouseReporter {
             run_id = %self.config.run_id,
             blocks = report.blocks.len(),
             samples = report.sample_count(),
+            receipts = report.receipt_records.len(),
             "Inserting benchmark results into ClickHouse"
         );
 
-        // Insert run.
-        let run_row = self.build_run_row(finished_at);
-        self.client.insert_rows("txgen_runs", &[run_row])?;
-
-        // Insert blocks.
+        // Insert detail rows before the run marker so readers only discover
+        // runs after all associated benchmark data is available.
         let block_rows = self.build_block_rows(report);
-        self.client.insert_rows("txgen_blocks", &block_rows)?;
+        self.client.insert_rows_synchronous("txgen_blocks", &block_rows)?;
 
         // Insert metric samples in bounded chunks. The report is backed by a
         // disk archive, so do not collect all rows at once.
@@ -806,12 +808,24 @@ impl Reporter for ClickHouseReporter {
             inserted_samples += self.insert_sample_batch(&chunk?)?;
         }
 
+        insert_receipt_gas_records(
+            &self.client,
+            self.config.run_id,
+            &report.receipt_records,
+            DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE,
+        )?;
+
+        // Insert the run synchronously and last as the visibility marker.
+        let run_row = self.build_run_row(finished_at);
+        self.client.insert_rows_synchronous("txgen_runs", &[run_row])?;
+
         tracing::info!(
             run_id = %self.config.run_id,
             scenario = %self.config.scenario_name,
             platform = %self.config.platform,
             blocks = block_rows.len(),
             samples = inserted_samples,
+            receipts = report.receipt_records.len(),
             "ClickHouse insert complete"
         );
 
@@ -935,7 +949,7 @@ mod tests {
     use crate::{
         metrics::LatencyStats, sample::SampleStore, ReceiptGasSample, ReceiptMetricsAccumulator,
     };
-    use alloy_primitives::U256;
+    use alloy_primitives::{Address, TxHash, B256, U256};
     use std::{collections::BTreeMap, time::Duration};
 
     fn sample_metrics() -> BenchMetrics {
@@ -1035,6 +1049,27 @@ mod tests {
         assert_eq!(parsed["receipt_metrics"][0]["labels"]["input"], "transfer");
         assert_eq!(parsed["receipt_metrics"][0]["gas_used"]["p95"], 21_000.0);
         assert_eq!(parsed["receipt_metrics"][0]["fee_paid"]["mean"], 42_000.0);
+    }
+
+    #[test]
+    fn test_json_reporter_omits_granular_receipt_records() {
+        let mut report = sample_report();
+        report.receipt_records = vec![ReceiptGasRecord {
+            tx_hash: TxHash::repeat_byte(0x11),
+            sender: Some(Address::repeat_byte(0x22)),
+            labels: BTreeMap::from([("input".to_string(), "transfer".to_string())]),
+            scenario_instance: None,
+            success: true,
+            block_number: Some(42),
+            block_hash: Some(B256::repeat_byte(0x33)),
+            gas_used: U256::from(21_000),
+            effective_gas_price: Some(U256::from(2)),
+        }];
+        let mut output = Vec::new();
+        JsonReporter::new(&mut output).finalize(&report).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert!(parsed.get("receipt_records").is_none());
     }
 
     #[test]

@@ -195,8 +195,14 @@ async fn execute_source<S: TxSource>(
         tracing::info!(reason = "--drain-timeout=0", "Skipped txpool drain");
     }
 
-    let receipt_metrics = receipt_collector.finish().await;
-    tracing::info!(groups = receipt_metrics.len(), "Receipt gas metrics finalized");
+    let receipt_collection = receipt_collector.finish().await;
+    tracing::info!(
+        groups = receipt_collection.metrics.len(),
+        records = receipt_collection.records.len(),
+        "Receipt gas metrics finalized"
+    );
+    let receipt_metrics = receipt_collection.metrics;
+    let receipt_records = receipt_collection.records;
 
     // Stop the scraper before finalizing.
     if !scraper_handles.is_empty() {
@@ -235,6 +241,7 @@ async fn execute_source<S: TxSource>(
         time_series: Some(time_series),
         sample_archive: Some(sample_archive),
         receipt_metrics,
+        receipt_records,
         ..Default::default()
     };
 

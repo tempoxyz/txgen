@@ -106,9 +106,27 @@ One aggregate row per expanded scenario step and run. A step that was never reac
 | `latency_p99_ms` | Float64 | P99 step latency |
 | `latency_max_ms` | Float64 | Maximum step latency |
 
+### `txgen_receipt_gas`
+
+One row per confirmed transaction. The row retains receipt-level gas values exactly; it does not attribute gas to internal calls.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `run_id` | UUID | Parent row in `txgen_runs` |
+| `tx_hash` | String | Confirmed transaction hash |
+| `sender` | String? | Sender address when known |
+| `labels_json` | String | Canonical JSON of workload or scenario labels |
+| `scenario_instance` | UInt64? | Scenario instance index when applicable |
+| `success` | Bool | Receipt execution status |
+| `block_number` | UInt64? | Inclusion block number when supplied by the receipt |
+| `block_hash` | String? | Inclusion block hash when supplied by the receipt |
+| `gas_used` | UInt256 | Outer transaction gas consumed |
+| `effective_gas_price` | UInt256? | Effective gas price when supplied by the receipt |
+| `fee_paid` | UInt256? | Exact `gas_used * effective_gas_price` when the fee field is present |
+
 ## Setup
 
-The seven numbered migrations are applied in filename order. For a new database, apply the complete set:
+The eight numbered migrations are applied in filename order. For a new database, apply the complete set:
 
 ```bash
 # Local (no auth)
@@ -126,7 +144,7 @@ Migration `005_rename_chain_timestamp.sql` is a one-way data conversion and must
 
 `apply.sh` sends migrations to the authenticated user's default database. It does not read `CLICKHOUSE_DATABASE`; when the runtime writer uses a non-default database, configure the migration user with the same default database or apply the numbered SQL files to that database through your normal deployment tooling.
 
-Migrations `006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sql` must be deployed before any scenario uses `--report clickhouse:<url>`. In particular, deploy both migrations before enabling the writer in Zones.
+Migrations `006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sql` must be deployed before any scenario uses `--report clickhouse:<url>`. Migration `008_txgen_receipt_gas.sql` must be deployed before enabling granular receipt publication. In particular, deploy all three migrations before enabling that writer in Zones.
 
 ## Usage
 
@@ -157,7 +175,7 @@ txgen-tempo scenario run \
 
 The scenario runner derives `scenario`, `platform`, and `mode=scenario`; those metadata keys are reserved and conflicting user values are rejected. `git-sha` and `git-ref` remain required, and other `-m key=value` pairs are stored in `txgen_runs.metadata`. Every destination receives the same client-generated `run_id`, which is also present in the JSON report.
 
-JSON files are finalized before ClickHouse publication. A ClickHouse failure is returned to the caller but does not remove JSON that has already been written. The writer requests synchronous acknowledgement for separate HTTP inserts of `txgen_scenario_steps`, then `txgen_scenario_runs`, and finally `txgen_runs`; scenario runs never require or insert `txgen_blocks`. The final `txgen_runs` insert is the visibility marker, so complete-run queries must begin with `txgen_runs` and inner-join the scenario tables by `run_id`. This hides child rows left by an interrupted publication.
+JSON files are finalized before ClickHouse publication. A ClickHouse failure is returned to the caller but does not remove JSON that has already been written. The writer requests synchronous acknowledgement for separate HTTP inserts of `txgen_scenario_steps`, `txgen_receipt_gas`, `txgen_scenario_runs`, and finally `txgen_runs`; scenario runs never require or insert `txgen_blocks`. The final `txgen_runs` insert is the visibility marker, so complete-run queries must begin with `txgen_runs` and inner-join the detail tables by `run_id`. This hides child rows left by an interrupted publication.
 
 ### Authentication
 
@@ -189,6 +207,24 @@ Additional metadata is stored in the `metadata` map column:
 Config-like keys (`tps`, `max_concurrent`, `chain_id`, `scrape_interval_ms`) are stored in the `config` map column.
 
 ## Example Queries
+
+### Granular receipt gas
+
+```sql
+SELECT
+    tx_hash,
+    sender,
+    labels_json,
+    scenario_instance,
+    success,
+    block_number,
+    gas_used,
+    effective_gas_price,
+    fee_paid
+FROM txgen_receipt_gas
+WHERE run_id = '{run_id}'
+ORDER BY labels_json, scenario_instance, tx_hash;
+```
 
 ### Per-block stats
 
