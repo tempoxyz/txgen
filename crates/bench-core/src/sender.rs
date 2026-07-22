@@ -1063,6 +1063,7 @@ fn normalize_key_sets(
     Ok((submission_keys, inclusion_keys))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn submit_tx(
     pending: PendingTx,
     endpoint: RpcEndpoint,
