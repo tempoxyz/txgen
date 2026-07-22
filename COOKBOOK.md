@@ -340,6 +340,26 @@ txgen-tempo scenario run \
 
 `--starts-per-second 10` means ten new end-to-end journeys per second; it does not mean ten transactions per second. `--tx-rate` is the separate per-chain transaction-submission limit. The leased `caller` account remains exclusive to one active journey and is returned even when that journey fails or times out.
 
+The bare report path above remains the shorthand for a JSON file. Report destinations are repeatable, so the same finalized run can be retained locally and published to ClickHouse:
+
+```bash
+CLICKHOUSE_USER=default \
+CLICKHOUSE_PASSWORD=secret \
+CLICKHOUSE_DATABASE=benchmarks \
+txgen-tempo scenario run \
+  --scenario ./generic-roundtrip.yaml \
+  --count 500 \
+  --starts-per-second 10 \
+  --max-in-flight 40 \
+  --report json:generic-roundtrip-report.json \
+  --report clickhouse:https://host:8443 \
+  -m git-sha=abc123 \
+  -m git-ref=main \
+  -m github-run-url=https://github.com/example/actions/runs/123
+```
+
+Both destinations use the `run_id` recorded in the JSON report. JSON destinations are written first; if ClickHouse publication fails, the command reports the error but leaves the JSON file in place. The scenario and platform fields are derived from the run, while additional `-m key=value` pairs are stored in `txgen_runs.metadata`.
+
 Use `--duration 10m` instead of, or together with, `--count`. When both are set, new starts stop at the first limit and active instances finish. `--failure-policy fail-fast` stops new starts after the first failed instance while allowing already-started instances to finish. See [Scenario Specification](README.md#scenario-specification) for every step, saved field, expression, timeout rule, and report field.
 
 ## Compose and validate reusable scenario fragments
@@ -493,7 +513,7 @@ txgen-tempo scenario run \
   --scenario ./scenario.yaml \
   --count 100 \
   --max-in-flight 10 \
-  --report composed-report.json
+  --report json:composed-report.json
 ```
 
 ## Replay historical blocks through Engine API
@@ -768,6 +788,22 @@ bench send --input txs.ndjson \
   -m git-sha=abc123 \
   -m git-ref=main
 ```
+
+Publish a scenario report to JSON and ClickHouse with one shared `run_id`:
+
+```bash
+CLICKHOUSE_USER=default CLICKHOUSE_PASSWORD=secret CLICKHOUSE_DATABASE=benchmarks \
+txgen-tempo scenario run \
+  --scenario scenario.yaml \
+  --count 100 \
+  --report json:scenario-report.json \
+  --report clickhouse:https://host:8443 \
+  -m git-sha=abc123 \
+  -m git-ref=main \
+  -m phase=nightly
+```
+
+Apply `scripts/clickhouse/006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sql` before enabling this writer, including before enabling it in Zones. The writer never inserts scenario data into `txgen_blocks`. It inserts the per-step rows and aggregate scenario row first, then inserts `txgen_runs` as the visibility marker. Dashboard queries should start from `txgen_runs` and inner-join the two scenario tables on `run_id`; child rows from an interrupted publication are then excluded. JSON is finalized before the ClickHouse requests, so a publication error does not discard the local report.
 
 Push samples via Prometheus remote write:
 
