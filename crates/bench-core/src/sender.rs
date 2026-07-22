@@ -1063,6 +1063,7 @@ fn normalize_key_sets(
     Ok((submission_keys, inclusion_keys))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn submit_tx(
     pending: PendingTx,
     endpoint: RpcEndpoint,
@@ -1204,25 +1205,6 @@ fn rpc_request_error(
         eyre::eyre!("authenticated RPC {operation} failed")
     } else {
         error.into()
-    }
-}
-
-async fn wait_for_provider_receipt(
-    provider: &DynProvider<AnyNetwork>,
-    tx_hash: TxHash,
-) -> Result<bool> {
-    let deadline = tokio::time::Instant::now() + RECEIPT_TIMEOUT;
-
-    loop {
-        if let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? {
-            return Ok(receipt.status());
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            eyre::bail!("timed out waiting for transaction receipt");
-        }
-
-        tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
     }
 }
 
