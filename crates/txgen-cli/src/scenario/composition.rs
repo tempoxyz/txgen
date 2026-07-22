@@ -656,8 +656,7 @@ fn validate_fragment_definition(
     for (output, output_kind) in &fragment.outputs {
         validate_path(output, "fragment output")
             .wrap_err_with(|| format!("invalid fragment '{name}' declared in '{source_file}'"))?;
-        if !matches!(output_kind.as_str(), "checkpoint" | "invoke" | "submit" | "receipt" | "log")
-        {
+        if !matches!(output_kind.as_str(), "checkpoint" | "invoke" | "submit" | "receipt" | "log") {
             bail!(
                 "fragment '{name}' in '{source_file}' output '{output}' has unknown type '{output_kind}'"
             );

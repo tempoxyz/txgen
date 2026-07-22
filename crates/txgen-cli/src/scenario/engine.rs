@@ -24,7 +24,7 @@ use alloy_network::{
     primitives::{BlockResponse, HeaderResponse},
     AnyNetwork, Network,
 };
-use alloy_primitives::{keccak256, Address, B256, TxHash, U256};
+use alloy_primitives::{keccak256, Address, TxHash, B256, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use bench_core::{RpcSubmission, RpcSubmitFailureKind, RpcSubmitter, SenderConfig};
 use eyre::{bail, Result, WrapErr};
@@ -479,7 +479,9 @@ where
     ) -> Result<(RuntimeContext, Vec<OwnedSemaphorePermit>), StepError> {
         let mut selections = Vec::with_capacity(self.bindings.len());
         for (name, binding) in &self.bindings {
-            let BindingRuntime::Account { selection, addresses, lease_pool, lease_slot, .. } = binding else {
+            let BindingRuntime::Account { selection, addresses, lease_pool, lease_slot, .. } =
+                binding
+            else {
                 continue;
             };
             let index = match selection {
