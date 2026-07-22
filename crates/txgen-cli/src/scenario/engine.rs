@@ -704,7 +704,7 @@ where
                         ScenarioActionContext {
                             chain: &chain.name,
                             chain_id: chain.chain_id,
-                            query_provider: &chain.provider,
+                            query_provider: &chain.query_provider,
                         },
                     )
                     .await

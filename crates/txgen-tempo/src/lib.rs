@@ -1,8 +1,8 @@
 pub mod auth_token_map;
 mod nonce;
 mod template;
-pub mod zone_auth;
 mod zone;
+pub mod zone_auth;
 
 pub use nonce::{prefetch_parallel_nonces, NONCE_PRECOMPILE};
 pub use txgen_cli::fetch_protocol_nonces;
