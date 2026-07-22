@@ -1,9 +1,11 @@
 use alloy_consensus::{SignableTransaction, Signed};
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_eips::eip2718::Encodable2718;
-use alloy_network::{Network, NetworkTransactionBuilder, TransactionBuilder, TxSignerSync};
+use alloy_network::{
+    AnyNetwork, Network, NetworkTransactionBuilder, TransactionBuilder, TxSignerSync,
+};
 use alloy_primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
-use alloy_provider::Provider;
+use alloy_provider::{DynProvider, Provider};
 use clap::{ArgGroup, Args};
 use eyre::{bail, Result, WrapErr};
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -527,6 +529,16 @@ where
     Ok((materialized.generated, info))
 }
 
+/// Runtime context supplied to an adapter-defined scenario action.
+pub struct ScenarioActionContext<'a> {
+    /// Scenario-local chain name.
+    pub chain: &'a str,
+    /// Effective chain ID returned by the chain RPC.
+    pub chain_id: u64,
+    /// Provider connected to the chain's configured query endpoint.
+    pub query_provider: &'a DynProvider<AnyNetwork>,
+}
+
 /// Trait for network-specific transaction generation.
 ///
 /// Each network (Ethereum, Tempo, etc.) implements this trait to map
@@ -544,6 +556,23 @@ pub trait NetworkAdapter: Send + Sync {
 
     /// Stable network name used by scenario chain definitions.
     fn network_name() -> &'static str;
+
+    /// Adapter-defined actions available to scenario `invoke` steps.
+    fn scenario_actions() -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Execute an adapter-defined scenario action without submitting a transaction.
+    fn invoke_scenario_action<'a>(
+        &'a self,
+        action: &'a str,
+        _arguments: &'a serde_yaml::Value,
+        _context: ScenarioActionContext<'a>,
+    ) -> impl std::future::Future<Output = Result<serde_yaml::Value>> + Send + 'a {
+        async move {
+            bail!("network '{}' does not support scenario action '{action}'", Self::network_name())
+        }
+    }
 
     /// Map a template to a network-specific transaction request.
     fn build_request(

@@ -124,6 +124,8 @@ pub struct ScenarioDef {
 pub enum BindingDef {
     /// Select an account and expose `<binding>.ref` and `<binding>.address`.
     Account(AccountBindingDef),
+    /// Generate a deterministic, per-instance bytes32 correlation value.
+    Bytes32(Bytes32BindingDef),
 }
 
 impl<'de> Deserialize<'de> for BindingDef {
@@ -142,7 +144,10 @@ impl<'de> Deserialize<'de> for BindingDef {
             Some("account") => {
                 serde_yaml::from_value(value).map(Self::Account).map_err(serde::de::Error::custom)
             }
-            Some(other) => Err(serde::de::Error::unknown_variant(other, &["account"])),
+            Some("bytes32") => {
+                serde_yaml::from_value(value).map(Self::Bytes32).map_err(serde::de::Error::custom)
+            }
+            Some(other) => Err(serde::de::Error::unknown_variant(other, &["account", "bytes32"])),
             None => Err(serde::de::Error::custom("scenario binding type must be a string")),
         }
     }
@@ -156,6 +161,14 @@ pub struct AccountBindingDef {
     pub pool: String,
     /// Account selection behavior.
     pub select: AccountSelection,
+}
+
+/// Configuration for a random bytes32 scenario binding.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Bytes32BindingDef {
+    /// The number of random bytes. bytes32 bindings require exactly 32.
+    pub random_bytes: u8,
 }
 
 /// Account selection behavior for a scenario binding.
@@ -226,6 +239,8 @@ pub struct StepProvenance {
 pub enum StepAction {
     /// Capture the current canonical chain cursor.
     Checkpoint(CheckpointStep),
+    /// Invoke an action supplied by the selected network adapter.
+    Invoke(InvokeStep),
     /// Materialize, sign, and submit a workload template.
     Submit(SubmitStep),
     /// Wait for a transaction receipt.
@@ -240,6 +255,19 @@ pub enum StepAction {
 pub struct CheckpointStep {
     /// Named chain to inspect.
     pub chain: String,
+}
+
+/// Invoke an action supplied by a network adapter.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvokeStep {
+    /// Named chain whose adapter executes the action.
+    pub chain: String,
+    /// Adapter-defined action name.
+    pub action: String,
+    /// Named action arguments resolved against the scenario runtime context.
+    #[serde(default, rename = "with")]
+    pub with_value: BTreeMap<String, serde_yaml::Value>,
 }
 
 /// Submit a named workload template.
@@ -345,7 +373,7 @@ impl<'de> Deserialize<'de> for StepDef {
 
         if mapping.len() != 1 {
             return Err(serde::de::Error::custom(
-                "scenario step must contain exactly one of `checkpoint`, `submit`, `wait_receipt`, or `wait_log`",
+                "scenario step must contain exactly one of `checkpoint`, `invoke`, `submit`, `wait_receipt`, or `wait_log`",
             ));
         }
 
@@ -356,6 +384,9 @@ impl<'de> Deserialize<'de> for StepDef {
         let action = match kind {
             "checkpoint" => serde_yaml::from_value(value)
                 .map(StepAction::Checkpoint)
+                .map_err(serde::de::Error::custom)?,
+            "invoke" => serde_yaml::from_value(value)
+                .map(StepAction::Invoke)
                 .map_err(serde::de::Error::custom)?,
             "submit" => serde_yaml::from_value(value)
                 .map(StepAction::Submit)
@@ -369,7 +400,7 @@ impl<'de> Deserialize<'de> for StepDef {
             other => {
                 return Err(serde::de::Error::unknown_variant(
                     other,
-                    &["checkpoint", "submit", "wait_receipt", "wait_log"],
+                    &["checkpoint", "invoke", "submit", "wait_receipt", "wait_log"],
                 ))
             }
         };
@@ -447,13 +478,26 @@ impl ScenarioSpec {
                     bail!("account binding '{name}' has an empty pool");
                 }
                 BindingDef::Account(_) => {}
+                BindingDef::Bytes32(binding) if binding.random_bytes != 32 => {
+                    bail!(
+                        "bytes32 binding '{name}' requires random_bytes: 32 (got {})",
+                        binding.random_bytes
+                    );
+                }
+                BindingDef::Bytes32(_) => {}
             }
         }
 
         let saves = self.collect_saves()?;
         let mut available = BTreeMap::new();
-        for name in self.scenario.bindings.keys() {
-            available.insert(name.clone(), AvailableRoot::AccountBinding);
+        for (name, binding) in &self.scenario.bindings {
+            available.insert(
+                name.clone(),
+                match binding {
+                    BindingDef::Account(_) => AvailableRoot::AccountBinding,
+                    BindingDef::Bytes32(_) => AvailableRoot::Bytes32Binding,
+                },
+            );
         }
 
         for (index, step) in self.scenario.steps.iter().enumerate() {
@@ -512,8 +556,16 @@ impl ScenarioSpec {
         let mut available = self
             .scenario
             .bindings
-            .keys()
-            .map(|name| (name.clone(), AvailableRoot::AccountBinding))
+            .iter()
+            .map(|(name, binding)| {
+                (
+                    name.clone(),
+                    match binding {
+                        BindingDef::Account(_) => AvailableRoot::AccountBinding,
+                        BindingDef::Bytes32(_) => AvailableRoot::Bytes32Binding,
+                    },
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         for step in self.scenario.steps.iter().take(step_index) {
             if let Some(save) = &step.save {
@@ -602,6 +654,16 @@ impl ScenarioSpec {
 
         match &step.action {
             StepAction::Checkpoint(_) => {}
+            StepAction::Invoke(invoke) => {
+                if invoke.action.trim().is_empty() {
+                    bail!("{label} has an empty action name");
+                }
+                for name in invoke.with_value.keys() {
+                    if name.trim().is_empty() {
+                        bail!("{label} contains an empty argument name");
+                    }
+                }
+            }
             StepAction::Submit(submit) => {
                 if submit.template.trim().is_empty() {
                     bail!("{label} has an empty template name");
@@ -721,6 +783,7 @@ impl StepDef {
     fn saved_kind(&self) -> SavedKind {
         match &self.action {
             StepAction::Checkpoint(_) => SavedKind::Checkpoint,
+            StepAction::Invoke(_) => SavedKind::Invoke,
             StepAction::Submit(step) => {
                 SavedKind::Submit { receipt: step.await_mode == Some(SubmitAwait::Receipt) }
             }
@@ -735,6 +798,11 @@ impl StepDef {
     ) -> Result<()> {
         match &self.action {
             StepAction::Checkpoint(_) => {}
+            StepAction::Invoke(step) => {
+                for value in step.with_value.values() {
+                    visit(value)?;
+                }
+            }
             StepAction::Submit(step) => visit(&step.with_value)?,
             StepAction::WaitReceipt(step) => {
                 visit(&step.transaction_hash)?;
@@ -769,6 +837,7 @@ impl StepAction {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Checkpoint(_) => "checkpoint",
+            Self::Invoke(_) => "invoke",
             Self::Submit(_) => "submit",
             Self::WaitReceipt(_) => "wait_receipt",
             Self::WaitLog(_) => "wait_log",
@@ -779,6 +848,7 @@ impl StepAction {
     pub fn chain(&self) -> &str {
         match self {
             Self::Checkpoint(step) => &step.chain,
+            Self::Invoke(step) => &step.chain,
             Self::Submit(step) => &step.chain,
             Self::WaitReceipt(step) => &step.chain,
             Self::WaitLog(step) => &step.chain,
@@ -789,12 +859,14 @@ impl StepAction {
 #[derive(Debug, Clone, Copy)]
 enum AvailableRoot {
     AccountBinding,
+    Bytes32Binding,
     Saved(SavedKind),
 }
 
 #[derive(Debug, Clone, Copy)]
 enum SavedKind {
     Checkpoint,
+    Invoke,
     Submit { receipt: bool },
     Receipt,
     Log,
@@ -818,6 +890,12 @@ fn validate_reference(
 
     match kind {
         AvailableRoot::AccountBinding => validate_account_path(root, tail),
+        AvailableRoot::Bytes32Binding => {
+            if tail.is_some() {
+                bail!("bytes32 binding '{root}' has no fields");
+            }
+            Ok(())
+        }
         AvailableRoot::Saved(kind) => validate_saved_path(root, *kind, tail),
     }
 }
@@ -856,6 +934,7 @@ fn validate_saved_path(root: &str, kind: SavedKind, tail: Option<&str>) -> Resul
         SavedKind::Checkpoint => {
             matches!(tail, "chain" | "block_number" | "block_hash" | "captured_at")
         }
+        SavedKind::Invoke => true,
         SavedKind::Submit { receipt } => {
             if (tail == "receipt" || tail.starts_with("receipt.")) && !receipt {
                 bail!("saved submit result '{root}' has no receipt because the step does not await one");
@@ -1078,6 +1157,7 @@ fn static_reference_type(
             "ref" => Some(StaticValueType::AccountRef),
             _ => None,
         },
+        AvailableRoot::Bytes32Binding => tail.is_empty().then_some(StaticValueType::Bytes32),
         AvailableRoot::Saved(SavedKind::Checkpoint) => match tail {
             "" => Some(StaticValueType::Object),
             "chain" => Some(StaticValueType::String),
@@ -1085,6 +1165,7 @@ fn static_reference_type(
             "block_hash" => Some(StaticValueType::Bytes32),
             _ => None,
         },
+        AvailableRoot::Saved(SavedKind::Invoke) => None,
         AvailableRoot::Saved(SavedKind::Submit { .. }) => match tail {
             "" | "receipt" => Some(StaticValueType::Object),
             "chain" | "template" | "id" | "receipt.chain" => Some(StaticValueType::String),
@@ -1285,6 +1366,96 @@ scenario:
         );
         let error = ScenarioSpec::parse(&yaml).unwrap_err().to_string();
         assert!(error.contains("requires `sender`"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn parses_adapter_invoke_and_saved_output_references() {
+        let yaml = BASE.replacen(
+            "    - checkpoint:\n        chain: zone\n      save: zone_before",
+            r#"    - invoke:
+        chain: l1
+        action: prepare_encrypted_deposit
+        with:
+          portalAddress: "0x0000000000000000000000000000000000000001"
+          recipient: { var: user.address }
+          zoneId: 9
+      save: prepared
+      timeout: 10s
+    - checkpoint:
+        chain: zone
+      save: zone_before"#,
+            1,
+        );
+        let yaml = yaml.replacen(
+            "depositHash: { var: deposit.tx_hash }",
+            "depositHash: { var: prepared.encrypted.ephemeralPubkeyX }",
+            1,
+        );
+        let spec = ScenarioSpec::parse(&yaml).unwrap();
+
+        let StepAction::Invoke(invoke) = &spec.scenario.steps[0].action else {
+            panic!("expected invoke step");
+        };
+        assert_eq!(invoke.action, "prepare_encrypted_deposit");
+        assert_eq!(invoke.with_value.len(), 3);
+        assert_eq!(spec.scenario.steps[0].timeout, Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn rejects_invalid_adapter_invoke() {
+        let empty_action = BASE.replacen(
+            "checkpoint:\n        chain: zone",
+            "invoke:\n        chain: zone\n        action: ''",
+            1,
+        );
+        let error = ScenarioSpec::parse(&empty_action).unwrap_err().to_string();
+        assert!(error.contains("empty action name"), "unexpected error: {error}");
+
+        let unknown_field = BASE.replacen(
+            "checkpoint:\n        chain: zone",
+            "invoke:\n        chain: zone\n        action: custom\n        unexpected: true",
+            1,
+        );
+        assert!(ScenarioSpec::parse(&unknown_field).is_err());
+    }
+
+    #[test]
+    fn parses_bytes32_correlation_binding() {
+        let yaml = BASE.replacen(
+            "  bindings:\n    user:",
+            "  bindings:\n    action_id:\n      bytes32: { random_bytes: 32 }\n    user:",
+            1,
+        );
+        let spec = ScenarioSpec::parse(&yaml).unwrap();
+        assert!(matches!(
+            spec.scenario.bindings["action_id"],
+            BindingDef::Bytes32(Bytes32BindingDef { random_bytes: 32 })
+        ));
+    }
+
+    #[test]
+    fn validates_bytes32_correlation_binding_reference() {
+        let yaml = BASE.replacen(
+            "  bindings:\n    user:",
+            "  bindings:\n    action_id:\n      bytes32: { random_bytes: 32 }\n    user:",
+            1,
+        );
+        let yaml = yaml.replacen(
+            "depositHash: { var: deposit.tx_hash }",
+            "depositHash: { var: action_id }",
+            1,
+        );
+        ScenarioSpec::parse(&yaml).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_bytes32_correlation_binding() {
+        let yaml = BASE.replacen(
+            "  bindings:\n    user:",
+            "  bindings:\n    action_id:\n      bytes32: { random_bytes: 31 }\n    user:",
+            1,
+        );
+        assert!(ScenarioSpec::parse(&yaml).is_err());
     }
 
     #[test]

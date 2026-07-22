@@ -2,6 +2,7 @@ pub mod auth_token_map;
 mod nonce;
 mod template;
 pub mod zone_auth;
+mod zone;
 
 pub use nonce::{prefetch_parallel_nonces, NONCE_PRECOMPILE};
 pub use txgen_cli::fetch_protocol_nonces;
@@ -28,7 +29,8 @@ use tempo_primitives::{
     TempoSignature, TempoTxEnvelope,
 };
 use txgen_cli::{
-    sign_standard_request, GenerateContext, NetworkAdapter, RequestSignContext, TxRequest,
+    sign_standard_request, GenerateContext, NetworkAdapter, RequestSignContext,
+    ScenarioActionContext, TxRequest,
 };
 use txgen_core::{
     derive_mnemonic_signer, AccountPoolDef, BuildContext, EcdsaSigner, GeneratedTx, SchedulingKey,
@@ -361,6 +363,19 @@ impl NetworkAdapter for TempoAdapter {
 
     fn network_name() -> &'static str {
         "tempo"
+    }
+
+    fn scenario_actions() -> &'static [&'static str] {
+        zone::SCENARIO_ACTIONS
+    }
+
+    async fn invoke_scenario_action(
+        &self,
+        action: &str,
+        arguments: &serde_yaml::Value,
+        context: ScenarioActionContext<'_>,
+    ) -> Result<serde_yaml::Value> {
+        zone::invoke(action, arguments, context).await
     }
 
     fn build_request(
