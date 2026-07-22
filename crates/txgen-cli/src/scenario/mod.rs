@@ -343,11 +343,19 @@ fn finalize_scenario_reports(
         }
     }
 
-    if failures.is_empty() {
-        Ok(())
-    } else {
+    if !failures.is_empty() {
         bail!("scenario report destination failure(s):\n- {}", failures.join("\n- "));
     }
+
+    if report.failed > 0 || report.timed_out > 0 {
+        bail!(
+            "scenario completed with {} failed instance(s), including {} timeout(s)",
+            report.failed,
+            report.timed_out
+        );
+    }
+
+    Ok(())
 }
 
 fn write_json_report_file(path: &std::path::Path, report: &ScenarioReport) -> Result<()> {

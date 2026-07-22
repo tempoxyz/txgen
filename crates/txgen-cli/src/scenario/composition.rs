@@ -334,7 +334,7 @@ impl ScenarioResolver {
             &root.source_file,
         )?;
         if let Some(base_dir) = &root.base_dir {
-            resolve_root_workload_paths(&mut root.raw, base_dir)?;
+            resolve_root_chain_paths(&mut root.raw, base_dir)?;
         }
 
         for expanded in &self.expanded_steps {
@@ -951,17 +951,32 @@ fn replace_scenario_steps(
     Ok(())
 }
 
-fn resolve_root_workload_paths(value: &mut serde_yaml::Value, base_dir: &Path) -> Result<()> {
+fn resolve_root_chain_paths(value: &mut serde_yaml::Value, base_dir: &Path) -> Result<()> {
     let Some(root) = value.as_mapping_mut() else { return Ok(()) };
     let Some(chains) = root.get_mut(string_key("chains")) else { return Ok(()) };
     let Some(chains) = chains.as_mapping_mut() else { return Ok(()) };
     for chain in chains.values_mut() {
         let Some(chain) = chain.as_mapping_mut() else { continue };
-        let Some(workload) = chain.get_mut(string_key("workload")) else { continue };
-        let Some(path) = workload.as_str() else { continue };
-        let path = Path::new(path);
-        if !path.as_os_str().is_empty() && path.is_relative() {
-            *workload = serde_yaml::Value::String(base_dir.join(path).display().to_string());
+        if let Some(workload) = chain.get_mut(string_key("workload")) &&
+            let Some(path) = workload.as_str()
+        {
+            let path = Path::new(path);
+            if !path.as_os_str().is_empty() && path.is_relative() {
+                *workload = serde_yaml::Value::String(base_dir.join(path).display().to_string());
+            }
+        }
+        if let Some(auth_map) = chain
+            .get_mut(string_key("request_auth"))
+            .and_then(serde_yaml::Value::as_mapping_mut)
+            .and_then(|auth| auth.get_mut(string_key("sender_header")))
+            .and_then(serde_yaml::Value::as_mapping_mut)
+            .and_then(|header| header.get_mut(string_key("map"))) &&
+            let Some(path) = auth_map.as_str()
+        {
+            let path = Path::new(path);
+            if !path.as_os_str().is_empty() && path.is_relative() {
+                *auth_map = serde_yaml::Value::String(base_dir.join(path).display().to_string());
+            }
         }
     }
     Ok(())
@@ -1287,7 +1302,14 @@ fragments:
 version: 1
 include: library/outer.yml
 chains:
-  primary: { network: tempo, rpc_url: http://primary.invalid, workload: ./workload.yml }
+  primary:
+    network: tempo
+    rpc_url: http://primary.invalid
+    request_auth:
+      sender_header:
+        name: X-Authorization-Token
+        map: ./sender-auth.json
+    workload: ./workload.yml
 scenario:
   name: nested
   steps:
@@ -1302,6 +1324,10 @@ scenario:
         assert_eq!(provenance.fragment, "leaf");
         assert_eq!(provenance.instance_alias, "top.child");
         assert_eq!(resolved.spec.chains["primary"].workload, dir.path().join("workload.yml"));
+        assert_eq!(
+            resolved.spec.chains["primary"].request_auth.as_ref().unwrap().sender_header.map,
+            dir.path().join("sender-auth.json")
+        );
     }
 
     #[cfg(unix)]
