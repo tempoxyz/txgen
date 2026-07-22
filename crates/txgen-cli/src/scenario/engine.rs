@@ -218,7 +218,8 @@ struct ScenarioStepGuard {
 
 impl Drop for ScenarioStepGuard {
     fn drop(&mut self) {
-        let mut active_steps = self.progress.active_steps.lock().expect("scenario progress mutex poisoned");
+        let mut active_steps =
+            self.progress.active_steps.lock().expect("scenario progress mutex poisoned");
         let count = active_steps.get_mut(&self.step).expect("active scenario step must exist");
         *count -= 1;
         if *count == 0 {
@@ -257,8 +258,8 @@ where
                 config.transaction_rate,
                 config.max_rpc_in_flight,
             )
-                .await
-                .wrap_err_with(|| format!("failed to preflight scenario chain '{name}'"))?;
+            .await
+            .wrap_err_with(|| format!("failed to preflight scenario chain '{name}'"))?;
             eprintln!(
                 "scenario chain preparation completed: chain={name} elapsed={:?}",
                 chain_started.elapsed(),
