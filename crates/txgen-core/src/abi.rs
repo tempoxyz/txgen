@@ -1,7 +1,7 @@
 use alloy_dyn_abi::DynSolValue;
-use alloy_json_abi::JsonAbi;
-use alloy_primitives::{Address, Bytes, U256};
-use eyre::{bail, Result, WrapErr};
+use alloy_json_abi::{JsonAbi, Param};
+use alloy_primitives::{Address, Bytes, B256, U256};
+use eyre::{bail, ensure, Result, WrapErr};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -360,7 +360,7 @@ fn encode_function_call(
     // Convert arguments to DynSolValue based on ABI types
     let mut encoded_args = Vec::with_capacity(args.len());
     for (arg, param) in args.iter().zip(&func.inputs) {
-        let sol_value = yaml_to_sol_value(arg, &param.ty.to_string(), resolver)?;
+        let sol_value = yaml_to_param_value(arg, param, resolver)?;
         encoded_args.push(sol_value);
     }
 
@@ -373,6 +373,76 @@ fn encode_function_call(
     calldata.extend_from_slice(&encoded_params);
 
     Ok(Bytes::from(calldata))
+}
+
+fn yaml_to_param_value(
+    value: &serde_yaml::Value,
+    param: &Param,
+    resolver: &mut ValueResolver<'_>,
+) -> Result<DynSolValue> {
+    if param.components.is_empty() {
+        return yaml_to_sol_value(value, &param.ty, resolver);
+    }
+
+    if param.ty == "tuple" {
+        return yaml_to_tuple_value(value, &param.components, resolver);
+    }
+
+    let Some(length) = param.ty.strip_prefix("tuple[").and_then(|ty| ty.strip_suffix(']')) else {
+        bail!("unsupported compound Solidity type: {}", param.ty);
+    };
+    let values = value.as_sequence().ok_or_else(|| eyre::eyre!("{} must be a list", param.ty))?;
+    let values = values
+        .iter()
+        .map(|value| yaml_to_tuple_value(value, &param.components, resolver))
+        .collect::<Result<Vec<_>>>()?;
+
+    if length.is_empty() {
+        Ok(DynSolValue::Array(values))
+    } else {
+        let expected: usize = length.parse()?;
+        if values.len() != expected {
+            bail!("{} expects {expected} values, got {}", param.ty, values.len());
+        }
+        Ok(DynSolValue::FixedArray(values))
+    }
+}
+
+fn yaml_to_tuple_value(
+    value: &serde_yaml::Value,
+    components: &[Param],
+    resolver: &mut ValueResolver<'_>,
+) -> Result<DynSolValue> {
+    let values = if let Some(values) = value.as_sequence() {
+        if values.len() != components.len() {
+            bail!("tuple expects {} values, got {}", components.len(), values.len());
+        }
+        values
+            .iter()
+            .zip(components)
+            .map(|(value, component)| yaml_to_param_value(value, component, resolver))
+            .collect::<Result<Vec<_>>>()?
+    } else if let Some(mapping) = value.as_mapping() {
+        if mapping.len() != components.len() {
+            bail!("tuple expects {} fields, got {}", components.len(), mapping.len());
+        }
+        let mut values = Vec::with_capacity(components.len());
+        for component in components {
+            if component.name.is_empty() {
+                bail!("unnamed tuple components must be supplied as a list");
+            }
+            let key = serde_yaml::Value::String(component.name.clone());
+            let value = mapping
+                .get(&key)
+                .ok_or_else(|| eyre::eyre!("tuple is missing field '{}'", component.name))?;
+            values.push(yaml_to_param_value(value, component, resolver)?);
+        }
+        values
+    } else {
+        bail!("tuple must be a list or mapping");
+    };
+
+    Ok(DynSolValue::Tuple(values))
 }
 
 fn resolve_call_arg_var(
@@ -537,10 +607,11 @@ fn yaml_to_sol_value(
             let s: String = serde_yaml::from_value(value.clone())?;
             let bytes: Bytes = s.parse()?;
             let size: usize = t[5..].parse()?;
-            let mut fixed = vec![0u8; size];
-            let len = bytes.len().min(size);
-            fixed[..len].copy_from_slice(&bytes[..len]);
-            Ok(DynSolValue::FixedBytes(alloy_primitives::FixedBytes::from_slice(&fixed), size))
+            ensure!(size <= 32, "invalid fixed bytes size {size}");
+            ensure!(bytes.len() == size, "{t} expects {size} bytes, got {}", bytes.len());
+            let mut fixed = [0u8; 32];
+            fixed[..size].copy_from_slice(&bytes);
+            Ok(DynSolValue::FixedBytes(B256::from(fixed), size))
         }
         t if t.ends_with("[]") => {
             // Dynamic array
@@ -663,6 +734,69 @@ mod tests {
         let sol_value = yaml_to_sol_value(&value, "uint256", &mut resolver).unwrap();
 
         assert_eq!(sol_value, DynSolValue::Uint(U256::from(16), 256));
+    }
+
+    #[test]
+    fn test_named_tuple_literal() {
+        let param: Param = serde_json::from_value(serde_json::json!({
+            "name": "encrypted",
+            "type": "tuple",
+            "internalType": "struct EncryptedDepositPayload",
+            "components": [
+                { "name": "ephemeralPubkeyX", "type": "bytes32" },
+                { "name": "ephemeralPubkeyYParity", "type": "uint8" },
+                { "name": "ciphertext", "type": "bytes" },
+                { "name": "nonce", "type": "bytes12" },
+                { "name": "tag", "type": "bytes16" }
+            ]
+        }))
+        .unwrap();
+        let value = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+ephemeralPubkeyX: "0x1111111111111111111111111111111111111111111111111111111111111111"
+ephemeralPubkeyYParity: 3
+ciphertext: "0x1234"
+nonce: "0x222222222222222222222222"
+tag: "0x33333333333333333333333333333333"
+"#,
+        )
+        .unwrap();
+        let accounts = AccountManager::empty();
+        let address_pools = AddressPoolManager::empty();
+        let mut rng = rand::rng();
+        let mut resolver =
+            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+
+        let actual = yaml_to_param_value(&value, &param, &mut resolver).unwrap();
+        let mut nonce = [0u8; 32];
+        nonce[..12].fill(0x22);
+        let mut tag = [0u8; 32];
+        tag[..16].fill(0x33);
+
+        assert_eq!(
+            actual,
+            DynSolValue::Tuple(vec![
+                DynSolValue::FixedBytes(B256::repeat_byte(0x11), 32,),
+                DynSolValue::Uint(U256::from(3), 8),
+                DynSolValue::Bytes(vec![0x12, 0x34]),
+                DynSolValue::FixedBytes(B256::from(nonce), 12),
+                DynSolValue::FixedBytes(B256::from(tag), 16),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_fixed_bytes_literal_rejects_wrong_length() {
+        let accounts = AccountManager::empty();
+        let address_pools = AddressPoolManager::empty();
+        let mut rng = rand::rng();
+        let mut resolver =
+            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let value = serde_yaml::Value::String("0x22".to_string());
+
+        let error = yaml_to_sol_value(&value, "bytes12", &mut resolver).unwrap_err();
+
+        assert!(error.to_string().contains("bytes12 expects 12 bytes, got 1"));
     }
 
     #[test]

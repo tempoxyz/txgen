@@ -120,7 +120,7 @@ fn parse_document(content: &str, label: &str) -> Result<serde_yaml::Value> {
 }
 
 /// Expand `${VAR}` patterns with environment variable values.
-fn expand_env_vars(input: &str) -> Result<String> {
+pub fn expand_env_vars(input: &str) -> Result<String> {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
 
