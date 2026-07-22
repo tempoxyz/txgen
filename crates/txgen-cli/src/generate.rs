@@ -898,10 +898,7 @@ where
             last_progress = Instant::now();
         }
     }
-    eprintln!(
-        "setup generation completed: steps={total_steps} elapsed={:?}",
-        started.elapsed(),
-    );
+    eprintln!("setup generation completed: steps={total_steps} elapsed={:?}", started.elapsed(),);
 
     Ok(bindings)
 }
@@ -1284,8 +1281,7 @@ where
 
     eprintln!(
         "starting workload generation: count={:?} duration={:?} signing_workers={signing_workers}",
-        limit.count,
-        limit.duration,
+        limit.count, limit.duration,
     );
 
     while limit.count.is_none_or(|count| written < count) {
@@ -1374,10 +1370,7 @@ where
 
     signing_pool.finish(writer)?;
     writer.flush()?;
-    eprintln!(
-        "workload generation completed: prepared={written} elapsed={:?}",
-        start.elapsed(),
-    );
+    eprintln!("workload generation completed: prepared={written} elapsed={:?}", start.elapsed(),);
     Ok(written)
 }
 
