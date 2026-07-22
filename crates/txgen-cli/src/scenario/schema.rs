@@ -1328,47 +1328,6 @@ scenario:
     }
 
     #[test]
-    fn parses_separate_query_rpc_and_sender_authentication() {
-        let yaml = BASE.replace(
-            "    rpc_url: http://l1.invalid",
-            r#"    rpc_url: http://l1-submit.invalid
-    query_rpc_url: http://l1-query.invalid
-    request_auth:
-      sender_header:
-        name: X-Authorization-Token
-        map: ./sender-auth.json
-        reload_interval: 250ms"#,
-        );
-        let yaml = yaml.replace(
-            "        transaction_hash: { var: deposit.tx_hash }",
-            "        transaction_hash: { var: deposit.tx_hash }\n        sender: { var: deposit.sender }",
-        );
-
-        let spec = ScenarioSpec::parse(&yaml).unwrap();
-        let chain = &spec.chains["l1"];
-        assert_eq!(chain.rpc_url, "http://l1-submit.invalid");
-        assert_eq!(chain.query_rpc_url.as_deref(), Some("http://l1-query.invalid"));
-        let sender_header = &chain.request_auth.as_ref().unwrap().sender_header;
-        assert_eq!(sender_header.name, "X-Authorization-Token");
-        assert_eq!(sender_header.map, PathBuf::from("./sender-auth.json"));
-        assert_eq!(sender_header.reload_interval, Some(Duration::from_millis(250)));
-    }
-
-    #[test]
-    fn authenticated_receipt_wait_requires_sender() {
-        let yaml = BASE.replace(
-            "    rpc_url: http://l1.invalid",
-            r#"    rpc_url: http://l1.invalid
-    request_auth:
-      sender_header:
-        name: X-Authorization-Token
-        map: ./sender-auth.json"#,
-        );
-        let error = ScenarioSpec::parse(&yaml).unwrap_err().to_string();
-        assert!(error.contains("requires `sender`"), "unexpected error: {error}");
-    }
-
-    #[test]
     fn parses_adapter_invoke_and_saved_output_references() {
         let yaml = BASE.replacen(
             "    - checkpoint:\n        chain: zone\n      save: zone_before",
@@ -1456,6 +1415,47 @@ scenario:
             1,
         );
         assert!(ScenarioSpec::parse(&yaml).is_err());
+    }
+
+    #[test]
+    fn parses_separate_query_rpc_and_sender_authentication() {
+        let yaml = BASE.replace(
+            "    rpc_url: http://l1.invalid",
+            r#"    rpc_url: http://l1-submit.invalid
+    query_rpc_url: http://l1-query.invalid
+    request_auth:
+      sender_header:
+        name: X-Authorization-Token
+        map: ./sender-auth.json
+        reload_interval: 250ms"#,
+        );
+        let yaml = yaml.replace(
+            "        transaction_hash: { var: deposit.tx_hash }",
+            "        transaction_hash: { var: deposit.tx_hash }\n        sender: { var: deposit.sender }",
+        );
+
+        let spec = ScenarioSpec::parse(&yaml).unwrap();
+        let chain = &spec.chains["l1"];
+        assert_eq!(chain.rpc_url, "http://l1-submit.invalid");
+        assert_eq!(chain.query_rpc_url.as_deref(), Some("http://l1-query.invalid"));
+        let sender_header = &chain.request_auth.as_ref().unwrap().sender_header;
+        assert_eq!(sender_header.name, "X-Authorization-Token");
+        assert_eq!(sender_header.map, PathBuf::from("./sender-auth.json"));
+        assert_eq!(sender_header.reload_interval, Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn authenticated_receipt_wait_requires_sender() {
+        let yaml = BASE.replace(
+            "    rpc_url: http://l1.invalid",
+            r#"    rpc_url: http://l1.invalid
+    request_auth:
+      sender_header:
+        name: X-Authorization-Token
+        map: ./sender-auth.json"#,
+        );
+        let error = ScenarioSpec::parse(&yaml).unwrap_err().to_string();
+        assert!(error.contains("requires `sender`"), "unexpected error: {error}");
     }
 
     #[test]
