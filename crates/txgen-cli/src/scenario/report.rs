@@ -298,6 +298,10 @@ impl ScenarioAccumulator {
             }
         }
     }
+
+    pub(crate) fn counts(&self) -> (u64, u64, u64) {
+        (self.completed, self.failed, self.timed_out)
+    }
 }
 
 impl ScenarioReport {
