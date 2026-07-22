@@ -72,7 +72,13 @@ struct TempoKeychainSetup {
 }
 
 #[derive(Clone, Default)]
-pub enum TempoSignContext {
+pub struct TempoSignContext {
+    signer: TempoRequestSigner,
+    sponsor: Option<EcdsaSigner>,
+}
+
+#[derive(Clone, Default)]
+enum TempoRequestSigner {
     /// Sign the request with the selected account as a normal Tempo transaction.
     #[default]
     Standard,
@@ -85,7 +91,7 @@ impl RequestSignContext<TempoNetwork> for TempoSignContext {
         self,
         name: String,
         phase: TxPhase,
-        request: TempoTransactionRequest,
+        mut request: TempoTransactionRequest,
         signer: EcdsaSigner,
         key: [u8; 20],
         inclusion_keys: Vec<SchedulingKey>,
@@ -96,8 +102,21 @@ impl RequestSignContext<TempoNetwork> for TempoSignContext {
         <TempoNetwork as alloy_network::Network>::TxEnvelope: From<alloy_consensus::Signed<<TempoNetwork as alloy_network::Network>::UnsignedTx>>
             + Encodable2718,
     {
-        match self {
-            Self::Standard => sign_standard_request::<TempoNetwork>(
+        let sender = match &self.signer {
+            TempoRequestSigner::Standard => signer.address(),
+            TempoRequestSigner::Keychain { user_address, .. } => *user_address,
+        };
+        if let Some(sponsor) = self.sponsor {
+            let transaction = request
+                .clone()
+                .build_aa()
+                .map_err(|err| eyre::eyre!("failed to build AA tx for sponsor: {err}"))?;
+            let fee_payer_hash = transaction.fee_payer_signature_hash(sender);
+            request.set_fee_payer_signature(sponsor.sign_hash_sync(&fee_payer_hash)?);
+        }
+
+        match self.signer {
+            TempoRequestSigner::Standard => sign_standard_request::<TempoNetwork>(
                 name,
                 phase,
                 request,
@@ -105,7 +124,7 @@ impl RequestSignContext<TempoNetwork> for TempoSignContext {
                 key,
                 inclusion_keys,
             ),
-            Self::Keychain { user_address, access_signer } => sign_keychain_request(
+            TempoRequestSigner::Keychain { user_address, access_signer } => sign_keychain_request(
                 name,
                 phase,
                 request,
@@ -253,8 +272,8 @@ impl TempoAdapter {
                 let access_signer = self.resolve_setup_access_signer(auth, selected, key_type)?;
                 req.set_key_type(key_type);
                 req.set_key_id(access_signer.address());
-                *sign_context =
-                    TempoSignContext::Keychain { user_address: selected.address, access_signer };
+                sign_context.signer =
+                    TempoRequestSigner::Keychain { user_address: selected.address, access_signer };
             }
             TempoAuthMode::KeyAuthorization => {
                 let access_signer = derive_inline_access_signer(auth, ctx)?;
@@ -267,8 +286,8 @@ impl TempoAdapter {
                 );
                 req.set_key_type(key_type);
                 req.set_key_id(key_id);
-                *sign_context =
-                    TempoSignContext::Keychain { user_address: selected.address, access_signer };
+                sign_context.signer =
+                    TempoRequestSigner::Keychain { user_address: selected.address, access_signer };
             }
         }
 
@@ -383,7 +402,7 @@ impl NetworkAdapter for TempoAdapter {
         req.set_chain_id(ctx.chain_id);
         req.set_nonce(nonce);
         req.set_gas_limit(template.gas_limit);
-        let mut sign_context = TempoSignContext::Standard;
+        let mut sign_context = TempoSignContext::default();
 
         match template.tx_type {
             TempoTxType::Tempo => {
@@ -432,19 +451,10 @@ impl NetworkAdapter for TempoAdapter {
 
                 self.apply_auth(&template, &selected, &mut req, &mut sign_context, ctx)?;
 
-                // Handle sponsor signing: build a temporary TempoTransaction to
-                // compute the fee_payer_signature_hash, sign it, then set on the request.
                 if let Some(ref sponsor_ref) = template.sponsor {
-                    let temp_tx = req
-                        .clone()
-                        .build_aa()
-                        .map_err(|e| eyre::eyre!("failed to build AA tx for sponsor: {e}"))?;
-
                     let sponsor = ctx.select_signer(sponsor_ref)?;
-                    let sponsor_signer = ctx.accounts.get_by_index(&sponsor.pool, sponsor.index)?;
-                    let fee_payer_hash = temp_tx.fee_payer_signature_hash(selected.address);
-                    let fee_payer_sig = sponsor_signer.sign_hash_sync(&fee_payer_hash)?;
-                    req.set_fee_payer_signature(fee_payer_sig);
+                    sign_context.sponsor =
+                        Some(ctx.accounts.get_by_index(&sponsor.pool, sponsor.index)?.clone());
                 }
             }
             TempoTxType::Legacy => {
@@ -1423,7 +1433,7 @@ input: "0x"
     }
 
     #[test]
-    fn test_sponsored_expiring_nonce_uniqueness_happens_before_fee_payer_signing() {
+    fn test_sponsored_expiring_nonce_is_signed_in_worker_context() {
         let accounts = test_accounts();
         let artifacts = ArtifactManager::empty();
         let gas = GasConfig::default();
@@ -1432,20 +1442,35 @@ input: "0x"
 
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
 
-        let first = TempoAdapter::new()
-            .build_request(sponsored_expiring_template(), &mut ctx)
-            .unwrap()
-            .request;
-        let second = TempoAdapter::new()
-            .build_request(sponsored_expiring_template(), &mut ctx)
-            .unwrap()
-            .request;
+        let first_request =
+            TempoAdapter::new().build_request(sponsored_expiring_template(), &mut ctx).unwrap();
+        let second_request =
+            TempoAdapter::new().build_request(sponsored_expiring_template(), &mut ctx).unwrap();
 
-        assert_ne!(first.max_fee_per_gas(), second.max_fee_per_gas());
+        assert!(first_request.request.fee_payer_signature.is_none());
+        assert!(second_request.request.fee_payer_signature.is_none());
         assert_ne!(
-            first.fee_payer_signature, second.fee_payer_signature,
+            first_request.request.max_fee_per_gas(),
+            second_request.request.max_fee_per_gas()
+        );
+
+        let first = sign_tempo_request(first_request, &ctx, "first");
+        let second = sign_tempo_request(second_request, &ctx, "second");
+        let first = TempoTxEnvelope::decode_2718(&mut first.raw.as_ref()).unwrap();
+        let second = TempoTxEnvelope::decode_2718(&mut second.raw.as_ref()).unwrap();
+        let (TempoTxEnvelope::AA(first), TempoTxEnvelope::AA(second)) = (&first, &second) else {
+            panic!("expected Tempo AA envelopes");
+        };
+
+        assert_ne!(
+            first.tx().fee_payer_signature,
+            second.tx().fee_payer_signature,
             "fee-payer signature must reflect the per-tx expiring uniqueness bump"
         );
+        let sender = accounts.get_by_index("users", 0).unwrap().address();
+        let sponsor = accounts.get_by_index("users", 1).unwrap().address();
+        assert_eq!(first.tx().recover_fee_payer(sender).unwrap(), sponsor);
+        assert_eq!(second.tx().recover_fee_payer(sender).unwrap(), sponsor);
     }
 
     #[test]
