@@ -8,6 +8,7 @@
 //! - [`reth_api`] - reth custom Engine API types (`reth_newPayload`, `reth_forkchoiceUpdated`)
 
 pub mod auth;
+pub mod clickhouse;
 pub mod clock;
 pub mod metrics;
 pub mod prometheus;
@@ -20,6 +21,7 @@ pub mod sender;
 pub mod source;
 
 pub use auth::{RequestAuthProvider, RpcRequestContext, SenderHeaderAuthProvider};
+pub use clickhouse::ClickHouseClient;
 pub use clock::RunClock;
 pub use metrics::{
     collect_block_stats, compute_latency_stats, trim_trailing_empty_blocks, BenchMetrics,
