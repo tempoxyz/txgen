@@ -560,7 +560,7 @@ impl AbiTypeParser<'_> {
                 bail!("expected ']' at byte {}", self.offset);
             }
             ty = match length {
-                Some(0) => bail!("fixed array length must be greater than zero"),
+                Some(0) => return Err(eyre::eyre!("fixed array length must be greater than zero")),
                 Some(length) => DynSolType::FixedArray(Box::new(ty), length),
                 None => DynSolType::Array(Box::new(ty)),
             };
@@ -611,7 +611,7 @@ impl AbiTypeParser<'_> {
         let offset = self.offset;
         match self.try_parse_identifier() {
             Some(identifier) => Ok(identifier),
-            None => bail!("expected Solidity type at byte {offset}"),
+            None => Err(eyre::eyre!("expected Solidity type at byte {offset}")),
         }
     }
 
