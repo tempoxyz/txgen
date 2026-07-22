@@ -230,6 +230,7 @@ struct TransactionOutputLine<'a> {
     phase: &'static str,
     id: String,
     raw: String,
+    sender: &'a Address,
     submission_keys: [&'a Address; 1],
     inclusion_keys: [Address; 0],
 }
@@ -273,6 +274,7 @@ async fn write_extracted_blocks<W: Write>(
                         phase: "workload",
                         id: format!("block:{}:tx:{index}", block.number),
                         raw: format!("0x{}", hex::encode(&transaction.raw)),
+                        sender: &transaction.signer,
                         submission_keys: [&transaction.signer],
                         inclusion_keys: [],
                     };
@@ -591,6 +593,7 @@ mod tests {
         assert_eq!(line["phase"], "workload");
         assert_eq!(line["id"], "block:42:tx:0");
         assert_eq!(line["raw"], "0x02cafe");
+        assert_eq!(line["sender"], "0x2222222222222222222222222222222222222222");
         assert_eq!(line["submission_keys"][0], "0x2222222222222222222222222222222222222222");
         assert_eq!(line["inclusion_keys"], serde_json::json!([]));
     }

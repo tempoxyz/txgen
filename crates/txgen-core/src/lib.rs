@@ -13,7 +13,7 @@ pub use accounts::{
     derive_mnemonic_signer, AccountManager, AccountPoolDef, AccountRef, AddressPoolDef,
     AddressPoolManager, EcdsaSigner, FastAddressPoolDef, SelectMode, SignerExt,
 };
-pub use nonce::NonceTracker;
+pub use nonce::{NonceReservation, NonceTracker};
 pub use output::{GeneratedTx, NdjsonWriter, TxPhase};
 pub use plugin::{BuildContext, SelectedSigner};
 pub use scheduling_key::{dedup_scheduling_keys, SchedulingKey};
@@ -22,4 +22,4 @@ pub use spec::{
     SequenceStep, SetupDef, SetupStep, WorkloadSpec,
 };
 pub use value::{FromGenerator, GenValue, Generator, ValueResolver};
-pub use yaml::{append_yaml, merge_yaml};
+pub use yaml::{append_yaml, expand_env_vars, merge_yaml};

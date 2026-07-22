@@ -4,7 +4,7 @@
 //! - file (reads NDJSON from a file)
 //! - stdin (reads NDJSON from stdin)
 
-use alloy_primitives::Bytes;
+use alloy_primitives::{Address, Bytes};
 use eyre::{Context, Result};
 use std::{io::BufRead, path::Path};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -21,6 +21,12 @@ pub struct SourceTx {
     pub id: Option<String>,
     /// Raw transaction bytes (hex-encoded with 0x prefix).
     pub raw: String,
+    /// Logical on-chain transaction sender.
+    ///
+    /// This is optional for compatibility with NDJSON generated before sender
+    /// metadata was introduced.
+    #[serde(default)]
+    pub sender: Option<Address>,
     /// Scheduling keys released once RPC submission succeeds (hex-encoded with 0x prefix).
     pub submission_keys: Vec<SchedulingKey>,
     /// Scheduling keys released once a transaction receipt is observed (hex-encoded with 0x
@@ -46,7 +52,14 @@ impl SourceTx {
             eyre::bail!("transactions must have at least one submission or inclusion key");
         }
 
-        Ok(GeneratedTx { phase: self.phase, id: self.id, raw, submission_keys, inclusion_keys })
+        Ok(GeneratedTx {
+            phase: self.phase,
+            id: self.id,
+            raw,
+            sender: self.sender,
+            submission_keys,
+            inclusion_keys,
+        })
     }
 }
 
@@ -146,7 +159,25 @@ mod tests {
 
         let generated = source_tx.into_generated_tx().unwrap();
         assert_eq!(generated.phase, TxPhase::Workload);
+        assert_eq!(generated.sender, None);
         assert_eq!(generated.submission_keys, vec![SchedulingKey::from([0x11; 20])]);
         assert_eq!(generated.inclusion_keys, vec![SchedulingKey::from([0x22; 20])]);
+    }
+
+    #[test]
+    fn parses_sender_metadata() {
+        let source_tx: SourceTx = serde_json::from_str(
+            r#"{
+                "raw": "0x02f870",
+                "sender": "0x3333333333333333333333333333333333333333",
+                "submission_keys": [
+                    "0x1111111111111111111111111111111111111111"
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let generated = source_tx.into_generated_tx().unwrap();
+        assert_eq!(generated.sender, Some(Address::repeat_byte(0x33)));
     }
 }

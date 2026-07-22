@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 # workspace
+bench-core.workspace = true
 txgen-core.workspace = true
 
 # CLI
@@ -23,15 +24,19 @@ rand.workspace = true
 rayon.workspace = true
 eyre.workspace = true
 humantime = "2"
+url = "2"
+uuid.workspace = true
 
 # alloy
 alloy-provider.workspace = true
 alloy-dyn-abi.workspace = true
+alloy-json-abi.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-network.workspace = true
 alloy-eips.workspace = true
 alloy-rlp.workspace = true
+alloy-rpc-types-eth.workspace = true
 alloy-rpc-client = "2"
 alloy-rpc-types-engine = "2"
 alloy-transport = "2"

@@ -2,16 +2,23 @@
 # Apply the ClickHouse schema.
 #
 # Usage:
-#   ./scripts/clickhouse/apply.sh <url> [user] [password]
+#   ./scripts/clickhouse/apply.sh <url> [user] [password] [start]
 #
 # Examples:
 #   ./scripts/clickhouse/apply.sh http://localhost:8123
 #   ./scripts/clickhouse/apply.sh https://host.clickhouse.cloud:8443 default password
+#   ./scripts/clickhouse/apply.sh https://host.clickhouse.cloud:8443 default password 006
 set -euo pipefail
 
-URL="${1:?usage: apply.sh <url> [user] [password]}"
+URL="${1:?usage: apply.sh <url> [user] [password] [start]}"
 USER="${2:-}"
 PASSWORD="${3:-}"
+START="${4:-001}"
+
+if [[ ! "$START" =~ ^[0-9]{3}$ ]]; then
+  echo "start migration must be a three-digit prefix such as 006" >&2
+  exit 2
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -24,7 +31,11 @@ if [[ -n "$PASSWORD" ]]; then
 fi
 
 for f in "$SCRIPT_DIR"/[0-9]*.sql; do
-  echo "Applying $(basename "$f")..."
+  MIGRATION="$(basename "$f")"
+  if [[ "${MIGRATION%%_*}" < "$START" ]]; then
+    continue
+  fi
+  echo "Applying $MIGRATION..."
   RESPONSE=$(curl -s -w "\n%{http_code}" "$URL/" --data-binary @"$f" "${AUTH_HEADERS[@]}" 2>&1)
   HTTP_CODE=$(echo "$RESPONSE" | tail -1)
   BODY=$(echo "$RESPONSE" | sed '$d')
