@@ -114,6 +114,20 @@ async fn routes_sender_authenticated_requests_separately_from_queries() {
     assert!(report.steps.iter().all(|step| step.success == 1 && step.failed == 0));
     assert_eq!(report.sampled_instances.len(), 1);
     assert_eq!(report.sampled_instances[0].outcome, "completed");
+    assert_eq!(report.receipt_metrics.len(), 2);
+    for (input, step) in [("sender_zero", "zero_submission"), ("sender_one", "one_submission")] {
+        let metrics = report
+            .receipt_metrics
+            .iter()
+            .find(|metrics| metrics.labels.get("input").map(String::as_str) == Some(input))
+            .expect("missing labeled receipt metrics");
+        assert_eq!(metrics.labels.get("chain").map(String::as_str), Some("test"));
+        assert_eq!(metrics.labels.get("step").map(String::as_str), Some(step));
+        assert_eq!(metrics.gas_used.count, 1);
+        assert_eq!(metrics.gas_used.p95, Some(21_000.0));
+        assert_eq!(metrics.effective_gas_price.mean, Some(1.0));
+        assert_eq!(metrics.fee_paid.p99, Some(21_000.0));
+    }
 
     let shared = shared.lock().expect("RPC state lock");
     let submission_requests = shared
