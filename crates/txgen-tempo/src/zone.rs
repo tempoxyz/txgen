@@ -4,7 +4,7 @@ use aes_gcm::{
 };
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_provider::Provider;
-use eyre::{bail, ensure, Result, WrapErr};
+use eyre::{ensure, Result, WrapErr};
 use hkdf::Hkdf;
 use k256::{
     ecdh::diffie_hellman,
@@ -70,7 +70,7 @@ pub(crate) async fn invoke(
                 .wrap_err("invalid prepare_encrypted_deposit arguments")?;
             prepare_encrypted_deposit(arguments, context).await
         }
-        _ => bail!("unsupported Tempo scenario action '{action}'"),
+        _ => Err(eyre::eyre!("unsupported Tempo scenario action '{action}'")),
     }
 }
 
@@ -113,7 +113,9 @@ fn configured_portal_address(chain_id: u64, zone_id: u32) -> Result<Address> {
     match (chain_id, zone_id) {
         (42_431, 6) => Ok("0x7069DeC4E64Fd07334A0933eDe836C17259c9B23".parse()?),
         (42_431, 7) => Ok("0x3F5296303400B56271b476F5A0B9cBF74350D6Ac".parse()?),
-        _ => bail!("no portal address configured for zone {zone_id} on chain {chain_id}"),
+        _ => {
+            Err(eyre::eyre!("no portal address configured for zone {zone_id} on chain {chain_id}"))
+        }
     }
 }
 
@@ -130,7 +132,7 @@ async fn active_encryption_key(
             return Ok((x, normalize_y_parity(y_parity)?, count_before - U256::from(1)));
         }
     }
-    bail!("ZonePortal encryption key rotated while preparing the recipient")
+    Err(eyre::eyre!("ZonePortal encryption key rotated while preparing the recipient"))
 }
 
 async fn encryption_key_count(
@@ -181,7 +183,7 @@ fn normalize_y_parity(y_parity: u8) -> Result<u8> {
     match y_parity {
         0 | 1 => Ok(0x02 + y_parity),
         0x02 | 0x03 => Ok(y_parity),
-        _ => bail!("invalid sequencer encryption key y parity {y_parity}"),
+        _ => Err(eyre::eyre!("invalid sequencer encryption key y parity {y_parity}")),
     }
 }
 
