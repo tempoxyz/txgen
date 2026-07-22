@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     materialize_and_sign_template, materialize_setup_online, MaterializedSetup, MaterializedTx,
-    NetworkAdapter,
+    NetworkAdapter, ScenarioActionContext,
 };
 use alloy_consensus::{SignableTransaction, Signed};
 use alloy_dyn_abi::{DynSolType, DynSolValue};
@@ -24,11 +24,11 @@ use alloy_network::{
     primitives::{BlockResponse, HeaderResponse},
     AnyNetwork, Network,
 };
-use alloy_primitives::{keccak256, Address, TxHash, U256};
+use alloy_primitives::{keccak256, Address, TxHash, B256, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use bench_core::{RpcSubmission, RpcSubmitFailureKind, RpcSubmitter, SenderConfig};
 use eyre::{bail, Result, WrapErr};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
@@ -167,7 +167,7 @@ fn load_validated_scenario_inputs<A: NetworkAdapter>(
     seed: u64,
 ) -> Result<(BTreeMap<String, ChainInput>, BTreeMap<String, BindingRuntime>)> {
     let chain_inputs = load_chain_inputs::<A>(spec)?;
-    validate_workload_references(spec, &chain_inputs)?;
+    validate_workload_references::<A>(spec, &chain_inputs)?;
     let bindings = build_binding_runtimes(spec, &chain_inputs, seed)?;
     Ok((chain_inputs, bindings))
 }
@@ -484,24 +484,32 @@ where
     ) -> Result<(RuntimeContext, Vec<OwnedSemaphorePermit>), StepError> {
         let mut selections = Vec::with_capacity(self.bindings.len());
         for (name, binding) in &self.bindings {
-            let index = match binding.selection {
-                AccountSelection::Lease => {
-                    let pool = binding.lease_pool.as_ref().expect("lease binding has pool");
-                    pool.index(instance, binding.lease_slot)
-                }
-                AccountSelection::Random => rng.random_range(0..binding.addresses.len()),
-                AccountSelection::Index(index) => index,
+            let BindingRuntime::Account { selection, addresses, lease_pool, lease_slot, .. } =
+                binding
+            else {
+                continue;
             };
-            selections.push((name, binding, index, binding.addresses[index]));
+            let index = match selection {
+                AccountSelection::Lease => {
+                    let pool = lease_pool.as_ref().expect("lease binding has pool");
+                    pool.index(instance, *lease_slot)
+                }
+                AccountSelection::Random => rng.random_range(0..addresses.len()),
+                AccountSelection::Index(index) => *index,
+            };
+            selections.push((name, binding, index, addresses[index]));
         }
 
         let mut lease_requests = selections
             .iter()
             .filter_map(|(name, binding, index, address)| {
-                (binding.selection == AccountSelection::Lease).then_some((
+                let BindingRuntime::Account { selection, lease_pool, .. } = binding else {
+                    return None;
+                };
+                (*selection == AccountSelection::Lease).then_some((
                     **address,
                     *name,
-                    binding.lease_pool.as_ref().expect("lease binding has pool"),
+                    lease_pool.as_ref().expect("lease binding has pool"),
                     *index,
                 ))
             })
@@ -520,7 +528,15 @@ where
 
         let mut roots = BTreeMap::new();
         for (name, binding, index, address) in selections {
-            roots.insert(name.clone(), account_binding_value(&binding.pool, index, address));
+            let BindingRuntime::Account { pool, .. } = binding else { unreachable!() };
+            roots.insert(name.clone(), account_binding_value(&pool, index, address));
+        }
+        for (name, binding) in &self.bindings {
+            if matches!(binding, BindingRuntime::Bytes32) {
+                let mut bytes = [0u8; 32];
+                rng.fill_bytes(&mut bytes);
+                roots.insert(name.clone(), RuntimeValue::Bytes32(B256::from(bytes)));
+            }
         }
         let context = RuntimeContext::new(roots)
             .map_err(|error| StepError::new("binding_error", error.to_string()))?;
@@ -540,6 +556,36 @@ where
             .ok_or_else(|| StepError::new("configuration_error", "unknown chain"))?;
         match &step.action {
             StepAction::Checkpoint(_) => chain.checkpoint().await,
+            StepAction::Invoke(invoke) => {
+                let arguments =
+                    serde_yaml::to_value(&invoke.with_value).map_err(StepError::expression)?;
+                let arguments =
+                    materialize_yaml(&arguments, context).map_err(StepError::expression)?;
+                let output = chain
+                    .adapter
+                    .invoke_scenario_action(
+                        &invoke.action,
+                        &arguments,
+                        ScenarioActionContext {
+                            chain: &chain.name,
+                            chain_id: chain.chain_id,
+                            query_provider: &chain.provider,
+                        },
+                    )
+                    .await
+                    .map_err(|error| StepError::new("invoke_error", error.to_string()))?;
+                let RuntimeValue::Object(mut output) = RuntimeValue::from_yaml(&output)
+                    .map_err(|error| StepError::new("invoke_error", error.to_string()))?
+                else {
+                    return Err(StepError::new(
+                        "invoke_error",
+                        "scenario action returned a non-object value",
+                    ));
+                };
+                output.insert("chain".to_string(), RuntimeValue::String(chain.name.clone()));
+                output.insert("action".to_string(), RuntimeValue::String(invoke.action.clone()));
+                Ok(RuntimeValue::Object(output))
+            }
             StepAction::Submit(submit) => {
                 let submit_rng = rng.clone();
                 let (value, next_rng) = chain
@@ -1286,12 +1332,15 @@ async fn submit_setup_transaction(
     Ok(transaction)
 }
 
-struct BindingRuntime {
-    pool: String,
-    selection: AccountSelection,
-    addresses: Vec<Address>,
-    lease_pool: Option<Arc<LeasePool>>,
-    lease_slot: usize,
+enum BindingRuntime {
+    Account {
+        pool: String,
+        selection: AccountSelection,
+        addresses: Vec<Address>,
+        lease_pool: Option<Arc<LeasePool>>,
+        lease_slot: usize,
+    },
+    Bytes32,
 }
 
 struct LeasePool {
@@ -1331,7 +1380,7 @@ fn build_binding_runtimes(
     let mut required_chains = BTreeMap::<String, BTreeSet<String>>::new();
 
     for (binding_name, binding) in &spec.scenario.bindings {
-        let BindingDef::Account(account) = binding;
+        let BindingDef::Account(account) = binding else { continue };
         pool_bindings.entry(account.pool.clone()).or_default().push(binding_name.clone());
         required_chains
             .entry(account.pool.clone())
@@ -1415,7 +1464,10 @@ fn build_binding_runtimes(
     let mut next_slot = BTreeMap::<String, usize>::new();
     let mut runtimes = BTreeMap::new();
     for (name, binding) in &spec.scenario.bindings {
-        let BindingDef::Account(account) = binding;
+        let BindingDef::Account(account) = binding else {
+            runtimes.insert(name.clone(), BindingRuntime::Bytes32);
+            continue;
+        };
         let addresses = pool_addresses[&account.pool].clone();
         if let AccountSelection::Index(index) = account.select &&
             index >= addresses.len()
@@ -1436,7 +1488,7 @@ fn build_binding_runtimes(
         };
         runtimes.insert(
             name.clone(),
-            BindingRuntime {
+            BindingRuntime::Account {
                 pool: account.pool.clone(),
                 selection: account.select,
                 addresses,
@@ -1462,7 +1514,7 @@ fn binding_submit_chains(spec: &ScenarioSpec, binding: &str) -> Result<Vec<Strin
     Ok(chains)
 }
 
-fn validate_workload_references(
+fn validate_workload_references<A: NetworkAdapter>(
     spec: &ScenarioSpec,
     chains: &BTreeMap<String, ChainInput>,
 ) -> Result<()> {
@@ -1470,6 +1522,20 @@ fn validate_workload_references(
         let label = step.diagnostic_label(index);
         let chain = &chains[step.action.chain()];
         match &step.action {
+            StepAction::Invoke(invoke)
+                if !A::scenario_actions().contains(&invoke.action.as_str()) =>
+            {
+                let supported = if A::scenario_actions().is_empty() {
+                    "none".to_string()
+                } else {
+                    A::scenario_actions().join(", ")
+                };
+                bail!(
+                    "{label} references unsupported '{}' action '{}' (supported actions: {supported})",
+                    A::network_name(),
+                    invoke.action
+                );
+            }
             StepAction::Submit(submit) if !chain.spec.templates.contains_key(&submit.template) => {
                 bail!(
                     "{label} references missing template '{}' on chain '{}'",

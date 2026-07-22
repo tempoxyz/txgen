@@ -708,7 +708,7 @@ Use a fragment anywhere an inline step is allowed:
 
 `as` is required. It must be one valid, non-dotted name segment and must be unique within its containing scenario or fragment. The same fragment may be used repeatedly under different aliases. Its local saves are placed below the alias, so `submission` and `receipt` above become `first_transfer.submission` and `first_transfer.receipt`. Fragment-authored `{ var: submission.tx_hash }` references resolve to the local save before caller-supplied parameter values are injected; a runtime expression passed through `with` therefore keeps the caller's scope. A nested use adds another segment: an inner alias `confirm` under an outer alias `batch` produces names such as `batch.confirm.receipt`. Report provenance uses the local save as the local step name when present and a deterministic action/index-derived name for an unsaved step.
 
-An `outputs` entry names a save declared by the fragment and its required result kind. The supported result kinds are `checkpoint`, `submit`, `receipt`, and `log`; expansion rejects missing output saves and result-kind mismatches. Local saves omitted from `outputs` remain private: callers may reference only declared outputs below the instance alias. A parent fragment must likewise re-export a nested output before its own caller can access it. Fragment uses may nest to any acyclic depth, while direct and indirect fragment recursion is rejected with the use chain.
+An `outputs` entry names a save declared by the fragment and its required result kind. The supported result kinds are `checkpoint`, `invoke`, `submit`, `receipt`, and `log`; expansion rejects missing output saves and result-kind mismatches. Local saves omitted from `outputs` remain private: callers may reference only declared outputs below the instance alias. A parent fragment must likewise re-export a nested output before its own caller can access it. Fragment uses may nest to any acyclic depth, while direct and indirect fragment recursion is rejected with the use chain.
 
 Expansion is deterministic and occurs before the existing chain, binding, save, forward-reference, template, ABI, event-filter, and type validation. Duplicate aliases, expanded saves, and invalid names are therefore checked together with surrounding inline steps. Errors identify the declaring source file and, when applicable, the fragment, instance alias, local step, and expanded step index.
 
@@ -845,6 +845,37 @@ Captures the chain's current canonical block cursor. Use it immediately before a
   save: before_delivery
 ```
 
+#### `invoke`
+
+Runs a query-only action supplied by the selected network adapter. `with` values may use runtime expressions, and the adapter's structured result can be saved and passed to later steps. Unsupported action names are rejected before any journey starts.
+
+The Tempo adapter provides `prepare_encrypted_deposit`, which is compatible with viem's `zone.encryptedDeposit.prepareRecipient`: it reads the current ZonePortal encryption key and creates a fresh secp256k1/AES-GCM payload for each invocation. Cryptographic material always comes from the operating system and is intentionally not controlled by the scenario seed. `portalAddress` is optional for Zone IDs known to viem; supply it for other deployments. `memo` is an optional `bytes32` and defaults to zero.
+
+```yaml
+- invoke:
+    chain: l1
+    action: prepare_encrypted_deposit
+    with:
+      recipient: { var: user.address }
+      zoneId: 9
+      portalAddress: ${ZONE_PORTAL_ADDRESS}
+  save: prepared
+
+- submit:
+    chain: l1
+    template: encrypted_deposit
+    with:
+      from: { var: user.ref }
+      call:
+        args:
+          - ${TOKEN_ADDRESS}
+          - 1000000
+          - { var: prepared.keyIndex }
+          - { var: prepared.encrypted }
+```
+
+The saved result contains viem's `chainId`, `encrypted`, `keyIndex`, `portalAddress`, and `zoneId` fields. `encrypted` contains `ciphertext`, `ephemeralPubkeyX`, `ephemeralPubkeyYParity`, `nonce`, and `tag` and can be used directly as the named tuple argument of `depositEncrypted`.
+
 #### `submit`
 
 Loads a named template from the selected chain's workload, deep-merges `with`, resolves runtime expressions, signs with that chain's adapter, and submits it through the in-process sender. The step completes after RPC acceptance and exposes the transaction hash. Set `await: receipt` to keep the step open until a successful receipt is observed; a reverted receipt fails the step.
@@ -898,6 +929,7 @@ A log wait must provide `from_block` or `transaction_hash`. Optional `address`, 
 | Step | Saved fields |
 |------|--------------|
 | `checkpoint` | `chain`, `block_number`, optional `block_hash`, `captured_at` |
+| `invoke` | adapter-defined result plus `chain` and `action` |
 | `submit` | `chain`, `template`/`id`, `sender`, `tx_hash`, `submitted_at`, `acceptance_latency`, optional `receipt` |
 | `submit.receipt` | `chain`, `transaction_hash`, `block_hash`, `block_number`, `status`, `gas_used`, `observed_at` |
 | `wait_receipt` | `chain`, `transaction_hash`, `block_hash`, `block_number`, `status`, `gas_used`, `observed_at` |
@@ -949,7 +981,7 @@ correlation:
       - { var: delivered.args.messageId }
 ```
 
-`abi_encode_packed` and `keccak256_packed` also accept an inferred list, for example `keccak256_packed: [{ var: user.address }, { var: publish.tx_hash }]`. Prefer the typed form when integer widths or another Solidity type distinction matters. Transformations are deterministic; arbitrary scripting is not supported.
+`abi_encode` supports Solidity tuple declarations with member names, including nested tuples and arrays; provide those values as YAML objects keyed by the member names. ABI expressions run only while an individual scenario instance materializes runtime expressions, after referenced values are available. `abi_encode_packed` and `keccak256_packed` also accept an inferred list, for example `keccak256_packed: [{ var: user.address }, { var: publish.tx_hash }]`. Prefer the typed form when integer widths or another Solidity type distinction matters. Transformations are deterministic; arbitrary scripting is not supported.
 
 ### Rate, concurrency, leases, and failures
 
@@ -1329,6 +1361,14 @@ Call argument variables reuse normal txgen generators such as `choice` and
 `uniform`. The `var` and `if` expressions are local to the call argument block and let
 arguments depend on earlier resolved variables.
 
+Solidity tuple arguments may be written as a list in component order or as a mapping keyed by the component names in the ABI. Tuple arrays use a list of tuple values. For example:
+
+```yaml
+args:
+  - token: "0x..."
+    amount: 1000000
+```
+
 ### Setup Transactions
 
 Use `setup.steps` for deterministic transactions that prepare the chain before the measured workload, such as contract deployments and mint/configuration calls. `txgen` emits all setup transactions first with `phase: "setup"`; workload transactions are emitted afterwards with `phase: "workload"`.
@@ -1626,6 +1666,7 @@ Summary of which RPC methods are required by each feature:
 | `eth_blockNumber` | `bench send` (query RPC when configured; benchmark block range), `scenario run` (`checkpoint`, confirmations, and block-range log polling) |
 | `eth_getBlockByNumber` | `bench send` (query RPC when configured; per-block stats collection), `scenario run` (`checkpoint`) |
 | `eth_getLogs` | `scenario run` (block-range `wait_log`) |
+| `eth_call` | `txgen-tempo scenario run` (`prepare_encrypted_deposit` and other adapter `invoke` actions) |
 | `debug_getRawBlock` | `txgen extract`, `txgen-ethereum extract-big-blocks` |
 | `eth_getBlockAccessListByBlockNumber` | `txgen extract --bal`, `txgen-ethereum extract-big-blocks --bal` |
 | `reth_newPayload` | `bench send-blocks` |
