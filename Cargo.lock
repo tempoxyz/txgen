@@ -5802,6 +5802,7 @@ dependencies = [
  "tokio",
  "txgen-core",
  "url",
+ "uuid",
 ]
 
 [[package]]

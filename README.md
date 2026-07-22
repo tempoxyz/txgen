@@ -81,7 +81,7 @@ txgen-tempo scenario run \
   --max-rpc-in-flight 100 \
   --seed 42 \
   --failure-policy continue \
-  --report scenario-report.json
+  --report json:scenario-report.json
 ```
 
 | Flag | Description |
@@ -96,7 +96,8 @@ txgen-tempo scenario run \
 | `--failure-policy <POLICY>` | `continue` (default) or `fail-fast` |
 | `--tx-rate <TPS>` | Separate per-chain transaction-submission limit across scenario instances (`0` = unlimited) |
 | `--max-rpc-in-flight <N>` | Upper bound on simultaneous transaction-submission RPC calls per chain (default: `100`) |
-| `--report <PATH>` | JSON report path; the report is written to stdout when omitted |
+| `--report <DESTINATION>` | Report destination; repeat for more than one. A bare path or `json:<path>` writes JSON, and `clickhouse:<url>` publishes to ClickHouse. JSON is written to stdout when omitted |
+| `-m, --metadata <KEY=VALUE>` | Metadata for external reporters; repeat for additional fields. ClickHouse requires `git-sha` and `git-ref` |
 | `--sample-instances <N>` | Include up to `N` sanitized instance lifecycle records in the report (default: `0`) |
 
 When both `--count` and `--duration` are present, txgen stops starting journeys at the first limit. See [Scenario Specification](#scenario-specification) for the schema, step results, expressions, and execution semantics.
@@ -366,7 +367,7 @@ This uses the same Prometheus remote write payload and `PROMETHEUS_*` environmen
 
 ### ClickHouse Reporting
 
-The ClickHouse reporter pushes benchmark results into three tables (`txgen_runs`, `txgen_blocks`, `txgen_metric_samples`). Block data is stored as factual chain data; metrics are stored as point-in-time scrape snapshots with no block attribution. It requires four metadata keys:
+The ClickHouse reporter stores common run metadata in `txgen_runs`. Bench runs additionally use `txgen_blocks` and `txgen_metric_samples`; scenario runs use `txgen_scenario_runs` and `txgen_scenario_steps` and do not write `txgen_blocks`. Block data is factual chain data, while metrics are point-in-time scrape snapshots with no block attribution. Bench reporting requires four metadata keys:
 
 ```bash
 bench send -i txs.ndjson \
@@ -387,7 +388,27 @@ bench send -i txs.ndjson \
 
 Authentication and insert batching are configured via environment variables: `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE`, and `CLICKHOUSE_SAMPLE_BATCH_SIZE` (default: `50000`). See [`scripts/clickhouse/README.md`](scripts/clickhouse/README.md) for schema setup and example queries.
 
-The JSON report includes:
+Scenario report destinations use the same `--report` flag and can be repeated. A bare path remains an alias for a JSON file:
+
+```bash
+CLICKHOUSE_USER=default \
+CLICKHOUSE_PASSWORD=secret \
+CLICKHOUSE_DATABASE=benchmarks \
+txgen-tempo scenario run \
+  --scenario scenario.yaml \
+  --count 100 \
+  --report scenario-report.json \
+  --report clickhouse:https://host:8443 \
+  -m git-sha=abc123 \
+  -m git-ref=main \
+  -m github-run-url=https://github.com/example/actions/runs/123
+```
+
+The scenario name, platform, and `mode=scenario` are derived from the finalized report; those metadata keys are reserved and conflicting user values are rejected. `git-sha` and `git-ref` are required metadata for the common `txgen_runs` row. Every destination receives the same client-generated `run_id`. JSON destinations are finalized before ClickHouse publication, so an upload error is returned without deleting a report file that was already written.
+
+Deploy migrations `006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sql` before enabling the scenario ClickHouse writer, including in the Zones workflow. Scenario publication requests synchronous acknowledgement for separate HTTP inserts of step rows, the aggregate scenario row, and finally `txgen_runs`. The last insert is the visibility marker: queries for complete scenario reports must begin at `txgen_runs` and join both scenario tables by `run_id`. An interrupted publication can leave child rows without a visible common run row.
+
+The bench JSON report includes:
 - `samples` — point-in-time metric snapshots (internal + node), stored as a time series
 - `blocks` — factual chain data for each block in the run (tx count, gas used, etc.)
 
@@ -860,9 +881,11 @@ The effective timeout for a step is its explicit sibling `timeout`, otherwise th
 
 The seed controls deterministic account/template/value choices. Each instance has isolated saved values, timing, failure state, and leases, so concurrent completion order cannot leak data between journeys.
 
-### JSON report
+### Scenario reports
 
-The scenario runner writes one JSON report to `--report`, or to stdout when no path is supplied. It includes the configured scenario name and execution configuration; started, completed, failed, and timed-out instance counts; completed scenarios per second; observed maximum in-flight instances; per-step success/failure counts and latency distributions; completed-journey latency; and failures grouped by stage and sanitized error class. `--sample-instances` optionally retains a bounded number of secret-free lifecycle records and safe failure details for debugging. Counts, minima, maxima, and means are exact; percentile estimates use a deterministic reservoir capped at 65,536 observations per distribution so duration-based runs use bounded memory.
+The scenario runner accepts repeatable report destinations. A bare `--report report.json` is the backward-compatible JSON form; `--report json:report.json` is the explicit form, and `--report clickhouse:<url>` publishes the same finalized report to ClickHouse. When `--report` is omitted, JSON is written to stdout. All destinations share the report's client-generated `run_id`, and JSON files are written before ClickHouse publication so a publication failure does not remove the local report.
+
+The report includes the configured scenario name and execution configuration; started, completed, failed, and timed-out instance counts; completed scenarios per second; observed maximum in-flight instances; per-step chain, success/failure counts, and latency distributions; completed-journey latency; and failures grouped by stage and sanitized error class. `--sample-instances` optionally retains a bounded number of secret-free lifecycle records and safe failure details for debugging. Counts, minima, maxima, and means are exact; percentile estimates use a deterministic reservoir capped at 65,536 observations per distribution so duration-based runs use bounded memory.
 
 Steps expanded from fragments carry an optional `provenance` object in aggregate step reports, failure records, and sampled lifecycle steps. It records `source_file`, `fragment`, `instance_alias`, `local_step_name`, and the zero-based `local_step_index`. Inline steps omit it. Consumers can group latency by fragment and local step across instances, or include the alias to compare individual fragment uses. Because `scenario render` omits this source metadata, a later run of rendered YAML reports those flattened steps as inline steps.
 
