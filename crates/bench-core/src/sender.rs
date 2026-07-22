@@ -1371,11 +1371,9 @@ mod tests {
 
     #[test]
     fn receipt_details_preserve_gas_and_effective_price() {
-        let details = decode_receipt_details(receipt_json(
-            TxHash::repeat_byte(0x42),
-            Some("0x3b9aca00"),
-        ))
-        .unwrap();
+        let details =
+            decode_receipt_details(receipt_json(TxHash::repeat_byte(0x42), Some("0x3b9aca00")))
+                .unwrap();
 
         assert_eq!(details.gas_used, U256::from(21_000));
         assert_eq!(details.effective_gas_price, Some(U256::from(1_000_000_000u64)));

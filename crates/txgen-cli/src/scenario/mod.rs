@@ -435,6 +435,7 @@ mod tests {
                 p95_ms: 10.0,
                 p99_ms: 10.0,
             },
+            receipt_metrics: Vec::new(),
             failures: Vec::new(),
             sampled_instances: Vec::new(),
         }

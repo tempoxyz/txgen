@@ -1212,10 +1212,8 @@ where
         sender: Address,
         tx_hash: TxHash,
     ) {
-        let handle = self
-            .receipt_collector_handle
-            .lock()
-            .expect("receipt collector handle mutex poisoned");
+        let handle =
+            self.receipt_collector_handle.lock().expect("receipt collector handle mutex poisoned");
         let Some(handle) = handle.as_ref() else { return };
         handle.track(
             Some(sender),
