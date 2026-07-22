@@ -27,6 +27,7 @@ use alloy_network::{
 use alloy_primitives::{keccak256, Address, B256, TxHash, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use bench_core::{
+    ReceiptCollector, ReceiptCollectorHandle, ReceiptMetricGroup, ReceiptMetricLabels,
     RequestAuthProvider, RpcEndpoint, RpcSubmission, RpcSubmitFailureKind, RpcSubmitter,
     SenderConfig, SenderHeaderAuthProvider,
 };
@@ -274,11 +275,13 @@ where
         for (name, prepared) in prepared_chains {
             let chain_started = Instant::now();
             eprintln!("scenario chain initialization started: chain={name}");
-            let chain =
-                prepared
-                    .initialize(instance_seed(config.seed, stable_hash(&name)))
-                    .await
-                    .wrap_err_with(|| format!("failed to initialize scenario chain '{name}'"))?;
+            let chain = prepared
+                .initialize(
+                    instance_seed(config.seed, stable_hash(&name)),
+                    config.max_rpc_in_flight,
+                )
+                .await
+                .wrap_err_with(|| format!("failed to initialize scenario chain '{name}'"))?;
             eprintln!(
                 "scenario chain initialization completed: chain={name} elapsed={:?}",
                 chain_started.elapsed(),
@@ -409,8 +412,14 @@ where
             }
         }
 
+        // Receipt draining is report finalization, not part of measured scenario execution.
         let finished_at = SystemTime::now();
         let elapsed = run_start.elapsed();
+        let mut receipt_metrics = Vec::new();
+        for chain in self.chains.values() {
+            receipt_metrics.extend(chain.finish_receipt_metrics().await);
+        }
+        receipt_metrics.sort_by(|left, right| left.labels.cmp(&right.labels));
         let step_definitions = self
             .spec
             .scenario
@@ -463,6 +472,7 @@ where
             next_instance,
             maximum_in_flight,
             &step_definitions,
+            receipt_metrics,
             outcomes,
         ))
     }
@@ -503,11 +513,11 @@ where
             let result = if matches!(&step.action, StepAction::Submit(_)) {
                 // Submit handles its own deadline so a timed-out RPC cannot outlive
                 // the instance and release its account lease while still running.
-                self.execute_step(step, &context, &mut rng, deadline).await
+                self.execute_step(step, &name, &context, &mut rng, deadline).await
             } else {
                 match tokio::time::timeout_at(
                     deadline,
-                    self.execute_step(step, &context, &mut rng, deadline),
+                    self.execute_step(step, &name, &context, &mut rng, deadline),
                 )
                 .await
                 {
@@ -641,6 +651,7 @@ where
     async fn execute_step(
         &self,
         step: &StepDef,
+        step_name: &str,
         context: &RuntimeContext,
         rng: &mut StdRng,
         deadline: TokioInstant,
@@ -684,7 +695,13 @@ where
             StepAction::Submit(submit) => {
                 let submit_rng = rng.clone();
                 let (value, next_rng) = chain
-                    .execute_submit(submit.clone(), context.clone(), submit_rng, deadline)
+                    .execute_submit(
+                        step_name,
+                        submit.clone(),
+                        context.clone(),
+                        submit_rng,
+                        deadline,
+                    )
                     .await?;
                 *rng = next_rng;
                 Ok(value)
@@ -774,6 +791,8 @@ struct ChainRuntime<A: NetworkAdapter> {
     submission_ambiguous: AtomicBool,
     query_provider: DynProvider<AnyNetwork>,
     submitter: RpcSubmitter,
+    receipt_collector: Mutex<Option<ReceiptCollector>>,
+    receipt_collector_handle: StdMutex<Option<ReceiptCollectorHandle>>,
 }
 
 struct ChainInput {
@@ -999,7 +1018,7 @@ where
         Ok(())
     }
 
-    async fn initialize(self, setup_seed: u64) -> Result<ChainRuntime<A>> {
+    async fn initialize(self, setup_seed: u64, receipt_workers: usize) -> Result<ChainRuntime<A>> {
         let Self {
             name,
             chain_id,
@@ -1042,6 +1061,8 @@ where
             .await
             .wrap_err_with(|| format!("failed to materialize setup for chain '{name}'"))?
         };
+        let receipt_collector = ReceiptCollector::start(submitter.clone(), receipt_workers);
+        let receipt_collector_handle = receipt_collector.handle();
 
         Ok(ChainRuntime {
             name,
@@ -1059,6 +1080,8 @@ where
             submission_ambiguous: AtomicBool::new(false),
             query_provider,
             submitter,
+            receipt_collector: Mutex::new(Some(receipt_collector)),
+            receipt_collector_handle: StdMutex::new(Some(receipt_collector_handle)),
         })
     }
 }
@@ -1154,6 +1177,7 @@ where
 
     async fn execute_submit(
         &self,
+        step_name: &str,
         submit: SubmitStep,
         context: RuntimeContext,
         mut rng: StdRng,
@@ -1171,6 +1195,14 @@ where
         {
             Ok(submission) => submission,
             Err(error) => {
+                if error.kind() == RpcSubmitFailureKind::Ambiguous {
+                    self.track_receipt_metrics(
+                        step_name,
+                        &submit.template,
+                        materialized.sender,
+                        materialized.tx_hash,
+                    );
+                }
                 let lookup = match error.kind() {
                     RpcSubmitFailureKind::BeforeSend => None,
                     RpcSubmitFailureKind::Rejected | RpcSubmitFailureKind::Ambiguous => {
@@ -1245,6 +1277,12 @@ where
                 }
             }
         };
+        self.track_receipt_metrics(
+            step_name,
+            &submit.template,
+            materialized.sender,
+            materialized.tx_hash,
+        );
         if submission.tx_hash != materialized.tx_hash {
             self.submission_ambiguous.store(true, Ordering::Release);
             return Err(StepError::new(
@@ -1296,6 +1334,43 @@ where
             ]),
             rng,
         ))
+    }
+
+    async fn finish_receipt_metrics(&self) -> Vec<ReceiptMetricGroup> {
+        drop(
+            self.receipt_collector_handle
+                .lock()
+                .expect("receipt collector handle mutex poisoned")
+                .take(),
+        );
+        let collector = self.receipt_collector.lock().await.take();
+        match collector {
+            Some(collector) => collector.finish().await,
+            None => Vec::new(),
+        }
+    }
+
+    fn track_receipt_metrics(
+        &self,
+        step_name: &str,
+        input: &str,
+        sender: Address,
+        tx_hash: TxHash,
+    ) {
+        let handle = self
+            .receipt_collector_handle
+            .lock()
+            .expect("receipt collector handle mutex poisoned");
+        let Some(handle) = handle.as_ref() else { return };
+        handle.track(
+            Some(sender),
+            tx_hash,
+            ReceiptMetricLabels::from([
+                ("chain".to_string(), self.name.clone()),
+                ("input".to_string(), input.to_string()),
+                ("step".to_string(), step_name.to_string()),
+            ]),
+        );
     }
 
     async fn prepare_submission(

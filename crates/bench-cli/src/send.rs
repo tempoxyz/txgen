@@ -12,8 +12,9 @@ use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     collect_block_stats, parse_reporters, start_scrapers, trim_trailing_empty_blocks,
     ConsoleReporter, FileSource, FinalReport, GeneratedTx, MetricsCollector, ProgressState,
-    Reporter, RequestAuthProvider, RpcEndpoint, RunClock, RunStats, SampleStore, ScraperConfig,
-    Sender, SenderConfig, SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
+    ReceiptCollector, Reporter, RequestAuthProvider, RpcEndpoint, RpcSubmitter, RunClock, RunStats,
+    SampleStore, ScraperConfig, Sender, SenderConfig, SenderHeaderAuthProvider, StdinSource,
+    TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -153,8 +154,15 @@ async fn execute_source<S: TxSource>(
         Vec::new()
     };
 
+    let receipt_submitter = RpcSubmitter::new_with_request_auth(
+        endpoints.clone(),
+        SenderConfig { rate_limit: 0, max_concurrent: args.max_concurrent },
+        request_auth.clone(),
+    )?;
+    let receipt_collector = ReceiptCollector::start(receipt_submitter, args.max_concurrent);
     let mut sender =
-        Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth);
+        Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth)
+            .with_receipt_collector(receipt_collector.handle());
 
     let mut reporters = parse_reporters(&args.reports, "send", metadata)?;
     if reporters.is_empty() {
@@ -173,6 +181,7 @@ async fn execute_source<S: TxSource>(
     send_workload_from_source(source, &mut sender, &metrics, &config, &mut reporters).await?;
 
     sender.flush().await?;
+    drop(sender);
 
     let (sent, success, failed) = metrics.counts();
     tracing::info!(sent, success, failed, "Bench send completed; starting post-processing");
@@ -185,6 +194,9 @@ async fn execute_source<S: TxSource>(
     } else {
         tracing::info!(reason = "--drain-timeout=0", "Skipped txpool drain");
     }
+
+    let receipt_metrics = receipt_collector.finish().await;
+    tracing::info!(groups = receipt_metrics.len(), "Receipt gas metrics finalized");
 
     // Stop the scraper before finalizing.
     if !scraper_handles.is_empty() {
@@ -222,6 +234,7 @@ async fn execute_source<S: TxSource>(
         bench_metrics: Some(final_metrics),
         time_series: Some(time_series),
         sample_archive: Some(sample_archive),
+        receipt_metrics,
         ..Default::default()
     };
 

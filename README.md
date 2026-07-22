@@ -442,8 +442,10 @@ bench send -i txs.ndjson \
 Authentication and insert batching are configured via environment variables: `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE`, and `CLICKHOUSE_SAMPLE_BATCH_SIZE` (default: `50000`). See [`scripts/clickhouse/README.md`](scripts/clickhouse/README.md) for schema setup and example queries.
 
 The JSON report includes:
+
 - `samples` — point-in-time metric snapshots (internal + node), stored as a time series
 - `blocks` — factual chain data for each block in the run (tx count, gas used, etc.)
+- `receipt_metrics` — confirmed-transaction `gas_used`, `effective_gas_price`, and `fee_paid` distributions grouped by workload input
 
 ### Prometheus Reporting
 
@@ -786,7 +788,9 @@ The seed controls deterministic account/template/value choices. Each instance ha
 
 ### JSON report
 
-The scenario runner writes one JSON report to `--report`, or to stdout when no path is supplied. It includes the configured scenario name and execution configuration; started, completed, failed, and timed-out instance counts; completed scenarios per second; observed maximum in-flight instances; per-step success/failure counts and latency distributions; completed-journey latency; and failures grouped by stage and sanitized error class. `--sample-instances` optionally retains a bounded number of secret-free lifecycle records and safe failure details for debugging. Counts, minima, maxima, and means are exact; percentile estimates use a deterministic reservoir capped at 65,536 observations per distribution so duration-based runs use bounded memory.
+The scenario runner writes one JSON report to `--report`, or to stdout when no path is supplied. It includes the configured scenario name and execution configuration; started, completed, failed, and timed-out instance counts; completed scenarios per second; observed maximum in-flight instances; per-step success/failure counts and latency distributions; completed-journey latency; receipt gas metrics grouped by chain, input template, and scenario step; and failures grouped by stage and sanitized error class. `--sample-instances` optionally retains a bounded number of secret-free lifecycle records and safe failure details for debugging. Latency counts, minima, maxima, and means are exact; latency percentile estimates use a deterministic reservoir capped at 65,536 observations per distribution so duration-based runs use bounded memory.
+
+Receipt metrics come only from confirmed outer-transaction receipts; txgen does not trace or split gas across internal calls. Each distribution reports `count`, `min`, `mean`, `p50`, `p95`, and `p99`. When a receipt omits both `effectiveGasPrice` and legacy `gasPrice`, its gas usage is still counted while its effective-price and fee distributions remain empty.
 
 Latency distributions use monotonic elapsed time. Wall-clock timestamps are included only for correlation with external chain and node data. Transaction acceptance alone never marks a journey successful.
 

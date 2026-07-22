@@ -1,4 +1,4 @@
-use bench_core::compute_latency_stats;
+use bench_core::{compute_latency_stats, ReceiptMetricGroup};
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
@@ -21,6 +21,9 @@ pub struct ScenarioReport {
     pub maximum_in_flight: usize,
     pub steps: Vec<StepReport>,
     pub total_scenario_latency: LatencyDistribution,
+    /// Receipt-derived gas metrics grouped by chain, workload input, and scenario step.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub receipt_metrics: Vec<ReceiptMetricGroup>,
     pub failures: Vec<FailureReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sampled_instances: Vec<InstanceLifecycle>,
@@ -295,6 +298,7 @@ impl ScenarioReport {
         started: u64,
         maximum_in_flight: usize,
         step_definitions: &[(String, String)],
+        receipt_metrics: Vec<ReceiptMetricGroup>,
         accumulator: ScenarioAccumulator,
     ) -> Self {
         let ScenarioAccumulator {
@@ -349,6 +353,7 @@ impl ScenarioReport {
             maximum_in_flight,
             steps,
             total_scenario_latency: total_scenario_latency.distribution(),
+            receipt_metrics,
             failures,
             sampled_instances,
         }
@@ -399,6 +404,8 @@ fn duration_ms_f64(duration: Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::U256;
+    use bench_core::{ReceiptGasSample, ReceiptMetricsAccumulator};
 
     #[test]
     fn report_counts_journey_success_and_timeouts() {
@@ -443,6 +450,18 @@ mod tests {
         for outcome in outcomes {
             accumulator.record(outcome);
         }
+        let mut receipt_metrics = ReceiptMetricsAccumulator::default();
+        receipt_metrics.record(
+            BTreeMap::from([
+                ("chain".to_string(), "zone".to_string()),
+                ("input".to_string(), "transfer".to_string()),
+                ("step".to_string(), "send".to_string()),
+            ]),
+            ReceiptGasSample {
+                gas_used: U256::from(21_000),
+                effective_gas_price: Some(U256::from(2)),
+            },
+        );
         let report = ScenarioReport::build(
             "roundtrip".into(),
             ScenarioReportConfig {
@@ -463,6 +482,7 @@ mod tests {
             2,
             2,
             &[("send".into(), "submit".into())],
+            receipt_metrics.into_metrics(),
             accumulator,
         );
         assert_eq!(report.completed, 1);
@@ -472,6 +492,9 @@ mod tests {
         assert_eq!(report.steps[0].failed, 1);
         assert_eq!(report.sampled_instances.len(), 1);
         assert_eq!(report.total_scenario_latency.samples, 1);
+        let serialized = serde_json::to_value(&report).unwrap();
+        assert_eq!(serialized["receipt_metrics"][0]["labels"]["step"], "send");
+        assert_eq!(serialized["receipt_metrics"][0]["fee_paid"]["p99"], 42_000.0);
     }
 
     #[test]
