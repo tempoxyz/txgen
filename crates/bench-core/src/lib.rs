@@ -7,6 +7,7 @@
 //! - [`reporter`] - Output (console, JSON + NDJSON samples, ClickHouse, Prometheus remote write)
 //! - [`reth_api`] - reth custom Engine API types (`reth_newPayload`, `reth_forkchoiceUpdated`)
 
+pub mod clickhouse;
 pub mod clock;
 pub mod metrics;
 pub mod prometheus;
@@ -18,6 +19,7 @@ pub mod scraper;
 pub mod sender;
 pub mod source;
 
+pub use clickhouse::ClickHouseClient;
 pub use clock::RunClock;
 pub use metrics::{
     collect_block_stats, compute_latency_stats, trim_trailing_empty_blocks, BenchMetrics,

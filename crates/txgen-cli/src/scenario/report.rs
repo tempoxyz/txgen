@@ -9,6 +9,8 @@ use std::{
 #[derive(Debug, Clone, Serialize)]
 pub struct ScenarioReport {
     pub version: u32,
+    /// Identifier shared by every output sink for this scenario run.
+    pub run_id: uuid::Uuid,
     pub scenario: String,
     pub configuration: ScenarioReportConfig,
     pub started_at_unix_ms: u64,
@@ -53,6 +55,7 @@ pub struct ChainReportConfig {
 pub struct StepReport {
     pub index: usize,
     pub name: String,
+    pub chain: String,
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<StepProvenance>,
@@ -304,7 +307,7 @@ impl ScenarioReport {
         elapsed: Duration,
         started: u64,
         maximum_in_flight: usize,
-        step_definitions: &[(String, String, Option<StepProvenance>)],
+        step_definitions: &[(String, String, String, Option<StepProvenance>)],
         accumulator: ScenarioAccumulator,
     ) -> Self {
         let ScenarioAccumulator {
@@ -322,9 +325,10 @@ impl ScenarioReport {
         let steps = step_definitions
             .iter()
             .enumerate()
-            .map(|(index, (name, kind, provenance))| StepReport {
+            .map(|(index, (name, chain, kind, provenance))| StepReport {
                 index,
                 name: name.clone(),
+                chain: chain.clone(),
                 kind: kind.clone(),
                 provenance: provenance.clone(),
                 success: step_success[index],
@@ -350,6 +354,7 @@ impl ScenarioReport {
 
         Self {
             version: 1,
+            run_id: uuid::Uuid::new_v4(),
             scenario,
             configuration,
             started_at_unix_ms: unix_ms(started_at),
@@ -485,7 +490,7 @@ mod tests {
             Duration::from_secs(1),
             2,
             2,
-            &[("send".into(), "submit".into(), None)],
+            &[("send".into(), "primary".into(), "submit".into(), None)],
             accumulator,
         );
         assert_eq!(report.completed, 1);
@@ -495,8 +500,12 @@ mod tests {
         assert_eq!(report.steps[0].failed, 1);
         assert_eq!(report.sampled_instances.len(), 1);
         assert_eq!(report.total_scenario_latency.samples, 1);
+        assert!(!report.run_id.is_nil());
+        assert_eq!(report.steps[0].chain, "primary");
 
         let serialized = serde_json::to_value(&report).unwrap();
+        assert_eq!(serialized["run_id"], report.run_id.to_string());
+        assert_eq!(serialized["steps"][0]["chain"], "primary");
         assert!(serialized["steps"][0].get("provenance").is_none());
         assert!(serialized["failures"][0].get("provenance").is_none());
         assert!(serialized["sampled_instances"][0].get("failure_provenance").is_none());
@@ -582,13 +591,21 @@ scenario:
             1,
             1,
             &[
-                ("first.cursor".into(), "checkpoint".into(), Some(first_provenance)),
-                ("second.cursor".into(), "checkpoint".into(), Some(provenance)),
+                (
+                    "first.cursor".into(),
+                    "primary".into(),
+                    "checkpoint".into(),
+                    Some(first_provenance),
+                ),
+                ("second.cursor".into(), "primary".into(), "checkpoint".into(), Some(provenance)),
             ],
             accumulator,
         );
 
         let serialized = serde_json::to_value(&report).unwrap();
+        assert_eq!(serialized["run_id"], report.run_id.to_string());
+        assert_eq!(serialized["steps"][0]["chain"], "primary");
+        assert_eq!(serialized["steps"][1]["chain"], "primary");
         for value in [
             &serialized["steps"][1]["provenance"],
             &serialized["failures"][0]["provenance"],
@@ -649,7 +666,12 @@ scenario:
             Duration::from_secs(1),
             1,
             1,
-            &[("first_transfer.submission".into(), "submit".into(), Some(provenance))],
+            &[(
+                "first_transfer.submission".into(),
+                "primary".into(),
+                "submit".into(),
+                Some(provenance),
+            )],
             accumulator,
         );
 
