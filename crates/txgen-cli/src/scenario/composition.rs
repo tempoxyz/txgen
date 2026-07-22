@@ -1325,12 +1325,7 @@ scenario:
         assert_eq!(provenance.instance_alias, "top.child");
         assert_eq!(resolved.spec.chains["primary"].workload, dir.path().join("workload.yml"));
         assert_eq!(
-            resolved.spec.chains["primary"]
-                .request_auth
-                .as_ref()
-                .unwrap()
-                .sender_header
-                .map,
+            resolved.spec.chains["primary"].request_auth.as_ref().unwrap().sender_header.map,
             dir.path().join("sender-auth.json")
         );
     }
