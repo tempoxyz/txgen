@@ -491,6 +491,7 @@ Deploy migrations `006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sq
 The bench JSON report includes:
 - `samples` — point-in-time metric snapshots (internal + node), stored as a time series
 - `blocks` — factual chain data for each block in the run (tx count, gas used, etc.)
+- `receipt_metrics` — confirmed-transaction `gas_used`, `effective_gas_price`, and `fee_paid` distributions grouped by workload input
 
 ### Prometheus Reporting
 
@@ -1024,7 +1025,9 @@ The seed controls deterministic account/template/value choices. Each instance ha
 
 The scenario runner accepts repeatable report destinations. A bare `--report report.json` is the backward-compatible JSON form; `--report json:report.json` is the explicit form, and `--report clickhouse:<url>` publishes the same finalized report to ClickHouse. When `--report` is omitted, JSON is written to stdout. All destinations share the report's client-generated `run_id`, and JSON files are written before ClickHouse publication so a publication failure does not remove the local report.
 
-The report includes the configured scenario name and execution configuration; started, completed, failed, and timed-out instance counts; completed scenarios per second; observed maximum in-flight instances; per-step chain, success/failure counts, and latency distributions; completed-journey latency; and failures grouped by stage and sanitized error class. `--sample-instances` optionally retains a bounded number of secret-free lifecycle records and safe failure details for debugging. Counts, minima, maxima, and means are exact; percentile estimates use a deterministic reservoir capped at 65,536 observations per distribution so duration-based runs use bounded memory.
+The report includes the configured scenario name and execution configuration; started, completed, failed, and timed-out instance counts; completed scenarios per second; observed maximum in-flight instances; per-step chain, success/failure counts, and latency distributions; completed-journey latency; receipt gas metrics grouped by chain, input template, and scenario step; and failures grouped by stage and sanitized error class. `--sample-instances` optionally retains a bounded number of secret-free lifecycle records and safe failure details for debugging. Counts, minima, maxima, and means are exact; percentile estimates use a deterministic reservoir capped at 65,536 observations per distribution so duration-based runs use bounded memory.
+
+Receipt metrics come only from confirmed outer-transaction receipts; txgen does not trace or split gas across internal calls. Each distribution reports `count`, `min`, `mean`, `p50`, `p95`, and `p99`. When a receipt omits both `effectiveGasPrice` and legacy `gasPrice`, its gas usage is still counted while its effective-price and fee distributions remain empty.
 
 Steps expanded from fragments carry an optional `provenance` object in aggregate step reports, failure records, and sampled lifecycle steps. It records `source_file`, `fragment`, `instance_alias`, `local_step_name`, and the zero-based `local_step_index`. Inline steps omit it. Consumers can group latency by fragment and local step across instances, or include the alias to compare individual fragment uses. Because `scenario render` omits this source metadata, a later run of rendered YAML reports those flattened steps as inline steps.
 

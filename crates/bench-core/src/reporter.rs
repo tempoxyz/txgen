@@ -8,6 +8,7 @@
 use crate::{
     clickhouse::ClickHouseClient,
     metrics::{BenchMetrics, BlockStats, RunStats, ThroughputSample, TimeSeriesMetrics},
+    receipt_metrics::ReceiptMetricGroup,
     sample::{Sample, SampleArchive},
 };
 use eyre::{bail, Context, Result};
@@ -38,6 +39,8 @@ pub struct FinalReport {
     pub sample_archive: Option<SampleArchive>,
     /// Per-block statistics.
     pub blocks: Vec<BlockStats>,
+    /// Receipt-derived gas metrics grouped by workload input labels.
+    pub receipt_metrics: Vec<ReceiptMetricGroup>,
 }
 
 impl FinalReport {
@@ -330,6 +333,9 @@ pub struct JsonReport {
     /// User-provided metadata key/value pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<std::collections::HashMap<String, String>>,
+    /// Receipt-derived gas metrics grouped by workload input labels.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub receipt_metrics: Vec<ReceiptMetricGroup>,
     /// Unified time-series samples (internal + node metrics).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub samples: Vec<Sample>,
@@ -434,8 +440,10 @@ fn samples_path_from_report(report_path: &Path) -> Option<std::path::PathBuf> {
 
 impl<W: Write + Send> Reporter for JsonReporter<W> {
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
-        let has_data =
-            report.bench_metrics.is_some() || !report.blocks.is_empty() || report.has_samples();
+        let has_data = report.bench_metrics.is_some() ||
+            !report.blocks.is_empty() ||
+            !report.receipt_metrics.is_empty() ||
+            report.has_samples();
         if !has_data {
             return Ok(());
         }
@@ -493,6 +501,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             blocks,
             run_stats: report.run_stats.clone(),
             metadata,
+            receipt_metrics: report.receipt_metrics.clone(),
             samples: Vec::new(),
         };
 
@@ -923,7 +932,10 @@ pub fn parse_reporters(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{metrics::LatencyStats, sample::SampleStore};
+    use crate::{
+        metrics::LatencyStats, sample::SampleStore, ReceiptGasSample, ReceiptMetricsAccumulator,
+    };
+    use alloy_primitives::U256;
     use std::{collections::BTreeMap, time::Duration};
 
     fn sample_metrics() -> BenchMetrics {
@@ -1002,6 +1014,27 @@ mod tests {
         assert_eq!(parsed["benchmark_id"], benchmark_id.to_string());
         assert_eq!(parsed["sent"], 1000);
         assert_eq!(parsed["success"], 950);
+    }
+
+    #[test]
+    fn test_json_reporter_includes_receipt_metrics() {
+        let mut accumulator = ReceiptMetricsAccumulator::default();
+        accumulator.record(
+            BTreeMap::from([("input".to_string(), "transfer".to_string())]),
+            ReceiptGasSample {
+                gas_used: U256::from(21_000),
+                effective_gas_price: Some(U256::from(2)),
+            },
+        );
+        let mut report = sample_report();
+        report.receipt_metrics = accumulator.into_metrics();
+        let mut output = Vec::new();
+        JsonReporter::new(&mut output).finalize(&report).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["receipt_metrics"][0]["labels"]["input"], "transfer");
+        assert_eq!(parsed["receipt_metrics"][0]["gas_used"]["p95"], 21_000.0);
+        assert_eq!(parsed["receipt_metrics"][0]["fee_paid"]["mean"], 42_000.0);
     }
 
     #[test]
