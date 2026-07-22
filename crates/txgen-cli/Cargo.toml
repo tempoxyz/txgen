@@ -25,6 +25,7 @@ rayon.workspace = true
 eyre.workspace = true
 humantime = "2"
 url = "2"
+uuid.workspace = true
 
 # alloy
 alloy-provider.workspace = true

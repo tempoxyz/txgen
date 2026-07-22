@@ -333,7 +333,12 @@ where
             .iter()
             .enumerate()
             .map(|(index, step)| {
-                (step_name(index, step), step.action.name().to_string(), step.provenance.clone())
+                (
+                    step_name(index, step),
+                    step.action.chain().to_string(),
+                    step.action.name().to_string(),
+                    step.provenance.clone(),
+                )
             })
             .collect::<Vec<_>>();
         let chain_configuration = self
