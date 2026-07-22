@@ -30,13 +30,41 @@ pub struct ScenarioSpec {
 pub struct ChainDef {
     /// Network adapter name, for example `tempo` or `ethereum`.
     pub network: String,
-    /// JSON-RPC endpoint for this chain.
+    /// JSON-RPC endpoint for transaction submission and sender-scoped requests.
     pub rpc_url: String,
+    /// Unauthenticated endpoint for chain, nonce, checkpoint, and log queries.
+    /// Defaults to `rpc_url` when omitted.
+    #[serde(default)]
+    pub query_rpc_url: Option<String>,
+    /// Optional request-scoped authentication for the submission endpoint.
+    #[serde(default)]
+    pub request_auth: Option<RequestAuthDef>,
     /// Effective chain ID, or `auto` to query it from the RPC endpoint.
     #[serde(default)]
     pub chain_id: ChainId,
     /// Existing txgen workload spec supplying accounts, artifacts, and templates.
     pub workload: PathBuf,
+}
+
+/// Request-scoped authentication for a scenario chain's submission endpoint.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestAuthDef {
+    /// Select a header value from a JSON map keyed by logical transaction sender.
+    pub sender_header: SenderHeaderAuthDef,
+}
+
+/// Sender-to-header map configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SenderHeaderAuthDef {
+    /// HTTP header populated with the selected map value.
+    pub name: String,
+    /// JSON file mapping sender addresses to header values.
+    pub map: PathBuf,
+    /// Interval between checks for an atomically replaced map.
+    #[serde(default, deserialize_with = "deserialize_optional_duration")]
+    pub reload_interval: Option<Duration>,
 }
 
 /// Chain ID selection in a scenario chain definition.
@@ -274,6 +302,10 @@ pub struct WaitReceiptStep {
     pub chain: String,
     /// Runtime expression resolving to the transaction hash.
     pub transaction_hash: serde_yaml::Value,
+    /// Runtime expression resolving to the logical transaction sender.
+    /// Required when request authentication is configured for the chain.
+    #[serde(default)]
+    pub sender: Option<serde_yaml::Value>,
     /// Accept a reverted receipt rather than failing the scenario step.
     #[serde(default)]
     pub allow_revert: bool,
@@ -300,6 +332,10 @@ pub struct WaitLogStep {
     /// Optional transaction-hash expression.
     #[serde(default)]
     pub transaction_hash: Option<serde_yaml::Value>,
+    /// Logical transaction sender used when a transaction-hash-only wait must
+    /// fetch receipts through an authenticated submission endpoint.
+    #[serde(default)]
+    pub sender: Option<serde_yaml::Value>,
     /// ABI artifact name in the selected chain's workload spec.
     pub abi: String,
     /// Event name or exact event signature.
@@ -401,11 +437,27 @@ impl ScenarioSpec {
             if chain.rpc_url.trim().is_empty() {
                 bail!("chain '{name}' has an empty rpc_url");
             }
+            if chain.query_rpc_url.as_ref().is_some_and(|url| url.trim().is_empty()) {
+                bail!("chain '{name}' has an empty query_rpc_url");
+            }
             if chain.workload.as_os_str().is_empty() {
                 bail!("chain '{name}' has an empty workload path");
             }
             if matches!(chain.chain_id, ChainId::Explicit(0)) {
                 bail!("chain '{name}' chain_id must be greater than zero");
+            }
+            if let Some(auth) = &chain.request_auth {
+                if auth.sender_header.name.trim().is_empty() {
+                    bail!("chain '{name}' request_auth sender_header has an empty name");
+                }
+                if auth.sender_header.map.as_os_str().is_empty() {
+                    bail!("chain '{name}' request_auth sender_header has an empty map path");
+                }
+                validate_optional_duration(
+                    auth.sender_header.reload_interval,
+                    &format!("chain '{name}' request_auth sender_header"),
+                    "reload_interval",
+                )?;
             }
         }
 
@@ -626,6 +678,17 @@ impl ScenarioSpec {
                     &label,
                     "transaction_hash",
                 )?;
+                if let Some(sender) = &wait.sender {
+                    validate_expression_type(
+                        sender,
+                        StaticValueType::Address,
+                        available,
+                        &label,
+                        "sender",
+                    )?;
+                } else if self.chains[chain].request_auth.is_some() {
+                    bail!("{label} requires `sender` when chain '{chain}' uses request_auth");
+                }
             }
             StepAction::WaitLog(wait) => {
                 if wait.abi.trim().is_empty() {
@@ -665,6 +728,19 @@ impl ScenarioSpec {
                         &label,
                         "transaction_hash",
                     )?;
+                }
+                if let Some(sender) = &wait.sender {
+                    validate_expression_type(
+                        sender,
+                        StaticValueType::Address,
+                        available,
+                        &label,
+                        "sender",
+                    )?;
+                } else if wait.from_block.is_none() && self.chains[chain].request_auth.is_some() {
+                    bail!(
+                        "{label} requires `sender` for a transaction-hash-only wait when chain '{chain}' uses request_auth"
+                    );
                 }
                 for name in wait.where_value.keys() {
                     if name.trim().is_empty() {
@@ -728,7 +804,12 @@ impl StepDef {
                 }
             }
             StepAction::Submit(step) => visit(&step.with_value)?,
-            StepAction::WaitReceipt(step) => visit(&step.transaction_hash)?,
+            StepAction::WaitReceipt(step) => {
+                visit(&step.transaction_hash)?;
+                if let Some(value) = &step.sender {
+                    visit(value)?;
+                }
+            }
             StepAction::WaitLog(step) => {
                 if let Some(value) = &step.from_block {
                     visit(value)?;
@@ -737,6 +818,9 @@ impl StepDef {
                     visit(value)?;
                 }
                 if let Some(value) = &step.transaction_hash {
+                    visit(value)?;
+                }
+                if let Some(value) = &step.sender {
                     visit(value)?;
                 }
                 for value in step.where_value.values() {
@@ -1334,6 +1418,47 @@ scenario:
     }
 
     #[test]
+    fn parses_separate_query_rpc_and_sender_authentication() {
+        let yaml = BASE.replace(
+            "    rpc_url: http://l1.invalid",
+            r#"    rpc_url: http://l1-submit.invalid
+    query_rpc_url: http://l1-query.invalid
+    request_auth:
+      sender_header:
+        name: X-Authorization-Token
+        map: ./sender-auth.json
+        reload_interval: 250ms"#,
+        );
+        let yaml = yaml.replace(
+            "        transaction_hash: { var: deposit.tx_hash }",
+            "        transaction_hash: { var: deposit.tx_hash }\n        sender: { var: deposit.sender }",
+        );
+
+        let spec = ScenarioSpec::parse(&yaml).unwrap();
+        let chain = &spec.chains["l1"];
+        assert_eq!(chain.rpc_url, "http://l1-submit.invalid");
+        assert_eq!(chain.query_rpc_url.as_deref(), Some("http://l1-query.invalid"));
+        let sender_header = &chain.request_auth.as_ref().unwrap().sender_header;
+        assert_eq!(sender_header.name, "X-Authorization-Token");
+        assert_eq!(sender_header.map, PathBuf::from("./sender-auth.json"));
+        assert_eq!(sender_header.reload_interval, Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn authenticated_receipt_wait_requires_sender() {
+        let yaml = BASE.replace(
+            "    rpc_url: http://l1.invalid",
+            r#"    rpc_url: http://l1.invalid
+    request_auth:
+      sender_header:
+        name: X-Authorization-Token
+        map: ./sender-auth.json"#,
+        );
+        let error = ScenarioSpec::parse(&yaml).unwrap_err().to_string();
+        assert!(error.contains("requires `sender`"), "unexpected error: {error}");
+    }
+
+    #[test]
     fn parses_random_and_index_account_selection() {
         let random: AccountSelection = serde_yaml::from_str("random").unwrap();
         let indexed: AccountSelection = serde_yaml::from_str("{ index: 7 }").unwrap();
@@ -1583,11 +1708,23 @@ scenario:
         let dir = std::env::temp_dir().join(unique);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("scenario.yml");
-        std::fs::write(&path, BASE).unwrap();
+        let yaml = BASE.replace(
+            "    rpc_url: http://zone.invalid",
+            r#"    rpc_url: http://zone.invalid
+    request_auth:
+      sender_header:
+        name: X-Authorization-Token
+        map: ./zone-auth.json"#,
+        );
+        std::fs::write(&path, yaml).unwrap();
 
         let spec = ScenarioSpec::load(&path).unwrap();
         assert_eq!(spec.chains["l1"].workload, dir.join("./l1.yml"));
         assert_eq!(spec.chains["zone"].workload, dir.join("./zone.yml"));
+        assert_eq!(
+            spec.chains["zone"].request_auth.as_ref().unwrap().sender_header.map,
+            dir.join("./zone-auth.json")
+        );
 
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();

@@ -4,9 +4,13 @@
 //! - Respecting scheduling key ordering (shared key = sequential, disjoint keys = parallel)
 //! - Applying rate limiting
 
-use crate::{metrics::MetricsCollector, RequestAuthProvider, RpcRequestContext};
+use crate::{
+    metrics::MetricsCollector,
+    receipt_metrics::{ReceiptCollectorHandle, ReceiptMetricLabels},
+    RequestAuthProvider, RpcRequestContext,
+};
 use alloy_network::{primitives::ReceiptResponse, AnyNetwork, AnyTransactionReceipt};
-use alloy_primitives::{Address, Bytes, TxHash};
+use alloy_primitives::{keccak256, Address, Bytes, TxHash, U256};
 use alloy_provider::{DynProvider, Provider};
 use alloy_transport::RpcError;
 use eyre::{Context, Result};
@@ -67,6 +71,18 @@ pub struct RpcSubmission {
     pub submitted_at: SystemTime,
 }
 
+/// Receipt fields retained for gas reporting without losing whether the RPC
+/// response actually supplied a fee field.
+#[derive(Debug)]
+pub struct RpcReceiptDetails {
+    /// Fully decoded transaction receipt.
+    pub receipt: AnyTransactionReceipt,
+    /// Gas consumed by the outer transaction receipt.
+    pub gas_used: U256,
+    /// Effective gas price when supplied by the RPC response.
+    pub effective_gas_price: Option<U256>,
+}
+
 /// Point at which an individual RPC submission failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcSubmitFailureKind {
@@ -109,18 +125,43 @@ impl RpcSubmitError {
         Self { kind, timed_out: true, diagnostic: diagnostic.to_string() }
     }
 
-    fn from_transport(error: alloy_transport::TransportError) -> Self {
-        let kind = match &error {
-            RpcError::ErrorResp(_) => RpcSubmitFailureKind::Rejected,
-            RpcError::UnsupportedFeature(_) |
-            RpcError::LocalUsageError(_) |
-            RpcError::SerError(_) => RpcSubmitFailureKind::BeforeSend,
-            RpcError::NullResp | RpcError::DeserError { .. } | RpcError::Transport(_) => {
-                RpcSubmitFailureKind::Ambiguous
-            }
+    fn from_transport(error: alloy_transport::TransportError, redact: bool) -> Self {
+        let kind = classify_transport_failure(&error);
+        let diagnostic = if redact {
+            "authenticated RPC submission failed".to_string()
+        } else {
+            error.to_string()
         };
-        Self { kind, timed_out: false, diagnostic: error.to_string() }
+        Self { kind, timed_out: false, diagnostic }
     }
+}
+
+fn classify_transport_failure(error: &alloy_transport::TransportError) -> RpcSubmitFailureKind {
+    match error {
+        RpcError::ErrorResp(_) => RpcSubmitFailureKind::Rejected,
+        RpcError::UnsupportedFeature(_) | RpcError::LocalUsageError(_) | RpcError::SerError(_) => {
+            RpcSubmitFailureKind::BeforeSend
+        }
+        RpcError::NullResp | RpcError::DeserError { .. } | RpcError::Transport(_) => {
+            RpcSubmitFailureKind::Ambiguous
+        }
+    }
+}
+
+fn submission_may_have_been_accepted(error: &alloy_transport::TransportError) -> bool {
+    if classify_transport_failure(error) == RpcSubmitFailureKind::Ambiguous {
+        return true;
+    }
+    let RpcError::ErrorResp(payload) = error else { return false };
+    known_transaction_error(&payload.message)
+}
+
+fn known_transaction_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("already known") ||
+        message.starts_with("known transaction") ||
+        message.contains("transaction already known") ||
+        message.contains("already imported")
 }
 
 impl std::fmt::Display for RpcSubmitError {
@@ -141,7 +182,8 @@ impl std::error::Error for RpcSubmitError {}
 /// key semantics as [`Sender`]. Raw submissions bypass key ordering.
 #[derive(Clone)]
 pub struct RpcSubmitter {
-    providers: Arc<[DynProvider<AnyNetwork>]>,
+    endpoints: Arc<[RpcEndpoint]>,
+    request_auth: Option<Arc<dyn RequestAuthProvider>>,
     semaphore: Arc<Semaphore>,
     rate_limiter: Option<Arc<RateLimiter>>,
     ordering: Arc<RpcOrdering>,
@@ -150,7 +192,21 @@ pub struct RpcSubmitter {
 impl RpcSubmitter {
     /// Create an RPC submitter backed by one or more interchangeable providers.
     pub fn new(providers: Vec<DynProvider<AnyNetwork>>, config: SenderConfig) -> Result<Self> {
-        if providers.is_empty() {
+        let endpoints = providers
+            .into_iter()
+            .enumerate()
+            .map(|(index, provider)| RpcEndpoint::new(format!("rpc-{index}"), provider))
+            .collect();
+        Self::new_with_request_auth(endpoints, config, None)
+    }
+
+    /// Create an RPC submitter with request-scoped authentication.
+    pub fn new_with_request_auth(
+        endpoints: Vec<RpcEndpoint>,
+        config: SenderConfig,
+        request_auth: Option<Arc<dyn RequestAuthProvider>>,
+    ) -> Result<Self> {
+        if endpoints.is_empty() {
             eyre::bail!("at least one RPC provider is required");
         }
         config.validate()?;
@@ -159,7 +215,8 @@ impl RpcSubmitter {
             (config.rate_limit > 0).then(|| Arc::new(RateLimiter::new(config.rate_limit)));
 
         Ok(Self {
-            providers: providers.into(),
+            endpoints: endpoints.into(),
+            request_auth,
             semaphore: Arc::new(Semaphore::new(config.max_concurrent)),
             rate_limiter,
             ordering: Arc::new(RpcOrdering::default()),
@@ -227,30 +284,37 @@ impl RpcSubmitter {
             None => self.acquire_permit().await.map_err(RpcSubmitError::before_send)?,
         };
 
-        // SAFETY: construction rejects an empty provider list.
-        let provider = self.providers.choose(&mut rand::rng()).expect("providers are non-empty");
+        let expected_hash = keccak256(&tx.raw);
+        let endpoint = self.endpoint_for_hash(expected_hash);
+        let headers = self
+            .headers_for(&endpoint, "eth_sendRawTransaction", tx.sender, None)
+            .map_err(RpcSubmitError::before_send)?;
+        let redact = self.request_auth.is_some();
         let submission = match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, submit_raw_rpc(provider, &tx.raw))
-                .await
-                .map_err(|_| {
-                    RpcSubmitError::deadline(
-                        RpcSubmitFailureKind::Ambiguous,
-                        "submission deadline elapsed after RPC dispatch; acceptance is unknown",
-                    )
-                })?
-                .map_err(RpcSubmitError::from_transport)?,
-            None => {
-                submit_raw_rpc(provider, &tx.raw).await.map_err(RpcSubmitError::from_transport)?
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline, submit_raw_rpc(&endpoint, &tx.raw, headers))
+                    .await
+                    .map_err(|_| {
+                        RpcSubmitError::deadline(
+                            RpcSubmitFailureKind::Ambiguous,
+                            "submission deadline elapsed after RPC dispatch; acceptance is unknown",
+                        )
+                    })?
+                    .map_err(|error| RpcSubmitError::from_transport(error, redact))?
             }
+            None => submit_raw_rpc(&endpoint, &tx.raw, headers)
+                .await
+                .map_err(|error| RpcSubmitError::from_transport(error, redact))?,
         };
         drop(permit);
 
         order.release_submission_keys();
         if let Some(inclusion_release) = order.take_inclusion_keys() {
-            let provider = provider.clone();
+            let submitter = self.clone();
+            let sender = tx.sender;
             let tx_hash = submission.tx_hash;
             tokio::spawn(async move {
-                let _ = wait_for_provider_receipt(&provider, tx_hash).await;
+                let _ = submitter.wait_for_receipt(sender, tx_hash).await;
                 drop(inclusion_release);
             });
         }
@@ -262,9 +326,133 @@ impl RpcSubmitter {
     pub async fn submit_raw(&self, raw: &Bytes) -> Result<RpcSubmission> {
         let _permit = self.acquire_permit().await?;
 
-        // SAFETY: construction rejects an empty provider list.
-        let provider = self.providers.choose(&mut rand::rng()).expect("providers are non-empty");
-        Ok(submit_raw_rpc(provider, raw).await?)
+        let endpoint = self.endpoint_for_hash(keccak256(raw));
+        let headers = self.headers_for(&endpoint, "eth_sendRawTransaction", None, None)?;
+        submit_raw_rpc(&endpoint, raw, headers)
+            .await
+            .map_err(|error| rpc_request_error(error, self.request_auth.is_some(), "submission"))
+    }
+
+    /// Fetch a transaction receipt through a sender-authenticated endpoint.
+    pub async fn get_transaction_receipt(
+        &self,
+        sender: Option<Address>,
+        tx_hash: TxHash,
+    ) -> Result<Option<AnyTransactionReceipt>> {
+        Ok(self
+            .get_transaction_receipt_details(sender, tx_hash)
+            .await?
+            .map(|details| details.receipt))
+    }
+
+    /// Fetch a transaction receipt while preserving optional fee-field
+    /// presence from the raw RPC response.
+    pub async fn get_transaction_receipt_details(
+        &self,
+        sender: Option<Address>,
+        tx_hash: TxHash,
+    ) -> Result<Option<RpcReceiptDetails>> {
+        let endpoint = self.endpoint_for_hash(tx_hash);
+        let headers =
+            self.headers_for(&endpoint, "eth_getTransactionReceipt", sender, Some(tx_hash))?;
+        let value = endpoint
+            .provider()
+            .client()
+            .request::<_, Option<serde_json::Value>>("eth_getTransactionReceipt", (tx_hash,))
+            .map_meta(|mut meta| {
+                meta.headers_mut().extend(headers);
+                meta
+            })
+            .await
+            .map_err(|error| {
+                rpc_request_error(error, self.request_auth.is_some(), "receipt lookup")
+            })?;
+
+        let details = value.map(decode_receipt_details).transpose()?;
+        if let Some(details) = &details &&
+            details.receipt.transaction_hash() != tx_hash
+        {
+            eyre::bail!("receipt lookup returned a different transaction hash");
+        }
+        Ok(details)
+    }
+
+    /// Check whether a transaction is known through a sender-authenticated endpoint.
+    pub async fn transaction_exists(
+        &self,
+        sender: Option<Address>,
+        tx_hash: TxHash,
+    ) -> Result<bool> {
+        let endpoint = self.endpoint_for_hash(tx_hash);
+        let headers =
+            self.headers_for(&endpoint, "eth_getTransactionByHash", sender, Some(tx_hash))?;
+        endpoint
+            .provider()
+            .client()
+            .request::<_, Option<serde_json::Value>>("eth_getTransactionByHash", (tx_hash,))
+            .map_meta(|mut meta| {
+                meta.headers_mut().extend(headers);
+                meta
+            })
+            .await
+            .map(|transaction| transaction.is_some())
+            .map_err(|error| {
+                rpc_request_error(error, self.request_auth.is_some(), "transaction lookup")
+            })
+    }
+
+    /// Validate submission authentication for a sender without dispatching an
+    /// RPC request.
+    ///
+    /// Every configured endpoint is checked because authentication providers
+    /// may use endpoint identity when selecting credentials.
+    pub fn validate_submission_auth(&self, sender: Option<Address>) -> Result<()> {
+        for endpoint in self.endpoints.iter() {
+            self.headers_for(endpoint, "eth_sendRawTransaction", sender, None)?;
+        }
+        Ok(())
+    }
+
+    fn endpoint_for_hash(&self, tx_hash: TxHash) -> RpcEndpoint {
+        // SAFETY: construction rejects an empty endpoint list.
+        let mut prefix = [0u8; 8];
+        prefix.copy_from_slice(&tx_hash[..8]);
+        let index =
+            (u64::from_be_bytes(prefix) % u64::try_from(self.endpoints.len()).unwrap()) as usize;
+        self.endpoints[index].clone()
+    }
+
+    fn headers_for(
+        &self,
+        endpoint: &RpcEndpoint,
+        method: &str,
+        sender: Option<Address>,
+        tx_hash: Option<TxHash>,
+    ) -> Result<HeaderMap> {
+        let headers = match &self.request_auth {
+            Some(auth) => auth.headers_for(&RpcRequestContext {
+                endpoint: endpoint.identity(),
+                method,
+                sender,
+                tx_hash,
+            }),
+            None => Ok(HeaderMap::new()),
+        }?;
+        Ok(mark_headers_sensitive(headers))
+    }
+
+    async fn wait_for_receipt(&self, sender: Option<Address>, tx_hash: TxHash) -> Result<bool> {
+        let deadline = tokio::time::Instant::now() + RECEIPT_TIMEOUT;
+
+        loop {
+            if let Some(receipt) = self.get_transaction_receipt(sender, tx_hash).await? {
+                return Ok(receipt.status());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                eyre::bail!("timed out waiting for transaction receipt");
+            }
+            tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
+        }
     }
 
     async fn acquire_permit(&self) -> Result<OwnedSemaphorePermit> {
@@ -523,6 +711,8 @@ pub struct Sender {
     /// Authentication failures discovered after the `send` call's own
     /// transaction was already dispatched. These are reported by `flush`.
     deferred_errors: VecDeque<eyre::Report>,
+    /// Optional receipt collector for workload gas reporting.
+    receipt_collector: Option<ReceiptCollectorHandle>,
 }
 
 impl Sender {
@@ -573,7 +763,14 @@ impl Sender {
             max_buffered,
             next_queue_id: 0,
             deferred_errors: VecDeque::new(),
+            receipt_collector: None,
         }
+    }
+
+    /// Attach receipt collection for every RPC-accepted workload transaction.
+    pub fn with_receipt_collector(mut self, collector: ReceiptCollectorHandle) -> Self {
+        self.receipt_collector = Some(collector);
+        self
     }
 
     /// Send a transaction.
@@ -819,6 +1016,7 @@ impl Sender {
         let metrics = self.metrics.clone();
         let completion_tx = self.completion_tx.clone();
         let request_auth = self.request_auth.clone();
+        let receipt_collector = self.receipt_collector.clone();
 
         self.worker_tasks.spawn(async move {
             submit_tx(
@@ -826,6 +1024,7 @@ impl Sender {
                 endpoint,
                 submission_headers,
                 request_auth,
+                receipt_collector,
                 metrics,
                 permit,
                 completion_tx,
@@ -864,11 +1063,13 @@ fn normalize_key_sets(
     Ok((submission_keys, inclusion_keys))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn submit_tx(
     pending: PendingTx,
     endpoint: RpcEndpoint,
     submission_headers: HeaderMap,
     request_auth: Option<Arc<dyn RequestAuthProvider>>,
+    receipt_collector: Option<ReceiptCollectorHandle>,
     metrics: Arc<MetricsCollector>,
     permit: OwnedSemaphorePermit,
     completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
@@ -881,6 +1082,7 @@ async fn submit_tx(
 
     metrics.record_sent();
 
+    let expected_hash = keccak256(&pending.raw);
     let start = Instant::now();
     let tx_hash = match send_raw_transaction(&endpoint, &pending.raw, submission_headers).await {
         Ok(tx_hash) => {
@@ -888,6 +1090,9 @@ async fn submit_tx(
             tx_hash
         }
         Err(e) => {
+            if submission_may_have_been_accepted(&e) {
+                track_workload_receipt(receipt_collector.as_ref(), &pending, expected_hash);
+            }
             if request_auth.is_some() {
                 tracing::warn!("Failed to send authenticated transaction");
             } else {
@@ -901,6 +1106,8 @@ async fn submit_tx(
     };
 
     drop(permit);
+
+    track_workload_receipt(receipt_collector.as_ref(), &pending, expected_hash);
 
     release_keys(&completion_tx, pending.submission_keys);
 
@@ -927,6 +1134,23 @@ async fn submit_tx(
     release_keys(&completion_tx, pending.inclusion_keys);
 }
 
+fn track_workload_receipt(
+    collector: Option<&ReceiptCollectorHandle>,
+    pending: &PendingTx,
+    tx_hash: TxHash,
+) {
+    if pending.phase != TxPhase::Workload {
+        return;
+    }
+    let Some(collector) = collector else { return };
+
+    let mut labels = ReceiptMetricLabels::new();
+    if let Some(input) = pending.id.clone() {
+        labels.insert("input".to_string(), input);
+    }
+    collector.track(pending.sender, tx_hash, labels);
+}
+
 async fn send_raw_transaction(
     endpoint: &RpcEndpoint,
     raw: &Bytes,
@@ -945,36 +1169,42 @@ async fn send_raw_transaction(
 }
 
 async fn submit_raw_rpc(
-    provider: &DynProvider<AnyNetwork>,
+    endpoint: &RpcEndpoint,
     raw: &Bytes,
+    headers: HeaderMap,
 ) -> alloy_transport::TransportResult<RpcSubmission> {
     let submitted_at = SystemTime::now();
     let start = Instant::now();
-    let pending_tx = provider.send_raw_transaction(raw).await?;
+    let tx_hash = send_raw_transaction(endpoint, raw, headers).await?;
 
-    Ok(RpcSubmission {
-        tx_hash: *pending_tx.tx_hash(),
-        acceptance_latency: start.elapsed(),
-        submitted_at,
-    })
+    Ok(RpcSubmission { tx_hash, acceptance_latency: start.elapsed(), submitted_at })
 }
 
-async fn wait_for_provider_receipt(
-    provider: &DynProvider<AnyNetwork>,
-    tx_hash: TxHash,
-) -> Result<bool> {
-    let deadline = tokio::time::Instant::now() + RECEIPT_TIMEOUT;
+fn decode_receipt_details(value: serde_json::Value) -> Result<RpcReceiptDetails> {
+    let effective_gas_price = value
+        .get("effectiveGasPrice")
+        .filter(|value| !value.is_null())
+        .or_else(|| value.get("gasPrice").filter(|value| !value.is_null()))
+        .map(|value| {
+            serde_json::from_value::<U256>(value.clone())
+                .wrap_err("invalid effective gas price in transaction receipt")
+        })
+        .transpose()?;
+    let receipt: AnyTransactionReceipt =
+        serde_json::from_value(value).wrap_err("invalid transaction receipt response")?;
 
-    loop {
-        if let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? {
-            return Ok(receipt.status());
-        }
+    Ok(RpcReceiptDetails { gas_used: U256::from(receipt.gas_used()), effective_gas_price, receipt })
+}
 
-        if tokio::time::Instant::now() >= deadline {
-            eyre::bail!("timed out waiting for transaction receipt");
-        }
-
-        tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
+fn rpc_request_error(
+    error: alloy_transport::TransportError,
+    redact: bool,
+    operation: &str,
+) -> eyre::Report {
+    if redact {
+        eyre::eyre!("authenticated RPC {operation} failed")
+    } else {
+        error.into()
     }
 }
 
@@ -1092,11 +1322,121 @@ impl RateLimiterState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ReceiptCollector, RunClock};
     use alloy_provider::ProviderBuilder;
     use alloy_transport::mock::Asserter;
 
+    #[derive(Default)]
+    struct RecordingAuth {
+        endpoints: StdMutex<Vec<String>>,
+    }
+
+    impl RequestAuthProvider for RecordingAuth {
+        fn headers_for(&self, context: &RpcRequestContext<'_>) -> Result<HeaderMap> {
+            if context.sender != Some(Address::repeat_byte(0x11)) {
+                eyre::bail!("missing sender mapping");
+            }
+            self.endpoints.lock().unwrap().push(context.endpoint.to_string());
+            Ok(HeaderMap::new())
+        }
+    }
+
     fn mocked_provider(asserter: Asserter) -> DynProvider<AnyNetwork> {
         ProviderBuilder::new_with_network::<AnyNetwork>().connect_mocked_client(asserter).erased()
+    }
+
+    fn receipt_json(
+        transaction_hash: TxHash,
+        effective_gas_price: Option<&str>,
+    ) -> serde_json::Value {
+        let mut receipt = serde_json::json!({
+            "transactionHash": transaction_hash,
+            "transactionIndex": "0x0",
+            "blockHash": TxHash::repeat_byte(0x44),
+            "blockNumber": "0x1",
+            "from": Address::repeat_byte(0x55),
+            "to": Address::repeat_byte(0x66),
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "contractAddress": null,
+            "logs": [],
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "status": "0x1",
+            "type": "0x2"
+        });
+        if let Some(price) = effective_gas_price {
+            receipt["effectiveGasPrice"] = serde_json::Value::String(price.to_string());
+        }
+        receipt
+    }
+
+    #[test]
+    fn receipt_details_preserve_gas_and_effective_price() {
+        let details =
+            decode_receipt_details(receipt_json(TxHash::repeat_byte(0x42), Some("0x3b9aca00")))
+                .unwrap();
+
+        assert_eq!(details.gas_used, U256::from(21_000));
+        assert_eq!(details.effective_gas_price, Some(U256::from(1_000_000_000u64)));
+    }
+
+    #[test]
+    fn receipt_details_preserve_missing_fee_fields() {
+        let details =
+            decode_receipt_details(receipt_json(TxHash::repeat_byte(0x42), None)).unwrap();
+
+        assert_eq!(details.gas_used, U256::from(21_000));
+        assert_eq!(details.effective_gas_price, None);
+    }
+
+    #[test]
+    fn only_known_transaction_errors_are_receipt_trackable() {
+        assert!(known_transaction_error("already known"));
+        assert!(known_transaction_error("Known transaction: 0x1234"));
+        assert!(known_transaction_error("transaction already imported"));
+        assert!(!known_transaction_error("unknown transaction type 0x7f"));
+        assert!(!known_transaction_error("nonce too low"));
+    }
+
+    #[tokio::test]
+    async fn sender_collects_receipts_without_inclusion_keys() {
+        let asserter = Asserter::new();
+        let raw = Bytes::from_static(&[0x02, 0xf8, 0x70]);
+        let tx_hash = keccak256(&raw);
+        asserter.push_success(&tx_hash);
+        asserter.push_success(&receipt_json(tx_hash, Some("0x2")));
+        let provider = mocked_provider(asserter.clone());
+        let config = SenderConfig { rate_limit: 0, max_concurrent: 1 };
+        let collector = ReceiptCollector::start(
+            RpcSubmitter::new(vec![provider.clone()], config.clone()).unwrap(),
+            1,
+        );
+        let metrics = MetricsCollector::new(RunClock::new());
+        let mut sender =
+            Sender::new(vec![provider], config, metrics).with_receipt_collector(collector.handle());
+
+        sender
+            .send(GeneratedTx {
+                phase: TxPhase::Workload,
+                id: Some("transfer".to_string()),
+                sender: Some(Address::repeat_byte(0x55)),
+                raw,
+                submission_keys: vec![SchedulingKey::from([0x11; 20])],
+                inclusion_keys: Vec::new(),
+            })
+            .await
+            .unwrap();
+        sender.flush().await.unwrap();
+        drop(sender);
+
+        let groups = collector.finish().await;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].labels["input"], "transfer");
+        assert_eq!(groups[0].gas_used.count, 1);
+        assert_eq!(groups[0].gas_used.min, Some(21_000.0));
+        assert_eq!(groups[0].effective_gas_price.min, Some(2.0));
+        assert_eq!(groups[0].fee_paid.min, Some(42_000.0));
+        assert!(asserter.read_q().is_empty());
     }
 
     #[test]
@@ -1120,6 +1460,38 @@ mod tests {
     fn test_rpc_submitter_rejects_empty_provider_list() {
         let result = RpcSubmitter::new(Vec::new(), SenderConfig::default());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rpc_submitter_preflights_auth_for_every_endpoint() {
+        let auth = Arc::new(RecordingAuth::default());
+        let submitter = RpcSubmitter::new_with_request_auth(
+            vec![
+                RpcEndpoint::new("first", mocked_provider(Asserter::new())),
+                RpcEndpoint::new("second", mocked_provider(Asserter::new())),
+            ],
+            SenderConfig::default(),
+            Some(auth.clone()),
+        )
+        .unwrap();
+
+        submitter.validate_submission_auth(Some(Address::repeat_byte(0x11))).unwrap();
+        assert_eq!(auth.endpoints.lock().unwrap().as_slice(), ["first", "second"]);
+        assert!(submitter.validate_submission_auth(Some(Address::repeat_byte(0x22))).is_err());
+    }
+
+    #[test]
+    fn rpc_submitter_uses_a_stable_endpoint_for_a_transaction_hash() {
+        let submitter = RpcSubmitter::new(
+            vec![mocked_provider(Asserter::new()), mocked_provider(Asserter::new())],
+            SenderConfig::default(),
+        )
+        .unwrap();
+        let transaction_hash = keccak256([0x02, 0xf8, 0x70]);
+
+        let first = submitter.endpoint_for_hash(transaction_hash);
+        let second = submitter.endpoint_for_hash(transaction_hash);
+        assert_eq!(first.identity(), second.identity());
     }
 
     #[tokio::test]
