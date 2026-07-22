@@ -10,6 +10,7 @@ mod addresses;
 mod bal;
 mod extract;
 mod generate;
+pub mod scenario;
 
 use addresses::run_addresses;
 pub use addresses::AddressesArgs;
@@ -17,9 +18,13 @@ use extract::{run_extract, run_extract_big_blocks};
 pub use extract::{ExtractArgs, ExtractBigBlocksArgs, ExtractFormat};
 use generate::run_generate;
 pub use generate::{
-    fetch_protocol_nonces, sign_standard_request, GenerateArgs, GenerateContext, NetworkAdapter,
-    RequestSignContext, TxRequest,
+    fetch_pending_protocol_nonces, fetch_protocol_nonces, materialize_and_sign_template,
+    materialize_setup, materialize_setup_online, sign_standard_request, GenerateArgs,
+    GenerateContext, MaterializedSetup, MaterializedTx, NetworkAdapter, RequestSignContext,
+    ScenarioActionContext, TxRequest,
 };
+use scenario::run_scenario_command;
+pub use scenario::{ScenarioArgs, ScenarioRenderArgs, ScenarioRunArgs, ScenarioValidateArgs};
 
 // ---------------------------------------------------------------------------
 // Private CLI plumbing
@@ -32,8 +37,9 @@ struct Cli {
     command: Command,
 }
 
+/// Chain-agnostic txgen subcommands shared by each network-specific binary.
 #[derive(Subcommand)]
-enum Command {
+pub enum Command {
     /// Generate transactions from a workload spec
     Generate(GenerateArgs),
     /// List all addresses from a workload spec (for funding)
@@ -42,13 +48,15 @@ enum Command {
     Extract(ExtractArgs),
     /// Generate synthetic big-block payloads from source blocks
     ExtractBigBlocks(ExtractBigBlocksArgs),
+    /// Run an asynchronous multi-chain transaction scenario
+    Scenario(ScenarioArgs),
 }
 
 // ---------------------------------------------------------------------------
 // Public entrypoint
 // ---------------------------------------------------------------------------
 
-pub async fn run<A: NetworkAdapter + 'static>(adapter: A) -> Result<()>
+pub async fn run<A: NetworkAdapter + Default + 'static>(adapter: A) -> Result<()>
 where
     <A::Network as Network>::TransactionRequest: Send + 'static,
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
@@ -60,10 +68,29 @@ where
     <A::Network as Network>::Header: Decodable + BlockHeader + Sealable,
 {
     let cli = Cli::parse();
-    match cli.command {
+    run_command(adapter, cli.command).await
+}
+
+/// Run one chain-agnostic txgen subcommand with the supplied network adapter.
+pub async fn run_command<A: NetworkAdapter + Default + 'static>(
+    adapter: A,
+    command: Command,
+) -> Result<()>
+where
+    <A::Network as Network>::TransactionRequest: Send + 'static,
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope: From<Signed<<A::Network as Network>::UnsignedTx>>
+        + Encodable2718
+        + Decodable
+        + Transaction
+        + alloy_consensus::transaction::SignerRecoverable,
+    <A::Network as Network>::Header: Decodable + BlockHeader + Sealable,
+{
+    match command {
         Command::Generate(args) => run_generate(adapter, args).await,
         Command::Addresses(args) => run_addresses(args),
         Command::Extract(args) => run_extract::<A::Network>(args).await,
         Command::ExtractBigBlocks(args) => run_extract_big_blocks::<A::Network>(args).await,
+        Command::Scenario(args) => run_scenario_command::<A>(args).await,
     }
 }

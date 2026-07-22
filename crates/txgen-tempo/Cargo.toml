@@ -16,7 +16,11 @@ txgen-cli.workspace = true
 
 # serde
 serde.workspace = true
+serde_json.workspace = true
 serde_yaml.workspace = true
+
+# CLI
+clap.workspace = true
 
 # alloy
 alloy-primitives.workspace = true
@@ -30,11 +34,19 @@ alloy-eips.workspace = true
 tempo-alloy.workspace = true
 tempo-primitives.workspace = true
 
+# crypto
+aes-gcm.workspace = true
+hkdf.workspace = true
+k256.workspace = true
+sha2.workspace = true
+
 # misc
 rand.workspace = true
+rustix.workspace = true
 eyre.workspace = true
 hex.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+zeroize.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+alloy-transport = "2"

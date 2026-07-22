@@ -6,13 +6,16 @@
 //! - ClickHouse (for time-series storage)
 
 use crate::{
+    clickhouse::ClickHouseClient,
     metrics::{BenchMetrics, BlockStats, RunStats, ThroughputSample, TimeSeriesMetrics},
+    receipt_metrics::ReceiptMetricGroup,
     sample::{Sample, SampleArchive},
 };
 use eyre::{bail, Context, Result};
 use flate2::{write::GzEncoder, Compression};
 use std::{
     collections::HashMap,
+    fmt,
     fs::File,
     io::{BufWriter, Write},
     path::Path,
@@ -36,6 +39,8 @@ pub struct FinalReport {
     pub sample_archive: Option<SampleArchive>,
     /// Per-block statistics.
     pub blocks: Vec<BlockStats>,
+    /// Receipt-derived gas metrics grouped by workload input labels.
+    pub receipt_metrics: Vec<ReceiptMetricGroup>,
 }
 
 impl FinalReport {
@@ -328,6 +333,9 @@ pub struct JsonReport {
     /// User-provided metadata key/value pairs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<std::collections::HashMap<String, String>>,
+    /// Receipt-derived gas metrics grouped by workload input labels.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub receipt_metrics: Vec<ReceiptMetricGroup>,
     /// Unified time-series samples (internal + node metrics).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub samples: Vec<Sample>,
@@ -432,8 +440,10 @@ fn samples_path_from_report(report_path: &Path) -> Option<std::path::PathBuf> {
 
 impl<W: Write + Send> Reporter for JsonReporter<W> {
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
-        let has_data =
-            report.bench_metrics.is_some() || !report.blocks.is_empty() || report.has_samples();
+        let has_data = report.bench_metrics.is_some() ||
+            !report.blocks.is_empty() ||
+            !report.receipt_metrics.is_empty() ||
+            report.has_samples();
         if !has_data {
             return Ok(());
         }
@@ -491,6 +501,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             blocks,
             run_stats: report.run_stats.clone(),
             metadata,
+            receipt_metrics: report.receipt_metrics.clone(),
             samples: Vec::new(),
         };
 
@@ -536,7 +547,7 @@ fn copy_and_gzip_samples_ndjson(report: &FinalReport, path: &Path) -> Result<usi
 }
 
 /// ClickHouse reporter configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClickHouseConfig {
     /// ClickHouse HTTP endpoint (e.g. `https://host:8443`).
     pub url: String,
@@ -566,6 +577,31 @@ pub struct ClickHouseConfig {
     pub metadata: HashMap<String, String>,
     /// Number of metric sample rows to insert per ClickHouse request.
     pub sample_batch_size: usize,
+}
+
+impl fmt::Debug for ClickHouseConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let url = reqwest::Url::parse(&self.url)
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|_| "[INVALID URL]".to_string());
+        formatter
+            .debug_struct("ClickHouseConfig")
+            .field("url", &url)
+            .field("database", &self.database)
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("run_id", &self.run_id)
+            .field("started_at", &self.started_at)
+            .field("scenario_name", &self.scenario_name)
+            .field("platform", &self.platform)
+            .field("mode", &self.mode)
+            .field("git_sha", &self.git_sha)
+            .field("git_ref", &self.git_ref)
+            .field("config", &self.config)
+            .field("metadata", &self.metadata)
+            .field("sample_batch_size", &self.sample_batch_size)
+            .finish()
+    }
 }
 
 /// Required metadata keys for the ClickHouse reporter.
@@ -644,67 +680,31 @@ impl ClickHouseConfig {
 /// - `txgen_metric_samples` — point-in-time metric snapshots
 pub struct ClickHouseReporter {
     config: ClickHouseConfig,
-    client: reqwest::Client,
+    client: ClickHouseClient,
 }
 
 impl ClickHouseReporter {
     /// Create a new ClickHouse reporter.
     pub fn new(config: ClickHouseConfig) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .context("failed to create HTTP client")?;
+        let client = ClickHouseClient::new(
+            config.url.clone(),
+            config.database.clone(),
+            config.user.clone(),
+            config.password.clone(),
+        )?;
 
         tracing::info!(
             run_id = %config.run_id,
             scenario = %config.scenario_name,
             platform = %config.platform,
             mode = %config.mode,
-            url = %config.url,
+            url = %client.endpoint_origin(),
             database = %config.database,
             sample_batch_size = config.sample_batch_size,
             "ClickHouse reporter initialized"
         );
 
         Ok(Self { config, client })
-    }
-
-    /// Insert rows into a table using `FORMAT JSONEachRow`.
-    fn insert_rows<T: serde::Serialize>(&self, table: &str, rows: &[T]) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        let mut body = String::new();
-        for row in rows {
-            // SAFETY: serialization of known structs should not fail
-            body.push_str(&serde_json::to_string(row).unwrap());
-            body.push('\n');
-        }
-
-        let query = format!("INSERT INTO {}.{} FORMAT JSONEachRow", self.config.database, table);
-        let url = format!("{}/?query={}", self.config.url, urlencoding::encode(&query));
-
-        let rt = tokio::runtime::Handle::current();
-        let mut req = self.client.post(&url).header("Content-Type", "application/json");
-        if let Some(ref user) = self.config.user {
-            req = req.header("X-ClickHouse-User", user);
-        }
-        if let Some(ref password) = self.config.password {
-            req = req.header("X-ClickHouse-Key", password);
-        }
-        let resp = tokio::task::block_in_place(|| rt.block_on(req.body(body).send()))
-            .wrap_err_with(|| format!("failed to insert into {table}"))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = tokio::task::block_in_place(|| rt.block_on(resp.text()))
-                .unwrap_or_else(|_| "<no body>".to_string());
-            bail!("ClickHouse insert into {table} failed (HTTP {status}): {body}");
-        }
-
-        tracing::info!(table, rows = rows.len(), "Inserted rows into ClickHouse");
-        Ok(())
     }
 
     /// Build the run row for insertion.
@@ -775,7 +775,7 @@ impl ClickHouseReporter {
         }
 
         let count = sample_rows.len();
-        self.insert_rows("txgen_metric_samples", &sample_rows)?;
+        self.client.insert_rows("txgen_metric_samples", &sample_rows)?;
         Ok(count)
     }
 }
@@ -793,11 +793,11 @@ impl Reporter for ClickHouseReporter {
 
         // Insert run.
         let run_row = self.build_run_row(finished_at);
-        self.insert_rows("txgen_runs", &[run_row])?;
+        self.client.insert_rows("txgen_runs", &[run_row])?;
 
         // Insert blocks.
         let block_rows = self.build_block_rows(report);
-        self.insert_rows("txgen_blocks", &block_rows)?;
+        self.client.insert_rows("txgen_blocks", &block_rows)?;
 
         // Insert metric samples in bounded chunks. The report is backed by a
         // disk archive, so do not collect all rows at once.
@@ -932,7 +932,10 @@ pub fn parse_reporters(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{metrics::LatencyStats, sample::SampleStore};
+    use crate::{
+        metrics::LatencyStats, sample::SampleStore, ReceiptGasSample, ReceiptMetricsAccumulator,
+    };
+    use alloy_primitives::U256;
     use std::{collections::BTreeMap, time::Duration};
 
     fn sample_metrics() -> BenchMetrics {
@@ -1011,6 +1014,27 @@ mod tests {
         assert_eq!(parsed["benchmark_id"], benchmark_id.to_string());
         assert_eq!(parsed["sent"], 1000);
         assert_eq!(parsed["success"], 950);
+    }
+
+    #[test]
+    fn test_json_reporter_includes_receipt_metrics() {
+        let mut accumulator = ReceiptMetricsAccumulator::default();
+        accumulator.record(
+            BTreeMap::from([("input".to_string(), "transfer".to_string())]),
+            ReceiptGasSample {
+                gas_used: U256::from(21_000),
+                effective_gas_price: Some(U256::from(2)),
+            },
+        );
+        let mut report = sample_report();
+        report.receipt_metrics = accumulator.into_metrics();
+        let mut output = Vec::new();
+        JsonReporter::new(&mut output).finalize(&report).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["receipt_metrics"][0]["labels"]["input"], "transfer");
+        assert_eq!(parsed["receipt_metrics"][0]["gas_used"]["p95"], 21_000.0);
+        assert_eq!(parsed["receipt_metrics"][0]["fee_paid"]["mean"], 42_000.0);
     }
 
     #[test]

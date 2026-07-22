@@ -1,5 +1,8 @@
+pub mod auth_token_map;
 mod nonce;
 mod template;
+mod zone;
+pub mod zone_auth;
 
 pub use nonce::{prefetch_parallel_nonces, NONCE_PRECOMPILE};
 pub use txgen_cli::fetch_protocol_nonces;
@@ -26,7 +29,8 @@ use tempo_primitives::{
     TempoSignature, TempoTxEnvelope,
 };
 use txgen_cli::{
-    sign_standard_request, GenerateContext, NetworkAdapter, RequestSignContext, TxRequest,
+    sign_standard_request, GenerateContext, NetworkAdapter, RequestSignContext,
+    ScenarioActionContext, TxRequest,
 };
 use txgen_core::{
     derive_mnemonic_signer, AccountPoolDef, BuildContext, EcdsaSigner, GeneratedTx, SchedulingKey,
@@ -59,9 +63,14 @@ const INLINE_ACCESS_KEY_START_INDEX: u32 = 1_000_000;
 pub struct TempoAdapter {
     /// Set exactly once by [`Self::prefetch_nonces`], then read lock-free
     /// on the hot path by [`Self::next_nonce_lazy`].
-    nonce_rpc: OnceLock<DynProvider<Ethereum>>,
+    nonce_rpc: OnceLock<NonceRpc>,
     /// Keychain setup state keyed by setup step id.
     keychain_setups: HashMap<String, TempoKeychainSetup>,
+}
+
+struct NonceRpc {
+    provider: DynProvider<Ethereum>,
+    pending: bool,
 }
 
 #[derive(Clone)]
@@ -180,11 +189,20 @@ impl TempoAdapter {
         nonce_key: U256,
     ) -> Result<u64> {
         if !ctx.nonces.contains(&scheduling_key) &&
-            let Some(provider) = self.nonce_rpc.get()
+            let Some(nonce_rpc) = self.nonce_rpc.get()
         {
+            if nonce_rpc.pending {
+                bail!(
+                    "online Tempo nonce lane was not prepared before synchronous materialization"
+                );
+            }
             let n = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(nonce::fetch_lane_nonce(provider, address, nonce_key))
+                tokio::runtime::Handle::current().block_on(nonce::fetch_lane_nonce(
+                    &nonce_rpc.provider,
+                    address,
+                    nonce_key,
+                    nonce_rpc.pending,
+                ))
             })?;
             ctx.nonces.reset(scheduling_key, n);
         }
@@ -343,6 +361,23 @@ impl NetworkAdapter for TempoAdapter {
     type Network = TempoNetwork;
     type SignContext = TempoSignContext;
 
+    fn network_name() -> &'static str {
+        "tempo"
+    }
+
+    fn scenario_actions() -> &'static [&'static str] {
+        zone::SCENARIO_ACTIONS
+    }
+
+    async fn invoke_scenario_action(
+        &self,
+        action: &str,
+        arguments: &serde_yaml::Value,
+        context: ScenarioActionContext<'_>,
+    ) -> Result<serde_yaml::Value> {
+        zone::invoke(action, arguments, context).await
+    }
+
     fn build_request(
         &self,
         template: Self::Template,
@@ -363,7 +398,29 @@ impl NetworkAdapter for TempoAdapter {
             );
         }
         let scheduling_key = compute_scheduling_key(selected.address, nonce_mode, ctx);
+        if matches!(nonce_mode, TempoNonceMode::Expiring) && template.nonce.is_some() {
+            bail!("`nonce` must not be set for an expiring Tempo transaction");
+        }
         let nonce = if let Some(nonce) = template.nonce {
+            if !matches!(nonce_mode, TempoNonceMode::Expiring) &&
+                self.nonce_rpc.get().is_some_and(|rpc| rpc.pending)
+            {
+                let expected = self.next_nonce_lazy(
+                    ctx,
+                    scheduling_key,
+                    selected.address,
+                    match nonce_mode {
+                        TempoNonceMode::Protocol => U256::ZERO,
+                        TempoNonceMode::Parallel(nonce_key) => nonce_key,
+                        TempoNonceMode::Expiring => unreachable!("excluded above"),
+                    },
+                )?;
+                if nonce != expected {
+                    bail!(
+                        "explicit nonce {nonce} does not match pending nonce {expected} for the selected Tempo lane"
+                    );
+                }
+            }
             nonce
         } else {
             match nonce_mode {
@@ -488,6 +545,59 @@ impl NetworkAdapter for TempoAdapter {
         })
     }
 
+    async fn prepare_request(
+        &self,
+        value: &serde_yaml::Value,
+        ctx: &mut BuildContext<'_>,
+    ) -> Result<()> {
+        let template: TempoTemplate = serde_yaml::from_value(value.clone())
+            .wrap_err("failed to parse Tempo template while preparing nonce state")?;
+        if template.expiring_nonce {
+            return Ok(());
+        }
+
+        // Preview only the signer and nonce-key choices. build_request performs
+        // these as its first RNG operations, so cloning the RNG finds the same
+        // lane without consuming the instance's deterministic stream twice.
+        let mut preview_rng = (*ctx.rng).clone();
+        let mut preview_nonces = txgen_core::NonceTracker::new();
+        let mut preview = BuildContext::new_with_address_pools(
+            ctx.chain_id,
+            ctx.gas,
+            ctx.accounts,
+            ctx.address_pools,
+            ctx.artifacts,
+            &mut preview_nonces,
+            &mut preview_rng,
+        );
+        let selected = preview.select_signer(&template.from)?;
+        let nonce_mode =
+            resolve_nonce_mode(&template, template.tx_type == TempoTxType::Tempo, &mut preview)?;
+        let (scheduling_key, nonce_key) = match nonce_mode {
+            TempoNonceMode::Protocol => (selected.address.0 .0, U256::ZERO),
+            TempoNonceMode::Parallel(nonce_key) => {
+                (compute_parallel_scheduling_key(selected.address, nonce_key), nonce_key)
+            }
+            TempoNonceMode::Expiring => return Ok(()),
+        };
+        if ctx.nonces.contains(&scheduling_key) {
+            return Ok(());
+        }
+        let nonce_rpc = self
+            .nonce_rpc
+            .get()
+            .ok_or_else(|| eyre::eyre!("online Tempo nonce provider is not initialized"))?;
+        let nonce = nonce::fetch_lane_nonce(
+            &nonce_rpc.provider,
+            selected.address,
+            nonce_key,
+            nonce_rpc.pending,
+        )
+        .await?;
+        ctx.nonces.reset(scheduling_key, nonce);
+        Ok(())
+    }
+
     fn expand_setup_extension(
         &mut self,
         step_id: &str,
@@ -504,7 +614,13 @@ impl NetworkAdapter for TempoAdapter {
         self.expand_keychain_authorize_pool(step_id, def, ctx).map(Some)
     }
 
-    async fn prefetch_nonces(&self, ctx: &mut GenerateContext, rpc: &str) -> Result<()> {
+    async fn prepare_nonces(
+        &self,
+        spec: &txgen_core::WorkloadSpec,
+        accounts: &txgen_core::AccountManager,
+        nonces: &mut txgen_core::NonceTracker,
+        rpc: &str,
+    ) -> Result<()> {
         use alloy_provider::{Provider, ProviderBuilder};
         use eyre::WrapErr;
 
@@ -512,18 +628,31 @@ impl NetworkAdapter for TempoAdapter {
             .connect_http(rpc.parse().wrap_err("invalid RPC URL")?)
             .erased();
 
-        let (accounts, nonces) = ctx.accounts_and_nonces();
-        txgen_cli::fetch_protocol_nonces(accounts, nonces, rpc).await?;
+        txgen_cli::fetch_pending_protocol_nonces(accounts, nonces, rpc).await?;
 
-        let (spec, accounts, nonces) = ctx.prefetch_state();
-        prefetch_parallel_nonces(&provider, accounts, spec, nonces).await?;
+        nonce::prefetch_pending_parallel_nonces(&provider, accounts, spec, nonces).await?;
 
         // Keep the provider so build_request can lazy-fetch nonces for any
         // (account, nonce_key) pair not enumerated by prefetch_parallel_nonces
         // (any non-literal `nonce_key` such as `uniform` or `choice`). `set`
         // only ever fails if called twice; the second call is a no-op we
         // accept silently because prefetch is only invoked once per run.
-        let _ = self.nonce_rpc.set(provider);
+        let _ = self.nonce_rpc.set(NonceRpc { provider, pending: true });
+
+        Ok(())
+    }
+
+    async fn prefetch_nonces(&self, ctx: &mut GenerateContext, rpc: &str) -> Result<()> {
+        use alloy_provider::{Provider, ProviderBuilder};
+        use eyre::WrapErr;
+
+        let provider = ProviderBuilder::<_, _, Ethereum>::new()
+            .connect_http(rpc.parse().wrap_err("invalid RPC URL")?)
+            .erased();
+        let (spec, accounts, nonces) = ctx.prefetch_state();
+        txgen_cli::fetch_protocol_nonces(accounts, nonces, rpc).await?;
+        prefetch_parallel_nonces(&provider, accounts, spec, nonces).await?;
+        let _ = self.nonce_rpc.set(NonceRpc { provider, pending: false });
 
         Ok(())
     }
@@ -964,6 +1093,8 @@ mod tests {
     use alloy_eips::eip2718::{Decodable2718, Encodable2718};
     use alloy_network::{NetworkTransactionBuilder, TxSignerSync};
     use alloy_primitives::Address;
+    use alloy_provider::{Provider, ProviderBuilder};
+    use alloy_transport::mock::Asserter;
     use rand::{rngs::StdRng, SeedableRng};
     use std::{
         collections::HashMap,
@@ -1292,6 +1423,72 @@ input: "0x"
 
         assert_eq!(tx_req.request.nonce_key, Some(U256::from(42)));
         assert_eq!(tx_req.request.nonce(), Some(0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_prepare_fetches_generated_pending_lane_without_blocking() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(7));
+        let provider = ProviderBuilder::<_, _, Ethereum>::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let adapter = TempoAdapter::new();
+        assert!(adapter.nonce_rpc.set(NonceRpc { provider, pending: true }).is_ok());
+
+        let value = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+type: tempo
+from:
+  pool: users
+  select: { index: 0 }
+to: "0x0000000000000000000000000000000000000001"
+value: 0
+gas_limit: 21000
+max_fee_per_gas: 1000000000
+max_priority_fee_per_gas: 1000000000
+nonce_key:
+  choice: [42]
+"#,
+        )
+        .unwrap();
+
+        adapter.prepare_request(&value, &mut ctx).await.unwrap();
+        let template: TempoTemplate = serde_yaml::from_value(value).unwrap();
+        let request = adapter.build_request(template, &mut ctx).unwrap();
+
+        let address = accounts.get_by_index("users", 0).unwrap().address();
+        let scheduling_key = compute_parallel_scheduling_key(address, U256::from(42));
+        assert_eq!(request.request.nonce_key, Some(U256::from(42)));
+        assert_eq!(request.request.nonce(), Some(7));
+        assert_eq!(ctx.nonces.current(&scheduling_key), 8);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[test]
+    fn expiring_nonce_rejects_an_explicit_nonce() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        let mut template = base_template(TempoTxType::Tempo);
+        template.expiring_nonce = true;
+        template.valid_for_secs = Some(10);
+        template.nonce = Some(0);
+
+        let error = match TempoAdapter::new().build_request(template, &mut ctx) {
+            Ok(_) => panic!("explicit expiring nonce should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must not be set"));
     }
 
     #[test]

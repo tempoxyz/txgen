@@ -8,10 +8,12 @@
 //! - [`reth_api`] - reth custom Engine API types (`reth_newPayload`, `reth_forkchoiceUpdated`)
 
 pub mod auth;
+pub mod clickhouse;
 pub mod clock;
 pub mod metrics;
 pub mod prometheus;
 pub mod prometheus_reporter;
+pub mod receipt_metrics;
 pub mod reporter;
 pub mod reth_api;
 pub mod sample;
@@ -20,6 +22,7 @@ pub mod sender;
 pub mod source;
 
 pub use auth::{RequestAuthProvider, RpcRequestContext, SenderHeaderAuthProvider};
+pub use clickhouse::ClickHouseClient;
 pub use clock::RunClock;
 pub use metrics::{
     collect_block_stats, compute_latency_stats, trim_trailing_empty_blocks, BenchMetrics,
@@ -30,6 +33,10 @@ pub use prometheus::parse_prometheus_text;
 pub use prometheus_reporter::{
     PrometheusConfig, PrometheusForwarder, PrometheusForwarderHandle, PrometheusForwarderSummary,
     PrometheusReporter,
+};
+pub use receipt_metrics::{
+    ReceiptCollector, ReceiptCollectorHandle, ReceiptGasSample, ReceiptMetricDistribution,
+    ReceiptMetricGroup, ReceiptMetricLabels, ReceiptMetrics, ReceiptMetricsAccumulator,
 };
 pub use reporter::{
     parse_reporters, ClickHouseConfig, ClickHouseReporter, ConsoleReporter, FinalReport,
@@ -42,6 +49,9 @@ pub use reth_api::{
 };
 pub use sample::{Sample, SampleArchive, SampleStore};
 pub use scraper::{start_scrapers, SampleCallback, ScraperConfig, ScraperHandle};
-pub use sender::{RpcEndpoint, Sender, SenderConfig};
+pub use sender::{
+    RpcEndpoint, RpcReceiptDetails, RpcSubmission, RpcSubmitError, RpcSubmitFailureKind,
+    RpcSubmitter, Sender, SenderConfig,
+};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource};
 pub use txgen_core::{GeneratedTx, TxPhase};
