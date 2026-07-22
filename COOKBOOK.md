@@ -18,6 +18,8 @@ Use `txgen-ethereum` for standard Ethereum transactions and `txgen-tempo` for Te
 - [Send to destination-only address pools](#send-to-destination-only-address-pools)
 - [Send a fixed number of synthetic transactions](#send-a-fixed-number-of-synthetic-transactions)
 - [Run a timed stress test](#run-a-timed-stress-test)
+- [Run a generic two-chain scenario](#run-a-generic-two-chain-scenario)
+- [Compose and validate reusable scenario fragments](#compose-and-validate-reusable-scenario-fragments)
 - [Replay historical blocks through Engine API](#replay-historical-blocks-through-engine-api)
 - [Replay blocks with Block Access Lists](#replay-blocks-with-block-access-lists)
 - [Pace block replay](#pace-block-replay)
@@ -215,6 +217,304 @@ txgen-tempo generate \
 ```
 
 Setup transactions are emitted before the timer starts. If both `--count` and `--duration` are provided, generation stops at whichever limit is reached first.
+
+## Run a generic two-chain scenario
+
+Use `scenario run` when a journey must cross an asynchronous chain boundary and later steps depend on receipts or decoded events. The runner materializes workload templates, signs them, submits them, waits, and writes one journey-level report; there is no separate `generate | bench send` pipeline to coordinate.
+
+Assume `alpha-workload.yaml` and `beta-workload.yaml` each define a `users` account pool, a `RelayEvents` ABI artifact, and the transaction templates named below. Save this scenario next to those workload files:
+
+```yaml
+version: 1
+
+chains:
+  alpha:
+    network: tempo
+    rpc_url: ${ALPHA_RPC_URL}
+    chain_id: auto
+    workload: ./alpha-workload.yaml
+  beta:
+    network: tempo
+    rpc_url: ${BETA_RPC_URL}
+    chain_id: auto
+    workload: ./beta-workload.yaml
+
+scenario:
+  name: generic-request-roundtrip
+  timeout: 30s
+  bindings:
+    caller:
+      account:
+        pool: users
+        select: lease
+
+  steps:
+    # Capture beta before publishing so the later wait can backfill safely.
+    - checkpoint:
+        chain: beta
+      save: beta_before_request
+
+    - submit:
+        chain: alpha
+        template: send_request
+        with:
+          from: { var: caller.ref }
+      save: request
+
+    - wait_receipt:
+        chain: alpha
+        transaction_hash: { var: request.tx_hash }
+      save: request_receipt
+
+    # Decode the correlation ID from the transaction's own event.
+    - wait_log:
+        chain: alpha
+        transaction_hash: { var: request.tx_hash }
+        abi: RelayEvents
+        event: RequestPublished
+      save: request_published
+
+    # The event may already exist when this step begins; the checkpoint makes
+    # the initial eth_getLogs backfill include it.
+    - wait_log:
+        chain: beta
+        from_block: { var: beta_before_request.block_number }
+        address: ${BETA_RELAY_ADDRESS}
+        abi: RelayEvents
+        event: RequestObserved
+        where:
+          requestId: { var: request_published.args.requestId }
+        confirmations: 2
+        max_block_range: 1000
+      save: request_observed
+      timeout: 90s
+
+    - checkpoint:
+        chain: alpha
+      save: alpha_before_response
+
+    - submit:
+        chain: beta
+        template: send_response
+        with:
+          from: { var: caller.ref }
+          call:
+            args:
+              - { var: request_observed.args.requestId }
+        await: receipt
+      save: response
+
+    - wait_log:
+        chain: alpha
+        from_block: { var: alpha_before_response.block_number }
+        address: ${ALPHA_RELAY_ADDRESS}
+        abi: RelayEvents
+        event: ResponseObserved
+        where:
+          requestId: { var: request_observed.args.requestId }
+      save: response_observed
+      timeout: 90s
+```
+
+Run many independent instances with bounded journey and RPC concurrency:
+
+```bash
+export ALPHA_RPC_URL=http://127.0.0.1:8545
+export BETA_RPC_URL=http://127.0.0.1:9545
+export ALPHA_RELAY_ADDRESS=0x1111111111111111111111111111111111111111
+export BETA_RELAY_ADDRESS=0x2222222222222222222222222222222222222222
+
+txgen-tempo scenario run \
+  --scenario ./generic-roundtrip.yaml \
+  --count 500 \
+  --starts-per-second 10 \
+  --max-in-flight 40 \
+  --tx-rate 100 \
+  --max-rpc-in-flight 100 \
+  --step-timeout 45s \
+  --seed 7 \
+  --failure-policy continue \
+  --sample-instances 5 \
+  --report generic-roundtrip-report.json
+```
+
+`--starts-per-second 10` means ten new end-to-end journeys per second; it does not mean ten transactions per second. `--tx-rate` is the separate per-chain transaction-submission limit. The leased `caller` account remains exclusive to one active journey and is returned even when that journey fails or times out.
+
+The bare report path above remains the shorthand for a JSON file. Report destinations are repeatable, so the same finalized run can be retained locally and published to ClickHouse:
+
+```bash
+CLICKHOUSE_USER=default \
+CLICKHOUSE_PASSWORD=secret \
+CLICKHOUSE_DATABASE=benchmarks \
+txgen-tempo scenario run \
+  --scenario ./generic-roundtrip.yaml \
+  --count 500 \
+  --starts-per-second 10 \
+  --max-in-flight 40 \
+  --report json:generic-roundtrip-report.json \
+  --report clickhouse:https://host:8443 \
+  -m git-sha=abc123 \
+  -m git-ref=main \
+  -m github-run-url=https://github.com/example/actions/runs/123
+```
+
+Both destinations use the `run_id` recorded in the JSON report. JSON destinations are written first; if ClickHouse publication fails, the command reports the error but leaves the JSON file in place. The scenario and platform fields are derived from the run, while additional `-m key=value` pairs are stored in `txgen_runs.metadata`.
+
+Use `--duration 10m` instead of, or together with, `--count`. When both are set, new starts stop at the first limit and active instances finish. `--failure-policy fail-fast` stops new starts after the first failed instance while allowing already-started instances to finish. See [Scenario Specification](README.md#scenario-specification) for every step, saved field, expression, timeout rule, and report field.
+
+## Compose and validate reusable scenario fragments
+
+Use named fragments when several scenarios share an ordered group of steps, or when one scenario needs the same group more than once with different arguments. This example assumes `primary-workload.yaml` defines a `users` account pool and a `transfer` transaction template. Arrange the files as follows:
+
+```text
+scenario.yaml
+primary-workload.yaml
+fragments/
+  common.yaml
+  transfers.yaml
+```
+
+Start with `fragments/transfers.yaml`. The fragment declares its input types, the saved results it exports and their step-result kinds, and its ordinary scenario steps:
+
+```yaml
+version: 1
+
+fragments:
+  submit-and-confirm:
+    parameters:
+      chain: string
+      sender: account_ref
+      recipient: address
+      amount: u256
+    outputs:
+      submission: submit
+      receipt: receipt
+    steps:
+      - submit:
+          chain: { param: chain }
+          template: transfer
+          with:
+            from: { param: sender }
+            call:
+              args:
+                - { param: recipient }
+                - { param: amount }
+        save: submission
+
+      - wait_receipt:
+          chain: { param: chain }
+          transaction_hash: { var: submission.tx_hash }
+        save: receipt
+```
+
+Create `fragments/common.yaml` with a fragment of its own and a nested include. `transfers.yaml` is resolved relative to `common.yaml`:
+
+```yaml
+version: 1
+include:
+  - transfers.yaml
+
+fragments:
+  capture-head:
+    parameters:
+      chain: string
+    outputs:
+      cursor: checkpoint
+    steps:
+      - checkpoint:
+          chain: { param: chain }
+        save: cursor
+```
+
+Included documents are libraries: they may contain only `version`, `include`, and `fragments`, so they cannot replace the entry point's chains or scenario. Includes are traversed depth-first in listed order. A repeated canonical path on the active include stack is a cycle; reaching the same file through a completed branch traverses it again, so repeated fragment contributions produce the normal duplicate-name error. Fragment declarations never silently override one another, and dependency/output contracts are validated even for fragments the root scenario does not instantiate.
+
+The root `scenario.yaml` can now instantiate `submit-and-confirm` twice. Each use has a unique, single-segment `as` alias and supplies exactly the declared `with` arguments. The last inline step demonstrates how subsequent steps read a namespaced output:
+
+```yaml
+version: 1
+
+include:
+  - fragments/common.yaml
+
+chains:
+  primary:
+    network: tempo
+    rpc_url: "${RPC_URL}"
+    chain_id: auto
+    workload: ./primary-workload.yaml
+
+scenario:
+  name: composed-transfers
+  timeout: 5m
+  bindings:
+    user:
+      account:
+        pool: users
+        select: lease
+  steps:
+    - use: capture-head
+      as: before_transfers
+      with:
+        chain: primary
+
+    - use: submit-and-confirm
+      as: first_transfer
+      with:
+        chain: primary
+        sender: { var: user.ref }
+        recipient: { var: user.address }
+        amount: 1
+
+    - use: submit-and-confirm
+      as: second_transfer
+      with:
+        chain: primary
+        sender: { var: user.ref }
+        recipient: { var: user.address }
+        amount: 2
+
+    - wait_receipt:
+        chain: primary
+        transaction_hash: { var: first_transfer.receipt.transaction_hash }
+      save: first_transfer_rechecked
+```
+
+The two uses expand in place and in order. Their local saves become `first_transfer.submission`, `first_transfer.receipt`, `second_transfer.submission`, and `second_transfer.receipt`. Local `{ var: submission.tx_hash }` references are resolved inside each fragment before caller parameter expressions are injected, so `{ var: user.ref }` keeps its caller scope. A nested fragment use adds its alias to the path. Direct or indirect fragment recursion is rejected.
+
+Parameter substitution replaces only an exact `{ param: name }` YAML node; it does not interpolate strings. Arguments may be literals, environment-expanded values, runtime references, or other supported txgen value expressions. Available parameter types are `string`, `account_ref`, `address`, `u256`, `bytes`, `bytes32`, `bool`, and unconstrained `value`. Every declared parameter is required, unknown arguments are errors, and each declared output must name a fragment save whose result kind is `checkpoint`, `submit`, `receipt`, or `log` as specified. Saves omitted from `outputs` are private to that fragment instance; nested outputs must be re-exported by a parent before the parent's caller can use them.
+
+Validate the composition without making RPC calls:
+
+```bash
+export RPC_URL=http://127.0.0.1:8545
+txgen-tempo scenario validate --scenario ./scenario.yaml
+```
+
+The command expands composition, loads workload and ABI files, runs template, event, filter, binding, save, forward-reference, and type checks, prints a success message, and exits. Composition errors identify the source file, fragment, alias, and expanded step when those contexts apply.
+
+Inspect or save the deterministic flattened form before running it:
+
+```bash
+# stdout
+txgen-tempo scenario render --scenario ./scenario.yaml
+
+# file
+txgen-tempo scenario render \
+  --scenario ./scenario.yaml \
+  --output ./rendered-scenario.yaml
+```
+
+The rendered YAML contains resolved workload paths and ordinary inline steps. It removes top-level include and fragment declarations, replaces fragment uses, and substitutes fragment-authored parameter expressions; same-named literal keys in ordinary application data remain intact. Environment variables are expanded too, so inspect and store the result as sensitive data when an RPC URL contains credentials. Composition provenance is intentionally omitted: running `scenario.yaml` records an optional provenance object on expanded report steps, failures, and sampled lifecycle steps, while reloading `rendered-scenario.yaml` treats those steps as ordinary inline steps.
+
+Run the original composed document to retain fragment, instance-alias, source-file, and local-step metadata for latency grouping:
+
+```bash
+txgen-tempo scenario run \
+  --scenario ./scenario.yaml \
+  --count 100 \
+  --max-in-flight 10 \
+  --report json:composed-report.json
+```
 
 ## Replay historical blocks through Engine API
 
@@ -488,6 +788,22 @@ bench send --input txs.ndjson \
   -m git-sha=abc123 \
   -m git-ref=main
 ```
+
+Publish a scenario report to JSON and ClickHouse with one shared `run_id`:
+
+```bash
+CLICKHOUSE_USER=default CLICKHOUSE_PASSWORD=secret CLICKHOUSE_DATABASE=benchmarks \
+txgen-tempo scenario run \
+  --scenario scenario.yaml \
+  --count 100 \
+  --report json:scenario-report.json \
+  --report clickhouse:https://host:8443 \
+  -m git-sha=abc123 \
+  -m git-ref=main \
+  -m phase=nightly
+```
+
+Apply `scripts/clickhouse/006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sql` before enabling this writer, including before enabling it in Zones. The writer never inserts scenario data into `txgen_blocks`. It inserts the per-step rows and aggregate scenario row first, then inserts `txgen_runs` as the visibility marker. Dashboard queries should start from `txgen_runs` and inner-join the two scenario tables on `run_id`; child rows from an interrupted publication are then excluded. JSON is finalized before the ClickHouse requests, so a publication error does not discard the local report.
 
 Push samples via Prometheus remote write:
 
