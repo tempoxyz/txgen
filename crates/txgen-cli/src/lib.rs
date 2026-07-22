@@ -72,7 +72,10 @@ where
 }
 
 /// Run one chain-agnostic txgen subcommand with the supplied network adapter.
-pub async fn run_command<A: NetworkAdapter + 'static>(adapter: A, command: Command) -> Result<()>
+pub async fn run_command<A: NetworkAdapter + Default + 'static>(
+    adapter: A,
+    command: Command,
+) -> Result<()>
 where
     <A::Network as Network>::TransactionRequest: Send + 'static,
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,

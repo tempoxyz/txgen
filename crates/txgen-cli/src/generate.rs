@@ -570,7 +570,10 @@ pub trait NetworkAdapter: Send + Sync {
         _context: ScenarioActionContext<'a>,
     ) -> impl std::future::Future<Output = Result<serde_yaml::Value>> + Send + 'a {
         async move {
-            bail!("network '{}' does not support scenario action '{action}'", Self::network_name())
+            Err(eyre::eyre!(
+                "network '{}' does not support scenario action '{action}'",
+                Self::network_name()
+            ))
         }
     }
 

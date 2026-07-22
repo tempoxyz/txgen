@@ -529,7 +529,7 @@ where
         let mut roots = BTreeMap::new();
         for (name, binding, index, address) in selections {
             let BindingRuntime::Account { pool, .. } = binding else { unreachable!() };
-            roots.insert(name.clone(), account_binding_value(&pool, index, address));
+            roots.insert(name.clone(), account_binding_value(pool, index, address));
         }
         for (name, binding) in &self.bindings {
             if matches!(binding, BindingRuntime::Bytes32) {

@@ -250,7 +250,7 @@ impl RpcSubmitter {
             let provider = provider.clone();
             let tx_hash = submission.tx_hash;
             tokio::spawn(async move {
-                let _ = wait_for_receipt(&provider, tx_hash).await;
+                let _ = wait_for_provider_receipt(&provider, tx_hash).await;
                 drop(inclusion_release);
             });
         }
@@ -959,6 +959,25 @@ async fn submit_raw_rpc(
     })
 }
 
+async fn wait_for_provider_receipt(
+    provider: &DynProvider<AnyNetwork>,
+    tx_hash: TxHash,
+) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + RECEIPT_TIMEOUT;
+
+    loop {
+        if let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? {
+            return Ok(receipt.status());
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            eyre::bail!("timed out waiting for transaction receipt");
+        }
+
+        tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
+    }
+}
+
 fn release_keys(completion_tx: &mpsc::UnboundedSender<SchedulingKeys>, keys: SchedulingKeys) {
     if !keys.is_empty() {
         let _ = completion_tx.send(keys);
@@ -1135,6 +1154,7 @@ mod tests {
         let transaction = GeneratedTx {
             phase: TxPhase::Workload,
             id: None,
+            sender: None,
             raw: Bytes::from_static(&[0x02, 0xf8, 0x70]),
             submission_keys: vec![SchedulingKey::from([0x11; 20])],
             inclusion_keys: Vec::new(),
