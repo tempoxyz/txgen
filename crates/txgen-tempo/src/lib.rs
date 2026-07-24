@@ -732,29 +732,21 @@ fn resolve_expiring_valid_before(template: &TempoTemplate) -> Result<u64> {
 ///
 /// Tempo expiring nonce replay protection is hash-based, so two otherwise
 /// identical transactions from the same sender can collide if their signed
-/// payload is identical. txgen uses a local monotonic counter to bump both fee
-/// fields before any signatures are produced. Adding the same bump to both
-/// fields preserves `max_priority_fee_per_gas <= max_fee_per_gas`.
+/// payload is identical. txgen uses a local monotonic counter to bump
+/// `max_fee_per_gas` before any signatures are produced, while leaving
+/// `max_priority_fee_per_gas` exactly as configured.
 fn apply_expiring_uniqueness_bump(
     req: &mut TempoTransactionRequest,
     ctx: &mut BuildContext<'_>,
 ) -> Result<()> {
     let bump = u128::from(ctx.next_nonce(EXPIRING_UNIQUENESS_COUNTER_KEY)) + 1;
 
-    let max_priority_fee_per_gas = req
-        .max_priority_fee_per_gas()
-        .ok_or_else(|| eyre::eyre!("Tempo expiring transactions require max_priority_fee_per_gas"))?
-        .checked_add(bump)
-        .ok_or_else(|| {
-            eyre::eyre!("expiring nonce max_priority_fee_per_gas overflowed uniqueness bump")
-        })?;
     let max_fee_per_gas = req
         .max_fee_per_gas()
         .ok_or_else(|| eyre::eyre!("Tempo expiring transactions require max_fee_per_gas"))?
         .checked_add(bump)
         .ok_or_else(|| eyre::eyre!("expiring nonce max_fee_per_gas overflowed uniqueness bump"))?;
 
-    req.set_max_priority_fee_per_gas(max_priority_fee_per_gas);
     req.set_max_fee_per_gas(max_fee_per_gas);
 
     Ok(())
@@ -1574,7 +1566,7 @@ nonce_key:
     }
 
     #[test]
-    fn test_expiring_nonce_fee_bumps_are_monotonic() {
+    fn test_expiring_nonce_max_fee_bumps_leave_zero_priority_fee_unchanged() {
         let accounts = test_accounts();
         let artifacts = ArtifactManager::empty();
         let gas = GasConfig::default();
@@ -1586,13 +1578,14 @@ nonce_key:
         let mut template = base_template(TempoTxType::Tempo);
         template.expiring_nonce = true;
         template.valid_before = Some(1_700_000_000);
+        template.max_priority_fee_per_gas = Some(0);
 
         let first = TempoAdapter::new().build_request(template.clone(), &mut ctx).unwrap().request;
         let second = TempoAdapter::new().build_request(template, &mut ctx).unwrap().request;
 
-        assert_eq!(first.max_priority_fee_per_gas(), Some(1_000_000_001));
+        assert_eq!(first.max_priority_fee_per_gas(), Some(0));
         assert_eq!(first.max_fee_per_gas(), Some(1_000_000_001));
-        assert_eq!(second.max_priority_fee_per_gas(), Some(1_000_000_002));
+        assert_eq!(second.max_priority_fee_per_gas(), Some(0));
         assert_eq!(second.max_fee_per_gas(), Some(1_000_000_002));
     }
 
@@ -1639,6 +1632,8 @@ nonce_key:
             .request;
 
         assert_ne!(first.max_fee_per_gas(), second.max_fee_per_gas());
+        assert_eq!(first.max_priority_fee_per_gas(), Some(1_000_000_000));
+        assert_eq!(second.max_priority_fee_per_gas(), Some(1_000_000_000));
         assert_ne!(
             first.fee_payer_signature, second.fee_payer_signature,
             "fee-payer signature must reflect the per-tx expiring uniqueness bump"

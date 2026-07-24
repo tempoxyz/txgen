@@ -1614,7 +1614,7 @@ templates:
 
 `valid_for_secs` must be `<= 30`, matching Tempo's expiring nonce validity window.
 
-For streamed benchmark pipelines such as `txgen-tempo generate | bench send`, txgen also applies a deterministic per-transaction fee bump before sponsor signing and sender signing. This guarantees that otherwise identical expiring transactions still produce unique signed payloads, avoiding hash-based replay collisions.
+For streamed benchmark pipelines such as `txgen-tempo generate | bench send`, txgen also applies a deterministic per-transaction bump to `max_fee_per_gas` before sponsor signing and sender signing. This guarantees that otherwise identical expiring transactions still produce unique signed payloads, avoiding hash-based replay collisions. `max_priority_fee_per_gas` remains exactly as configured, including zero.
 
 Recommended benchmark setting: `valid_for_secs: 25`. This matches `tempo-bench`'s default behavior and stays inside Tempo's 30-second protocol limit while leaving some propagation slack.
 
