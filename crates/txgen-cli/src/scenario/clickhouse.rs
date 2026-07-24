@@ -186,6 +186,15 @@ fn report_config(report: &ScenarioReport) -> BTreeMap<String, String> {
         config.insert(format!("{prefix}.network"), chain.network.clone());
         config.insert(format!("{prefix}.chain_id"), chain.chain_id.to_string());
         config.insert(format!("{prefix}.workload"), chain.workload.clone());
+        config.insert(format!("{prefix}.observation.mode"), chain.observation_mode.clone());
+        config.insert(
+            format!("{prefix}.observation.poll_interval_ms"),
+            chain.observation_poll_interval_ms.to_string(),
+        );
+        config.insert(
+            format!("{prefix}.observation.subscription_configured"),
+            chain.subscription_configured.to_string(),
+        );
     }
     config
 }
@@ -266,12 +275,13 @@ struct ScenarioStepRow {
 mod tests {
     use super::*;
     use crate::scenario::{
-        ChainReportConfig, LatencyDistribution, ScenarioReportConfig, StepProvenance, StepReport,
+        CausalEdgeReport, ChainReportConfig, InstanceLifecycle, LatencyDistribution, LifecycleStep,
+        ProtocolMilestone, ScenarioReportConfig, StepProvenance, StepReport,
     };
 
     fn sample_report() -> ScenarioReport {
         ScenarioReport {
-            version: 1,
+            version: 2,
             run_id: uuid::Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap(),
             scenario: "zones-roundtrip".into(),
             configuration: ScenarioReportConfig {
@@ -280,6 +290,9 @@ mod tests {
                     network: "tempo".into(),
                     chain_id: 4242,
                     workload: "/workloads/zone.yml".into(),
+                    observation_mode: "auto".into(),
+                    observation_poll_interval_ms: 50,
+                    subscription_configured: true,
                 }],
                 requested_instances: Some(100),
                 run_duration_ms: None,
@@ -302,9 +315,11 @@ mod tests {
             maximum_in_flight: 18,
             steps: vec![StepReport {
                 index: 0,
+                id: "deposit.submit".into(),
                 name: "deposit.submit".into(),
                 chain: "zone".into(),
                 kind: "submit".into(),
+                depends_on: vec!["deposit.prepare".into()],
                 provenance: Some(StepProvenance {
                     source_file: "fragments/deposit.yml".into(),
                     fragment: "deposit".into(),
@@ -323,6 +338,15 @@ mod tests {
                     p95_ms: 6.0,
                     p99_ms: 7.0,
                 },
+                command_latency: LatencyDistribution {
+                    samples: 100,
+                    min_ms: 1.0,
+                    max_ms: 8.0,
+                    mean_ms: 3.0,
+                    p50_ms: 2.0,
+                    p95_ms: 6.0,
+                    p99_ms: 7.0,
+                },
             }],
             total_scenario_latency: LatencyDistribution {
                 samples: 98,
@@ -333,10 +357,82 @@ mod tests {
                 p95_ms: 60.0,
                 p99_ms: 70.0,
             },
+            client_observed_e2e_latency: LatencyDistribution {
+                samples: 98,
+                min_ms: 10.0,
+                max_ms: 80.0,
+                mean_ms: 30.0,
+                p50_ms: 20.0,
+                p95_ms: 60.0,
+                p99_ms: 70.0,
+            },
+            observed_critical_path_latency: LatencyDistribution {
+                samples: 98,
+                min_ms: 8.0,
+                max_ms: 64.0,
+                mean_ms: 24.0,
+                p50_ms: 16.0,
+                p95_ms: 48.0,
+                p99_ms: 56.0,
+            },
+            causal_edges: vec![CausalEdgeReport {
+                relation: "dependency".into(),
+                source_step_id: "deposit.prepare".into(),
+                destination_step_id: "deposit.submit".into(),
+                source_milestone: "step_finished".into(),
+                destination_milestone: "step_started".into(),
+                observed_latency: LatencyDistribution::default(),
+                chain_timestamp_delta: LatencyDistribution::default(),
+                destination_observation_lag: LatencyDistribution::default(),
+            }],
             receipt_metrics: Vec::new(),
             receipt_records: Vec::new(),
             failures: Vec::new(),
-            sampled_instances: Vec::new(),
+            sampled_instances: vec![InstanceLifecycle {
+                instance: 7,
+                started_at_unix_ms: 1_100,
+                finished_at_unix_ms: 1_150,
+                elapsed_ms: 50,
+                client_observed_e2e_latency_ms: 50.0,
+                observed_critical_path_latency_ms: 40.0,
+                critical_path_step_ids: vec!["deposit.prepare".into(), "deposit.submit".into()],
+                outcome: "completed".into(),
+                failure_step: None,
+                failure_provenance: None,
+                failure_classification: None,
+                failure_detail: None,
+                steps: vec![LifecycleStep {
+                    index: 0,
+                    id: "deposit.submit".into(),
+                    name: "deposit.submit".into(),
+                    kind: "submit".into(),
+                    depends_on: vec!["deposit.prepare".into()],
+                    provenance: None,
+                    success: true,
+                    started_offset_ms: 10,
+                    finished_offset_ms: 14,
+                    latency_ms: 4.0,
+                    command_latency_ms: 4.0,
+                    milestones: vec![ProtocolMilestone {
+                        kind: "submit".into(),
+                        chain: "zone".into(),
+                        run_offset_ms: 12,
+                        wall_time_unix_ms: 1_112,
+                        submitted_at_unix_ms: Some(1_110),
+                        accepted_at_unix_ms: Some(1_112),
+                        first_observed_at_unix_ms: None,
+                        transaction_hash: None,
+                        block_number: None,
+                        block_hash: None,
+                        transaction_index: None,
+                        log_index: None,
+                        canonical_block_timestamp_ms: None,
+                        confirmation_depth: 0,
+                        event_names: Vec::new(),
+                        log_indices: Vec::new(),
+                    }],
+                }],
+            }],
         }
     }
 
@@ -368,8 +464,16 @@ mod tests {
         assert_eq!(common["git_sha"], "abc123");
         assert_eq!(common["git_ref"], "main");
         assert_eq!(common["config"]["chain.zone.chain_id"], "4242");
+        assert_eq!(common["config"]["chain.zone.observation.mode"], "auto");
+        assert_eq!(common["config"]["chain.zone.observation.poll_interval_ms"], "50");
+        assert_eq!(common["config"]["chain.zone.observation.subscription_configured"], "true");
         assert_eq!(common["metadata"]["phase"], "nightly");
-        assert_eq!(aggregate["report_version"], 1);
+        assert_eq!(aggregate["report_version"], 2);
+        assert!(
+            aggregate.get("client_observed_e2e_latency_samples").is_none(),
+            "the migration-free writer must use only the existing aggregate columns"
+        );
+        assert!(aggregate.get("observed_critical_path_latency_samples").is_none());
         assert_eq!(aggregate["requested_journeys"], 100);
         assert_eq!(aggregate["started_journeys"], 100);
         assert_eq!(aggregate["completed_journeys"], 98);
@@ -386,6 +490,12 @@ mod tests {
         assert_eq!(aggregate["latency_p99_ms"], 70.0);
         assert_eq!(aggregate["latency_max_ms"], 80.0);
         assert_eq!(step["step_index"], 0);
+        assert!(
+            step.get("step_id").is_none(),
+            "the migration-free writer must use only the existing step columns"
+        );
+        assert!(step.get("depends_on").is_none());
+        assert!(step.get("command_latency_samples").is_none());
         assert_eq!(step["step_name"], "deposit.submit");
         assert_eq!(step["chain"], "zone");
         assert_eq!(step["kind"], "submit");
@@ -408,13 +518,16 @@ mod tests {
         duration_report.configuration.requested_instances = None;
         duration_report.steps.push(StepReport {
             index: 1,
+            id: "unreached".into(),
             name: "unreached".into(),
             chain: "zone".into(),
             kind: "wait_log".into(),
+            depends_on: vec!["deposit.submit".into()],
             provenance: None,
             success: 0,
             failed: 0,
             latency: LatencyDistribution::default(),
+            command_latency: LatencyDistribution::default(),
         });
         let duration_rows = reporter.build_rows(&duration_report);
         let aggregate = serde_json::to_value(&duration_rows.scenario).unwrap();

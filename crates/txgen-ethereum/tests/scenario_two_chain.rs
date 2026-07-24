@@ -4,7 +4,10 @@ use serde_json::{json, Value};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -27,6 +30,9 @@ struct RpcState {
     chain: MockChain,
     chain_id: u64,
     receipt_status: bool,
+    checkpoint_delay: Duration,
+    checkpoint_active: Arc<AtomicUsize>,
+    checkpoint_max_active: Arc<AtomicUsize>,
     bridge: Arc<Mutex<BridgeState>>,
 }
 
@@ -177,6 +183,163 @@ async fn seeded_runs_produce_the_same_signed_transactions() {
     let first = execute_seeded_roundtrip(0x5eed).await;
     let second = execute_seeded_roundtrip(0x5eed).await;
     assert_eq!(first, second);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dag_runs_independent_delayed_branches_concurrently_before_join() {
+    let bridge = Arc::new(Mutex::new(BridgeState::default()));
+    let checkpoint_active = Arc::new(AtomicUsize::new(0));
+    let checkpoint_max_active = Arc::new(AtomicUsize::new(0));
+    let delay = Duration::from_millis(100);
+    let (x_url, x_server) = spawn_delayed_rpc(
+        MockChain::X,
+        1_001,
+        bridge.clone(),
+        delay,
+        checkpoint_active.clone(),
+        checkpoint_max_active.clone(),
+    )
+    .await;
+    let (y_url, y_server) = spawn_delayed_rpc(
+        MockChain::Y,
+        1_002,
+        bridge,
+        delay,
+        checkpoint_active,
+        checkpoint_max_active.clone(),
+    )
+    .await;
+    let directory = TempDir::new();
+    write_fixture_files(directory.path(), &x_url, &y_url);
+    fs::write(
+        directory.path().join("dag-branches.yaml"),
+        format!(
+            r#"version: 1
+chains:
+  x:
+    network: ethereum
+    rpc_url: "{x_url}"
+    chain_id: auto
+    workload: ./x-workload.yaml
+  y:
+    network: ethereum
+    rpc_url: "{y_url}"
+    chain_id: auto
+    workload: ./y-workload.yaml
+scenario:
+  name: concurrent-delayed-branches
+  execution: dag
+  steps:
+    - id: x_branch
+      checkpoint: {{ chain: x }}
+      save: x_point
+    - id: y_branch
+      checkpoint: {{ chain: y }}
+      save: y_point
+    - id: join
+      depends_on: [x_branch, y_branch]
+      checkpoint: {{ chain: x }}
+      save: joined
+"#
+        ),
+    )
+    .expect("write DAG scenario");
+
+    let scenario =
+        ScenarioSpec::load(&directory.path().join("dag-branches.yaml")).expect("load DAG scenario");
+    let report = execute_scenario::<EthereumAdapter>(
+        scenario,
+        ScenarioExecutionConfig {
+            count: Some(1),
+            duration: None,
+            starts_per_second: 0.0,
+            max_in_flight: 1,
+            step_timeout: Some(Duration::from_secs(2)),
+            seed: 0x5eed,
+            failure_policy: FailurePolicy::Continue,
+            transaction_rate: 0,
+            max_rpc_in_flight: 4,
+            sample_instances: 1,
+        },
+    )
+    .await
+    .expect("execute DAG scenario");
+    x_server.abort();
+    y_server.abort();
+
+    assert_eq!(report.completed, 1);
+    assert_eq!(checkpoint_max_active.load(Ordering::SeqCst), 2);
+    let steps = &report.sampled_instances[0].steps;
+    let x_branch = steps.iter().find(|step| step.id == "x_branch").unwrap();
+    let y_branch = steps.iter().find(|step| step.id == "y_branch").unwrap();
+    let join = steps.iter().find(|step| step.id == "join").unwrap();
+    assert!(x_branch.started_offset_ms.abs_diff(y_branch.started_offset_ms) < 50);
+    assert!(join.started_offset_ms >= x_branch.finished_offset_ms);
+    assert!(join.started_offset_ms >= y_branch.finished_offset_ms);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dag_rejects_unordered_regular_nonce_submissions_from_one_account() {
+    let bridge = Arc::new(Mutex::new(BridgeState::default()));
+    let (rpc_url, server) = spawn_rpc(MockChain::X, 1_001, bridge.clone()).await;
+    let directory = TempDir::new();
+    write_fixture_files(directory.path(), &rpc_url, &rpc_url);
+    fs::write(
+        directory.path().join("dag-regular-nonce.yaml"),
+        format!(
+            r#"version: 1
+chains:
+  x:
+    network: ethereum
+    rpc_url: "{rpc_url}"
+    chain_id: auto
+    workload: ./x-workload.yaml
+scenario:
+  name: unsafe-regular-nonce-branches
+  execution: dag
+  steps:
+    - id: first
+      submit:
+        chain: x
+        template: relay
+      save: first_tx
+    - id: second
+      submit:
+        chain: x
+        template: relay
+      save: second_tx
+"#
+        ),
+    )
+    .expect("write regular nonce DAG scenario");
+
+    let report = execute_scenario::<EthereumAdapter>(
+        ScenarioSpec::load(&directory.path().join("dag-regular-nonce.yaml"))
+            .expect("load regular nonce DAG scenario"),
+        ScenarioExecutionConfig {
+            count: Some(1),
+            duration: None,
+            starts_per_second: 0.0,
+            max_in_flight: 1,
+            step_timeout: Some(Duration::from_secs(2)),
+            seed: 0x5eed,
+            failure_policy: FailurePolicy::Continue,
+            transaction_rate: 0,
+            max_rpc_in_flight: 4,
+            sample_instances: 1,
+        },
+    )
+    .await
+    .expect("execute regular nonce DAG scenario");
+    server.abort();
+
+    assert_eq!(report.completed, 0);
+    assert_eq!(report.failed, 1);
+    assert_eq!(
+        report.sampled_instances[0].failure_classification.as_deref(),
+        Some("unsafe_parallel_nonce")
+    );
+    assert_eq!(bridge.lock().unwrap().x.submissions, 1);
 }
 
 async fn execute_seeded_roundtrip(seed: u64) -> (Vec<Bytes>, Vec<Bytes>) {
@@ -442,12 +605,57 @@ async fn spawn_rpc_with_receipt_status(
     receipt_status: bool,
     bridge: Arc<Mutex<BridgeState>>,
 ) -> (String, JoinHandle<()>) {
+    spawn_delayed_rpc_with_receipt_status(
+        chain,
+        chain_id,
+        receipt_status,
+        bridge,
+        Duration::ZERO,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    )
+    .await
+}
+
+async fn spawn_delayed_rpc(
+    chain: MockChain,
+    chain_id: u64,
+    bridge: Arc<Mutex<BridgeState>>,
+    checkpoint_delay: Duration,
+    checkpoint_active: Arc<AtomicUsize>,
+    checkpoint_max_active: Arc<AtomicUsize>,
+) -> (String, JoinHandle<()>) {
+    spawn_delayed_rpc_with_receipt_status(
+        chain,
+        chain_id,
+        true,
+        bridge,
+        checkpoint_delay,
+        checkpoint_active,
+        checkpoint_max_active,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_delayed_rpc_with_receipt_status(
+    chain: MockChain,
+    chain_id: u64,
+    receipt_status: bool,
+    bridge: Arc<Mutex<BridgeState>>,
+    checkpoint_delay: Duration,
+    checkpoint_active: Arc<AtomicUsize>,
+    checkpoint_max_active: Arc<AtomicUsize>,
+) -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock RPC");
     let address = listener.local_addr().expect("mock RPC address");
     let app = Router::new().route("/", post(handle_rpc)).with_state(RpcState {
         chain,
         chain_id,
         receipt_status,
+        checkpoint_delay,
+        checkpoint_active,
+        checkpoint_max_active,
         bridge,
     });
     let server = tokio::spawn(async move {
@@ -465,10 +673,31 @@ async fn handle_rpc(State(state): State<RpcState>, Json(request): Json<Value>) -
         "eth_chainId" => json!(quantity(state.chain_id)),
         "eth_getTransactionCount" => json!("0x0"),
         "eth_blockNumber" => {
+            if !state.checkpoint_delay.is_zero() {
+                let active = state.checkpoint_active.fetch_add(1, Ordering::SeqCst) + 1;
+                state.checkpoint_max_active.fetch_max(active, Ordering::SeqCst);
+                tokio::time::sleep(state.checkpoint_delay).await;
+                state.checkpoint_active.fetch_sub(1, Ordering::SeqCst);
+            }
             let bridge = state.bridge.lock().expect("bridge state lock");
             json!(quantity(bridge.chain(state.chain).head))
         }
-        "eth_getBlockByNumber" => block_value(START_BLOCK, B256::repeat_byte(0x55)),
+        "eth_getBlockByNumber" => {
+            let number = params.get(0).and_then(parse_quantity).unwrap_or(START_BLOCK);
+            let hash = state
+                .bridge
+                .lock()
+                .expect("bridge state lock")
+                .chain(state.chain)
+                .log
+                .as_ref()
+                .filter(|_| number == EVENT_BLOCK)
+                .and_then(|log| log.get("blockHash"))
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<B256>().ok())
+                .unwrap_or_else(|| B256::repeat_byte(0x55));
+            block_value(number, hash)
+        }
         "eth_sendRawTransaction" => {
             let raw = params
                 .get(0)

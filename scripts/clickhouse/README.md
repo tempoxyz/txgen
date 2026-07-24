@@ -72,17 +72,17 @@ One aggregate row per finalized scenario run. Common identity, timestamps, scena
 | `elapsed_ms` | UInt64 | Total run elapsed time |
 | `completed_journeys_per_second` | Float64 | Completed journeys divided by elapsed time |
 | `maximum_in_flight` | UInt64 | Highest observed active-journey count |
-| `latency_samples` | UInt64 | Completed-journey latency observations |
-| `latency_min_ms` | Float64 | Minimum completed-journey latency |
-| `latency_mean_ms` | Float64 | Mean completed-journey latency |
-| `latency_p50_ms` | Float64 | P50 completed-journey latency |
-| `latency_p95_ms` | Float64 | P95 completed-journey latency |
-| `latency_p99_ms` | Float64 | P99 completed-journey latency |
-| `latency_max_ms` | Float64 | Maximum completed-journey latency |
+| `latency_samples` | UInt64 | Completed client-observed journey latency observations |
+| `latency_min_ms` | Float64 | Minimum client-observed journey latency |
+| `latency_mean_ms` | Float64 | Mean client-observed journey latency |
+| `latency_p50_ms` | Float64 | P50 client-observed journey latency |
+| `latency_p95_ms` | Float64 | P95 client-observed journey latency |
+| `latency_p99_ms` | Float64 | P99 client-observed journey latency |
+| `latency_max_ms` | Float64 | Maximum client-observed journey latency |
 
 ### `txgen_scenario_steps`
 
-One aggregate row per expanded scenario step and run. A step that was never reached has zero successes, failures, and latency samples. Fragment provenance is null for ordinary inline steps.
+One aggregate row per expanded scenario step and run. For report version 2, the legacy `latency_*` columns contain client command duration, not protocol latency. A step that was never reached has zero successes, failures, and duration samples. Fragment provenance is null for ordinary inline steps.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -98,13 +98,13 @@ One aggregate row per expanded scenario step and run. A step that was never reac
 | `local_step_index` | UInt64? | Zero-based position in the declaring fragment |
 | `success` | UInt64 | Successful executions |
 | `failed` | UInt64 | Failed executions |
-| `latency_samples` | UInt64 | Attempted-step latency observations |
-| `latency_min_ms` | Float64 | Minimum step latency |
-| `latency_mean_ms` | Float64 | Mean step latency |
-| `latency_p50_ms` | Float64 | P50 step latency |
-| `latency_p95_ms` | Float64 | P95 step latency |
-| `latency_p99_ms` | Float64 | P99 step latency |
-| `latency_max_ms` | Float64 | Maximum step latency |
+| `latency_samples` | UInt64 | Attempted-step command-duration observations |
+| `latency_min_ms` | Float64 | Minimum command duration |
+| `latency_mean_ms` | Float64 | Mean command duration |
+| `latency_p50_ms` | Float64 | P50 command duration |
+| `latency_p95_ms` | Float64 | P95 command duration |
+| `latency_p99_ms` | Float64 | P99 command duration |
+| `latency_max_ms` | Float64 | Maximum command duration |
 
 ### `txgen_receipt_gas`
 

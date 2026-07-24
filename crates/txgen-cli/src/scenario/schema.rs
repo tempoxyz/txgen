@@ -7,7 +7,7 @@ use alloy_primitives::{Address, B256, I256, U256};
 use eyre::{bail, Result, WrapErr};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -42,8 +42,52 @@ pub struct ChainDef {
     /// Effective chain ID, or `auto` to query it from the RPC endpoint.
     #[serde(default)]
     pub chain_id: ChainId,
+    /// Canonical receipt/log observation transport and polling fallback.
+    #[serde(default)]
+    pub observation: ObservationDef,
     /// Existing txgen workload spec supplying accounts, artifacts, and templates.
     pub workload: PathBuf,
+}
+
+/// Chain-level observation defaults inherited by receipt and log waits.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationDef {
+    /// Prefer subscriptions automatically, require them, or use polling only.
+    #[serde(default)]
+    pub mode: ObservationMode,
+    /// Optional WebSocket endpoint used only as a wake-up source.
+    #[serde(default)]
+    pub websocket_url: Option<String>,
+    /// Canonical HTTP polling fallback interval.
+    #[serde(
+        default = "default_observation_poll_interval",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub poll_interval: Duration,
+}
+
+impl Default for ObservationDef {
+    fn default() -> Self {
+        Self {
+            mode: ObservationMode::Auto,
+            websocket_url: None,
+            poll_interval: default_observation_poll_interval(),
+        }
+    }
+}
+
+/// Receipt/log observation transport selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationMode {
+    /// Prefer subscriptions when a WebSocket is configured, with polling fallback.
+    #[default]
+    Auto,
+    /// Require the configured WebSocket subscription path.
+    Subscription,
+    /// Observe only through canonical polling.
+    Poll,
 }
 
 /// Request-scoped authentication for a scenario chain's submission endpoint.
@@ -105,6 +149,9 @@ impl<'de> Deserialize<'de> for ChainId {
 pub struct ScenarioDef {
     /// Human-readable scenario name included in reports.
     pub name: String,
+    /// Step scheduling semantics.
+    #[serde(default)]
+    pub execution: ScenarioExecutionMode,
     /// Default timeout inherited by steps without an explicit timeout.
     #[serde(
         default,
@@ -117,6 +164,17 @@ pub struct ScenarioDef {
     pub bindings: BTreeMap<String, BindingDef>,
     /// Ordered workflow steps.
     pub steps: Vec<StepDef>,
+}
+
+/// Scheduling semantics for one scenario instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScenarioExecutionMode {
+    /// Execute steps in their declared list order.
+    #[default]
+    Sequential,
+    /// Execute every step as soon as its explicit dependencies complete.
+    Dag,
 }
 
 /// Scenario-local binding definition.
@@ -205,9 +263,13 @@ impl<'de> Deserialize<'de> for AccountSelection {
     }
 }
 
-/// One ordered scenario step with optional save and timeout metadata.
+/// One scenario step with execution, dependency, save, and timeout metadata.
 #[derive(Debug, Clone)]
 pub struct StepDef {
+    /// Stable identity required by DAG scenarios.
+    pub id: Option<String>,
+    /// Stable IDs of steps that must complete before this step starts.
+    pub depends_on: Vec<String>,
     /// Step operation.
     pub action: StepAction,
     /// Immutable runtime root populated after this step completes.
@@ -309,6 +371,9 @@ pub struct WaitReceiptStep {
     /// Accept a reverted receipt rather than failing the scenario step.
     #[serde(default)]
     pub allow_revert: bool,
+    /// Per-step observation mode override.
+    #[serde(default)]
+    pub mode: Option<ObservationMode>,
     /// Polling interval override.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub poll_interval: Option<Duration>,
@@ -337,12 +402,20 @@ pub struct WaitLogStep {
     #[serde(default)]
     pub sender: Option<serde_yaml::Value>,
     /// ABI artifact name in the selected chain's workload spec.
+    #[serde(default)]
     pub abi: String,
     /// Event name or exact event signature.
+    #[serde(default)]
     pub event: String,
     /// Decoded event argument equality filters.
     #[serde(default, rename = "where")]
     pub where_value: BTreeMap<String, serde_yaml::Value>,
+    /// Multiple required events decoded from one canonical transaction receipt.
+    #[serde(default)]
+    pub events: BTreeMap<String, ReceiptEventDef>,
+    /// Per-step observation mode override.
+    #[serde(default)]
+    pub mode: Option<ObservationMode>,
     /// Polling interval override.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub poll_interval: Option<Duration>,
@@ -352,6 +425,22 @@ pub struct WaitLogStep {
     /// Maximum inclusive block span requested from `eth_getLogs` at once.
     #[serde(default, alias = "block_range")]
     pub max_block_range: Option<u64>,
+}
+
+/// One required event in a receipt-scoped `wait_log.events` group.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptEventDef {
+    /// ABI artifact name in the selected chain's workload spec.
+    pub abi: String,
+    /// Event name or exact event signature.
+    pub event: String,
+    /// Optional contract-address expression.
+    #[serde(default)]
+    pub address: Option<serde_yaml::Value>,
+    /// Decoded event argument equality filters.
+    #[serde(default, rename = "where")]
+    pub where_value: BTreeMap<String, serde_yaml::Value>,
 }
 
 impl<'de> Deserialize<'de> for StepDef {
@@ -370,6 +459,17 @@ impl<'de> Deserialize<'de> for StepDef {
             .map(parse_duration_value)
             .transpose()
             .map_err(serde::de::Error::custom)?;
+        let id = mapping
+            .remove(serde_yaml::Value::String("id".to_string()))
+            .map(serde_yaml::from_value)
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+        let depends_on = mapping
+            .remove(serde_yaml::Value::String("depends_on".to_string()))
+            .map(serde_yaml::from_value)
+            .transpose()
+            .map_err(serde::de::Error::custom)?
+            .unwrap_or_default();
 
         if mapping.len() != 1 {
             return Err(serde::de::Error::custom(
@@ -405,7 +505,7 @@ impl<'de> Deserialize<'de> for StepDef {
             }
         };
 
-        Ok(Self { action, save, timeout, provenance: None })
+        Ok(Self { id, depends_on, action, save, timeout, provenance: None })
     }
 }
 
@@ -445,6 +545,24 @@ impl ScenarioSpec {
             }
             if matches!(chain.chain_id, ChainId::Explicit(0)) {
                 bail!("chain '{name}' chain_id must be greater than zero");
+            }
+            validate_optional_duration(
+                Some(chain.observation.poll_interval),
+                &format!("chain '{name}' observation"),
+                "poll_interval",
+            )?;
+            if chain.observation.mode == ObservationMode::Subscription &&
+                chain.observation.websocket_url.is_none()
+            {
+                bail!("chain '{name}' observation mode `subscription` requires `websocket_url`");
+            }
+            if let Some(websocket_url) = &chain.observation.websocket_url {
+                let parsed = url::Url::parse(websocket_url).map_err(|_| {
+                    eyre::eyre!("chain '{name}' has an invalid observation websocket_url")
+                })?;
+                if !matches!(parsed.scheme(), "ws" | "wss") {
+                    bail!("chain '{name}' observation websocket_url must use ws or wss");
+                }
             }
             if let Some(auth) = &chain.request_auth {
                 if auth.sender_header.name.trim().is_empty() {
@@ -489,25 +607,158 @@ impl ScenarioSpec {
         }
 
         let saves = self.collect_saves()?;
-        let mut available = BTreeMap::new();
-        for (name, binding) in &self.scenario.bindings {
-            available.insert(
-                name.clone(),
-                match binding {
-                    BindingDef::Account(_) => AvailableRoot::AccountBinding,
-                    BindingDef::Bytes32(_) => AvailableRoot::Bytes32Binding,
-                },
-            );
-        }
-
-        for (index, step) in self.scenario.steps.iter().enumerate() {
-            self.validate_step(index, step, &saves, &available)?;
-            if let Some(save) = &step.save {
-                available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
+        match self.scenario.execution {
+            ScenarioExecutionMode::Sequential => {
+                self.validate_declared_step_ids(false)?;
+                let mut available = self.binding_roots();
+                for (index, step) in self.scenario.steps.iter().enumerate() {
+                    if !step.depends_on.is_empty() {
+                        bail!(
+                            "{} configures `depends_on`, which requires `scenario.execution: dag`",
+                            step.diagnostic_label(index)
+                        );
+                    }
+                    self.validate_step(index, step, &saves, &available, None)?;
+                    if let Some(save) = &step.save {
+                        available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
+                    }
+                }
+            }
+            ScenarioExecutionMode::Dag => {
+                let graph = self.validate_dag_graph()?;
+                for (index, step) in self.scenario.steps.iter().enumerate() {
+                    let available = self.available_roots_for_ancestors(&graph.ancestors[index]);
+                    self.validate_step(
+                        index,
+                        step,
+                        &saves,
+                        &available,
+                        Some(&graph.ancestors[index]),
+                    )?;
+                }
             }
         }
 
         Ok(())
+    }
+
+    fn binding_roots(&self) -> BTreeMap<String, AvailableRoot> {
+        self.scenario
+            .bindings
+            .iter()
+            .map(|(name, binding)| {
+                (
+                    name.clone(),
+                    match binding {
+                        BindingDef::Account(_) => AvailableRoot::AccountBinding,
+                        BindingDef::Bytes32(_) => AvailableRoot::Bytes32Binding,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn available_roots_for_ancestors(
+        &self,
+        ancestors: &BTreeSet<usize>,
+    ) -> BTreeMap<String, AvailableRoot> {
+        let mut available = self.binding_roots();
+        for index in ancestors {
+            let step = &self.scenario.steps[*index];
+            if let Some(save) = &step.save {
+                available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
+            }
+        }
+        available
+    }
+
+    fn validate_declared_step_ids(&self, require_all: bool) -> Result<BTreeMap<String, usize>> {
+        let mut ids = BTreeMap::new();
+        for (index, step) in self.scenario.steps.iter().enumerate() {
+            let Some(id) = &step.id else {
+                if require_all {
+                    bail!(
+                        "{} requires an explicit `id` because `scenario.execution` is `dag`",
+                        step.diagnostic_label(index)
+                    );
+                }
+                continue;
+            };
+            validate_step_id(id).wrap_err_with(|| {
+                format!("{} has an invalid step ID", step.diagnostic_label(index))
+            })?;
+            if let Some(previous) = ids.insert(id.clone(), index) {
+                bail!(
+                    "duplicate step ID '{id}' at {} and {}",
+                    self.scenario.steps[previous].diagnostic_label(previous),
+                    step.diagnostic_label(index)
+                );
+            }
+        }
+        Ok(ids)
+    }
+
+    fn validate_dag_graph(&self) -> Result<DagGraph> {
+        let ids = self.validate_declared_step_ids(true)?;
+        let mut dependents = vec![Vec::new(); self.scenario.steps.len()];
+        let mut indegree = vec![0usize; self.scenario.steps.len()];
+
+        for (index, step) in self.scenario.steps.iter().enumerate() {
+            let mut seen = BTreeSet::new();
+            for dependency in &step.depends_on {
+                validate_step_id(dependency).wrap_err_with(|| {
+                    format!("{} has an invalid dependency ID", step.diagnostic_label(index))
+                })?;
+                if !seen.insert(dependency) {
+                    bail!(
+                        "{} lists duplicate dependency '{dependency}'",
+                        step.diagnostic_label(index)
+                    );
+                }
+                let Some(&dependency_index) = ids.get(dependency) else {
+                    bail!(
+                        "{} depends on missing step ID '{dependency}'",
+                        step.diagnostic_label(index)
+                    );
+                };
+                dependents[dependency_index].push(index);
+                indegree[index] = indegree[index]
+                    .checked_add(1)
+                    .ok_or_else(|| eyre::eyre!("scenario dependency count overflowed usize"))?;
+            }
+        }
+
+        let mut ready = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(index, count)| (*count == 0).then_some(index))
+            .collect::<BTreeSet<_>>();
+        let mut ancestors = vec![BTreeSet::new(); self.scenario.steps.len()];
+        let mut visited = 0usize;
+        while let Some(index) = ready.pop_first() {
+            visited += 1;
+            for &dependent in &dependents[index] {
+                ancestors[dependent].insert(index);
+                let inherited = ancestors[index].iter().copied().collect::<Vec<_>>();
+                ancestors[dependent].extend(inherited);
+                indegree[dependent] -= 1;
+                if indegree[dependent] == 0 {
+                    ready.insert(dependent);
+                }
+            }
+        }
+
+        if visited != self.scenario.steps.len() {
+            let cyclic = indegree
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| **count > 0)
+                .map(|(index, _)| self.scenario.steps[index].effective_id(index))
+                .collect::<Vec<_>>();
+            bail!("scenario DAG contains a dependency cycle involving: {}", cyclic.join(", "));
+        }
+
+        Ok(DagGraph { ancestors })
     }
 
     fn collect_saves(&self) -> Result<BTreeMap<String, usize>> {
@@ -553,23 +804,18 @@ impl ScenarioSpec {
         accepts_precomputed_hash: bool,
         filter_name: &str,
     ) -> Result<()> {
-        let mut available = self
-            .scenario
-            .bindings
-            .iter()
-            .map(|(name, binding)| {
-                (
-                    name.clone(),
-                    match binding {
-                        BindingDef::Account(_) => AvailableRoot::AccountBinding,
-                        BindingDef::Bytes32(_) => AvailableRoot::Bytes32Binding,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        for step in self.scenario.steps.iter().take(step_index) {
-            if let Some(save) = &step.save {
-                available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
+        let mut available = self.binding_roots();
+        match self.scenario.execution {
+            ScenarioExecutionMode::Sequential => {
+                for step in self.scenario.steps.iter().take(step_index) {
+                    if let Some(save) = &step.save {
+                        available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
+                    }
+                }
+            }
+            ScenarioExecutionMode::Dag => {
+                let graph = self.validate_dag_graph()?;
+                available = self.available_roots_for_ancestors(&graph.ancestors[step_index]);
             }
         }
 
@@ -596,22 +842,31 @@ impl ScenarioSpec {
         label: &str,
     ) -> Result<()> {
         let saves = self.collect_saves()?;
-        let mut available = self
-            .scenario
-            .bindings
-            .keys()
-            .map(|name| (name.clone(), AvailableRoot::AccountBinding))
-            .collect::<BTreeMap<_, _>>();
-        for step in self.scenario.steps.iter().take(step_index) {
-            if let Some(save) = &step.save {
-                available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
+        let mut available = self.binding_roots();
+        match self.scenario.execution {
+            ScenarioExecutionMode::Sequential => {
+                for step in self.scenario.steps.iter().take(step_index) {
+                    if let Some(save) = &step.save {
+                        available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
+                    }
+                }
+            }
+            ScenarioExecutionMode::Dag => {
+                // The expanded concrete steps validate every actual parameter use
+                // against its dependency ancestry. Retain all save shapes here so
+                // the fragment-boundary check can still determine the argument type.
+                for step in &self.scenario.steps {
+                    if let Some(save) = &step.save {
+                        available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
+                    }
+                }
             }
         }
 
         let paths = collect_variable_paths(expression)
             .map_err(|error| eyre::eyre!("invalid {label}: {error}"))?;
         for path in &paths {
-            validate_reference(path, step_index, &saves, &available)
+            validate_reference(path, step_index, &saves, &available, None)
                 .map_err(|error| eyre::eyre!("invalid {label}: {error}"))?;
         }
         if expected == "value" {
@@ -641,6 +896,7 @@ impl ScenarioSpec {
         step: &StepDef,
         saves: &BTreeMap<String, usize>,
         available: &BTreeMap<String, AvailableRoot>,
+        dependency_ancestors: Option<&BTreeSet<usize>>,
     ) -> Result<()> {
         let label = step.diagnostic_label(index);
         if step.timeout == Some(Duration::ZERO) {
@@ -671,6 +927,13 @@ impl ScenarioSpec {
             }
             StepAction::WaitReceipt(wait) => {
                 validate_optional_duration(wait.poll_interval, &label, "poll_interval")?;
+                if wait.mode == Some(ObservationMode::Subscription) &&
+                    self.chains[chain].observation.websocket_url.is_none()
+                {
+                    bail!(
+                        "{label} observation mode `subscription` requires chain '{chain}' to configure `observation.websocket_url`"
+                    );
+                }
                 validate_expression_type(
                     &wait.transaction_hash,
                     StaticValueType::Bytes32,
@@ -691,17 +954,70 @@ impl ScenarioSpec {
                 }
             }
             StepAction::WaitLog(wait) => {
-                if wait.abi.trim().is_empty() {
-                    bail!("{label} has an empty ABI name");
-                }
-                if wait.event.trim().is_empty() {
-                    bail!("{label} has an empty event name");
+                if wait.events.is_empty() {
+                    if wait.abi.trim().is_empty() {
+                        bail!("{label} has an empty ABI name");
+                    }
+                    if wait.event.trim().is_empty() {
+                        bail!("{label} has an empty event name");
+                    }
+                } else {
+                    if wait.transaction_hash.is_none() {
+                        bail!("{label} receipt-scoped `events` requires `transaction_hash`");
+                    }
+                    if wait.from_block.is_some() {
+                        bail!(
+                            "{label} receipt-scoped `events` cannot be combined with `from_block`"
+                        );
+                    }
+                    if !wait.abi.is_empty() ||
+                        !wait.event.is_empty() ||
+                        wait.address.is_some() ||
+                        !wait.where_value.is_empty()
+                    {
+                        bail!(
+                            "{label} receipt-scoped `events` cannot be combined with top-level `abi`, `event`, `address`, or `where`"
+                        );
+                    }
+                    for (event_id, event) in &wait.events {
+                        validate_runtime_root(event_id, "receipt event ID")
+                            .wrap_err_with(|| format!("{label} has an invalid event ID"))?;
+                        if event.abi.trim().is_empty() {
+                            bail!("{label} event '{event_id}' has an empty ABI name");
+                        }
+                        if event.event.trim().is_empty() {
+                            bail!("{label} event '{event_id}' has an empty event name");
+                        }
+                        if let Some(address) = &event.address {
+                            validate_expression_type(
+                                address,
+                                StaticValueType::Address,
+                                available,
+                                &label,
+                                &format!("events.{event_id}.address"),
+                            )?;
+                        }
+                        for name in event.where_value.keys() {
+                            if name.trim().is_empty() {
+                                bail!(
+                                    "{label} event '{event_id}' contains an empty decoded argument filter name"
+                                );
+                            }
+                        }
+                    }
                 }
                 if wait.from_block.is_none() && wait.transaction_hash.is_none() {
                     bail!("{label} requires `from_block` or `transaction_hash`");
                 }
                 validate_optional_nonzero(wait.max_block_range, &label, "max_block_range")?;
                 validate_optional_duration(wait.poll_interval, &label, "poll_interval")?;
+                if wait.mode == Some(ObservationMode::Subscription) &&
+                    self.chains[chain].observation.websocket_url.is_none()
+                {
+                    bail!(
+                        "{label} observation mode `subscription` requires chain '{chain}' to configure `observation.websocket_url`"
+                    );
+                }
                 if let Some(from_block) = &wait.from_block {
                     validate_expression_type(
                         from_block,
@@ -737,7 +1053,9 @@ impl ScenarioSpec {
                         &label,
                         "sender",
                     )?;
-                } else if wait.from_block.is_none() && self.chains[chain].request_auth.is_some() {
+                } else if (wait.from_block.is_none() || !wait.events.is_empty()) &&
+                    self.chains[chain].request_auth.is_some()
+                {
                     bail!(
                         "{label} requires `sender` for a transaction-hash-only wait when chain '{chain}' uses request_auth"
                     );
@@ -754,9 +1072,9 @@ impl ScenarioSpec {
             let paths = collect_variable_paths(expression)
                 .map_err(|error| eyre::eyre!("invalid runtime expression in {label}: {error}"))?;
             for path in paths {
-                validate_reference(&path, index, saves, available).map_err(|error| {
-                    eyre::eyre!("invalid runtime reference in {label}: {error}")
-                })?;
+                validate_reference(&path, index, saves, available, dependency_ancestors).map_err(
+                    |error| eyre::eyre!("invalid runtime reference in {label}: {error}"),
+                )?;
             }
             Ok(())
         })
@@ -764,6 +1082,17 @@ impl ScenarioSpec {
 }
 
 impl StepDef {
+    /// Stable execution identity.
+    ///
+    /// DAG scenarios require an explicit ID. Sequential scenarios retain their
+    /// existing save-derived or action/index-derived identity when one is omitted.
+    pub fn effective_id(&self, expanded_index: usize) -> String {
+        self.id
+            .clone()
+            .or_else(|| self.save.clone())
+            .unwrap_or_else(|| format!("step_{}_{}", expanded_index + 1, self.action.name()))
+    }
+
     /// Human-readable identity used by validation and preflight diagnostics.
     pub(crate) fn diagnostic_label(&self, expanded_index: usize) -> String {
         let Some(provenance) = &self.provenance else {
@@ -788,7 +1117,7 @@ impl StepDef {
                 SavedKind::Submit { receipt: step.await_mode == Some(SubmitAwait::Receipt) }
             }
             StepAction::WaitReceipt(_) => SavedKind::Receipt,
-            StepAction::WaitLog(_) => SavedKind::Log,
+            StepAction::WaitLog(step) => SavedKind::Log { grouped: !step.events.is_empty() },
         }
     }
 
@@ -825,6 +1154,14 @@ impl StepDef {
                 }
                 for value in step.where_value.values() {
                     visit(value)?;
+                }
+                for event in step.events.values() {
+                    if let Some(value) = &event.address {
+                        visit(value)?;
+                    }
+                    for value in event.where_value.values() {
+                        visit(value)?;
+                    }
                 }
             }
         }
@@ -869,7 +1206,11 @@ enum SavedKind {
     Invoke,
     Submit { receipt: bool },
     Receipt,
-    Log,
+    Log { grouped: bool },
+}
+
+struct DagGraph {
+    ancestors: Vec<BTreeSet<usize>>,
 }
 
 fn validate_reference(
@@ -877,12 +1218,24 @@ fn validate_reference(
     current_step: usize,
     saves: &BTreeMap<String, usize>,
     available: &BTreeMap<String, AvailableRoot>,
+    dependency_ancestors: Option<&BTreeSet<usize>>,
 ) -> Result<()> {
     let Some((root, kind, tail)) = longest_path_match(path, available) else {
-        if let Some((save, save_step, _)) = longest_path_match(path, saves) &&
-            *save_step >= current_step
-        {
-            bail!("forward reference '{path}' targets save '{save}' from step {}", save_step + 1);
+        if let Some((save, save_step, _)) = longest_path_match(path, saves) {
+            if let Some(ancestors) = dependency_ancestors {
+                if !ancestors.contains(save_step) {
+                    bail!(
+                        "reference '{path}' targets save '{save}' from step {}, which is not a dependency ancestor of step {}",
+                        save_step + 1,
+                        current_step + 1
+                    );
+                }
+            } else if *save_step >= current_step {
+                bail!(
+                    "forward reference '{path}' targets save '{save}' from step {}",
+                    save_step + 1
+                );
+            }
         }
         let root = path.split('.').next().unwrap_or(path);
         bail!("unknown runtime root '{root}' in reference '{path}'");
@@ -954,6 +1307,11 @@ fn validate_saved_path(root: &str, kind: SavedKind, tail: Option<&str>) -> Resul
                     "receipt.tx_hash" |
                     "receipt.block_hash" |
                     "receipt.block_number" |
+                    "receipt.transaction_index" |
+                    "receipt.block_timestamp_ms" |
+                    "receipt.first_observed_at" |
+                    "receipt.confirmed_at" |
+                    "receipt.confirmation_depth" |
                     "receipt.status" |
                     "receipt.gas_used" |
                     "receipt.observed_at"
@@ -967,29 +1325,42 @@ fn validate_saved_path(root: &str, kind: SavedKind, tail: Option<&str>) -> Resul
                     "tx_hash" |
                     "block_hash" |
                     "block_number" |
+                    "transaction_index" |
+                    "block_timestamp_ms" |
+                    "first_observed_at" |
+                    "confirmed_at" |
+                    "confirmation_depth" |
                     "status" |
                     "gas_used" |
                     "observed_at"
             )
         }
-        SavedKind::Log => {
-            tail == "args" ||
-                tail.starts_with("args.") ||
-                matches!(
-                    tail,
-                    "chain" |
-                        "address" |
-                        "contract_address" |
-                        "transaction_hash" |
-                        "tx_hash" |
-                        "block_hash" |
-                        "block_number" |
-                        "log_index" |
-                        "event" |
-                        "event_name" |
-                        "first_observed_at" |
-                        "observed_at"
-                )
+        SavedKind::Log { grouped } => {
+            matches!(
+                tail,
+                "chain" |
+                    "transaction_hash" |
+                    "tx_hash" |
+                    "block_hash" |
+                    "block_number" |
+                    "transaction_index" |
+                    "block_timestamp_ms" |
+                    "first_observed_at" |
+                    "observed_at" |
+                    "confirmed_at" |
+                    "confirmation_depth"
+            ) || if grouped {
+                tail == "events" ||
+                    tail.starts_with("events.") ||
+                    matches!(tail, "status" | "gas_used")
+            } else {
+                tail == "args" ||
+                    tail.starts_with("args.") ||
+                    matches!(
+                        tail,
+                        "address" | "contract_address" | "log_index" | "event" | "event_name"
+                    )
+            }
         }
     };
     if valid {
@@ -1176,8 +1547,13 @@ fn static_reference_type(
             "submitted_at" |
             "acceptance_latency" |
             "receipt.block_number" |
+            "receipt.transaction_index" |
+            "receipt.block_timestamp_ms" |
             "receipt.gas_used" |
-            "receipt.observed_at" => Some(StaticValueType::Uint),
+            "receipt.first_observed_at" |
+            "receipt.observed_at" |
+            "receipt.confirmed_at" |
+            "receipt.confirmation_depth" => Some(StaticValueType::Uint),
             "receipt.status" => Some(StaticValueType::Bool),
             _ => None,
         },
@@ -1185,18 +1561,26 @@ fn static_reference_type(
             "" => Some(StaticValueType::Object),
             "chain" => Some(StaticValueType::String),
             "transaction_hash" | "tx_hash" | "block_hash" => Some(StaticValueType::Bytes32),
-            "block_number" | "gas_used" | "observed_at" => Some(StaticValueType::Uint),
+            "block_number" | "transaction_index" | "block_timestamp_ms" | "gas_used" |
+            "first_observed_at" | "observed_at" | "confirmed_at" | "confirmation_depth" => {
+                Some(StaticValueType::Uint)
+            }
             "status" => Some(StaticValueType::Bool),
             _ => None,
         },
-        AvailableRoot::Saved(SavedKind::Log) => match tail {
-            "" | "args" => Some(StaticValueType::Object),
-            "chain" | "event" | "event_name" => Some(StaticValueType::String),
-            "address" | "contract_address" => Some(StaticValueType::Address),
+        AvailableRoot::Saved(SavedKind::Log { grouped }) => match tail {
+            "" => Some(StaticValueType::Object),
+            "chain" => Some(StaticValueType::String),
             "transaction_hash" | "tx_hash" | "block_hash" => Some(StaticValueType::Bytes32),
-            "block_number" | "log_index" | "first_observed_at" | "observed_at" => {
-                Some(StaticValueType::Uint)
-            }
+            "block_number" | "transaction_index" | "block_timestamp_ms" | "first_observed_at" |
+            "observed_at" | "confirmed_at" | "confirmation_depth" => Some(StaticValueType::Uint),
+            "events" if *grouped => Some(StaticValueType::Object),
+            "status" if *grouped => Some(StaticValueType::Bool),
+            "gas_used" if *grouped => Some(StaticValueType::Uint),
+            "args" if !*grouped => Some(StaticValueType::Object),
+            "event" | "event_name" if !*grouped => Some(StaticValueType::String),
+            "address" | "contract_address" if !*grouped => Some(StaticValueType::Address),
+            "log_index" if !*grouped => Some(StaticValueType::Uint),
             _ => None,
         },
     }
@@ -1239,6 +1623,14 @@ fn validate_save_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_step_id(id: &str) -> Result<()> {
+    validate_name(id, "step ID")?;
+    if id.split('.').any(str::is_empty) {
+        bail!("step ID '{id}' contains an empty component");
+    }
+    Ok(())
+}
+
 fn deserialize_optional_duration<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<Duration>, D::Error>
@@ -1248,6 +1640,18 @@ where
     Option::<String>::deserialize(deserializer)?
         .map(|value| humantime::parse_duration(&value).map_err(serde::de::Error::custom))
         .transpose()
+}
+
+fn deserialize_duration<'de, D>(deserializer: D) -> std::result::Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    humantime::parse_duration(&value).map_err(serde::de::Error::custom)
+}
+
+const fn default_observation_poll_interval() -> Duration {
+    Duration::from_millis(50)
 }
 
 fn parse_duration_value(value: serde_yaml::Value) -> Result<Duration> {
@@ -1316,15 +1720,172 @@ scenario:
     fn parses_representative_scenario() {
         let spec = ScenarioSpec::parse(BASE).unwrap();
         assert_eq!(spec.version, 1);
+        assert_eq!(spec.scenario.execution, ScenarioExecutionMode::Sequential);
         assert_eq!(spec.chains["l1"].chain_id, ChainId::Auto);
         assert_eq!(spec.chains["zone"].chain_id, ChainId::Explicit(1337));
         assert_eq!(spec.scenario.timeout, Some(Duration::from_secs(300)));
         assert_eq!(spec.scenario.steps.len(), 4);
         assert_eq!(spec.scenario.steps[1].timeout, Some(Duration::from_secs(20)));
+        assert_eq!(spec.scenario.steps[0].effective_id(0), "zone_before");
+        assert_eq!(spec.scenario.steps[1].effective_id(1), "deposit");
         assert!(matches!(
             spec.scenario.bindings["user"],
             BindingDef::Account(AccountBindingDef { select: AccountSelection::Lease, .. })
         ));
+    }
+
+    #[test]
+    fn validates_dag_ids_dependencies_and_transitive_output_ancestry() {
+        let yaml = r#"
+version: 1
+chains:
+  primary:
+    network: tempo
+    rpc_url: http://primary.invalid
+    workload: ./workload.yml
+scenario:
+  name: dag
+  execution: dag
+  steps:
+    - id: consume
+      depends_on: [join]
+      wait_receipt:
+        chain: primary
+        transaction_hash: { var: produced.block_hash }
+    - id: join
+      depends_on: [produce]
+      checkpoint: { chain: primary }
+    - id: produce
+      checkpoint: { chain: primary }
+      save: produced
+"#;
+        let spec = ScenarioSpec::parse(yaml).unwrap();
+        assert_eq!(spec.scenario.execution, ScenarioExecutionMode::Dag);
+        assert_eq!(spec.scenario.steps[0].effective_id(0), "consume");
+        assert_eq!(spec.scenario.steps[0].depends_on, ["join"]);
+        assert_eq!(spec.scenario.steps[1].depends_on, ["produce"]);
+    }
+
+    #[test]
+    fn rejects_invalid_dag_identity_and_dependency_graphs() {
+        let base = r#"
+version: 1
+chains:
+  primary:
+    network: tempo
+    rpc_url: http://primary.invalid
+    workload: ./workload.yml
+scenario:
+  name: dag
+  execution: dag
+  steps:
+    - id: first
+      checkpoint: { chain: primary }
+    - id: second
+      depends_on: [first]
+      checkpoint: { chain: primary }
+"#;
+
+        let missing_id =
+            base.replacen("    - id: first\n      checkpoint:", "    - checkpoint:", 1);
+        let error = ScenarioSpec::parse(&missing_id).unwrap_err().to_string();
+        assert!(error.contains("requires an explicit `id`"), "unexpected error: {error}");
+
+        let duplicate = base.replacen("id: second", "id: first", 1);
+        let error = ScenarioSpec::parse(&duplicate).unwrap_err().to_string();
+        assert!(error.contains("duplicate step ID 'first'"), "unexpected error: {error}");
+
+        let missing_dependency = base.replacen("depends_on: [first]", "depends_on: [missing]", 1);
+        let error = ScenarioSpec::parse(&missing_dependency).unwrap_err().to_string();
+        assert!(
+            error.contains("depends on missing step ID 'missing'"),
+            "unexpected error: {error}"
+        );
+
+        let cycle = base.replacen(
+            "    - id: first\n      checkpoint",
+            "    - id: first\n      depends_on: [second]\n      checkpoint",
+            1,
+        );
+        let error = ScenarioSpec::parse(&cycle).unwrap_err().to_string();
+        assert!(error.contains("dependency cycle"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn rejects_dag_output_reference_from_non_ancestor() {
+        let yaml = r#"
+version: 1
+chains:
+  primary:
+    network: tempo
+    rpc_url: http://primary.invalid
+    workload: ./workload.yml
+scenario:
+  name: dag
+  execution: dag
+  steps:
+    - id: produce
+      checkpoint: { chain: primary }
+      save: produced
+    - id: sibling
+      checkpoint: { chain: primary }
+    - id: consume
+      depends_on: [sibling]
+      wait_receipt:
+        chain: primary
+        transaction_hash: { var: produced.block_hash }
+"#;
+        let error = ScenarioSpec::parse(yaml).unwrap_err().to_string();
+        assert!(error.contains("not a dependency ancestor"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn sequential_mode_rejects_dependency_metadata() {
+        let yaml = BASE.replacen(
+            "    - checkpoint:\n        chain: zone",
+            "    - id: before\n      depends_on: [other]\n      checkpoint:\n        chain: zone",
+            1,
+        );
+        let error = ScenarioSpec::parse(&yaml).unwrap_err().to_string();
+        assert!(error.contains("requires `scenario.execution: dag`"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn fragment_use_dependency_makes_caller_output_an_ancestor() {
+        let yaml = r#"
+version: 1
+chains:
+  primary:
+    network: tempo
+    rpc_url: http://primary.invalid
+    workload: ./workload.yml
+fragments:
+  observe:
+    steps:
+      - id: receipt
+        wait_receipt:
+          chain: primary
+          transaction_hash: { var: submitted.tx_hash }
+scenario:
+  name: fragment-dependency-ancestry
+  execution: dag
+  steps:
+    - id: submit
+      submit:
+        chain: primary
+        template: transfer
+      save: submitted
+    - use: observe
+      as: observation
+      depends_on: [submit]
+"#;
+        let spec = ScenarioSpec::parse(yaml).unwrap();
+        assert_eq!(spec.scenario.steps[1].id.as_deref(), Some("observation.receipt"));
+        assert_eq!(spec.scenario.steps[1].depends_on, ["submit"]);
+
+        let without_dependency = yaml.replace("      depends_on: [submit]\n", "");
+        let error = ScenarioSpec::parse(&without_dependency).unwrap_err().to_string();
+        assert!(error.contains("not a dependency ancestor"), "unexpected error: {error}");
     }
 
     #[test]
@@ -1648,6 +2209,96 @@ scenario:
     fn accepts_zero_confirmations() {
         let yaml = BASE.replace("confirmations: 1", "confirmations: 0");
         ScenarioSpec::parse(&yaml).unwrap();
+    }
+
+    #[test]
+    fn saved_observation_fields_and_log_shapes_match_runtime_outputs() {
+        for (kind, fields) in [
+            (
+                SavedKind::Submit { receipt: true },
+                &["receipt.confirmed_at", "receipt.confirmation_depth"][..],
+            ),
+            (SavedKind::Receipt, &["confirmed_at", "confirmation_depth"][..]),
+            (
+                SavedKind::Log { grouped: false },
+                &["confirmed_at", "confirmation_depth", "args.amount", "address"][..],
+            ),
+            (
+                SavedKind::Log { grouped: true },
+                &["confirmed_at", "confirmation_depth", "events.processed.args.amount", "status"][..],
+            ),
+        ] {
+            for field in fields {
+                validate_saved_path("saved", kind, Some(field)).unwrap();
+            }
+        }
+
+        for (kind, impossible) in [
+            (SavedKind::Log { grouped: false }, "events.processed"),
+            (SavedKind::Log { grouped: false }, "status"),
+            (SavedKind::Log { grouped: true }, "args.amount"),
+            (SavedKind::Log { grouped: true }, "address"),
+            (SavedKind::Log { grouped: true }, "log_index"),
+        ] {
+            assert!(
+                validate_saved_path("saved", kind, Some(impossible)).is_err(),
+                "{impossible} must not validate for {kind:?}"
+            );
+        }
+
+        for (kind, path) in [
+            (SavedKind::Submit { receipt: true }, "saved.receipt.confirmation_depth"),
+            (SavedKind::Receipt, "saved.confirmed_at"),
+            (SavedKind::Log { grouped: false }, "saved.confirmation_depth"),
+            (SavedKind::Log { grouped: true }, "saved.confirmed_at"),
+        ] {
+            let available = BTreeMap::from([("saved".to_string(), AvailableRoot::Saved(kind))]);
+            assert_eq!(
+                static_reference_type(path, &available),
+                Some(StaticValueType::Uint),
+                "{path} must retain its numeric static type"
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_step_requires_chain_websocket_configuration() {
+        let yaml = BASE.replacen(
+            "        poll_interval: 100ms",
+            "        mode: subscription\n        poll_interval: 100ms",
+            1,
+        );
+        let error = ScenarioSpec::parse(&yaml).unwrap_err().to_string();
+        assert!(error.contains("requires chain 'l1' to configure `observation.websocket_url`"));
+
+        let yaml = yaml.replacen(
+            "    workload: ./l1.yml",
+            "    workload: ./l1.yml\n    observation:\n      mode: auto\n      websocket_url: ws://l1.invalid",
+            1,
+        );
+        ScenarioSpec::parse(&yaml).unwrap();
+    }
+
+    #[test]
+    fn receipt_scoped_event_group_rejects_from_block() {
+        let yaml = r#"
+version: 1
+chains:
+  l1: { network: ethereum, rpc_url: http://rpc.invalid, workload: ./workload.yml }
+scenario:
+  name: invalid
+  steps:
+    - wait_log:
+        chain: l1
+        transaction_hash: "0x1111111111111111111111111111111111111111111111111111111111111111"
+        from_block: 1
+        events:
+          first:
+            abi: Token
+            event: Transfer
+"#;
+        let error = ScenarioSpec::parse(yaml).unwrap_err().to_string();
+        assert!(error.contains("receipt-scoped `events` cannot be combined with `from_block`"));
     }
 
     #[test]

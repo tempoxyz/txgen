@@ -11,7 +11,7 @@ use eyre::{bail, Result, WrapErr};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     io::Write,
     path::PathBuf,
     sync::mpsc,
@@ -169,6 +169,31 @@ pub struct MaterializedTx {
     pub created_address: Option<Address>,
 }
 
+/// Adapter request and nonce reservations prepared before final transaction signing.
+pub(crate) struct PreparedMaterializedTx<A: NetworkAdapter> {
+    name: String,
+    phase: TxPhase,
+    tx_req: AdapterTxRequest<A>,
+    signer: EcdsaSigner,
+    inclusion_keys: Vec<SchedulingKey>,
+    sender: Address,
+    nonce: Option<u64>,
+    nonce_reservations: Vec<txgen_core::NonceReservation>,
+    created_address: Option<Address>,
+}
+
+impl<A: NetworkAdapter> PreparedMaterializedTx<A> {
+    pub(crate) fn nonce_reservations(&self) -> &[txgen_core::NonceReservation] {
+        &self.nonce_reservations
+    }
+
+    pub(crate) fn scheduling_keys(&self) -> BTreeSet<[u8; 20]> {
+        std::iter::once(self.tx_req.key)
+            .chain(self.inclusion_keys.iter().map(|key| key.into_inner()))
+            .collect()
+    }
+}
+
 /// Setup transactions and substitutions materialized from one workload spec.
 pub struct MaterializedSetup {
     /// Signed setup transactions in workload order.
@@ -277,40 +302,54 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
+    let prepared = prepare_materialized_template(adapter, name, value, phase, inclusion_keys, ctx)?;
+    let reservations = prepared.nonce_reservations.clone();
+    match sign_prepared_materialized_template(prepared) {
+        Ok(transaction) => Ok(transaction),
+        Err(error) => {
+            if !rollback_nonce_reservations(ctx.nonces, &reservations) {
+                return Err(error.wrap_err("failed to rewind nonce state after materialization"));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Build a request and commit its nonce reservations without performing the final signature.
+pub(crate) fn prepare_materialized_template<A: NetworkAdapter>(
+    adapter: &A,
+    name: &str,
+    value: serde_yaml::Value,
+    phase: TxPhase,
+    inclusion_keys: &[SchedulingKey],
+    ctx: &mut BuildContext<'_>,
+) -> Result<PreparedMaterializedTx<A>> {
     let result = (|| -> Result<_> {
         let template: A::Template = serde_yaml::from_value(value)
             .wrap_err_with(|| format!("failed to parse template '{name}'"))?;
         let tx_req = adapter
             .build_request(template, ctx)
             .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
-        let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?;
+        let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?.clone();
         let sender = signer.address();
         let nonce = tx_req.request.nonce();
         let created_address = match (tx_req.request.kind(), nonce) {
             (Some(TxKind::Create), Some(nonce)) => Some(sender.create(nonce)),
             _ => None,
         };
-
-        let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context } = tx_req;
-        let generated = sign_context.sign_request(
-            name.to_string(),
-            phase,
-            request,
-            signer.clone(),
-            key,
-            dedup_scheduling_keys(inclusion_keys.iter().copied()),
-        )?;
-        let tx_hash = keccak256(&generated.raw);
-        Ok((generated, sender, tx_hash, nonce, created_address))
+        Ok((tx_req, signer, sender, nonce, created_address))
     })();
 
     match result {
-        Ok((generated, sender, tx_hash, nonce, created_address)) => {
+        Ok((tx_req, signer, sender, nonce, created_address)) => {
             let nonce_reservations = ctx.take_nonce_reservations();
-            Ok(MaterializedTx {
-                generated,
+            Ok(PreparedMaterializedTx {
+                name: name.to_string(),
+                phase,
+                tx_req,
+                signer,
+                inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),
                 sender,
-                tx_hash,
                 nonce,
                 nonce_reservations,
                 created_address,
@@ -323,6 +362,57 @@ where
             Err(error)
         }
     }
+}
+
+/// Sign and encode a previously prepared adapter request.
+pub(crate) fn sign_prepared_materialized_template<A: NetworkAdapter>(
+    prepared: PreparedMaterializedTx<A>,
+) -> Result<MaterializedTx>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let PreparedMaterializedTx {
+        name,
+        phase,
+        tx_req,
+        signer,
+        inclusion_keys,
+        sender,
+        nonce,
+        nonce_reservations,
+        created_address,
+    } = prepared;
+    let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context } = tx_req;
+    let expected_keys = std::iter::once(key)
+        .chain(inclusion_keys.iter().map(|key| key.into_inner()))
+        .collect::<BTreeSet<_>>();
+    let generated = sign_context.sign_request(name, phase, request, signer, key, inclusion_keys)?;
+    let generated_keys = generated
+        .submission_keys
+        .iter()
+        .chain(&generated.inclusion_keys)
+        .map(|key| key.into_inner())
+        .collect::<BTreeSet<_>>();
+    if generated_keys != expected_keys {
+        bail!("transaction signer changed the prepared scheduling keys");
+    }
+    let tx_hash = keccak256(&generated.raw);
+    Ok(MaterializedTx { generated, sender, tx_hash, nonce, nonce_reservations, created_address })
+}
+
+fn rollback_nonce_reservations(
+    nonces: &mut NonceTracker,
+    reservations: &[txgen_core::NonceReservation],
+) -> bool {
+    let mut restored = true;
+    for reservation in reservations.iter().rev() {
+        if reservation.kind == txgen_core::NonceReservationKind::Ordered {
+            restored &= nonces.rewind(reservation.key, reservation.nonce);
+        }
+    }
+    restored
 }
 
 /// Materialize a workload's setup section for direct online submission.
@@ -514,10 +604,26 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    tokio::time::timeout(prepare_timeout, adapter.prepare_request(&value, ctx))
-        .await
-        .map_err(|_| eyre::eyre!("timed out preparing request from template '{name}'"))?
-        .wrap_err_with(|| format!("failed to prepare request from template '{name}'"))?;
+    let preparation =
+        tokio::time::timeout(prepare_timeout, adapter.prepare_request(&value, ctx)).await;
+    match preparation {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            if !ctx.rollback_nonce_reservations() {
+                return Err(
+                    error.wrap_err("failed to rewind nonce state after request preparation failed")
+                );
+            }
+            return Err(error)
+                .wrap_err_with(|| format!("failed to prepare request from template '{name}'"));
+        }
+        Err(_) => {
+            if !ctx.rollback_nonce_reservations() {
+                bail!("failed to rewind nonce state after request preparation timed out");
+            }
+            bail!("timed out preparing request from template '{name}'");
+        }
+    }
     let materialized =
         materialize_and_sign_template(adapter, name, value, TxPhase::Setup, inclusion_keys, ctx)?;
     let nonce =
@@ -585,6 +691,19 @@ pub trait NetworkAdapter: Send + Sync {
         template: Self::Template,
         ctx: &mut BuildContext<'_>,
     ) -> Result<TxRequest<<Self::Network as Network>::TransactionRequest, Self::SignContext>>;
+
+    /// Return an adapter-defined dense uniqueness group for one scenario submit.
+    ///
+    /// Steps in the same group receive deterministic consecutive identities,
+    /// independent of unrelated submits. Adapters use this for finite
+    /// per-transaction resources such as a configured signing-key range.
+    fn scenario_unique_nonce_group(
+        &self,
+        _template: &serde_yaml::Value,
+        _overlay: &serde_yaml::Value,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
 
     /// Prepare asynchronous state needed before synchronous request building.
     ///
@@ -1794,7 +1913,81 @@ fn account_ref_value(pool: &str, index: usize) -> Result<serde_yaml::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_network::Ethereum;
+    use alloy_rpc_types_eth::TransactionRequest;
     use std::collections::HashMap;
+    use txgen_core::{derive_mnemonic_signer, GasConfig};
+
+    struct PendingPrepareAdapter;
+    struct MutatingKeyAdapter;
+    struct MutatingKeySignContext;
+
+    impl NetworkAdapter for PendingPrepareAdapter {
+        type Template = serde_yaml::Value;
+        type Network = Ethereum;
+        type SignContext = ();
+
+        fn network_name() -> &'static str {
+            "pending-test"
+        }
+
+        fn build_request(
+            &self,
+            _template: Self::Template,
+            _ctx: &mut BuildContext<'_>,
+        ) -> Result<TxRequest<TransactionRequest>> {
+            unreachable!("timed-out preparation must not build a request")
+        }
+
+        async fn prepare_request(
+            &self,
+            _value: &serde_yaml::Value,
+            ctx: &mut BuildContext<'_>,
+        ) -> Result<()> {
+            ctx.next_nonce([0x44; 20]);
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    impl RequestSignContext<Ethereum> for MutatingKeySignContext {
+        fn sign_request(
+            self,
+            name: String,
+            phase: TxPhase,
+            _request: TransactionRequest,
+            signer: EcdsaSigner,
+            _key: [u8; 20],
+            _inclusion_keys: Vec<SchedulingKey>,
+        ) -> Result<GeneratedTx> {
+            Ok(GeneratedTx {
+                phase,
+                id: Some(name),
+                raw: Bytes::new(),
+                sender: Some(signer.address()),
+                submission_keys: vec![SchedulingKey::from([0x99; 20])],
+                inclusion_keys: Vec::new(),
+            })
+        }
+    }
+
+    impl NetworkAdapter for MutatingKeyAdapter {
+        type Template = serde_yaml::Value;
+        type Network = Ethereum;
+        type SignContext = MutatingKeySignContext;
+
+        fn network_name() -> &'static str {
+            "mutating-key-test"
+        }
+
+        fn build_request(
+            &self,
+            _template: Self::Template,
+            _ctx: &mut BuildContext<'_>,
+        ) -> Result<TxRequest<TransactionRequest, Self::SignContext>> {
+            unreachable!("test constructs its prepared request directly")
+        }
+    }
 
     fn var(path: &str) -> serde_yaml::Value {
         let mut mapping = serde_yaml::Mapping::new();
@@ -1859,5 +2052,58 @@ call:
         assert_eq!(values[3], var("tick"));
         assert_eq!(yaml_get(yaml_get(&values[4], "if"), "cond"), &var("is_bid"));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn timed_out_async_preparation_rewinds_ordered_nonce_reservations() {
+        let accounts = AccountManager::empty();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut context = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let error = materialize_setup_value_online(
+            &PendingPrepareAdapter,
+            "pending",
+            serde_yaml::Value::Null,
+            &[],
+            &mut context,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("timed out preparing request"));
+        assert_eq!(context.next_nonce([0x44; 20]), 0);
+    }
+
+    #[test]
+    fn prepared_signer_cannot_change_scheduling_keys() {
+        let signer = derive_mnemonic_signer(
+            "test test test test test test test test test test test junk",
+            0,
+        )
+        .unwrap();
+        let prepared = PreparedMaterializedTx::<MutatingKeyAdapter> {
+            name: "mutating".to_string(),
+            phase: TxPhase::Workload,
+            tx_req: TxRequest {
+                request: TransactionRequest::default(),
+                signer_pool: "unused".to_string(),
+                signer_index: 0,
+                key: [0x11; 20],
+                sign_context: MutatingKeySignContext,
+            },
+            signer: signer.clone(),
+            inclusion_keys: vec![SchedulingKey::from([0x22; 20])],
+            sender: signer.address(),
+            nonce: None,
+            nonce_reservations: Vec::new(),
+            created_address: None,
+        };
+
+        let error = sign_prepared_materialized_template(prepared).unwrap_err();
+        assert!(error.to_string().contains("changed the prepared scheduling keys"));
     }
 }

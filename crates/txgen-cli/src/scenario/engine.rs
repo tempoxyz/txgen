@@ -1,12 +1,12 @@
 use super::{
     error::StepError,
     report::{
-        unix_ms, ChainReportConfig, InstanceFailure, InstanceOutcome, ScenarioAccumulator,
-        ScenarioReport, ScenarioReportConfig, StepOutcome,
+        unix_ms, ChainReportConfig, InstanceFailure, InstanceOutcome, ProtocolMilestone,
+        ScenarioAccumulator, ScenarioReport, ScenarioReportConfig, StepOutcome,
     },
     schema::{
-        AccountSelection, BindingDef, ChainDef, ChainId, ScenarioSpec, StepAction, StepDef,
-        SubmitAwait, SubmitStep,
+        AccountSelection, BindingDef, ChainDef, ChainId, ObservationMode, ScenarioExecutionMode,
+        ScenarioSpec, StepAction, StepDef, SubmitAwait, SubmitStep,
     },
     value::{
         collect_variable_paths, eval_expression, materialize_yaml, RuntimeContext, RuntimeValue,
@@ -14,6 +14,9 @@ use super::{
     wait::{self, DEFAULT_POLL_INTERVAL},
 };
 use crate::{
+    generate::{
+        prepare_materialized_template, sign_prepared_materialized_template, PreparedMaterializedTx,
+    },
     materialize_and_sign_template, materialize_setup_online, MaterializedSetup, MaterializedTx,
     NetworkAdapter, ScenarioActionContext,
 };
@@ -28,18 +31,16 @@ use alloy_primitives::{keccak256, Address, TxHash, B256, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use bench_core::{
     ReceiptCollection, ReceiptCollector, ReceiptCollectorHandle, ReceiptMetricLabels,
-    RequestAuthProvider, RpcEndpoint, RpcSubmission, RpcSubmitFailureKind, RpcSubmitter,
+    RequestAuthProvider, RpcEndpoint, RpcSubmission, RpcSubmitFailureKind, RpcSubmitter, RunClock,
     SenderConfig, SenderHeaderAuthProvider,
 };
 use eyre::{bail, Result, WrapErr};
+use futures::{stream::FuturesUnordered, StreamExt};
 use rand::{rngs::StdRng, Rng, RngCore, SeedableRng};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex as StdMutex,
-    },
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime},
 };
 use tokio::{
@@ -48,8 +49,8 @@ use tokio::{
     time::Instant as TokioInstant,
 };
 use txgen_core::{
-    merge_yaml, AccountManager, AddressPoolManager, ArtifactManager, BuildContext, NonceTracker,
-    SignerExt, TxPhase, WorkloadSpec,
+    merge_yaml, AccountManager, AddressPoolManager, ArtifactManager, BuildContext,
+    NonceReservationKind, NonceTracker, SignerExt, TxPhase, WorkloadSpec,
 };
 
 const FALLBACK_STEP_TIMEOUT: Duration = Duration::from_secs(300);
@@ -149,6 +150,7 @@ pub async fn execute_scenario<A>(
 ) -> Result<ScenarioReport>
 where
     A: NetworkAdapter + Default + Send + Sync + 'static,
+    <A::Network as Network>::TransactionRequest: Send + 'static,
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
@@ -183,6 +185,11 @@ struct ScenarioEngine<A: NetworkAdapter> {
     bindings: BTreeMap<String, BindingRuntime>,
     default_step_timeout: Duration,
     progress: Arc<ScenarioRuntimeProgress>,
+}
+
+struct StepExecution {
+    value: RuntimeValue,
+    milestones: Vec<ProtocolMilestone>,
 }
 
 #[derive(Default)]
@@ -231,6 +238,7 @@ impl Drop for ScenarioStepGuard {
 impl<A> ScenarioEngine<A>
 where
     A: NetworkAdapter + Default + Send + Sync + 'static,
+    <A::Network as Network>::TransactionRequest: Send + 'static,
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
@@ -251,12 +259,25 @@ where
             let input = chain_inputs
                 .remove(name)
                 .expect("every scenario chain was loaded during preflight");
+            let subscription_required = spec.scenario.steps.iter().any(|step| {
+                if step.action.chain() != name {
+                    return false;
+                }
+                match &step.action {
+                    StepAction::WaitReceipt(wait) => {
+                        wait.mode == Some(ObservationMode::Subscription)
+                    }
+                    StepAction::WaitLog(wait) => wait.mode == Some(ObservationMode::Subscription),
+                    _ => false,
+                }
+            });
             let chain = ChainRuntime::<A>::prepare(
                 name,
                 definition,
                 input,
                 config.transaction_rate,
                 config.max_rpc_in_flight,
+                subscription_required,
             )
             .await
             .wrap_err_with(|| format!("failed to preflight scenario chain '{name}'"))?;
@@ -320,7 +341,8 @@ where
     }
 
     async fn run(self: Arc<Self>, config: ScenarioExecutionConfig) -> Result<ScenarioReport> {
-        let started_at = SystemTime::now();
+        let clock = RunClock::new();
+        let started_at = SystemTime::UNIX_EPOCH + Duration::from_millis(clock.start_unix_ms());
         let run_start = Instant::now();
         let mut tasks: JoinSet<InstanceOutcome> = JoinSet::new();
         let mut outcomes =
@@ -394,7 +416,10 @@ where
                     .ok_or_else(|| eyre::eyre!("scenario instance counter overflowed u64"))?;
                 let engine = self.clone();
                 let seed = config.seed;
-                tasks.spawn(async move { engine.run_instance(instance, seed).await });
+                let instance_clock = clock.clone();
+                tasks.spawn(
+                    async move { engine.run_instance(instance, seed, instance_clock).await },
+                );
                 last_instance_start = Some(Instant::now());
                 in_flight += 1;
                 maximum_in_flight = maximum_in_flight.max(in_flight);
@@ -453,10 +478,19 @@ where
             .iter()
             .enumerate()
             .map(|(index, step)| {
+                let dependencies = match self.spec.scenario.execution {
+                    ScenarioExecutionMode::Sequential if index > 0 => {
+                        vec![self.spec.scenario.steps[index - 1].effective_id(index - 1)]
+                    }
+                    ScenarioExecutionMode::Sequential => Vec::new(),
+                    ScenarioExecutionMode::Dag => step.depends_on.clone(),
+                };
                 (
+                    step.effective_id(index),
                     step_name(index, step),
                     step.action.chain().to_string(),
                     step.action.name().to_string(),
+                    dependencies,
                     step.provenance.clone(),
                 )
             })
@@ -469,6 +503,12 @@ where
                 network: A::network_name().to_string(),
                 chain_id: chain.chain_id,
                 workload: chain.workload_path.display().to_string(),
+                observation_mode: observation_mode_name(chain.observation_mode).to_string(),
+                observation_poll_interval_ms: u64::try_from(
+                    chain.observation_poll_interval.as_millis(),
+                )
+                .unwrap_or(u64::MAX),
+                subscription_configured: chain.observation_subscription_configured,
             })
             .collect();
         let report_configuration = ScenarioReportConfig {
@@ -511,7 +551,16 @@ where
         ))
     }
 
-    async fn run_instance(&self, instance: u64, run_seed: u64) -> InstanceOutcome {
+    async fn run_instance(
+        self: Arc<Self>,
+        instance: u64,
+        run_seed: u64,
+        clock: RunClock,
+    ) -> InstanceOutcome {
+        let _submission_scope = InstanceSubmissionScope {
+            instance,
+            lanes: self.chains.values().map(|chain| chain.submission_lanes.clone()).collect(),
+        };
         let started_at = SystemTime::now();
         let started = Instant::now();
         let mut rng = StdRng::seed_from_u64(instance_seed(run_seed, instance));
@@ -536,45 +585,52 @@ where
                 };
             }
         };
+
+        match self.spec.scenario.execution {
+            ScenarioExecutionMode::Sequential => {
+                self.run_sequential_instance(
+                    instance,
+                    started_at,
+                    started,
+                    &mut context,
+                    &mut rng,
+                    &clock,
+                )
+                .await
+            }
+            ScenarioExecutionMode::Dag => {
+                self.run_dag_instance(instance, run_seed, started_at, started, context, &clock)
+                    .await
+            }
+        }
+    }
+
+    async fn run_sequential_instance(
+        &self,
+        instance: u64,
+        started_at: SystemTime,
+        started: Instant,
+        context: &mut RuntimeContext,
+        rng: &mut StdRng,
+        clock: &RunClock,
+    ) -> InstanceOutcome {
         let mut step_outcomes = Vec::new();
 
         for (index, step) in self.spec.scenario.steps.iter().enumerate() {
-            let name = step_name(index, step);
-            let kind = step.action.name().to_string();
-            let _step_guard = self.progress.enter(&name);
-            let step_started = Instant::now();
-            let timeout = step.timeout.unwrap_or(self.default_step_timeout);
-            let deadline = TokioInstant::now() + timeout;
-            let result = if matches!(&step.action, StepAction::Submit(_)) {
-                // Submit handles its own deadline so a timed-out RPC cannot outlive
-                // the instance and release its account lease while still running.
-                self.execute_step(instance, step, &name, &context, &mut rng, deadline).await
-            } else {
-                match tokio::time::timeout_at(
-                    deadline,
-                    self.execute_step(instance, step, &name, &context, &mut rng, deadline),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(StepError::timeout()),
-                }
-            };
-            let latency = step_started.elapsed();
+            let dependencies = (index > 0)
+                .then(|| self.spec.scenario.steps[index - 1].effective_id(index - 1))
+                .into_iter()
+                .collect();
+            let (result, outcome) = self
+                .execute_one_step(instance, index, step, dependencies, context, rng, clock)
+                .await;
 
             match result {
                 Ok(value) => {
-                    step_outcomes.push(StepOutcome {
-                        index,
-                        name: name.clone(),
-                        kind,
-                        provenance: step.provenance.clone(),
-                        success: true,
-                        latency,
-                    });
+                    step_outcomes.push(outcome);
                     if let Some(save) = &step.save {
                         match context.with_path(save.clone(), value) {
-                            Ok(next) => context = next,
+                            Ok(next) => *context = next,
                             Err(error) => {
                                 return failed_outcome(
                                     instance,
@@ -590,14 +646,7 @@ where
                     }
                 }
                 Err(error) => {
-                    step_outcomes.push(StepOutcome {
-                        index,
-                        name: name.clone(),
-                        kind,
-                        provenance: step.provenance.clone(),
-                        success: false,
-                        latency,
-                    });
+                    step_outcomes.push(outcome);
                     return failed_outcome(
                         instance,
                         started_at,
@@ -619,6 +668,167 @@ where
             steps: step_outcomes,
             failure: None,
         }
+    }
+
+    async fn run_dag_instance(
+        self: Arc<Self>,
+        instance: u64,
+        run_seed: u64,
+        started_at: SystemTime,
+        started: Instant,
+        mut context: RuntimeContext,
+        clock: &RunClock,
+    ) -> InstanceOutcome {
+        let steps = &self.spec.scenario.steps;
+        let ids = steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| (step.effective_id(index), index))
+            .collect::<BTreeMap<_, _>>();
+        let mut remaining_dependencies =
+            steps.iter().map(|step| step.depends_on.len()).collect::<Vec<_>>();
+        let mut dependents = vec![Vec::new(); steps.len()];
+        for (index, step) in steps.iter().enumerate() {
+            for dependency in &step.depends_on {
+                dependents[ids[dependency]].push(index);
+            }
+        }
+        let mut ready = remaining_dependencies
+            .iter()
+            .enumerate()
+            .filter_map(|(index, remaining)| (*remaining == 0).then_some(index))
+            .collect::<BTreeSet<_>>();
+        let mut running = FuturesUnordered::new();
+        let mut outcomes = Vec::new();
+        let mut failures = Vec::<(usize, StepDef, StepError)>::new();
+
+        loop {
+            while failures.is_empty() {
+                let Some(index) = ready.pop_first() else { break };
+                let step = steps[index].clone();
+                let step_context = context.clone();
+                let engine = self.clone();
+                let step_clock = clock.clone();
+                let step_seed = instance_seed(
+                    instance_seed(run_seed, instance),
+                    stable_hash(&step.effective_id(index)),
+                );
+                running.push(async move {
+                    let mut rng = StdRng::seed_from_u64(step_seed);
+                    let dependencies = step.depends_on.clone();
+                    let (result, outcome) = engine
+                        .execute_one_step(
+                            instance,
+                            index,
+                            &step,
+                            dependencies,
+                            &step_context,
+                            &mut rng,
+                            &step_clock,
+                        )
+                        .await;
+                    (index, step, result, outcome)
+                });
+            }
+
+            let Some((index, step, result, outcome)) = running.next().await else { break };
+            outcomes.push(outcome);
+            match result {
+                Ok(value) if failures.is_empty() => {
+                    if let Some(save) = &step.save {
+                        match context.with_path(save.clone(), value) {
+                            Ok(next) => context = next,
+                            Err(error) => {
+                                failures.push((
+                                    index,
+                                    step,
+                                    StepError::new("context_error", error.to_string()),
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                    for &dependent in &dependents[index] {
+                        remaining_dependencies[dependent] -= 1;
+                        if remaining_dependencies[dependent] == 0 {
+                            ready.insert(dependent);
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => failures.push((index, step, error)),
+            }
+        }
+
+        outcomes.sort_by_key(|outcome| outcome.index);
+        if let Some((index, step, error)) = failures.into_iter().min_by_key(|(index, _, _)| *index)
+        {
+            return failed_outcome(instance, started_at, started, outcomes, index, &step, error);
+        }
+
+        InstanceOutcome {
+            instance,
+            started_at_unix_ms: unix_ms(started_at),
+            finished_at_unix_ms: unix_ms(SystemTime::now()),
+            elapsed: started.elapsed(),
+            steps: outcomes,
+            failure: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_one_step(
+        &self,
+        instance: u64,
+        index: usize,
+        step: &StepDef,
+        depends_on: Vec<String>,
+        context: &RuntimeContext,
+        rng: &mut StdRng,
+        clock: &RunClock,
+    ) -> (Result<RuntimeValue, StepError>, StepOutcome) {
+        let name = step_name(index, step);
+        let id = step.effective_id(index);
+        let kind = step.action.name().to_string();
+        let _step_guard = self.progress.enter(&name);
+        let started_offset_ms = clock.offset_ms();
+        let step_started = Instant::now();
+        let timeout = step.timeout.unwrap_or(self.default_step_timeout);
+        let deadline = TokioInstant::now() + timeout;
+        let execution = if matches!(&step.action, StepAction::Submit(_)) {
+            // Submit handles its own deadline so a timed-out RPC cannot outlive
+            // the instance and release its account lease while still running.
+            self.execute_step(instance, index, step, &name, context, rng, deadline, clock).await
+        } else {
+            match tokio::time::timeout_at(
+                deadline,
+                self.execute_step(instance, index, step, &name, context, rng, deadline, clock),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(StepError::timeout()),
+            }
+        };
+        let milestones = match &execution {
+            Ok(execution) => execution.milestones.clone(),
+            Err(error) => error.milestones().to_vec(),
+        };
+        let result = execution.map(|execution| execution.value);
+        let outcome = StepOutcome {
+            index,
+            id,
+            name,
+            kind,
+            depends_on,
+            provenance: step.provenance.clone(),
+            success: result.is_ok(),
+            latency: step_started.elapsed(),
+            started_offset_ms,
+            finished_offset_ms: clock.offset_ms(),
+            milestones,
+        };
+        (result, outcome)
     }
 
     async fn bind_instance(
@@ -687,21 +897,27 @@ where
         Ok((context, leases))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_step(
         &self,
         instance: u64,
+        step_index: usize,
         step: &StepDef,
         step_name: &str,
         context: &RuntimeContext,
         rng: &mut StdRng,
         deadline: TokioInstant,
-    ) -> Result<RuntimeValue, StepError> {
+        clock: &RunClock,
+    ) -> Result<StepExecution, StepError> {
         let chain = self
             .chains
             .get(step.action.chain())
             .ok_or_else(|| StepError::new("configuration_error", "unknown chain"))?;
         match &step.action {
-            StepAction::Checkpoint(_) => chain.checkpoint().await,
+            StepAction::Checkpoint(_) => chain
+                .checkpoint()
+                .await
+                .map(|value| StepExecution { value, milestones: Vec::new() }),
             StepAction::Invoke(invoke) => {
                 let arguments =
                     serde_yaml::to_value(&invoke.with_value).map_err(StepError::expression)?;
@@ -730,18 +946,64 @@ where
                 };
                 output.insert("chain".to_string(), RuntimeValue::String(chain.name.clone()));
                 output.insert("action".to_string(), RuntimeValue::String(invoke.action.clone()));
-                Ok(RuntimeValue::Object(output))
+                Ok(StepExecution { value: RuntimeValue::Object(output), milestones: Vec::new() })
             }
             StepAction::Submit(submit) => {
                 let submit_rng = rng.clone();
+                let ordered_predecessors = self.ordered_predecessor_ids(step_index);
+                let step_id = step.effective_id(step_index);
+                let submit_rank = self.spec.scenario.steps[..step_index]
+                    .iter()
+                    .filter(|candidate| {
+                        matches!(
+                            &candidate.action,
+                            StepAction::Submit(candidate_submit)
+                                if candidate_submit.chain == submit.chain
+                        )
+                    })
+                    .count();
+                let submits_per_instance = self
+                    .spec
+                    .scenario
+                    .steps
+                    .iter()
+                    .filter(|candidate| {
+                        matches!(
+                            &candidate.action,
+                            StepAction::Submit(candidate_submit)
+                                if candidate_submit.chain == submit.chain
+                        )
+                    })
+                    .count();
+                let submit_rank = u64::try_from(submit_rank)
+                    .map_err(|_| StepError::new("configuration_error", "submit rank overflow"))?;
+                let submits_per_instance = u64::try_from(submits_per_instance).map_err(|_| {
+                    StepError::new("configuration_error", "too many scenario submit steps")
+                })?;
+                let unique_nonce_hint = instance
+                    .checked_mul(submits_per_instance)
+                    .and_then(|base| base.checked_add(submit_rank))
+                    .ok_or_else(|| {
+                        StepError::new(
+                            "configuration_error",
+                            "scenario transaction identity overflow",
+                        )
+                    })?;
+                let dense_unique_nonce_hint =
+                    self.dense_unique_nonce_hint(chain, instance, step_index, submit)?;
                 let (value, next_rng) = chain
                     .execute_submit(
                         instance,
                         step_name,
+                        &step_id,
+                        unique_nonce_hint,
+                        dense_unique_nonce_hint,
+                        &ordered_predecessors,
                         submit.clone(),
                         context.clone(),
                         submit_rng,
                         deadline,
+                        clock,
                     )
                     .await?;
                 *rng = next_rng;
@@ -756,38 +1018,210 @@ where
                     .map(|value| wait::expression_address(value, context))
                     .transpose()
                     .map_err(StepError::expression)?;
-                let receipt = wait::wait_for_receipt(
-                    &chain.query_provider,
+                let observation =
+                    chain.observation.for_step(wait_receipt.mode, wait_receipt.poll_interval);
+                let receipt = wait::wait_for_receipt_observed(
+                    &observation,
                     &chain.submitter,
                     &chain.name,
                     sender,
                     hash,
-                    wait_receipt.poll_interval.unwrap_or(DEFAULT_POLL_INTERVAL),
                     wait_receipt.confirmations.unwrap_or(0),
+                    observation.default_subscription(),
                 )
                 .await?;
+                let milestone = observation_milestone(
+                    "receipt",
+                    &chain.name,
+                    &receipt.observation,
+                    Vec::new(),
+                    clock,
+                );
                 if !receipt.status && !wait_receipt.allow_revert {
-                    return Err(StepError::new("reverted_receipt", "transaction receipt reverted"));
+                    return Err(StepError::new("reverted_receipt", "transaction receipt reverted")
+                        .with_milestones(vec![milestone]));
                 }
-                Ok(receipt.value)
+                Ok(StepExecution { value: receipt.value, milestones: vec![milestone] })
             }
             StepAction::WaitLog(wait_log) => {
-                let abi = chain
-                    .artifacts
-                    .get(&wait_log.abi)
-                    .map_err(|error| StepError::abi(error.to_string()))?;
-                wait::wait_for_log(
-                    &chain.query_provider,
-                    &chain.submitter,
-                    &chain.name,
-                    abi,
-                    wait_log,
-                    context,
-                )
-                .await
+                let observation = chain.observation.for_step(wait_log.mode, wait_log.poll_interval);
+                let behavior = observation.default_subscription();
+                let (result, event_names) = if wait_log.events.is_empty() {
+                    let abi = chain
+                        .artifacts
+                        .get(&wait_log.abi)
+                        .map_err(|error| StepError::abi(error.to_string()))?;
+                    (
+                        wait::wait_for_log_observed(
+                            &observation,
+                            &chain.submitter,
+                            &chain.name,
+                            abi,
+                            wait_log,
+                            context,
+                            behavior,
+                        )
+                        .await?,
+                        vec![wait_log.event.clone()],
+                    )
+                } else {
+                    let hash = wait_log
+                        .transaction_hash
+                        .as_ref()
+                        .ok_or_else(|| {
+                            StepError::missing(
+                                "receipt-scoped event group requires transaction_hash",
+                            )
+                        })
+                        .and_then(|value| {
+                            expression_hash(value, context).map_err(StepError::expression)
+                        })?;
+                    let sender = wait_log
+                        .sender
+                        .as_ref()
+                        .map(|value| wait::expression_address(value, context))
+                        .transpose()
+                        .map_err(StepError::expression)?;
+                    let mut prepared = Vec::with_capacity(wait_log.events.len());
+                    let mut names = Vec::with_capacity(wait_log.events.len());
+                    for (id, event) in &wait_log.events {
+                        let abi = chain
+                            .artifacts
+                            .get(&event.abi)
+                            .map_err(|error| StepError::abi(error.to_string()))?;
+                        prepared.push(wait::prepare_receipt_event(
+                            id,
+                            abi,
+                            &event.event,
+                            event.address.as_ref(),
+                            &event.where_value,
+                            context,
+                        )?);
+                        names.push(event.event.clone());
+                    }
+                    (
+                        wait::wait_for_transaction_events(
+                            &observation,
+                            &chain.submitter,
+                            &chain.name,
+                            sender,
+                            hash,
+                            &prepared,
+                            wait_log.confirmations.unwrap_or(0),
+                            behavior,
+                        )
+                        .await?,
+                        names,
+                    )
+                };
+                Ok(StepExecution {
+                    value: result.value,
+                    milestones: vec![observation_milestone(
+                        if wait_log.events.is_empty() { "log" } else { "receipt_events" },
+                        &chain.name,
+                        &result.observation,
+                        event_names,
+                        clock,
+                    )],
+                })
             }
         }
     }
+
+    fn ordered_predecessor_ids(&self, step_index: usize) -> BTreeSet<String> {
+        if self.spec.scenario.execution == ScenarioExecutionMode::Sequential {
+            return self
+                .spec
+                .scenario
+                .steps
+                .iter()
+                .take(step_index)
+                .enumerate()
+                .map(|(index, step)| step.effective_id(index))
+                .collect();
+        }
+
+        let ids = self
+            .spec
+            .scenario
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| (step.effective_id(index), index))
+            .collect::<BTreeMap<_, _>>();
+        let mut ancestors = BTreeSet::new();
+        let mut pending = self.spec.scenario.steps[step_index].depends_on.clone();
+        while let Some(id) = pending.pop() {
+            if !ancestors.insert(id.clone()) {
+                continue;
+            }
+            let index = ids[&id];
+            pending.extend(self.spec.scenario.steps[index].depends_on.iter().cloned());
+        }
+        ancestors
+    }
+
+    fn dense_unique_nonce_hint(
+        &self,
+        chain: &ChainRuntime<A>,
+        instance: u64,
+        step_index: usize,
+        submit: &SubmitStep,
+    ) -> Result<Option<u64>, StepError> {
+        let template = chain
+            .spec
+            .templates
+            .get(&submit.template)
+            .expect("submit template references were validated");
+        let group = chain
+            .adapter
+            .scenario_unique_nonce_group(template, &submit.with_value)
+            .map_err(|error| StepError::new("configuration_error", error.to_string()))?;
+        let Some(group) = group else { return Ok(None) };
+
+        let mut groups = Vec::new();
+        for (index, candidate) in self.spec.scenario.steps.iter().enumerate() {
+            let StepAction::Submit(candidate) = &candidate.action else { continue };
+            if candidate.chain != submit.chain {
+                continue;
+            }
+            let template = chain
+                .spec
+                .templates
+                .get(&candidate.template)
+                .expect("submit template references were validated");
+            let candidate_group = chain
+                .adapter
+                .scenario_unique_nonce_group(template, &candidate.with_value)
+                .map_err(|error| StepError::new("configuration_error", error.to_string()))?;
+            groups.push((index, candidate_group));
+        }
+        dense_unique_nonce_identity(instance, step_index, &group, &groups)
+    }
+}
+
+fn dense_unique_nonce_identity(
+    instance: u64,
+    step_index: usize,
+    group: &str,
+    groups: &[(usize, Option<String>)],
+) -> Result<Option<u64>, StepError> {
+    let matching = groups
+        .iter()
+        .filter(|(_, candidate)| candidate.as_deref() == Some(group))
+        .collect::<Vec<_>>();
+    let rank = matching.iter().filter(|(index, _)| *index < step_index).count();
+    let count = matching.len();
+    debug_assert!(count > 0, "the current step belongs to the requested uniqueness group");
+    let rank = u64::try_from(rank)
+        .map_err(|_| StepError::new("configuration_error", "unique nonce rank overflow"))?;
+    let count = u64::try_from(count)
+        .map_err(|_| StepError::new("configuration_error", "too many unique nonce steps"))?;
+    instance
+        .checked_mul(count)
+        .and_then(|base| base.checked_add(rank))
+        .map(Some)
+        .ok_or_else(|| StepError::new("configuration_error", "dense scenario identity overflow"))
 }
 
 fn failed_outcome(
@@ -830,8 +1264,11 @@ struct ChainRuntime<A: NetworkAdapter> {
     nonces: Mutex<NonceTracker>,
     submit_prepare_gate: Mutex<()>,
     submission_lanes: Arc<SubmissionLanes>,
-    submission_ambiguous: AtomicBool,
     query_provider: DynProvider<AnyNetwork>,
+    observation: wait::ObservationRuntime,
+    observation_mode: ObservationMode,
+    observation_poll_interval: Duration,
+    observation_subscription_configured: bool,
     submitter: RpcSubmitter,
     receipt_collector: Mutex<Option<ReceiptCollector>>,
     receipt_collector_handle: StdMutex<Option<ReceiptCollectorHandle>>,
@@ -859,36 +1296,120 @@ struct PreparedChain<A: NetworkAdapter> {
     adapter: A,
     nonces: NonceTracker,
     query_provider: DynProvider<AnyNetwork>,
+    observation: wait::ObservationRuntime,
+    observation_mode: ObservationMode,
+    observation_poll_interval: Duration,
+    observation_subscription_configured: bool,
     submitter: RpcSubmitter,
 }
 
 #[derive(Default)]
 struct SubmissionLanes {
-    active: StdMutex<BTreeSet<[u8; 20]>>,
+    active: StdMutex<BTreeMap<[u8; 20], SubmissionLaneOwner>>,
+    ambiguous: StdMutex<BTreeSet<[u8; 20]>>,
+    seen_by_instance: StdMutex<BTreeMap<(u64, [u8; 20]), String>>,
     notify: tokio::sync::Notify,
 }
 
 impl SubmissionLanes {
-    fn try_acquire(self: &Arc<Self>, keys: BTreeSet<[u8; 20]>) -> Option<SubmissionLaneGuard> {
-        let mut active = self.active.lock().expect("submission lane mutex poisoned");
-        if keys.iter().any(|key| active.contains(key)) {
-            return None;
+    fn try_acquire(
+        self: &Arc<Self>,
+        keys: BTreeSet<[u8; 20]>,
+        owner: SubmissionLaneOwner,
+        ordered_predecessors: &BTreeSet<String>,
+    ) -> SubmissionLaneAcquire {
+        {
+            let seen =
+                self.seen_by_instance.lock().expect("submission lane history mutex poisoned");
+            if keys.iter().any(|key| {
+                seen.get(&(owner.instance, *key)).is_some_and(|previous| {
+                    previous != &owner.step && !ordered_predecessors.contains(previous)
+                })
+            }) {
+                return SubmissionLaneAcquire::UnsafeSameInstance;
+            }
         }
-        active.extend(keys.iter().copied());
-        Some(SubmissionLaneGuard { lanes: self.clone(), keys })
+        let mut active = self.active.lock().expect("submission lane mutex poisoned");
+        if active
+            .iter()
+            .any(|(key, existing)| keys.contains(key) && existing.instance == owner.instance)
+        {
+            return SubmissionLaneAcquire::UnsafeSameInstance;
+        }
+        if keys.iter().any(|key| active.contains_key(key)) {
+            return SubmissionLaneAcquire::Busy;
+        }
+        active.extend(keys.iter().copied().map(|key| (key, owner.clone())));
+        self.seen_by_instance
+            .lock()
+            .expect("submission lane history mutex poisoned")
+            .extend(keys.iter().copied().map(|key| ((owner.instance, key), owner.step.clone())));
+        SubmissionLaneAcquire::Acquired(SubmissionLaneGuard { lanes: self.clone(), keys, owner })
     }
+
+    fn release_instance(&self, instance: u64) {
+        self.seen_by_instance
+            .lock()
+            .expect("submission lane history mutex poisoned")
+            .retain(|(seen_instance, _), _| *seen_instance != instance);
+    }
+
+    fn mark_ambiguous(&self, keys: &BTreeSet<[u8; 20]>) {
+        self.ambiguous.lock().expect("submission lane ambiguity mutex poisoned").extend(keys);
+    }
+
+    fn has_ambiguous_ordered_lane(
+        &self,
+        has_ordered_nonces: bool,
+        keys: &BTreeSet<[u8; 20]>,
+    ) -> bool {
+        has_ordered_nonces &&
+            self.ambiguous
+                .lock()
+                .expect("submission lane ambiguity mutex poisoned")
+                .iter()
+                .any(|key| keys.contains(key))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SubmissionLaneOwner {
+    instance: u64,
+    step: String,
+}
+
+enum SubmissionLaneAcquire {
+    Acquired(SubmissionLaneGuard),
+    Busy,
+    UnsafeSameInstance,
 }
 
 struct SubmissionLaneGuard {
     lanes: Arc<SubmissionLanes>,
     keys: BTreeSet<[u8; 20]>,
+    owner: SubmissionLaneOwner,
+}
+
+struct InstanceSubmissionScope {
+    instance: u64,
+    lanes: Vec<Arc<SubmissionLanes>>,
+}
+
+impl Drop for InstanceSubmissionScope {
+    fn drop(&mut self) {
+        for lanes in &self.lanes {
+            lanes.release_instance(self.instance);
+        }
+    }
 }
 
 impl Drop for SubmissionLaneGuard {
     fn drop(&mut self) {
         let mut active = self.lanes.active.lock().expect("submission lane mutex poisoned");
         for key in &self.keys {
-            active.remove(key);
+            if active.get(key) == Some(&self.owner) {
+                active.remove(key);
+            }
         }
         drop(active);
         self.lanes.notify.notify_waiters();
@@ -1021,14 +1542,37 @@ where
             let overlay = materialize_yaml(&submit.with_value, &RuntimeContext::empty())?;
             merge_yaml(&mut value, overlay);
             let value = setup.resolve_template(value)?;
-            tokio::time::timeout(
+            let preparation = tokio::time::timeout(
                 FALLBACK_STEP_TIMEOUT,
                 adapter.prepare_request(&value, &mut context),
             )
-            .await
-            .map_err(|_| {
-                eyre::eyre!("{label} template '{}' preparation timed out", submit.template)
-            })??;
+            .await;
+            match preparation {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    if !context.rollback_nonce_reservations() {
+                        bail!(
+                            "{label} failed to restore nonce state after preparing template '{}'",
+                            submit.template
+                        );
+                    }
+                    return Err(error).wrap_err_with(|| {
+                        format!(
+                            "{label} failed to prepare request from template '{}'",
+                            submit.template
+                        )
+                    });
+                }
+                Err(_) => {
+                    if !context.rollback_nonce_reservations() {
+                        bail!(
+                            "{label} failed to restore nonce state after template '{}' preparation timed out",
+                            submit.template
+                        );
+                    }
+                    bail!("{label} template '{}' preparation timed out", submit.template);
+                }
+            }
             let transaction = materialize_and_sign_template(
                 &adapter,
                 &submit.template,
@@ -1065,6 +1609,10 @@ where
             mut adapter,
             mut nonces,
             query_provider,
+            observation,
+            observation_mode,
+            observation_poll_interval,
+            observation_subscription_configured,
             submitter,
         } = self;
         let setup = {
@@ -1111,8 +1659,11 @@ where
             nonces: Mutex::new(nonces),
             submit_prepare_gate: Mutex::new(()),
             submission_lanes: Arc::new(SubmissionLanes::default()),
-            submission_ambiguous: AtomicBool::new(false),
             query_provider,
+            observation,
+            observation_mode,
+            observation_poll_interval,
+            observation_subscription_configured,
             submitter,
             receipt_collector: Mutex::new(Some(receipt_collector)),
             receipt_collector_handle: StdMutex::new(Some(receipt_collector_handle)),
@@ -1122,7 +1673,8 @@ where
 
 impl<A> ChainRuntime<A>
 where
-    A: NetworkAdapter + Default,
+    A: NetworkAdapter + Default + 'static,
+    <A::Network as Network>::TransactionRequest: Send + 'static,
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
@@ -1133,6 +1685,7 @@ where
         input: ChainInput,
         transaction_rate: u64,
         max_rpc_in_flight: usize,
+        subscription_required: bool,
     ) -> Result<PreparedChain<A>> {
         let ChainInput {
             workload_path,
@@ -1149,6 +1702,16 @@ where
         let query_provider = ProviderBuilder::new_with_network::<AnyNetwork>()
             .connect_http(query_rpc_url.clone())
             .erased();
+        let observation = wait::ObservationRuntime::from_config(
+            query_provider.clone(),
+            &definition.observation,
+            subscription_required,
+        )
+        .await
+        .map_err(|error| {
+            eyre::eyre!("failed to configure observation for chain '{name}': {error}")
+        })?;
+        let observation_subscription_configured = observation.has_subscription();
         let rpc_chain_id =
             tokio::time::timeout(FALLBACK_STEP_TIMEOUT, query_provider.get_chain_id())
                 .await
@@ -1205,22 +1768,72 @@ where
             adapter,
             nonces,
             query_provider,
+            observation,
+            observation_mode: definition.observation.mode,
+            observation_poll_interval: definition.observation.poll_interval,
+            observation_subscription_configured,
             submitter,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_submit(
         &self,
         instance: u64,
         step_name: &str,
+        step_id: &str,
+        unique_nonce_hint: u64,
+        dense_unique_nonce_hint: Option<u64>,
+        ordered_predecessors: &BTreeSet<String>,
         submit: SubmitStep,
         context: RuntimeContext,
         mut rng: StdRng,
         deadline: TokioInstant,
-    ) -> Result<(RuntimeValue, StdRng), StepError> {
+        clock: &RunClock,
+    ) -> Result<(StepExecution, StdRng), StepError> {
         let (materialized, submission_lanes) = self
-            .prepare_submission(&submit.template, &submit.with_value, &context, &mut rng, deadline)
+            .prepare_submission(
+                instance,
+                step_id,
+                unique_nonce_hint,
+                dense_unique_nonce_hint,
+                &submit.template,
+                &submit.with_value,
+                ordered_predecessors,
+                &context,
+                &mut rng,
+                deadline,
+            )
             .await?;
+        let has_ordered_nonces = materialized
+            .nonce_reservations
+            .iter()
+            .any(|reservation| reservation.kind == NonceReservationKind::Ordered);
+        if self
+            .submission_lanes
+            .has_ambiguous_ordered_lane(has_ordered_nonces, &submission_lanes.keys)
+        {
+            drop(submission_lanes);
+            match self.rollback_submitted_nonces(&materialized, deadline).await {
+                Some(true) => {}
+                Some(false) => {
+                    return Err(StepError::new(
+                        "nonce_recovery_error",
+                        "failed to restore nonce state after the affected nonce lane was disabled",
+                    ));
+                }
+                None => {
+                    return Err(StepError::new(
+                        "timeout",
+                        "step timed out while aborting after the affected nonce lane was disabled",
+                    ));
+                }
+            }
+            return Err(StepError::new(
+                "nonce_state_ambiguous",
+                "an earlier submission on this nonce lane had an unknown acceptance outcome",
+            ));
+        }
         let attempt_started_at = SystemTime::now();
         let attempt_started = Instant::now();
         let submission = match self
@@ -1253,10 +1866,19 @@ where
                         match lookup {
                             Ok(result) => Some(result),
                             Err(_) => {
-                                self.submission_ambiguous.store(true, Ordering::Release);
+                                if has_ordered_nonces {
+                                    self.submission_lanes.mark_ambiguous(&submission_lanes.keys);
+                                }
+                                let suffix = if has_ordered_nonces {
+                                    "; further ordered submissions on affected nonce lanes are disabled"
+                                } else {
+                                    ""
+                                };
                                 return Err(StepError::new(
                                     "timeout",
-                                    "step timed out while checking an uncertain transaction submission; further submissions on this chain are disabled",
+                                    format!(
+                                        "step timed out while checking an uncertain transaction submission{suffix}"
+                                    ),
                                 ));
                             }
                         }
@@ -1275,17 +1897,17 @@ where
                     match self.rollback_submitted_nonces(&materialized, deadline).await {
                         Some(true) => {}
                         Some(false) => {
-                            self.submission_ambiguous.store(true, Ordering::Release);
+                            self.submission_lanes.mark_ambiguous(&submission_lanes.keys);
                             return Err(StepError::new(
                                 "nonce_recovery_error",
                                 "failed to restore nonce state after an RPC rejection",
                             ));
                         }
                         None => {
-                            self.submission_ambiguous.store(true, Ordering::Release);
+                            self.submission_lanes.mark_ambiguous(&submission_lanes.keys);
                             return Err(StepError::new(
                                 "timeout",
-                                "step timed out before nonce recovery could be proven safe; further submissions on this chain are disabled",
+                                "step timed out before nonce recovery could be proven safe; further ordered submissions on affected nonce lanes are disabled",
                             ));
                         }
                     }
@@ -1300,7 +1922,9 @@ where
                     // A JSON-RPC rejection is not proof that its nonce is reusable:
                     // `already known`, `nonce too low`, and replacement errors can
                     // all describe state the local tracker cannot safely reconstruct.
-                    self.submission_ambiguous.store(true, Ordering::Release);
+                    if has_ordered_nonces {
+                        self.submission_lanes.mark_ambiguous(&submission_lanes.keys);
+                    }
                     let classification = if error.kind() == RpcSubmitFailureKind::Rejected &&
                         lookup.as_ref().is_some_and(|result| {
                             result.as_ref().is_ok_and(|transaction| !*transaction)
@@ -1321,7 +1945,9 @@ where
             materialized.tx_hash,
         );
         if submission.tx_hash != materialized.tx_hash {
-            self.submission_ambiguous.store(true, Ordering::Release);
+            if has_ordered_nonces {
+                self.submission_lanes.mark_ambiguous(&submission_lanes.keys);
+            }
             return Err(StepError::new(
                 "rpc_hash_mismatch",
                 "RPC returned a transaction hash different from the signed payload",
@@ -1329,46 +1955,93 @@ where
         }
         drop(submission_lanes);
 
-        let receipt = if submit.await_mode == Some(SubmitAwait::Receipt) {
-            let receipt = tokio::time::timeout_at(
+        let accepted_at = submission
+            .submitted_at
+            .checked_add(submission.acceptance_latency)
+            .unwrap_or(submission.submitted_at);
+        let submit_milestone = ProtocolMilestone {
+            kind: "submit".to_string(),
+            chain: self.name.clone(),
+            run_offset_ms: clock.offset_ms(),
+            wall_time_unix_ms: unix_ms(accepted_at),
+            submitted_at_unix_ms: Some(unix_ms(submission.submitted_at)),
+            accepted_at_unix_ms: Some(unix_ms(accepted_at)),
+            first_observed_at_unix_ms: None,
+            transaction_hash: Some(submission.tx_hash),
+            block_number: None,
+            block_hash: None,
+            transaction_index: None,
+            log_index: None,
+            canonical_block_timestamp_ms: None,
+            confirmation_depth: 0,
+            event_names: Vec::new(),
+            log_indices: Vec::new(),
+        };
+        let (receipt, receipt_milestone) = if submit.await_mode == Some(SubmitAwait::Receipt) {
+            let receipt = match tokio::time::timeout_at(
                 deadline,
-                wait::wait_for_receipt(
-                    &self.query_provider,
+                wait::wait_for_receipt_observed(
+                    &self.observation,
                     &self.submitter,
                     &self.name,
                     Some(materialized.sender),
                     submission.tx_hash,
-                    DEFAULT_POLL_INTERVAL,
                     0,
+                    self.observation.default_subscription(),
                 ),
             )
             .await
-            .map_err(|_| StepError::timeout())??;
+            {
+                Ok(Ok(receipt)) => receipt,
+                Ok(Err(error)) => {
+                    return Err(error.with_milestones(vec![submit_milestone.clone()]));
+                }
+                Err(_) => {
+                    return Err(StepError::timeout().with_milestones(vec![submit_milestone.clone()]));
+                }
+            };
+            let milestone = observation_milestone(
+                "receipt",
+                &self.name,
+                &receipt.observation,
+                Vec::new(),
+                clock,
+            );
             if !receipt.status {
-                return Err(StepError::new("reverted_receipt", "submitted transaction reverted"));
+                return Err(StepError::new("reverted_receipt", "submitted transaction reverted")
+                    .with_milestones(vec![submit_milestone.clone(), milestone]));
             }
-            receipt.value
+            (receipt.value, Some(milestone))
         } else {
-            RuntimeValue::Null
+            (RuntimeValue::Null, None)
         };
 
+        let mut milestones = vec![submit_milestone];
+        milestones.extend(receipt_milestone);
+
         Ok((
-            object([
-                ("chain", RuntimeValue::String(self.name.clone())),
-                ("template", RuntimeValue::String(submit.template.clone())),
-                ("id", RuntimeValue::String(submit.template)),
-                ("sender", RuntimeValue::Address(materialized.sender)),
-                ("tx_hash", RuntimeValue::Bytes32(submission.tx_hash)),
-                ("submitted_at", RuntimeValue::Uint(U256::from(unix_ms(submission.submitted_at)))),
-                (
-                    "acceptance_latency",
-                    RuntimeValue::Uint(U256::from(
-                        u64::try_from(submission.acceptance_latency.as_millis())
-                            .unwrap_or(u64::MAX),
-                    )),
-                ),
-                ("receipt", receipt),
-            ]),
+            StepExecution {
+                value: object([
+                    ("chain", RuntimeValue::String(self.name.clone())),
+                    ("template", RuntimeValue::String(submit.template.clone())),
+                    ("id", RuntimeValue::String(submit.template)),
+                    ("sender", RuntimeValue::Address(materialized.sender)),
+                    ("tx_hash", RuntimeValue::Bytes32(submission.tx_hash)),
+                    (
+                        "submitted_at",
+                        RuntimeValue::Uint(U256::from(unix_ms(submission.submitted_at))),
+                    ),
+                    (
+                        "acceptance_latency",
+                        RuntimeValue::Uint(U256::from(
+                            u64::try_from(submission.acceptance_latency.as_millis())
+                                .unwrap_or(u64::MAX),
+                        )),
+                    ),
+                    ("receipt", receipt),
+                ]),
+                milestones,
+            },
             rng,
         ))
     }
@@ -1410,10 +2083,16 @@ where
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn prepare_submission(
         &self,
+        instance: u64,
+        step_id: &str,
+        unique_nonce_hint: u64,
+        dense_unique_nonce_hint: Option<u64>,
         template: &str,
         overlay: &serde_yaml::Value,
+        ordered_predecessors: &BTreeSet<String>,
         context: &RuntimeContext,
         rng: &mut StdRng,
         deadline: TokioInstant,
@@ -1422,54 +2101,111 @@ where
             let prepare_gate = lock_before_deadline(&self.submit_prepare_gate, deadline)
                 .await
                 .ok_or_else(StepError::timeout)?;
-            if self.submission_ambiguous.load(Ordering::Acquire) {
-                return Err(StepError::new(
-                    "nonce_state_ambiguous",
-                    "an earlier submission on this chain had an unknown acceptance outcome",
-                ));
-            }
 
             let mut attempt_rng = rng.clone();
-            let materialized = tokio::time::timeout_at(
-                deadline,
-                self.materialize(template, overlay, context, &mut attempt_rng),
-            )
-            .await
-            .map_err(|_| StepError::timeout())??;
-            let keys = materialized
-                .nonce_reservations
-                .iter()
-                .map(|reservation| reservation.key)
-                .chain(
-                    materialized
-                        .generated
-                        .submission_keys
-                        .iter()
-                        .chain(&materialized.generated.inclusion_keys)
-                        .map(|key| key.into_inner()),
+            let prepared = self
+                .prepare_materialization(
+                    template,
+                    overlay,
+                    context,
+                    &mut attempt_rng,
+                    unique_nonce_hint,
+                    dense_unique_nonce_hint,
+                    deadline,
                 )
+                .await?;
+            let reservations = prepared.nonce_reservations().to_vec();
+            let has_ordered_nonces = reservations
+                .iter()
+                .any(|reservation| reservation.kind == NonceReservationKind::Ordered);
+            let keys = reservations
+                .iter()
+                .filter(|reservation| reservation.kind == NonceReservationKind::Ordered)
+                .map(|reservation| reservation.key)
+                .chain(prepared.scheduling_keys())
                 .collect::<BTreeSet<_>>();
             if keys.is_empty() {
-                if !self.rollback_reserved_nonces(&materialized).await {
-                    self.submission_ambiguous.store(true, Ordering::Release);
+                if !self.rollback_nonce_reservations(&reservations).await {
+                    self.submission_lanes.mark_ambiguous(&keys);
                 }
                 return Err(StepError::new(
                     "materialization_error",
                     "materialized transaction has no scheduling key",
                 ));
             }
+            if self.submission_lanes.has_ambiguous_ordered_lane(has_ordered_nonces, &keys) {
+                if !self.rollback_nonce_reservations(&reservations).await {
+                    self.submission_lanes.mark_ambiguous(&keys);
+                    return Err(StepError::new(
+                        "nonce_recovery_error",
+                        "failed to restore nonce state after detecting an ambiguous nonce lane",
+                    ));
+                }
+                return Err(StepError::new(
+                    "nonce_state_ambiguous",
+                    "an earlier submission on this nonce lane had an unknown acceptance outcome",
+                ));
+            }
 
             let notified = self.submission_lanes.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if let Some(lanes) = self.submission_lanes.try_acquire(keys) {
-                *rng = attempt_rng;
-                drop(prepare_gate);
-                return Ok((materialized, lanes));
+            let owner = SubmissionLaneOwner { instance, step: step_id.to_string() };
+            match self.submission_lanes.try_acquire(
+                keys.clone(),
+                owner.clone(),
+                ordered_predecessors,
+            ) {
+                SubmissionLaneAcquire::Acquired(lanes) => {
+                    *rng = attempt_rng;
+                    let materialized = if has_ordered_nonces {
+                        match sign_prepared_before_deadline::<A>(prepared, deadline).await {
+                            Ok(transaction) => transaction,
+                            Err(error) => {
+                                if !self.rollback_nonce_reservations(&reservations).await {
+                                    self.submission_lanes.mark_ambiguous(&lanes.keys);
+                                    return Err(StepError::new(
+                                        "nonce_recovery_error",
+                                        "failed to restore nonce state after transaction signing failed",
+                                    ));
+                                }
+                                return Err(error);
+                            }
+                        }
+                    } else {
+                        drop(prepare_gate);
+                        sign_prepared_before_deadline::<A>(prepared, deadline).await?
+                    };
+                    return self.finish_prepared_submission(materialized, lanes).await;
+                }
+                SubmissionLaneAcquire::UnsafeSameInstance => {
+                    if !self.rollback_nonce_reservations(&reservations).await {
+                        self.submission_lanes.mark_ambiguous(&keys);
+                        return Err(StepError::new(
+                            "nonce_recovery_error",
+                            "failed to restore nonce state after detecting unsafe parallel submission",
+                        ));
+                    }
+                    return Err(StepError::new(
+                        "unsafe_parallel_nonce",
+                        "parallel steps in one scenario instance use the same ordered nonce lane; add an explicit dependency",
+                    ));
+                }
+                SubmissionLaneAcquire::Busy if !has_ordered_nonces => {
+                    *rng = attempt_rng;
+                    drop(prepare_gate);
+                    let materialized =
+                        sign_prepared_before_deadline::<A>(prepared, deadline).await?;
+                    let lanes = self
+                        .wait_for_submission_lanes(keys, owner, ordered_predecessors, deadline)
+                        .await?;
+                    return self.finish_prepared_submission(materialized, lanes).await;
+                }
+                SubmissionLaneAcquire::Busy => {}
             }
 
-            if !self.rollback_reserved_nonces(&materialized).await {
-                self.submission_ambiguous.store(true, Ordering::Release);
+            if !self.rollback_nonce_reservations(&reservations).await {
+                self.submission_lanes.mark_ambiguous(&keys);
                 return Err(StepError::new(
                     "nonce_recovery_error",
                     "failed to restore nonce state while waiting for an active submission lane",
@@ -1480,13 +2216,74 @@ where
         }
     }
 
-    async fn materialize(
+    async fn wait_for_submission_lanes(
+        &self,
+        keys: BTreeSet<[u8; 20]>,
+        owner: SubmissionLaneOwner,
+        ordered_predecessors: &BTreeSet<String>,
+        deadline: TokioInstant,
+    ) -> Result<SubmissionLaneGuard, StepError> {
+        loop {
+            let notified = self.submission_lanes.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.submission_lanes.try_acquire(
+                keys.clone(),
+                owner.clone(),
+                ordered_predecessors,
+            ) {
+                SubmissionLaneAcquire::Acquired(lanes) => return Ok(lanes),
+                SubmissionLaneAcquire::UnsafeSameInstance => {
+                    return Err(StepError::new(
+                        "unsafe_parallel_nonce",
+                        "parallel steps in one scenario instance use the same ordered nonce lane; add an explicit dependency",
+                    ));
+                }
+                SubmissionLaneAcquire::Busy => {
+                    tokio::time::timeout_at(deadline, notified)
+                        .await
+                        .map_err(|_| StepError::timeout())?;
+                }
+            }
+        }
+    }
+
+    async fn finish_prepared_submission(
+        &self,
+        transaction: MaterializedTx,
+        lanes: SubmissionLaneGuard,
+    ) -> Result<(MaterializedTx, SubmissionLaneGuard), StepError> {
+        let has_ordered_nonces = transaction
+            .nonce_reservations
+            .iter()
+            .any(|reservation| reservation.kind == NonceReservationKind::Ordered);
+        if !self.submission_lanes.has_ambiguous_ordered_lane(has_ordered_nonces, &lanes.keys) {
+            return Ok((transaction, lanes));
+        }
+        drop(lanes);
+        if !self.rollback_reserved_nonces(&transaction).await {
+            return Err(StepError::new(
+                "nonce_recovery_error",
+                "failed to restore nonce state after the affected nonce lane was disabled",
+            ));
+        }
+        Err(StepError::new(
+            "nonce_state_ambiguous",
+            "an earlier submission on this nonce lane had an unknown acceptance outcome",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_materialization(
         &self,
         template: &str,
         overlay: &serde_yaml::Value,
         context: &RuntimeContext,
         rng: &mut StdRng,
-    ) -> Result<MaterializedTx, StepError> {
+        unique_nonce_hint: u64,
+        dense_unique_nonce_hint: Option<u64>,
+        deadline: TokioInstant,
+    ) -> Result<PreparedMaterializedTx<A>, StepError> {
         let mut value = self
             .spec
             .templates
@@ -1499,7 +2296,8 @@ where
             .setup
             .resolve_template(value)
             .map_err(|error| StepError::new("materialization_error", error.to_string()))?;
-        let mut nonces = self.nonces.lock().await;
+        let mut nonces =
+            lock_before_deadline(&self.nonces, deadline).await.ok_or_else(StepError::timeout)?;
         let mut build_context = BuildContext::new_with_address_pools(
             self.chain_id,
             &self.spec.gas,
@@ -1509,11 +2307,40 @@ where
             &mut nonces,
             rng,
         );
-        self.adapter
-            .prepare_request(&value, &mut build_context)
-            .await
-            .map_err(|error| StepError::new("materialization_error", error.to_string()))?;
-        materialize_and_sign_template(
+        build_context.set_unique_nonce_hint(unique_nonce_hint);
+        if let Some(hint) = dense_unique_nonce_hint {
+            build_context.set_dense_unique_nonce_hint(hint);
+        }
+        let preparation = tokio::time::timeout_at(
+            deadline,
+            self.adapter.prepare_request(&value, &mut build_context),
+        )
+        .await;
+        let preparation_error = match preparation {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(StepError::new("materialization_error", error.to_string())),
+            Err(_) => Some(StepError::timeout()),
+        };
+        if let Some(error) = preparation_error {
+            let reservations = build_context.take_nonce_reservations();
+            let mut restored = true;
+            let mut ordered_keys = BTreeSet::new();
+            for reservation in reservations.iter().rev() {
+                if reservation.kind == NonceReservationKind::Ordered {
+                    ordered_keys.insert(reservation.key);
+                    restored &= build_context.nonces.rewind(reservation.key, reservation.nonce);
+                }
+            }
+            if !restored {
+                self.submission_lanes.mark_ambiguous(&ordered_keys);
+                return Err(StepError::new(
+                    "nonce_recovery_error",
+                    "failed to restore nonce state after transaction preparation failed",
+                ));
+            }
+            return Err(error);
+        }
+        prepare_materialized_template(
             &self.adapter,
             template,
             value,
@@ -1524,13 +2351,22 @@ where
         .map_err(|error| StepError::new("materialization_error", error.to_string()))
     }
 
-    async fn rollback_reserved_nonces(&self, transaction: &MaterializedTx) -> bool {
+    async fn rollback_nonce_reservations(
+        &self,
+        reservations: &[txgen_core::NonceReservation],
+    ) -> bool {
         let mut nonces = self.nonces.lock().await;
         let mut restored = true;
-        for reservation in transaction.nonce_reservations.iter().rev() {
-            restored &= nonces.rewind(reservation.key, reservation.nonce);
+        for reservation in reservations.iter().rev() {
+            if reservation.kind == NonceReservationKind::Ordered {
+                restored &= nonces.rewind(reservation.key, reservation.nonce);
+            }
         }
         restored
+    }
+
+    async fn rollback_reserved_nonces(&self, transaction: &MaterializedTx) -> bool {
+        self.rollback_nonce_reservations(&transaction.nonce_reservations).await
     }
 
     async fn rollback_submitted_nonces(
@@ -1538,6 +2374,13 @@ where
         transaction: &MaterializedTx,
         deadline: TokioInstant,
     ) -> Option<bool> {
+        if !transaction
+            .nonce_reservations
+            .iter()
+            .any(|reservation| reservation.kind == NonceReservationKind::Ordered)
+        {
+            return Some(true);
+        }
         // Exclude speculative materialization while proving that this accepted
         // reservation is still the newest value on every affected lane.
         let _prepare_gate = lock_before_deadline(&self.submit_prepare_gate, deadline).await?;
@@ -1558,6 +2401,35 @@ where
             ("block_hash", block_hash.map(RuntimeValue::Bytes32).unwrap_or(RuntimeValue::Null)),
             ("captured_at", RuntimeValue::Uint(U256::from(unix_ms(SystemTime::now())))),
         ]))
+    }
+}
+
+async fn sign_prepared_before_deadline<A>(
+    prepared: PreparedMaterializedTx<A>,
+    deadline: TokioInstant,
+) -> Result<MaterializedTx, StepError>
+where
+    A: NetworkAdapter + 'static,
+    <A::Network as Network>::TransactionRequest: Send + 'static,
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let mut signing =
+        tokio::task::spawn_blocking(move || sign_prepared_materialized_template(prepared));
+    match tokio::time::timeout_at(deadline, &mut signing).await {
+        Ok(Ok(Ok(transaction))) => Ok(transaction),
+        Ok(Ok(Err(error))) => Err(StepError::new("materialization_error", error.to_string())),
+        Ok(Err(error)) => Err(StepError::new(
+            "materialization_error",
+            format!("transaction signing task failed: {error}"),
+        )),
+        Err(_) => {
+            // Tokio cannot cancel blocking work that has started, but aborting
+            // prevents a queued signer from starting after its scenario ended.
+            signing.abort();
+            Err(StepError::timeout())
+        }
     }
 }
 
@@ -1848,41 +2720,80 @@ fn validate_workload_references<A: NetworkAdapter>(
                 );
             }
             StepAction::WaitLog(wait_log) => {
-                let abi = chain.artifacts.get(&wait_log.abi).wrap_err_with(|| {
-                    format!(
-                        "{label} references missing ABI artifact '{}' on chain '{}'",
-                        wait_log.abi, wait_log.chain
-                    )
-                })?;
-                let filter_types =
-                    wait::resolve_event_filter_types(abi, &wait_log.event, &wait_log.where_value)
-                        .wrap_err_with(|| {
-                        format!(
-                            "{label} has an invalid event '{}' for ABI '{}' on chain '{}'",
-                            wait_log.event, wait_log.abi, wait_log.chain
-                        )
-                    })?;
-                for (name, expression) in &wait_log.where_value {
-                    let filter_type = &filter_types[name];
-                    spec.validate_abi_filter_expression_type(
+                if wait_log.events.is_empty() {
+                    validate_event_reference(
+                        spec,
                         index,
-                        expression,
-                        &filter_type.sol_type,
-                        filter_type.accepts_precomputed_hash,
-                        name,
+                        &label,
+                        chain,
+                        &wait_log.chain,
+                        None,
+                        &wait_log.abi,
+                        &wait_log.event,
+                        &wait_log.where_value,
                     )?;
-                    if collect_variable_paths(expression)?.is_empty() {
-                        wait::validate_constant_event_filter(expression, filter_type)
-                            .wrap_err_with(|| {
-                                format!(
-                                    "{label} event filter '{}' is invalid for ABI type '{}'",
-                                    name, filter_type.sol_type
-                                )
-                            })?;
+                } else {
+                    for (event_id, event) in &wait_log.events {
+                        validate_event_reference(
+                            spec,
+                            index,
+                            &label,
+                            chain,
+                            &wait_log.chain,
+                            Some(event_id),
+                            &event.abi,
+                            &event.event,
+                            &event.where_value,
+                        )?;
                     }
                 }
             }
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_event_reference(
+    spec: &ScenarioSpec,
+    step_index: usize,
+    label: &str,
+    chain: &ChainInput,
+    chain_name: &str,
+    event_id: Option<&str>,
+    abi_name: &str,
+    event_name: &str,
+    filters: &BTreeMap<String, serde_yaml::Value>,
+) -> Result<()> {
+    let context = event_id.map(|id| format!(" receipt event '{id}'")).unwrap_or_default();
+    let abi = chain.artifacts.get(abi_name).wrap_err_with(|| {
+        format!(
+            "{label}{context} references missing ABI artifact '{abi_name}' on chain '{chain_name}'"
+        )
+    })?;
+    let filter_types =
+        wait::resolve_event_filter_types(abi, event_name, filters).wrap_err_with(|| {
+            format!(
+                "{label}{context} has an invalid event '{event_name}' for ABI '{abi_name}' on chain '{chain_name}'"
+            )
+        })?;
+    for (name, expression) in filters {
+        let filter_type = &filter_types[name];
+        spec.validate_abi_filter_expression_type(
+            step_index,
+            expression,
+            &filter_type.sol_type,
+            filter_type.accepts_precomputed_hash,
+            name,
+        )?;
+        if collect_variable_paths(expression)?.is_empty() {
+            wait::validate_constant_event_filter(expression, filter_type).wrap_err_with(|| {
+                format!(
+                    "{label}{context} event filter '{name}' is invalid for ABI type '{}'",
+                    filter_type.sol_type
+                )
+            })?;
         }
     }
     Ok(())
@@ -1936,6 +2847,45 @@ fn object<const N: usize>(values: [(&str, RuntimeValue); N]) -> RuntimeValue {
 
 fn step_name(index: usize, step: &StepDef) -> String {
     step.save.clone().unwrap_or_else(|| format!("step_{}_{}", index + 1, step.action.name()))
+}
+
+fn observation_mode_name(mode: ObservationMode) -> &'static str {
+    match mode {
+        ObservationMode::Auto => "auto",
+        ObservationMode::Subscription => "subscription",
+        ObservationMode::Poll => "poll",
+    }
+}
+
+fn observation_milestone(
+    kind: &str,
+    chain: &str,
+    observation: &wait::ObservationMetadata,
+    event_names: Vec<String>,
+    clock: &RunClock,
+) -> ProtocolMilestone {
+    let since_first = observation.first_observed.monotonic.elapsed();
+    let first_offset_ms = clock
+        .offset_ms()
+        .saturating_sub(u64::try_from(since_first.as_millis()).unwrap_or(u64::MAX));
+    ProtocolMilestone {
+        kind: kind.to_string(),
+        chain: chain.to_string(),
+        run_offset_ms: first_offset_ms,
+        wall_time_unix_ms: observation.first_observed.unix_ms(),
+        submitted_at_unix_ms: None,
+        accepted_at_unix_ms: None,
+        first_observed_at_unix_ms: Some(observation.first_observed.unix_ms()),
+        transaction_hash: Some(observation.transaction_hash),
+        block_number: Some(observation.block_number),
+        block_hash: Some(observation.block_hash),
+        transaction_index: observation.transaction_index,
+        log_index: (observation.log_indices.len() == 1).then(|| observation.log_indices[0]),
+        canonical_block_timestamp_ms: observation.block_timestamp_ms,
+        confirmation_depth: observation.confirmation_depth,
+        event_names,
+        log_indices: observation.log_indices.clone(),
+    }
 }
 
 fn start_delay(
@@ -1995,6 +2945,19 @@ mod tests {
         assert_eq!(instance_seed(42, 7), instance_seed(42, 7));
         assert_ne!(instance_seed(42, 7), instance_seed(42, 8));
         assert_ne!(instance_seed(42, 7), instance_seed(43, 7));
+    }
+
+    #[test]
+    fn dense_unique_identities_ignore_unrelated_submit_steps() {
+        let groups = vec![
+            (0, None),
+            (1, Some("other".to_string())),
+            (9, Some("inline".to_string())),
+            (12, Some("inline".to_string())),
+        ];
+        assert_eq!(dense_unique_nonce_identity(0, 9, "inline", &groups).unwrap(), Some(0));
+        assert_eq!(dense_unique_nonce_identity(0, 12, "inline", &groups).unwrap(), Some(1));
+        assert_eq!(dense_unique_nonce_identity(1, 9, "inline", &groups).unwrap(), Some(2));
     }
 
     #[test]
@@ -2117,12 +3080,57 @@ scenario:
     #[test]
     fn submission_lanes_allow_disjoint_keys_and_exclude_collisions() {
         let lanes = Arc::new(SubmissionLanes::default());
-        let first = lanes.try_acquire(BTreeSet::from([[1; 20]])).unwrap();
-        let second = lanes.try_acquire(BTreeSet::from([[2; 20]])).unwrap();
-        assert!(lanes.try_acquire(BTreeSet::from([[1; 20]])).is_none());
+        let first_owner = SubmissionLaneOwner { instance: 1, step: "first".into() };
+        let second_owner = SubmissionLaneOwner { instance: 2, step: "second".into() };
+        let SubmissionLaneAcquire::Acquired(first) =
+            lanes.try_acquire(BTreeSet::from([[1; 20]]), first_owner.clone(), &BTreeSet::new())
+        else {
+            panic!("first lane should be available");
+        };
+        let SubmissionLaneAcquire::Acquired(second) =
+            lanes.try_acquire(BTreeSet::from([[2; 20]]), second_owner.clone(), &BTreeSet::new())
+        else {
+            panic!("disjoint lane should be available");
+        };
+        assert!(matches!(
+            lanes.try_acquire(BTreeSet::from([[1; 20]]), second_owner.clone(), &BTreeSet::new()),
+            SubmissionLaneAcquire::Busy
+        ));
+        assert!(matches!(
+            lanes.try_acquire(BTreeSet::from([[1; 20]]), first_owner.clone(), &BTreeSet::new()),
+            SubmissionLaneAcquire::UnsafeSameInstance
+        ));
         drop(first);
-        assert!(lanes.try_acquire(BTreeSet::from([[1; 20]])).is_some());
+        let unordered_owner = SubmissionLaneOwner { instance: 1, step: "unordered".into() };
+        assert!(matches!(
+            lanes.try_acquire(BTreeSet::from([[1; 20]]), unordered_owner, &BTreeSet::new()),
+            SubmissionLaneAcquire::UnsafeSameInstance
+        ));
+        let ordered_owner = SubmissionLaneOwner { instance: 1, step: "ordered".into() };
+        let SubmissionLaneAcquire::Acquired(ordered) = lanes.try_acquire(
+            BTreeSet::from([[1; 20]]),
+            ordered_owner,
+            &BTreeSet::from(["first".to_string()]),
+        ) else {
+            panic!("explicitly ordered reuse should be available");
+        };
+        drop(ordered);
+        assert!(matches!(
+            lanes.try_acquire(BTreeSet::from([[1; 20]]), second_owner, &BTreeSet::new()),
+            SubmissionLaneAcquire::Acquired(_)
+        ));
         drop(second);
+    }
+
+    #[test]
+    fn ambiguous_submission_only_blocks_intersecting_ordered_lanes() {
+        let lanes = SubmissionLanes::default();
+        let affected = BTreeSet::from([[1; 20], [2; 20]]);
+        lanes.mark_ambiguous(&affected);
+
+        assert!(lanes.has_ambiguous_ordered_lane(true, &BTreeSet::from([[1; 20]])));
+        assert!(!lanes.has_ambiguous_ordered_lane(true, &BTreeSet::from([[3; 20]])));
+        assert!(!lanes.has_ambiguous_ordered_lane(false, &BTreeSet::from([[1; 20]])));
     }
 
     #[test]

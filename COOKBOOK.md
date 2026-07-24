@@ -318,7 +318,68 @@ scenario:
       timeout: 90s
 ```
 
-For a private Zone, keep `rpc_url` as the authenticated submission endpoint, add an unauthenticated `query_rpc_url`, and configure `request_auth.sender_header` with `name`, `map`, and optional `reload_interval`. The sender field above selects the credential for standalone receipt-based waits; submit steps select it from the materialized transaction automatically.
+For a private Zone, keep `rpc_url` as the authenticated submission endpoint, add an unauthenticated `query_rpc_url`, and configure `request_auth.sender_header` with `name`, `map`, and optional `reload_interval`. The sender field above selects the credential for standalone receipt-based waits; submit steps select it from the materialized transaction automatically. Configure `observation.mode` as `auto`, `subscription`, or `poll`; `auto` uses `observation.websocket_url` when supplied and otherwise falls back to `observation.poll_interval`, whose default is `50ms`.
+
+Existing step lists remain sequential. Opt into a DAG when independent waits or transactions should overlap:
+
+```yaml
+scenario:
+  name: request-observations
+  execution: dag
+  steps:
+    - id: before_request
+      checkpoint:
+        chain: beta
+      save: beta_cursor
+
+    - id: publish
+      depends_on: [before_request]
+      submit:
+        chain: alpha
+        template: send_request
+      save: request
+
+    - id: receipt
+      depends_on: [publish]
+      wait_receipt:
+        chain: alpha
+        transaction_hash: { var: request.tx_hash }
+      save: request_receipt
+
+    - id: delivery
+      depends_on: [before_request, publish]
+      wait_log:
+        chain: beta
+        from_block: { var: beta_cursor.block_number }
+        abi: RelayEvents
+        event: RequestObserved
+      save: request_observed
+
+    - id: joined
+      depends_on: [receipt, delivery]
+      checkpoint:
+        chain: alpha
+```
+
+Every DAG step has a stable `id`. A step that reads a saved output must depend on the step that produced it, directly or through another dependency. Ready steps start immediately, and the final checkpoint above waits for both branches. Validation rejects cycles, missing IDs, and output references outside the dependency ancestry.
+
+When one receipt must contain several events, group them in one `wait_log` step:
+
+```yaml
+- wait_log:
+    chain: alpha
+    transaction_hash: { var: request.tx_hash }
+    events:
+      processed:
+        abi: RelayEvents
+        event: RequestProcessed
+      callback:
+        abi: RelayEvents
+        event: RequestCallback
+  save: request_events
+```
+
+Both events are required and are saved under `request_events.events`. They keep their individual filters, decoded arguments, and log indices while sharing one receipt inclusion milestone.
 
 Run many independent instances with bounded journey and RPC concurrency:
 
@@ -363,6 +424,16 @@ txgen-tempo scenario run \
 ```
 
 Both destinations use the `run_id` recorded in the JSON report. JSON destinations are written first; if ClickHouse publication fails, the command reports the error but leaves the JSON file in place. The scenario and platform fields are derived from the run, while additional `-m key=value` pairs are stored in `txgen_runs.metadata`.
+
+Read scenario timings according to their clock and boundary:
+
+- Chain inclusion uses canonical block timestamps and retains Tempo millisecond precision when available.
+- Client observation lag measures destination inclusion to the client's first receipt or log observation.
+- Causal-edge latency measures one declared source milestone to its dependent destination milestone.
+- Client-observed E2E measures instance start until all required terminal branches finish.
+- Observed critical-path percentiles come from complete per-instance DAG traces, not sums of aggregate percentiles.
+
+Per-step command latency is orchestration and RPC duration, not protocol latency. `--sample-instances` adds bounded secret-free milestones and critical-path step IDs; it never uploads calldata, signed transactions, keys, authorization headers or maps, decoded event values, or template overlays.
 
 Use `--duration 10m` instead of, or together with, `--count`. When both are set, new starts stop at the first limit and active instances finish. `--failure-policy fail-fast` stops new starts after the first failed instance while allowing already-started instances to finish. See [Scenario Specification](README.md#scenario-specification) for every step, saved field, expression, timeout rule, and report field.
 
@@ -484,6 +555,8 @@ scenario:
 ```
 
 The two uses expand in place and in order. Their local saves become `first_transfer.submission`, `first_transfer.receipt`, `second_transfer.submission`, and `second_transfer.receipt`. Local `{ var: submission.tx_hash }` references are resolved inside each fragment before caller parameter expressions are injected, so `{ var: user.ref }` keeps its caller scope. A nested fragment use adds its alias to the path. Direct or indirect fragment recursion is rejected.
+
+For `scenario.execution: dag`, a fragment use may declare `depends_on` beside `use` and `as`. The caller dependencies are added to every root of the expanded fragment DAG. This lets a complete fragment wait for a prior step without serializing independent roots inside that fragment.
 
 Parameter substitution replaces only an exact `{ param: name }` YAML node; it does not interpolate strings. Arguments may be literals, environment-expanded values, runtime references, or other supported txgen value expressions. Available parameter types are `string`, `account_ref`, `address`, `u256`, `bytes`, `bytes32`, `bool`, and unconstrained `value`. Every declared parameter is required, unknown arguments are errors, and each declared output must name a fragment save whose result kind is `checkpoint`, `invoke`, `submit`, `receipt`, or `log` as specified. Saves omitted from `outputs` are private to that fragment instance; nested outputs must be re-exported by a parent before the parent's caller can use them.
 
@@ -807,7 +880,7 @@ txgen-tempo scenario run \
   -m phase=nightly
 ```
 
-Apply `scripts/clickhouse/006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sql` before enabling this writer, including before enabling it in Zones. The writer never inserts scenario data into `txgen_blocks`. It inserts the per-step rows and aggregate scenario row first, then inserts `txgen_runs` as the visibility marker. Dashboard queries should start from `txgen_runs` and inner-join the two scenario tables on `run_id`; child rows from an interrupted publication are then excluded. JSON is finalized before the ClickHouse requests, so a publication error does not discard the local report.
+Apply `scripts/clickhouse/006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sql` before enabling this writer, and apply `008_txgen_receipt_gas.sql` before publishing receipt gas rows. The version 2 JSON report contains DAG identities, causal edges, and sampled traces without requiring another database migration; ClickHouse continues to receive the existing aggregate, step, and receipt-gas projection. The writer never inserts scenario data into `txgen_blocks`. It inserts per-step and receipt-gas rows plus the aggregate scenario row before inserting `txgen_runs` as the visibility marker. Dashboard queries should begin with `txgen_runs` and join required detail tables on `run_id`; child rows from an interrupted publication are then excluded. JSON is finalized before the ClickHouse requests, so a publication error does not discard the local report.
 
 Push samples via Prometheus remote write:
 

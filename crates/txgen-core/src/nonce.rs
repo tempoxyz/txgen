@@ -7,6 +7,21 @@ pub struct NonceReservation {
     pub key: [u8; 20],
     /// Reserved nonce value.
     pub nonce: u64,
+    /// Whether the reservation orders transactions or only guarantees uniqueness.
+    pub kind: NonceReservationKind,
+}
+
+/// How a locally reserved nonce participates in submission ordering and rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonceReservationKind {
+    /// A chain nonce that orders transactions sharing the same scheduling lane.
+    Ordered,
+    /// A consume-once local counter used to make independently valid payloads unique.
+    ///
+    /// Unique reservations are allocated atomically, but they neither serialize
+    /// transaction submission nor get reused after a later materialization or
+    /// submission failure.
+    Unique,
 }
 
 /// Tracks nonces per scheduling key.
