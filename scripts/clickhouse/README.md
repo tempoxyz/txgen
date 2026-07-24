@@ -72,23 +72,21 @@ One aggregate row per finalized scenario run. Common identity, timestamps, scena
 | `elapsed_ms` | UInt64 | Total run elapsed time |
 | `completed_journeys_per_second` | Float64 | Completed journeys divided by elapsed time |
 | `maximum_in_flight` | UInt64 | Highest observed active-journey count |
-| `latency_samples` | UInt64 | Completed client-observed journey latency observations |
-| `latency_min_ms` | Float64 | Minimum client-observed journey latency |
-| `latency_mean_ms` | Float64 | Mean client-observed journey latency |
-| `latency_p50_ms` | Float64 | P50 client-observed journey latency |
-| `latency_p95_ms` | Float64 | P95 client-observed journey latency |
-| `latency_p99_ms` | Float64 | P99 client-observed journey latency |
-| `latency_max_ms` | Float64 | Maximum client-observed journey latency |
+| `client_observed_e2e_latency_*` | UInt64 / Float64 | Total client-observed journey latency distribution |
+| `observed_critical_path_latency_*` | UInt64 / Float64 | Per-instance observed DAG critical-path distribution |
+| `latency_*` | UInt64 / Float64 | Backward-compatible version 1 alias for client-observed journey latency |
 
 ### `txgen_scenario_steps`
 
-One aggregate row per expanded scenario step and run. For report version 2, the legacy `latency_*` columns contain client command duration, not protocol latency. A step that was never reached has zero successes, failures, and duration samples. Fragment provenance is null for ordinary inline steps.
+One aggregate row per expanded scenario step and run. A step that was never reached has zero successes, failures, and command-duration samples. Fragment provenance is null for ordinary inline steps.
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `run_id` | UUID | Parent row in `txgen_runs` |
 | `step_index` | UInt64 | Zero-based expanded step position |
+| `step_id` | String | Stable DAG step ID; deterministic generated ID for a legacy sequential scenario |
 | `step_name` | String | Expanded save name or deterministic fallback |
+| `depends_on` | Array(String) | Stable IDs of this step's direct dependencies |
 | `chain` | String | Scenario chain alias |
 | `kind` | String | `checkpoint`, `submit`, `wait_receipt`, or `wait_log` |
 | `source_file` | String? | Fragment declaration file |
@@ -98,13 +96,84 @@ One aggregate row per expanded scenario step and run. For report version 2, the 
 | `local_step_index` | UInt64? | Zero-based position in the declaring fragment |
 | `success` | UInt64 | Successful executions |
 | `failed` | UInt64 | Failed executions |
-| `latency_samples` | UInt64 | Attempted-step command-duration observations |
-| `latency_min_ms` | Float64 | Minimum command duration |
-| `latency_mean_ms` | Float64 | Mean command duration |
-| `latency_p50_ms` | Float64 | P50 command duration |
-| `latency_p95_ms` | Float64 | P95 command duration |
-| `latency_p99_ms` | Float64 | P99 command duration |
-| `latency_max_ms` | Float64 | Maximum command duration |
+| `command_latency_*` | UInt64 / Float64 | Client command-duration distribution; not protocol latency |
+| `latency_*` | UInt64 / Float64 | Backward-compatible version 1 alias for command duration |
+
+### `txgen_scenario_causal_edges`
+
+One aggregate row per dependency edge or transaction-correlated `submit_to_observation` relation. Percentiles are calculated from completed per-instance observations rather than by adding aggregate step percentiles.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `run_id` | UUID | Parent row in `txgen_runs` |
+| `relation` | String | `dependency` or `submit_to_observation` |
+| `source_step_id` | String | Stable source step ID |
+| `destination_step_id` | String | Stable destination step ID |
+| `source_milestone` | String | Source protocol milestone kind |
+| `destination_milestone` | String | Destination protocol milestone kind |
+| `observed_latency_*` | UInt64 / Float64 | Source-to-destination client-observed latency distribution |
+| `chain_timestamp_delta_*` | UInt64 / Float64 | Signed canonical chain-timestamp delta distribution |
+| `destination_observation_lag_*` | UInt64 / Float64 | Signed destination inclusion-to-observation lag distribution |
+
+Each distribution has `samples`, `min_ms`, `mean_ms`, `p50_ms`, `p95_ms`, `p99_ms`, and `max_ms` columns. A zero sample count means that metric was not computable for that relation. Chain timestamp and observation-lag values are signed because independent chain clocks can differ.
+
+### `txgen_scenario_instance_traces`
+
+One row per sampled scenario instance. Runs configured without instance sampling insert no rows.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `run_id` | UUID | Parent row in `txgen_runs` |
+| `scenario_instance` | UInt64 | Scenario instance index |
+| `started_at_unix_ms` | UInt64 | Instance start wall time |
+| `finished_at_unix_ms` | UInt64 | Instance finish wall time |
+| `outcome` | String | Completed or failed outcome |
+| `client_observed_e2e_latency_ms` | Float64 | Total client-observed journey latency |
+| `observed_critical_path_latency_ms` | Float64 | Observed critical-path latency for this instance |
+| `critical_path_step_ids` | Array(String) | Stable IDs on the selected observed critical path |
+
+### `txgen_scenario_trace_steps`
+
+One row per step in a sampled instance, including commands without a protocol milestone.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `run_id` | UUID | Parent row in `txgen_runs` |
+| `scenario_instance` | UInt64 | Scenario instance index |
+| `step_id` / `step_index` | String / UInt64 | Stable identity and expanded position |
+| `step_name` / `kind` | String | Display name and command kind |
+| `depends_on` | Array(String) | Direct dependency IDs used by this instance |
+| `success` | Bool | Whether the command completed successfully |
+| `started_offset_ms` / `finished_offset_ms` | UInt64 | Monotonic run offsets bounding the command |
+| `command_latency_ms` | Float64 | Local command duration, not protocol latency |
+
+### `txgen_scenario_trace_milestones`
+
+Secret-free protocol milestones for sampled instances. Receipt-scoped event groups use one milestone row with aligned `event_names` and `log_indices` arrays so events from one transaction share their inclusion and observation times.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `run_id` | UUID | Parent row in `txgen_runs` |
+| `scenario_instance` | UInt64 | Scenario instance index |
+| `step_id` | String | Stable scenario step ID |
+| `step_index` | UInt64 | Zero-based expanded step position |
+| `milestone_index` | UInt16 | Stable position within the sampled step trace |
+| `chain` | String | Scenario chain alias |
+| `kind` | String | `submit`, `receipt`, or `log`; submit rows carry submission and acceptance timestamps |
+| `run_offset_ms` | UInt64 | Monotonic offset from run start |
+| `wall_time_unix_ms` | UInt64 | Wall-clock observation time |
+| `submitted_at_unix_ms` | UInt64? | Transaction submission-start wall time |
+| `accepted_at_unix_ms` | UInt64? | RPC acceptance-observation wall time |
+| `first_observed_at_unix_ms` | UInt64? | First receipt or log observation wall time |
+| `transaction_hash` | String? | Transaction hash when applicable |
+| `block_number` | UInt64? | Canonical inclusion block number |
+| `block_hash` | String? | Canonical inclusion block hash |
+| `transaction_index` | UInt64? | Transaction index within the block |
+| `log_index` | UInt64? | Log index for a single-log milestone |
+| `canonical_block_timestamp_ms` | UInt64? | Canonical block timestamp, including Tempo millisecond precision when available |
+| `confirmation_depth` | UInt64 | Confirmation depth at milestone completion |
+| `event_names` | Array(String) | Receipt-scoped event IDs or names |
+| `log_indices` | Array(UInt64) | Log indices aligned with `event_names` |
 
 ### `txgen_receipt_gas`
 
@@ -126,7 +195,7 @@ One row per confirmed transaction. The row retains receipt-level gas values exac
 
 ## Setup
 
-The eight numbered migrations are applied in filename order. For a new database, apply the complete set:
+The nine numbered migrations are applied in filename order. For a new database, apply the complete set:
 
 ```bash
 # Local (no auth)
@@ -142,9 +211,15 @@ Migration `005_rename_chain_timestamp.sql` is a one-way data conversion and must
 ./scripts/clickhouse/apply.sh https://host.clickhouse.cloud:8443 default password 006
 ```
 
+On a deployment already migrated through `008`, apply only the additive scenario-report migration:
+
+```bash
+./scripts/clickhouse/apply.sh https://host.clickhouse.cloud:8443 default password 009
+```
+
 `apply.sh` sends migrations to the authenticated user's default database. It does not read `CLICKHOUSE_DATABASE`; when the runtime writer uses a non-default database, configure the migration user with the same default database or apply the numbered SQL files to that database through your normal deployment tooling.
 
-Migrations `006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sql` must be deployed before any scenario uses `--report clickhouse:<url>`. Migration `008_txgen_receipt_gas.sql` must be deployed before enabling granular receipt publication. In particular, deploy all three migrations before enabling that writer in Zones.
+Migrations `006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sql` must be deployed before any scenario uses `--report clickhouse:<url>`. Migration `008_txgen_receipt_gas.sql` must be deployed before enabling granular receipt publication. Deploy additive migration `009_txgen_scenario_causal_metrics.sql` before publishing report schema version 2; it retains the version 1 columns for existing queries.
 
 ## Usage
 
@@ -175,7 +250,7 @@ txgen-tempo scenario run \
 
 The scenario runner derives `scenario`, `platform`, and `mode=scenario`; those metadata keys are reserved and conflicting user values are rejected. `git-sha` and `git-ref` remain required, and other `-m key=value` pairs are stored in `txgen_runs.metadata`. Every destination receives the same client-generated `run_id`, which is also present in the JSON report.
 
-JSON files are finalized before ClickHouse publication. A ClickHouse failure is returned to the caller but does not remove JSON that has already been written. The writer requests synchronous acknowledgement for separate HTTP inserts of `txgen_scenario_steps`, `txgen_receipt_gas`, `txgen_scenario_runs`, and finally `txgen_runs`; scenario runs never require or insert `txgen_blocks`. The final `txgen_runs` insert is the visibility marker, so complete-run queries must begin with `txgen_runs` and inner-join the detail tables by `run_id`. This hides child rows left by an interrupted publication.
+JSON files are finalized before ClickHouse publication. A ClickHouse failure is returned to the caller but does not remove JSON that has already been written. The writer requests synchronous acknowledgement for detail inserts—including steps, causal edges, optional sampled traces and milestones, and receipt gas—then inserts `txgen_scenario_runs` and finally `txgen_runs`; scenario runs never require or insert `txgen_blocks`. The final `txgen_runs` insert is the visibility marker, so complete-run queries must begin with `txgen_runs` and inner-join the required detail tables by `run_id`. This hides child rows left by an interrupted publication.
 
 ### Authentication
 
@@ -207,6 +282,35 @@ Additional metadata is stored in the `metadata` map column:
 Config-like keys (`tps`, `max_concurrent`, `chain_id`, `scrape_interval_ms`) are stored in the `config` map column.
 
 ## Example Queries
+
+### Scenario causal edges
+
+```sql
+SELECT
+    source_step_id,
+    destination_step_id,
+    relation,
+    observed_latency_p50_ms,
+    observed_latency_p95_ms,
+    chain_timestamp_delta_p50_ms,
+    destination_observation_lag_p50_ms
+FROM txgen_scenario_causal_edges
+WHERE run_id = '{run_id}'
+ORDER BY source_step_id, destination_step_id, relation;
+```
+
+### Sampled critical paths
+
+```sql
+SELECT
+    scenario_instance,
+    client_observed_e2e_latency_ms,
+    observed_critical_path_latency_ms,
+    critical_path_step_ids
+FROM txgen_scenario_instance_traces
+WHERE run_id = '{run_id}'
+ORDER BY scenario_instance;
+```
 
 ### Granular receipt gas
 

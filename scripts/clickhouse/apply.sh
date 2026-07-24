@@ -36,12 +36,25 @@ for f in "$SCRIPT_DIR"/[0-9]*.sql; do
     continue
   fi
   echo "Applying $MIGRATION..."
-  RESPONSE=$(curl -s -w "\n%{http_code}" "$URL/" --data-binary @"$f" "${AUTH_HEADERS[@]}" 2>&1)
-  HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-  BODY=$(echo "$RESPONSE" | sed '$d')
-  if [[ "$HTTP_CODE" != "200" ]]; then
-    echo "FAILED (HTTP $HTTP_CODE): $(basename "$f")" >&2
-    echo "$BODY" >&2
+  STATEMENT=0
+  QUERY=""
+  while IFS= read -r LINE || [[ -n "$LINE" ]]; do
+    QUERY+="$LINE"$'\n'
+    if [[ "$LINE" =~ \;[[:space:]]*$ ]]; then
+      STATEMENT=$((STATEMENT + 1))
+      RESPONSE=$(curl -s -w "\n%{http_code}" "$URL/" --data-binary "$QUERY" "${AUTH_HEADERS[@]}" 2>&1)
+      HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+      BODY=$(echo "$RESPONSE" | sed '$d')
+      if [[ "$HTTP_CODE" != "200" ]]; then
+        echo "FAILED (HTTP $HTTP_CODE): $MIGRATION statement $STATEMENT" >&2
+        echo "$BODY" >&2
+        exit 1
+      fi
+      QUERY=""
+    fi
+  done < "$f"
+  if [[ -n "${QUERY//[[:space:]]/}" ]]; then
+    echo "FAILED: $MIGRATION has an unterminated SQL statement" >&2
     exit 1
   fi
 done

@@ -880,7 +880,7 @@ txgen-tempo scenario run \
   -m phase=nightly
 ```
 
-Apply `scripts/clickhouse/006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sql` before enabling this writer, and apply `008_txgen_receipt_gas.sql` before publishing receipt gas rows. The version 2 JSON report contains DAG identities, causal edges, and sampled traces without requiring another database migration; ClickHouse continues to receive the existing aggregate, step, and receipt-gas projection. The writer never inserts scenario data into `txgen_blocks`. It inserts per-step and receipt-gas rows plus the aggregate scenario row before inserting `txgen_runs` as the visibility marker. Dashboard queries should begin with `txgen_runs` and join required detail tables on `run_id`; child rows from an interrupted publication are then excluded. JSON is finalized before the ClickHouse requests, so a publication error does not discard the local report.
+Apply migrations through `scripts/clickhouse/009_txgen_scenario_causal_metrics.sql` before publishing scenario report schema version 2. The additive migration retains the version 1 columns used by existing queries. The writer never inserts scenario data into `txgen_blocks`; it inserts steps, causal edges, optional sampled traces, receipt gas, and the aggregate scenario row before inserting `txgen_runs` as the visibility marker. Dashboard queries should begin with `txgen_runs` and join required detail tables on `run_id`; child rows from an interrupted publication are then excluded. JSON is finalized before the ClickHouse requests, so a publication error does not discard the local report.
 
 Push samples via Prometheus remote write:
 
