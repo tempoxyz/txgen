@@ -110,7 +110,7 @@ Resolve and statically validate a scenario without connecting to its RPC endpoin
 txgen-tempo scenario validate --scenario scenario.yaml
 ```
 
-Validation expands included fragments first, then loads the referenced workload and ABI files and checks chains, bindings, templates, events, filters, saves, forward references, and statically known types. A valid document prints a success message and exits with status zero; invalid input reports its composition or validation context and exits nonzero. Remote chain IDs, nonces, and deployed state are checked only by `scenario run`.
+Validation expands included fragments first, then loads the referenced workload and ABI files and checks chains, bindings, templates, events, filters, saves, DAG IDs and dependencies, output ancestry, and statically known types. A valid document prints a success message and exits with status zero; invalid input reports its composition or validation context and exits nonzero. Remote chain IDs, nonces, and deployed state are checked only by `scenario run`.
 
 #### `scenario render`
 
@@ -486,7 +486,7 @@ txgen-tempo scenario run \
 
 The scenario name, platform, and `mode=scenario` are derived from the finalized report; those metadata keys are reserved and conflicting user values are rejected. `git-sha` and `git-ref` are required metadata for the common `txgen_runs` row. Every destination receives the same client-generated `run_id`. JSON destinations are finalized before ClickHouse publication, so an upload error is returned without deleting a report file that was already written.
 
-Deploy migrations `006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sql` before enabling the scenario ClickHouse writer, and deploy `008_txgen_receipt_gas.sql` before publishing receipt gas rows. Detail rows are synchronously acknowledged before `txgen_runs` is inserted as the visibility marker. Queries for complete benchmark or scenario reports must begin at `txgen_runs` and join detail tables by `run_id`; an interrupted publication can leave child rows without a visible common run row.
+Deploy migrations `006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sql` before enabling the scenario ClickHouse writer, and deploy `008_txgen_receipt_gas.sql` before publishing receipt gas rows. The version 2 JSON report includes DAG identities, causal edges, and sampled traces, while ClickHouse publication remains compatible with the existing aggregate, step, and receipt-gas schema through migration 008. Detail rows are synchronously acknowledged before `txgen_runs` is inserted as the visibility marker. Queries for complete benchmark or scenario reports must begin at `txgen_runs` and join detail tables by `run_id`; an interrupted publication can leave child rows without a visible common run row.
 
 The bench JSON report includes:
 - `samples` — point-in-time metric snapshots (internal + node), stored as a time series
@@ -641,6 +641,49 @@ scenario:
       save: acknowledgement_recorded
 ```
 
+Omit `scenario.execution` to retain the ordered, strictly sequential behavior of existing specifications. Set `execution: dag` to make dependencies explicit and start every ready step immediately:
+
+```yaml
+scenario:
+  name: concurrent-observation
+  execution: dag
+  steps:
+    - id: before_delivery
+      checkpoint:
+        chain: destination
+      save: destination_cursor
+
+    - id: publish
+      depends_on: [before_delivery]
+      submit:
+        chain: origin
+        template: publish_message
+      save: publication
+
+    - id: observe_receipt
+      depends_on: [publish]
+      wait_receipt:
+        chain: origin
+        transaction_hash: { var: publication.tx_hash }
+      save: publication_receipt
+
+    - id: observe_delivery
+      depends_on: [before_delivery, publish]
+      wait_log:
+        chain: destination
+        from_block: { var: destination_cursor.block_number }
+        abi: Relay
+        event: MessageDelivered
+      save: delivery
+
+    - id: after_both
+      depends_on: [observe_receipt, observe_delivery]
+      checkpoint:
+        chain: origin
+```
+
+Every DAG step has a stable, unique `id`; `depends_on` may be omitted for a root step. A runtime output may be referenced only by a dependency descendant: `observe_delivery` depends on `before_delivery` for its cursor and on `publish` for the causal edge. Validation rejects missing dependencies, cycles, and references to outputs that are not dependency ancestors. A journey completes after every required terminal branch completes. Independent ready steps run concurrently, while `after_both` cannot start until both observation branches finish.
+
 `chain_id: auto` queries the endpoint and uses the returned chain ID for signing. An explicit integer may be used instead and is validated against the endpoint. When one account binding is used to submit on multiple chains, its named pool must derive the same ordered addresses in each consuming workload.
 
 `rpc_url` is the submission endpoint. `query_rpc_url` optionally selects a separate unauthenticated endpoint for chain ID and nonce initialization, checkpoints, confirmation heights, and log queries; it defaults to `rpc_url`. A chain can authenticate sender-scoped submission traffic with the same sender map used by `bench send`:
@@ -651,6 +694,10 @@ chains:
     network: tempo
     rpc_url: ${ZONE_SUBMISSION_RPC_URL}
     query_rpc_url: ${ZONE_QUERY_RPC_URL}
+    observation:
+      mode: auto
+      websocket_url: ${ZONE_WEBSOCKET_URL}
+      poll_interval: 50ms
     request_auth:
       sender_header:
         name: X-Authorization-Token
@@ -668,6 +715,8 @@ The selected header is attached only to `eth_sendRawTransaction` and sender-scop
     transaction_hash: { var: publish.tx_hash }
     sender: { var: publish.sender }
 ```
+
+`observation.mode` is `auto`, `subscription`, or `poll`. `auto` prefers WebSocket new-head and log subscriptions when `websocket_url` is available, performs canonical backfill and verification around subscription setup, and falls back to polling. `subscription` requires the WebSocket transport. `poll` always uses RPC polling. `poll_interval` is the chain fallback interval for scenario waits and defaults to `50ms`; an individual `wait_receipt` or `wait_log` may override it with its own `mode` and `poll_interval`. Subscription wakeups are paired with canonical backfill so receipts and logs produced before or during setup are not lost.
 
 ### Reusable fragments and composition
 
@@ -734,6 +783,19 @@ Use a fragment anywhere an inline step is allowed:
 ```
 
 `as` is required. It must be one valid, non-dotted name segment and must be unique within its containing scenario or fragment. The same fragment may be used repeatedly under different aliases. Its local saves are placed below the alias, so `submission` and `receipt` above become `first_transfer.submission` and `first_transfer.receipt`. Fragment-authored `{ var: submission.tx_hash }` references resolve to the local save before caller-supplied parameter values are injected; a runtime expression passed through `with` therefore keeps the caller's scope. A nested use adds another segment: an inner alias `confirm` under an outer alias `batch` produces names such as `batch.confirm.receipt`. Report provenance uses the local save as the local step name when present and a deterministic action/index-derived name for an unsaved step.
+
+In a DAG scenario, a fragment use may also declare `depends_on` beside `use` and `as`. Expansion adds those caller dependencies to every root of the fragment's internal DAG, so the complete fragment waits for the declared prerequisites while independent roots inside it may still start together:
+
+```yaml
+- use: submit-and-confirm
+  as: transfer
+  depends_on: [fund_account]
+  with:
+    chain: primary
+    sender: { var: user.ref }
+    recipient: { var: user.address }
+    amount: 1
+```
 
 An `outputs` entry names a save declared by the fragment and its required result kind. The supported result kinds are `checkpoint`, `invoke`, `submit`, `receipt`, and `log`; expansion rejects missing output saves and result-kind mismatches. Local saves omitted from `outputs` remain private: callers may reference only declared outputs below the instance alias. A parent fragment must likewise re-export a nested output before its own caller can access it. Fragment uses may nest to any acyclic depth, while direct and indirect fragment recursion is rejected with the use chain.
 
@@ -860,7 +922,7 @@ The expanded order is the `capture-head` step, both steps from `first_transfer`,
 
 ### Steps
 
-Every step selects one named chain. `save` and `timeout` are sibling keys of the step action, as shown above.
+Every step selects one named chain. `id`, `depends_on`, `save`, and `timeout` are sibling keys of the step action. `id` and `depends_on` are used by DAG scenarios; legacy sequential scenarios continue to derive identity and ordering from list position.
 
 #### `checkpoint`
 
@@ -919,14 +981,15 @@ Loads a named template from the selected chain's workload, deep-merges `with`, r
 
 #### `wait_receipt`
 
-Polls for a supplied transaction hash. By default a reverted receipt fails the step; set `allow_revert: true` only when a revert is an expected result. The defaults are a `500ms` poll interval and zero additional confirmations.
+Observes a supplied transaction hash using the chain's configured observation mode. By default a reverted receipt fails the step; set `allow_revert: true` only when a revert is an expected result. The default fallback poll interval is `50ms`, and the default is zero additional confirmations. `confirmations: 0` verifies the canonical receipt without waiting for another block.
 
 ```yaml
 - wait_receipt:
     chain: origin
     transaction_hash: { var: publish.tx_hash }
     sender: { var: publish.sender }
-    poll_interval: 250ms
+    mode: auto
+    poll_interval: 50ms
     confirmations: 2
   save: publish_receipt
 ```
@@ -935,7 +998,7 @@ Polls for a supplied transaction hash. By default a reverted receipt fails the s
 
 Loads an ABI artifact from the selected chain's workload and resolves `event` by name or exact signature. It decodes indexed and unindexed arguments, then returns the first canonical match in block-number/log-index order.
 
-A log wait must provide `from_block` or `transaction_hash`. Optional `address`, `transaction_hash`, and `where` fields narrow the match. Each `where` entry compares one decoded argument to a resolved, typed runtime value. The defaults are a `500ms` poll interval, zero additional confirmations, and at most 1,000 blocks per `eth_getLogs` request. The waiter backfills from the starting cursor before polling new blocks, honors confirmations, and discards removed or reorged candidates when the provider exposes that information.
+A log wait must provide `from_block` or `transaction_hash`. Optional `address`, `transaction_hash`, and `where` fields narrow the match. Each `where` entry compares one decoded argument to a resolved, typed runtime value. The default fallback poll interval is `50ms`, with zero additional confirmations and at most 1,000 blocks per `eth_getLogs` request. The waiter backfills from the starting cursor, uses the selected subscription or polling mode, honors confirmations, and discards removed or reorged candidates after canonical verification.
 
 ```yaml
 - wait_log:
@@ -944,28 +1007,56 @@ A log wait must provide `from_block` or `transaction_hash`. Optional `address`, 
     address: ${DESTINATION_RELAY_ADDRESS}
     abi: Relay
     event: "MessageDelivered(bytes32,address)"
+    mode: auto
     where:
       messageId: { var: message_published.args.messageId }
     max_block_range: 1000
   save: delivered
 ```
 
+For multiple required events emitted by one transaction, use receipt-scoped `events` instead of separate waits:
+
+```yaml
+- wait_log:
+    chain: origin
+    transaction_hash: { var: withdrawal.tx_hash }
+    sender: { var: withdrawal.sender }
+    confirmations: 0
+    events:
+      withdrawal:
+        address: ${PORTAL_ADDRESS}
+        abi: Portal
+        event: WithdrawalProcessed
+        where:
+          withdrawalId: { var: withdrawal_requested.args.withdrawalId }
+      callback:
+        address: ${CALLBACK_ADDRESS}
+        abi: Callback
+        event: WithdrawalCallback
+        where:
+          withdrawalId: { var: withdrawal_requested.args.withdrawalId }
+  save: processed
+```
+
+The grouped form requires `transaction_hash`, rejects `from_block`, and requires every named event. `events` is mutually exclusive with the legacy top-level `abi`, `event`, `address`, and `where` fields. The saved result contains common receipt fields plus `events.withdrawal` and `events.callback`; each child retains its exact decoded arguments and log index for downstream expressions. Events from the same receipt share one inclusion and observation milestone, rather than appearing as independent near-zero-duration protocol steps.
+
 ### Saved values
 
-`save: <name>` adds an immutable typed result to the current scenario instance. Saved values are not shared between concurrent instances, and a name cannot be reused. References to a later step are rejected before execution where they can be identified statically. Fragment-local save names remain simple names in their declarations; expansion qualifies them with the complete instance alias path so callers can use expressions such as `{ var: first_transfer.receipt.block_number }`.
+`save: <name>` adds an immutable typed result to the current scenario instance. Saved values are not shared between concurrent instances, and a name cannot be reused. Sequential scenarios reject forward references; DAG scenarios require the producing step to be a dependency ancestor. Fragment-local save names remain simple names in their declarations; expansion qualifies them with the complete instance alias path so callers can use expressions such as `{ var: first_transfer.receipt.block_number }`.
 
 | Step | Saved fields |
 |------|--------------|
 | `checkpoint` | `chain`, `block_number`, optional `block_hash`, `captured_at` |
 | `invoke` | adapter-defined result plus `chain` and `action` |
 | `submit` | `chain`, `template`/`id`, `sender`, `tx_hash`, `submitted_at`, `acceptance_latency`, optional `receipt` |
-| `submit.receipt` | `chain`, `transaction_hash`, `block_hash`, `block_number`, `status`, `gas_used`, `observed_at` |
-| `wait_receipt` | `chain`, `transaction_hash`, `block_hash`, `block_number`, `status`, `gas_used`, `observed_at` |
-| `wait_log` | `chain`, `address`, `transaction_hash`, `block_hash`, `block_number`, `log_index`, `event`, typed `args`, `first_observed_at` |
+| `submit.receipt` | `chain`, `transaction_hash`, `block_hash`, `block_number`, `transaction_index`, `status`, `gas_used`, `block_timestamp_ms`, `first_observed_at`, `confirmed_at`, `confirmation_depth` |
+| `wait_receipt` | `chain`, `transaction_hash`, `block_hash`, `block_number`, `transaction_index`, `status`, `gas_used`, `block_timestamp_ms`, `first_observed_at`, `confirmed_at`, `confirmation_depth` |
+| `wait_log` | `chain`, `address`, `transaction_hash`, `block_hash`, `block_number`, `transaction_index`, `log_index`, `event`, typed `args`, `first_observed_at`, `confirmed_at`, `confirmation_depth`, canonical `block_timestamp_ms` |
+| grouped `wait_log` | Common receipt timing and confirmation fields plus `events.<id>` children containing each event's address, log index, event name, and typed `args` |
 
 The compatibility aliases `tx_hash`, `contract_address`, `event_name`, and `observed_at` may be used where applicable. Saved results and reports never include private keys, mnemonics, authorization headers, or other signer secrets.
 
-`captured_at`, `submitted_at`, `observed_at`, and `first_observed_at` are Unix timestamps in milliseconds. `acceptance_latency` is an integer number of milliseconds.
+`captured_at`, `submitted_at`, `observed_at`, `first_observed_at`, and `confirmed_at` are Unix timestamps in milliseconds. Canonical block timestamps retain Tempo's millisecond timestamp part when the RPC supplies it. `acceptance_latency` is an integer number of milliseconds.
 
 ### Runtime expressions
 
@@ -1017,6 +1108,8 @@ correlation:
 
 An account binding with `select: lease` holds one pool account for the entire instance and returns it on success, failure, timeout, or cancellation. Two active instances do not receive the same leased account. `select: random` and `select: { index: N }` retain their non-exclusive workload-style behavior.
 
+Independent DAG submits may use the same account concurrently when every affected transaction uses an expiring nonce; nonce reservations are atomic and deterministic for a fixed seed. If independent regular-nonce submits from one account attempt to share an ordered nonce lane, the journey is rejected even when the first RPC finishes before its sibling reaches submission. Add an explicit dependency to order those submits.
+
 The effective timeout for a step is its explicit sibling `timeout`, otherwise the CLI `--step-timeout` override when supplied, otherwise `scenario.timeout`, and finally five minutes when none is configured. A timeout fails that instance and is counted separately in the report. If transaction acceptance is still unknown at a submit deadline, further submissions on that chain are disabled to avoid reusing an uncertain nonce. Receipt reverts fail unless explicitly allowed. Under `continue`, later instances continue to start after a failure. Under `fail-fast`, the runner stops starting new instances after the first failure while allowing instances that already started to finish. A scenario counts as completed successfully only after every required submit and wait step succeeds, and the command exits nonzero after writing its report when any instance failed or timed out.
 
 The seed controls deterministic account/template/value choices. Each instance has isolated saved values, timing, failure state, and leases, so concurrent completion order cannot leak data between journeys.
@@ -1025,15 +1118,28 @@ The seed controls deterministic account/template/value choices. Each instance ha
 
 The scenario runner accepts repeatable report destinations. A bare `--report report.json` is the backward-compatible JSON form; `--report json:report.json` is the explicit form, and `--report clickhouse:<url>` publishes the same finalized report to ClickHouse. When `--report` is omitted, JSON is written to stdout. All destinations share the report's client-generated `run_id`, and JSON files are written before ClickHouse publication so a publication failure does not remove the local report.
 
-The report includes the configured scenario name and execution configuration; started, completed, failed, and timed-out instance counts; completed scenarios per second; observed maximum in-flight instances; per-step chain, success/failure counts, and latency distributions; completed-journey latency; receipt gas metrics grouped by chain, input template, and scenario step; and failures grouped by stage and sanitized error class. `--sample-instances` optionally retains a bounded number of secret-free lifecycle records and safe failure details for debugging. Counts, minima, maxima, and means are exact; percentile estimates use a deterministic reservoir capped at 65,536 observations per distribution so duration-based runs use bounded memory.
+Report schema version 2 adds stable step IDs and dependencies, explicitly labeled per-step command duration, client-observed end-to-end latency, per-instance observed critical-path latency, and causal-edge latency aggregates. The original completed-journey latency field remains as a backward-compatible alias for the client-observed E2E distribution. Critical-path P50/P95/P99 values are calculated from completed per-instance traces; txgen never constructs a path percentile by adding aggregate step or edge percentiles.
+
+The protocol timing fields distinguish:
+
+- **Chain inclusion latency:** elapsed time between relevant canonical protocol milestones, using block timestamps when both ends are available.
+- **Client observation latency:** delay from canonical destination inclusion to the client's first observation.
+- **Causal-edge latency:** the observed source-milestone to destination-milestone interval for one declared dependency edge.
+- **Total journey latency:** monotonic client elapsed time from starting one instance until every required terminal branch completes.
+
+Command duration measures how long the runner spent executing a step, including local orchestration and RPC work. It is reported separately and is not described as protocol latency.
+
+The report also includes the configured scenario name and execution configuration; started, completed, failed, and timed-out instance counts; completed scenarios per second; observed maximum in-flight instances; receipt gas metrics grouped by chain, input template, and scenario step; and failures grouped by stage and sanitized error class. Counts, minima, maxima, and means are exact; percentile estimates use a deterministic reservoir capped at 65,536 observations per distribution so duration-based runs use bounded memory.
+
+`--sample-instances` optionally retains bounded, secret-free lifecycle traces. A sampled trace includes the critical-path step IDs and raw submission, acceptance, receipt, and log milestones with monotonic run offsets, wall-clock observation times, transaction and canonical block identity, transaction/log indices, canonical block timestamps, and confirmation depth. Grouped events from one receipt share one inclusion milestone. Traces never include calldata, signed transaction bytes, private keys, mnemonics, authorization headers or maps, template overlays, decoded event values, or other runtime secrets.
 
 Receipt metrics come only from confirmed outer-transaction receipts; txgen does not trace or split gas across internal calls. Each distribution reports `count`, `min`, `mean`, `p50`, `p95`, and `p99`. When a receipt omits both `effectiveGasPrice` and legacy `gasPrice`, its gas usage is still counted while its effective-price and fee distributions remain empty.
 
-When ClickHouse reporting is configured, txgen also writes the exact transaction hash, sender, canonical labels, optional scenario instance, receipt status and block identity, gas used, optional effective gas price, and optional fee paid for each collected receipt to `txgen_receipt_gas`. These granular rows are intentionally omitted from JSON reports, which retain the compact aggregate distributions above.
+When ClickHouse reporting is configured, txgen publishes the backward-compatible journey and command-duration aliases to the existing scenario tables. Causal-edge aggregates and sampled lifecycle traces remain available in the JSON report. ClickHouse also receives the exact transaction hash, sender, canonical labels, optional scenario instance, receipt status and block identity, gas used, optional effective gas price, and optional fee paid for each collected receipt through `txgen_receipt_gas`.
 
-Steps expanded from fragments carry an optional `provenance` object in aggregate step reports, failure records, and sampled lifecycle steps. It records `source_file`, `fragment`, `instance_alias`, `local_step_name`, and the zero-based `local_step_index`. Inline steps omit it. Consumers can group latency by fragment and local step across instances, or include the alias to compare individual fragment uses. Because `scenario render` omits this source metadata, a later run of rendered YAML reports those flattened steps as inline steps.
+Steps expanded from fragments carry an optional `provenance` object in aggregate step reports, failure records, and sampled lifecycle steps. It records `source_file`, `fragment`, `instance_alias`, `local_step_name`, and the zero-based `local_step_index`. Inline steps omit it. Consumers can group command duration by fragment and local step across instances, or include the alias to compare individual fragment uses. Because `scenario render` omits this source metadata, a later run of rendered YAML reports those flattened steps as inline steps.
 
-Latency distributions use monotonic elapsed time. Wall-clock timestamps are included only for correlation with external chain and node data. Transaction acceptance alone never marks a journey successful.
+Client-observed and critical-path distributions use monotonic elapsed time. Wall-clock timestamps are included only for correlation with external chain and node data. Chain timestamp deltas remain signed so clock skew between independent chains is visible. Transaction acceptance alone never marks a journey successful.
 
 ## Output Format
 
@@ -1614,7 +1720,7 @@ templates:
 
 `valid_for_secs` must be `<= 30`, matching Tempo's expiring nonce validity window.
 
-For streamed benchmark pipelines such as `txgen-tempo generate | bench send`, txgen also applies a deterministic per-transaction fee bump before sponsor signing and sender signing. This guarantees that otherwise identical expiring transactions still produce unique signed payloads, avoiding hash-based replay collisions.
+For streamed benchmark pipelines such as `txgen-tempo generate | bench send`, txgen also applies a deterministic per-transaction bump to `max_fee_per_gas` before sponsor signing and sender signing. This guarantees that otherwise identical expiring transactions still produce unique signed payloads, avoiding hash-based replay collisions. `max_priority_fee_per_gas` remains exactly as configured, including zero.
 
 Recommended benchmark setting: `valid_for_secs: 25`. This matches `tempo-bench`'s default behavior and stays inside Tempo's 30-second protocol limit while leaving some propagation slack.
 

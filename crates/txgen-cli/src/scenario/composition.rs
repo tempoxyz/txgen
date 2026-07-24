@@ -123,6 +123,7 @@ struct UseDef {
     fragment: String,
     alias: String,
     arguments: BTreeMap<String, serde_yaml::Value>,
+    depends_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -131,6 +132,7 @@ struct ExpansionScope {
     parameters: BTreeMap<String, serde_yaml::Value>,
     local_roots: BTreeSet<String>,
     local_aliases: BTreeSet<String>,
+    local_step_ids: BTreeSet<String>,
     fragment: Option<String>,
 }
 
@@ -159,6 +161,7 @@ struct SaveOrigin {
 struct FragmentScope {
     roots: BTreeSet<String>,
     aliases: BTreeSet<String>,
+    step_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -453,8 +456,58 @@ impl ScenarioResolver {
         let result = self.expand_fragment(&fragment, &use_label, full_alias.clone(), arguments);
         self.fragment_stack.pop();
         let outputs = result?;
+        let dependencies = qualify_dependencies(&use_def.depends_on, caller_scope);
+        validate_dependency_list(&dependencies, &use_label)?;
+        self.add_dependencies_to_fragment_roots(insertion_index, dependencies, &use_label)?;
         self.alias_outputs.insert(full_alias, outputs.keys().cloned().collect::<BTreeSet<_>>());
         Ok(outputs)
+    }
+
+    fn add_dependencies_to_fragment_roots(
+        &mut self,
+        insertion_index: usize,
+        dependencies: Vec<String>,
+        use_label: &str,
+    ) -> Result<()> {
+        if dependencies.is_empty() {
+            return Ok(());
+        }
+        if insertion_index == self.expanded_steps.len() {
+            bail!("{use_label} configures `depends_on` but expands to no concrete steps");
+        }
+
+        let fragment_step_ids = self.expanded_steps[insertion_index..]
+            .iter()
+            .map(|step| step_id(&step.value, &step.diagnostic))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let root_indices = self.expanded_steps[insertion_index..]
+            .iter()
+            .enumerate()
+            .map(|(offset, step)| {
+                let is_root = step_dependencies(&step.value, &step.diagnostic)?
+                    .unwrap_or_default()
+                    .iter()
+                    .all(|dependency| !fragment_step_ids.contains(dependency));
+                Ok(is_root.then_some(insertion_index + offset))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        for index in root_indices.into_iter().flatten() {
+            let expanded = &mut self.expanded_steps[index];
+            let mut combined =
+                step_dependencies(&expanded.value, &expanded.diagnostic)?.unwrap_or_default();
+            for dependency in &dependencies {
+                if !combined.contains(dependency) {
+                    combined.push(dependency.clone());
+                }
+            }
+            set_step_dependencies(&mut expanded.value, combined, &expanded.diagnostic)?;
+        }
+        Ok(())
     }
 
     fn expand_fragment(
@@ -470,6 +523,7 @@ impl ScenarioResolver {
             parameters,
             local_roots: local_scope.roots,
             local_aliases: local_scope.aliases,
+            local_step_ids: local_scope.step_ids,
             fragment: Some(fragment.name.clone()),
         };
         let mut accessible_saves = BTreeMap::new();
@@ -529,11 +583,26 @@ impl ScenarioResolver {
         let action = concrete_action(&value, &label)?.to_string();
         let output_kind = output_kind_for_action(&action).to_string();
         let local_save = step_save(&value, &label)?.map(str::to_string);
+        let local_id = step_id(&value, &label)?.map(str::to_string);
+
+        if let Some(alias) = &scope.alias_prefix {
+            if let Some(id) = &local_id {
+                validate_component(id, "fragment-local step ID")
+                    .wrap_err_with(|| format!("invalid {label}"))?;
+                set_step_id(&mut value, format!("{alias}.{id}"), &label)?;
+            }
+
+            if let Some(dependencies) = step_dependencies(&value, &label)? {
+                let dependencies = qualify_dependencies(&dependencies, scope);
+                set_step_dependencies(&mut value, dependencies, &label)?;
+            }
+        }
 
         let provenance =
             if let (Some(fragment), Some(alias)) = (&scope.fragment, &scope.alias_prefix) {
                 let local_step_name = local_save
                     .clone()
+                    .or_else(|| local_id.clone())
                     .unwrap_or_else(|| format!("step_{}_{}", local_step_index + 1, action));
                 Some(StepProvenance {
                     source_file: source_file.to_string(),
@@ -673,6 +742,7 @@ fn validate_fragment_definition(
 fn validate_fragment_scope(fragment: &LocatedFragment) -> Result<FragmentScope> {
     let mut roots = BTreeMap::<String, String>::new();
     let mut aliases = BTreeSet::new();
+    let mut step_ids = BTreeMap::<String, String>::new();
     for (index, step) in fragment.definition.steps.iter().enumerate() {
         let label = step_label(&fragment.source_file, index);
         let root = if let Some(use_def) = parse_use(step, &label)? {
@@ -682,6 +752,18 @@ fn validate_fragment_scope(fragment: &LocatedFragment) -> Result<FragmentScope> 
             Some((use_def.alias, "alias"))
         } else {
             concrete_action(step, &label)?;
+            if let Some(id) = step_id(step, &label)? {
+                validate_component(id, "fragment-local step ID")
+                    .wrap_err_with(|| format!("invalid {label} in fragment '{}'", fragment.name))?;
+                if let Some(previous) = step_ids.insert(id.to_string(), label.clone()) {
+                    bail!(
+                        "fragment '{}' in '{}' reuses local step ID '{}' at {previous} and {label}",
+                        fragment.name,
+                        fragment.source_file,
+                        id
+                    );
+                }
+            }
             step_save(step, &label)?
                 .map(|save| {
                     validate_component(save, "fragment-local save").wrap_err_with(|| {
@@ -703,7 +785,11 @@ fn validate_fragment_scope(fragment: &LocatedFragment) -> Result<FragmentScope> 
             );
         }
     }
-    Ok(FragmentScope { roots: roots.into_keys().collect(), aliases })
+    Ok(FragmentScope {
+        roots: roots.into_keys().collect(),
+        aliases,
+        step_ids: step_ids.into_keys().collect(),
+    })
 }
 
 fn validate_root_scope(steps: &[serde_yaml::Value], source_file: &str) -> Result<()> {
@@ -750,7 +836,7 @@ fn parse_use(value: &serde_yaml::Value, label: &str) -> Result<Option<UseDef>> {
     for key in mapping.keys() {
         let key =
             key.as_str().ok_or_else(|| eyre::eyre!("{label} composition keys must be strings"))?;
-        if !matches!(key, "use" | "as" | "with") {
+        if !matches!(key, "use" | "as" | "with" | "depends_on") {
             unknown.push(key.to_string());
         }
     }
@@ -786,8 +872,44 @@ fn parse_use(value: &serde_yaml::Value, label: &str) -> Result<Option<UseDef>> {
             bail!("{label} fragment `with` must be a parameter mapping");
         }
     };
+    let depends_on = step_dependencies(value, label)?.unwrap_or_default();
+    validate_dependency_list(&depends_on, label)?;
 
-    Ok(Some(UseDef { fragment: fragment.to_string(), alias: alias.to_string(), arguments }))
+    Ok(Some(UseDef {
+        fragment: fragment.to_string(),
+        alias: alias.to_string(),
+        arguments,
+        depends_on,
+    }))
+}
+
+fn qualify_dependencies(dependencies: &[String], scope: &ExpansionScope) -> Vec<String> {
+    let Some(alias) = &scope.alias_prefix else {
+        return dependencies.to_vec();
+    };
+    dependencies
+        .iter()
+        .map(|dependency| {
+            let root = dependency.split('.').next().unwrap_or(dependency);
+            if scope.local_step_ids.contains(root) || scope.local_aliases.contains(root) {
+                format!("{alias}.{dependency}")
+            } else {
+                dependency.clone()
+            }
+        })
+        .collect()
+}
+
+fn validate_dependency_list(dependencies: &[String], label: &str) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for dependency in dependencies {
+        validate_path(dependency, "dependency ID")
+            .wrap_err_with(|| format!("invalid {label} dependency"))?;
+        if !seen.insert(dependency) {
+            bail!("{label} lists duplicate dependency '{dependency}'");
+        }
+    }
+    Ok(())
 }
 
 fn transform_value(
@@ -878,7 +1000,7 @@ fn concrete_action<'a>(value: &'a serde_yaml::Value, label: &str) -> Result<&'a 
     let actions = mapping
         .keys()
         .filter_map(serde_yaml::Value::as_str)
-        .filter(|key| !matches!(*key, "save" | "timeout"))
+        .filter(|key| !matches!(*key, "id" | "depends_on" | "save" | "timeout"))
         .collect::<Vec<_>>();
     if actions.len() != 1 {
         bail!(
@@ -913,11 +1035,69 @@ fn step_save<'a>(value: &'a serde_yaml::Value, label: &str) -> Result<Option<&'a
         .transpose()
 }
 
+fn step_id<'a>(value: &'a serde_yaml::Value, label: &str) -> Result<Option<&'a str>> {
+    let serde_yaml::Value::Mapping(mapping) = value else {
+        bail!("{label} scenario step must be a mapping");
+    };
+    mapping
+        .get(string_key("id"))
+        .map(|id| id.as_str().ok_or_else(|| eyre::eyre!("{label} `id` must be a string")))
+        .transpose()
+}
+
+fn step_dependencies(value: &serde_yaml::Value, label: &str) -> Result<Option<Vec<String>>> {
+    let serde_yaml::Value::Mapping(mapping) = value else {
+        bail!("{label} scenario step must be a mapping");
+    };
+    mapping
+        .get(string_key("depends_on"))
+        .map(|dependencies| {
+            let dependencies = dependencies
+                .as_sequence()
+                .ok_or_else(|| eyre::eyre!("{label} `depends_on` must be a sequence"))?;
+            dependencies
+                .iter()
+                .map(|dependency| {
+                    dependency
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| eyre::eyre!("{label} dependency IDs must be strings"))
+                })
+                .collect()
+        })
+        .transpose()
+}
+
 fn set_step_save(value: &mut serde_yaml::Value, save: String, label: &str) -> Result<()> {
     let serde_yaml::Value::Mapping(mapping) = value else {
         bail!("{label} scenario step must be a mapping");
     };
     mapping.insert(string_key("save"), serde_yaml::Value::String(save));
+    Ok(())
+}
+
+fn set_step_id(value: &mut serde_yaml::Value, id: String, label: &str) -> Result<()> {
+    let serde_yaml::Value::Mapping(mapping) = value else {
+        bail!("{label} scenario step must be a mapping");
+    };
+    mapping.insert(string_key("id"), serde_yaml::Value::String(id));
+    Ok(())
+}
+
+fn set_step_dependencies(
+    value: &mut serde_yaml::Value,
+    dependencies: Vec<String>,
+    label: &str,
+) -> Result<()> {
+    let serde_yaml::Value::Mapping(mapping) = value else {
+        bail!("{label} scenario step must be a mapping");
+    };
+    mapping.insert(
+        string_key("depends_on"),
+        serde_yaml::Value::Sequence(
+            dependencies.into_iter().map(serde_yaml::Value::String).collect(),
+        ),
+    );
     Ok(())
 }
 
@@ -1163,6 +1343,223 @@ scenario:
         assert_eq!(first.fragment, "mark");
         assert_eq!(first.instance_alias, "first");
         assert_eq!(first.local_step_name, "point");
+    }
+
+    #[test]
+    fn namespaces_fragment_local_dag_ids_and_dependencies() {
+        let yaml = r#"
+version: 1
+chains:
+  primary:
+    network: tempo
+    rpc_url: http://primary.invalid
+    workload: ./workload.yml
+fragments:
+  branch:
+    outputs: { point: checkpoint }
+    steps:
+      - id: capture
+        checkpoint: { chain: primary }
+        save: point
+      - id: finish
+        depends_on: [capture]
+        checkpoint: { chain: primary }
+scenario:
+  name: fragment-dag
+  execution: dag
+  steps:
+    - { use: branch, as: first }
+    - { use: branch, as: second }
+"#;
+        let resolved = parse_scenario(yaml).unwrap();
+        let steps = &resolved.spec.scenario.steps;
+        assert_eq!(steps.len(), 4);
+        assert_eq!(steps[0].id.as_deref(), Some("first.capture"));
+        assert_eq!(steps[1].id.as_deref(), Some("first.finish"));
+        assert_eq!(steps[1].depends_on, ["first.capture"]);
+        assert_eq!(steps[2].id.as_deref(), Some("second.capture"));
+        assert_eq!(steps[3].id.as_deref(), Some("second.finish"));
+        assert_eq!(steps[3].depends_on, ["second.capture"]);
+
+        let rendered = serde_yaml::to_string(&resolved.rendered).unwrap();
+        assert!(rendered.contains("id: first.capture"));
+        assert!(rendered.contains("- first.capture"));
+        assert!(rendered.contains("id: second.capture"));
+        assert!(rendered.contains("- second.capture"));
+    }
+
+    #[test]
+    fn applies_fragment_use_dependencies_to_each_expanded_root() {
+        let yaml = r#"
+version: 1
+chains:
+  primary:
+    network: tempo
+    rpc_url: http://primary.invalid
+    workload: ./workload.yml
+fragments:
+  branch:
+    steps:
+      - id: left
+        checkpoint: { chain: primary }
+      - id: right
+        checkpoint: { chain: primary }
+      - id: join
+        depends_on: [left, right]
+        checkpoint: { chain: primary }
+scenario:
+  name: fragment-use-dependencies
+  execution: dag
+  steps:
+    - id: seed
+      checkpoint: { chain: primary }
+    - use: branch
+      as: work
+      depends_on: [seed]
+"#;
+        let resolved = parse_scenario(yaml).unwrap();
+        let steps = &resolved.spec.scenario.steps;
+        assert_eq!(steps[1].id.as_deref(), Some("work.left"));
+        assert_eq!(steps[1].depends_on, ["seed"]);
+        assert_eq!(steps[2].id.as_deref(), Some("work.right"));
+        assert_eq!(steps[2].depends_on, ["seed"]);
+        assert_eq!(steps[3].id.as_deref(), Some("work.join"));
+        assert_eq!(steps[3].depends_on, ["work.left", "work.right"]);
+    }
+
+    #[test]
+    fn namespaces_nested_fragment_use_dependencies() {
+        let yaml = r#"
+version: 1
+chains:
+  primary:
+    network: tempo
+    rpc_url: http://primary.invalid
+    workload: ./workload.yml
+fragments:
+  inner:
+    steps:
+      - id: left
+        checkpoint: { chain: primary }
+      - id: right
+        checkpoint: { chain: primary }
+  outer:
+    steps:
+      - id: start
+        checkpoint: { chain: primary }
+      - use: inner
+        as: child
+        depends_on: [start]
+scenario:
+  name: nested-fragment-use-dependencies
+  execution: dag
+  steps:
+    - id: seed
+      checkpoint: { chain: primary }
+    - use: outer
+      as: top
+      depends_on: [seed]
+"#;
+        let resolved = parse_scenario(yaml).unwrap();
+        let steps = &resolved.spec.scenario.steps;
+        assert_eq!(steps[1].id.as_deref(), Some("top.start"));
+        assert_eq!(steps[1].depends_on, ["seed"]);
+        assert_eq!(steps[2].id.as_deref(), Some("top.child.left"));
+        assert_eq!(steps[2].depends_on, ["top.start"]);
+        assert_eq!(steps[3].id.as_deref(), Some("top.child.right"));
+        assert_eq!(steps[3].depends_on, ["top.start"]);
+    }
+
+    #[test]
+    fn validates_fragment_use_dependency_metadata() {
+        let base = r#"
+version: 1
+chains:
+  primary:
+    network: tempo
+    rpc_url: http://primary.invalid
+    workload: ./workload.yml
+fragments:
+  mark:
+    steps:
+      - id: point
+        checkpoint: { chain: primary }
+scenario:
+  name: fragment-use-dependencies
+  steps:
+    - id: seed
+      checkpoint: { chain: primary }
+    - use: mark
+      as: work
+      depends_on: [seed]
+"#;
+        let sequential = parse_scenario(base).unwrap_err().to_string();
+        assert!(
+            sequential.contains("requires `scenario.execution: dag`"),
+            "unexpected error: {sequential}"
+        );
+
+        let scalar = base.replace("depends_on: [seed]", "depends_on: seed");
+        let scalar = parse_scenario(&scalar).unwrap_err().to_string();
+        assert!(scalar.contains("`depends_on` must be a sequence"), "unexpected error: {scalar}");
+
+        let non_string = base.replace("depends_on: [seed]", "depends_on: [1]");
+        let non_string = parse_scenario(&non_string).unwrap_err().to_string();
+        assert!(
+            non_string.contains("dependency IDs must be strings"),
+            "unexpected error: {non_string}"
+        );
+
+        let duplicate = base.replace("depends_on: [seed]", "depends_on: [seed, seed]");
+        let duplicate = parse_scenario(&duplicate).unwrap_err().to_string();
+        assert!(
+            duplicate.contains("lists duplicate dependency 'seed'"),
+            "unexpected error: {duplicate}"
+        );
+
+        let empty = base.replace(
+            "    steps:\n      - id: point\n        checkpoint: { chain: primary }",
+            "    steps: []",
+        );
+        let empty = parse_scenario(&empty).unwrap_err().to_string();
+        assert!(empty.contains("expands to no concrete steps"), "unexpected error: {empty}");
+    }
+
+    #[test]
+    fn namespaces_dependencies_on_nested_fragment_steps() {
+        let yaml = r#"
+version: 1
+chains:
+  primary:
+    network: tempo
+    rpc_url: http://primary.invalid
+    workload: ./workload.yml
+fragments:
+  inner:
+    steps:
+      - id: done
+        checkpoint: { chain: primary }
+  outer:
+    steps:
+      - id: start
+        checkpoint: { chain: primary }
+      - use: inner
+        as: child
+      - id: finish
+        depends_on: [start, child.done]
+        checkpoint: { chain: primary }
+scenario:
+  name: nested-fragment-dag
+  execution: dag
+  steps:
+    - { use: outer, as: top }
+"#;
+        let resolved = parse_scenario(yaml).unwrap();
+        let steps = &resolved.spec.scenario.steps;
+        assert_eq!(steps[0].id.as_deref(), Some("top.start"));
+        assert_eq!(steps[1].id.as_deref(), Some("top.child.done"));
+        assert_eq!(steps[2].id.as_deref(), Some("top.finish"));
+        assert_eq!(steps[2].depends_on, ["top.start", "top.child.done"]);
     }
 
     #[test]

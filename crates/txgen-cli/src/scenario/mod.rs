@@ -23,8 +23,8 @@ pub use engine::{
     execute_scenario, validate_scenario_offline, FailurePolicy, ScenarioExecutionConfig,
 };
 pub use report::{
-    ChainReportConfig, FailureReport, InstanceLifecycle, LatencyDistribution, LifecycleStep,
-    ScenarioReport, ScenarioReportConfig, StepReport,
+    CausalEdgeReport, ChainReportConfig, FailureReport, InstanceLifecycle, LatencyDistribution,
+    LifecycleStep, ProtocolMilestone, ScenarioReport, ScenarioReportConfig, StepReport,
 };
 pub use schema::*;
 pub use value::{
@@ -143,6 +143,7 @@ impl From<FailurePolicyArg> for FailurePolicy {
 pub(crate) async fn run_scenario_command<A>(args: ScenarioArgs) -> Result<()>
 where
     A: NetworkAdapter + Default + Send + Sync + 'static,
+    <A::Network as Network>::TransactionRequest: Send + 'static,
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
@@ -197,6 +198,7 @@ fn render_scenario<A: NetworkAdapter>(args: ScenarioRenderArgs) -> Result<()> {
 async fn run_scenario<A>(args: ScenarioRunArgs) -> Result<()>
 where
     A: NetworkAdapter + Default + Send + Sync + 'static,
+    <A::Network as Network>::TransactionRequest: Send + 'static,
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
@@ -379,7 +381,7 @@ mod tests {
 
     fn sample_report() -> ScenarioReport {
         ScenarioReport {
-            version: 1,
+            version: 2,
             run_id: uuid::Uuid::new_v4(),
             scenario: "reporting-test".into(),
             configuration: ScenarioReportConfig {
@@ -388,6 +390,9 @@ mod tests {
                     network: "tempo".into(),
                     chain_id: 1,
                     workload: "/tmp/workload.yml".into(),
+                    observation_mode: "auto".into(),
+                    observation_poll_interval_ms: 50,
+                    subscription_configured: false,
                 }],
                 requested_instances: Some(2),
                 run_duration_ms: None,
@@ -410,9 +415,11 @@ mod tests {
             maximum_in_flight: 2,
             steps: vec![StepReport {
                 index: 0,
+                id: "submit".into(),
                 name: "submit".into(),
                 chain: "primary".into(),
                 kind: "submit".into(),
+                depends_on: Vec::new(),
                 provenance: None,
                 success: 1,
                 failed: 1,
@@ -425,6 +432,15 @@ mod tests {
                     p95_ms: 2.0,
                     p99_ms: 2.0,
                 },
+                command_latency: LatencyDistribution {
+                    samples: 2,
+                    min_ms: 0.5,
+                    max_ms: 1.5,
+                    mean_ms: 1.0,
+                    p50_ms: 0.5,
+                    p95_ms: 1.5,
+                    p99_ms: 1.5,
+                },
             }],
             total_scenario_latency: LatencyDistribution {
                 samples: 1,
@@ -435,6 +451,25 @@ mod tests {
                 p95_ms: 10.0,
                 p99_ms: 10.0,
             },
+            client_observed_e2e_latency: LatencyDistribution {
+                samples: 1,
+                min_ms: 11.0,
+                max_ms: 11.0,
+                mean_ms: 11.0,
+                p50_ms: 11.0,
+                p95_ms: 11.0,
+                p99_ms: 11.0,
+            },
+            observed_critical_path_latency: LatencyDistribution {
+                samples: 1,
+                min_ms: 8.0,
+                max_ms: 8.0,
+                mean_ms: 8.0,
+                p50_ms: 8.0,
+                p95_ms: 8.0,
+                p99_ms: 8.0,
+            },
+            causal_edges: Vec::new(),
             receipt_metrics: Vec::new(),
             receipt_records: Vec::new(),
             failures: Vec::new(),
@@ -571,6 +606,11 @@ mod tests {
         let _ = std::fs::remove_file(path);
 
         assert_eq!(written["run_id"], report.run_id.to_string());
+        assert_eq!(written["version"], 2);
+        assert_eq!(written["steps"][0]["id"], "submit");
+        assert_eq!(written["steps"][0]["command_latency"]["p95_ms"], 1.5);
+        assert_eq!(written["client_observed_e2e_latency"]["p95_ms"], 11.0);
+        assert_eq!(written["observed_critical_path_latency"]["p95_ms"], 8.0);
         assert!(error.contains("scenario aggregate row"));
         assert!(error.contains(&report.run_id.to_string()));
         assert_eq!(requests.len(), 2);
