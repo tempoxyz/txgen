@@ -126,6 +126,12 @@ pub struct SendArgs {
     #[arg(long)]
     pub collect_latencies: bool,
 
+    /// Collect receipt-derived gas metrics for every accepted workload transaction.
+    ///
+    /// Disabled by default because receipt polling adds substantial RPC load.
+    #[arg(long)]
+    pub collect_receipt_metrics: bool,
+
     /// Skip setup-phase transactions in the input stream.
     #[arg(long)]
     pub skip_setup: bool,
@@ -456,6 +462,28 @@ mod tests {
         };
 
         assert!(args.collect_latencies);
+    }
+
+    #[test]
+    fn test_send_collect_receipt_metrics_default_disabled() {
+        let cli = Cli::try_parse_from(["bench", "send"]).unwrap();
+
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+
+        assert!(!args.collect_receipt_metrics);
+    }
+
+    #[test]
+    fn test_send_collect_receipt_metrics_enabled() {
+        let cli = Cli::try_parse_from(["bench", "send", "--collect-receipt-metrics"]).unwrap();
+
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+
+        assert!(args.collect_receipt_metrics);
     }
 
     #[test]
