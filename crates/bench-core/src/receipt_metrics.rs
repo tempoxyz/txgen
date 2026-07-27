@@ -294,42 +294,40 @@ impl ReceiptCollector {
 
 async fn run_collector(
     mut receiver: mpsc::UnboundedReceiver<ReceiptRequest>,
-    mut finish: oneshot::Receiver<()>,
+    finish: oneshot::Receiver<()>,
     submitter: RpcSubmitter,
     workers: usize,
 ) -> ReceiptCollection {
+    // Receipt metrics are post-processing. Do not compete with the measured
+    // submission workload for RPC, CPU, or connection capacity. Registrations
+    // remain queued until the sender signals that the benchmark has finished.
+    let _ = finish.await;
+    receiver.close();
+
     let mut records = Vec::new();
     let mut tasks = JoinSet::new();
     let mut seen = BTreeSet::new();
     let semaphore = Arc::new(Semaphore::new(workers));
-    let mut finishing = false;
 
     loop {
-        if finishing && receiver.is_empty() && tasks.is_empty() {
+        if receiver.is_empty() && tasks.is_empty() {
             break;
         }
 
         tokio::select! {
-            _ = &mut finish, if !finishing => {
-                receiver.close();
-                finishing = true;
-            }
             result = tasks.join_next(), if !tasks.is_empty() => {
                 record_task_result(&mut records, result);
             }
-            request = receiver.recv(), if !finishing || !receiver.is_empty() => {
-                match request {
-                    Some(request) => {
-                        if !seen.insert(request.dedup_key()) {
-                            continue;
-                        }
-                        let submitter = submitter.clone();
-                        let semaphore = semaphore.clone();
-                        tasks.spawn(async move {
-                            collect_receipt(submitter, request, semaphore).await
-                        });
+            request = receiver.recv(), if tasks.len() < workers && !receiver.is_empty() => {
+                if let Some(request) = request {
+                    if !seen.insert(request.dedup_key()) {
+                        continue;
                     }
-                    None => finishing = true,
+                    let submitter = submitter.clone();
+                    let semaphore = semaphore.clone();
+                    tasks.spawn(async move {
+                        collect_receipt(submitter, request, semaphore).await
+                    });
                 }
             }
         }

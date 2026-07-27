@@ -1429,6 +1429,9 @@ mod tests {
         sender.flush().await.unwrap();
         drop(sender);
 
+        // Receipt RPC work is deferred until benchmark submission has stopped.
+        assert_eq!(asserter.read_q().len(), 1);
+
         let collection = collector.finish().await;
         let groups = &collection.metrics;
         assert_eq!(groups.len(), 1);
