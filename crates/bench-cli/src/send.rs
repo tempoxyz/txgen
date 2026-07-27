@@ -28,6 +28,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         tps = args.tps,
         skip_setup = args.skip_setup,
         collect_latencies = args.collect_latencies,
+        collect_receipt_metrics = args.collect_receipt_metrics,
         retries = args.retries.map_or("forever".to_string(), |retries| retries.to_string()),
         "Starting send"
     );
@@ -154,15 +155,21 @@ async fn execute_source<S: TxSource>(
         Vec::new()
     };
 
-    let receipt_submitter = RpcSubmitter::new_with_request_auth(
-        endpoints.clone(),
-        SenderConfig { rate_limit: 0, max_concurrent: args.max_concurrent },
-        request_auth.clone(),
-    )?;
-    let receipt_collector = ReceiptCollector::start(receipt_submitter, args.max_concurrent);
+    let receipt_collector = if args.collect_receipt_metrics {
+        let receipt_submitter = RpcSubmitter::new_with_request_auth(
+            endpoints.clone(),
+            SenderConfig { rate_limit: 0, max_concurrent: args.max_concurrent },
+            request_auth.clone(),
+        )?;
+        Some(ReceiptCollector::start(receipt_submitter, args.max_concurrent))
+    } else {
+        None
+    };
     let mut sender =
-        Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth)
-            .with_receipt_collector(receipt_collector.handle());
+        Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth);
+    if let Some(collector) = &receipt_collector {
+        sender = sender.with_receipt_collector(collector.handle());
+    }
 
     let mut reporters = parse_reporters(&args.reports, "send", metadata)?;
     if reporters.is_empty() {
@@ -195,12 +202,24 @@ async fn execute_source<S: TxSource>(
         tracing::info!(reason = "--drain-timeout=0", "Skipped txpool drain");
     }
 
-    let receipt_collection = receipt_collector.finish().await;
-    tracing::info!(
-        groups = receipt_collection.metrics.len(),
-        records = receipt_collection.records.len(),
-        "Receipt gas metrics finalized"
-    );
+    let receipt_collection = match receipt_collector {
+        Some(collector) => {
+            let collection = collector.finish().await;
+            tracing::info!(
+                groups = collection.metrics.len(),
+                records = collection.records.len(),
+                "Receipt gas metrics finalized"
+            );
+            collection
+        }
+        None => {
+            tracing::info!(
+                reason = "--collect-receipt-metrics not set",
+                "Skipped receipt gas metrics"
+            );
+            Default::default()
+        }
+    };
     let receipt_metrics = receipt_collection.metrics;
     let receipt_records = receipt_collection.records;
 
