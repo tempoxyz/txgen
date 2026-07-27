@@ -694,6 +694,14 @@ impl MetricsCollector {
     /// Compute final metrics.
     pub async fn finalize(&self) -> BenchMetrics {
         let elapsed = self.clock.elapsed();
+        self.finalize_with_elapsed(elapsed).await
+    }
+
+    /// Compute final metrics using an explicitly captured elapsed duration.
+    ///
+    /// This keeps post-processing time out of the measured workload duration
+    /// when finalization happens after the workload has completed.
+    pub async fn finalize_with_elapsed(&self, elapsed: Duration) -> BenchMetrics {
         self.finish_aggregation().await;
 
         let latency = if self.collect_latencies {
@@ -718,6 +726,14 @@ impl MetricsCollector {
     /// Extract time-series metrics for graphing.
     pub async fn time_series(&self) -> TimeSeriesMetrics {
         let total_elapsed = self.clock.elapsed();
+        self.time_series_with_elapsed(total_elapsed).await
+    }
+
+    /// Extract time-series metrics using an explicitly captured elapsed duration.
+    ///
+    /// The supplied duration determines the number of throughput buckets, so
+    /// post-processing does not add trailing empty samples.
+    pub async fn time_series_with_elapsed(&self, total_elapsed: Duration) -> TimeSeriesMetrics {
         let total_seconds = total_elapsed.as_secs() + 1;
         self.finish_aggregation().await;
 
@@ -1028,6 +1044,22 @@ mod tests {
         assert_eq!(ts.throughput.iter().map(|sample| sample.sent).sum::<u64>(), 2);
         assert_eq!(ts.throughput.iter().map(|sample| sample.success).sum::<u64>(), 2);
         assert_eq!(ts.throughput.iter().map(|sample| sample.failed).sum::<u64>(), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_elapsed_controls_final_metrics_and_time_series_window() {
+        let collector = MetricsCollector::new(RunClock::new());
+        collector.record_sent();
+        collector.record_success(Duration::from_millis(10));
+
+        let workload_elapsed = Duration::from_millis(2_500);
+        let metrics = collector.finalize_with_elapsed(workload_elapsed).await;
+        let ts = collector.time_series_with_elapsed(workload_elapsed).await;
+
+        assert_eq!(metrics.elapsed, workload_elapsed);
+        assert_eq!(ts.throughput.len(), 3);
+        assert_eq!(ts.throughput.iter().map(|sample| sample.sent).sum::<u64>(), 1);
+        assert_eq!(ts.throughput.iter().map(|sample| sample.success).sum::<u64>(), 1);
     }
 
     #[tokio::test]

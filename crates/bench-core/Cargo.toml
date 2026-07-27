@@ -45,4 +45,4 @@ alloy-rpc-client = "2"
 prost = "0.12"
 snap = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }

@@ -183,8 +183,18 @@ async fn execute_source<S: TxSource>(
     sender.flush().await?;
     drop(sender);
 
+    // Freeze the measured workload duration before post-processing. Txpool
+    // drain and receipt collection can take substantially longer than sending
+    // and must not reduce the reported submission throughput.
+    let workload_elapsed = metrics.elapsed_since_start();
     let (sent, success, failed) = metrics.counts();
-    tracing::info!(sent, success, failed, "Bench send completed; starting post-processing");
+    tracing::info!(
+        sent,
+        success,
+        failed,
+        elapsed = ?workload_elapsed,
+        "Bench send completed; starting post-processing"
+    );
 
     // Wait for the txpool to drain so all transactions are included in blocks
     // before we collect block stats. The scraper and block poller keep running.
@@ -217,10 +227,10 @@ async fn execute_source<S: TxSource>(
         tracing::info!(reason = "no metrics scrapers", "Skipped metrics scraper stop");
     }
 
-    let final_metrics = metrics.finalize().await;
+    let final_metrics = metrics.finalize_with_elapsed(workload_elapsed).await;
     tracing::info!("Metrics finalized");
 
-    let time_series = metrics.time_series().await;
+    let time_series = metrics.time_series_with_elapsed(workload_elapsed).await;
     tracing::info!("Time series built");
 
     // Finalize the sample archive before reporters read it.
