@@ -611,6 +611,105 @@ impl fmt::Debug for ClickHouseConfig {
 const REQUIRED_METADATA: &[&str] = &["scenario", "platform", "git-sha", "git-ref"];
 const DEFAULT_CLICKHOUSE_SAMPLE_BATCH_SIZE: usize = 50_000;
 
+// Metrics queried by the internal performance dashboard in
+// tempoxyz/tempo-apps-internal (apps/perf and packages/perf-core). Keep this
+// sorted so membership checks stay cheap while processing large sample archives.
+const CLICKHOUSE_DASHBOARD_METRICS: &[&str] = &[
+    "consensus_engine_marshal_finalized_height",
+    "consensus_engine_marshal_processed_height",
+    "node_disk_read_bytes_total",
+    "node_disk_written_bytes_total",
+    "node_memory_Buffers_bytes",
+    "node_memory_Cached_bytes",
+    "node_memory_MemAvailable_bytes",
+    "node_memory_MemTotal_bytes",
+    "node_memory_SReclaimable_bytes",
+    "node_pressure_cpu_waiting_seconds_total",
+    "node_pressure_io_waiting_seconds_total",
+    "node_pressure_memory_waiting_seconds_total",
+    "node_schedstat_running_seconds_total",
+    "node_schedstat_timeslices_total",
+    "node_schedstat_waiting_seconds_total",
+    "reth_consensus_engine_beacon_backpressure_active",
+    "reth_consensus_engine_beacon_backpressure_stall_duration",
+    "reth_consensus_engine_beacon_backpressure_stall_duration_sum",
+    "reth_consensus_engine_beacon_block_insert_total_duration",
+    "reth_consensus_engine_beacon_execution_cache_wait_duration",
+    "reth_consensus_engine_beacon_new_payload_gas_per_second_last",
+    "reth_consensus_engine_beacon_new_payload_latency",
+    "reth_consensus_engine_beacon_new_payload_total_gas_last",
+    "reth_consensus_engine_persistence_prune_before_duration_seconds",
+    "reth_consensus_engine_persistence_save_blocks_batch_size",
+    "reth_consensus_engine_persistence_save_blocks_batch_size_sum",
+    "reth_consensus_engine_persistence_save_blocks_duration_seconds",
+    "reth_consensus_engine_persistence_save_blocks_duration_seconds_sum",
+    "reth_jemalloc_allocated",
+    "reth_jemalloc_resident",
+    "reth_process_cpu_seconds_total",
+    "reth_process_open_fds",
+    "reth_process_resident_memory_bytes",
+    "reth_storage_providers_database_save_blocks_write_state",
+    "reth_storage_providers_database_save_blocks_write_trie_updates",
+    "reth_sync_block_validation_state_root_histogram",
+    "reth_sync_caching_account_cache_hits",
+    "reth_sync_caching_account_cache_misses",
+    "reth_sync_caching_storage_cache_hits",
+    "reth_sync_caching_storage_cache_misses",
+    "reth_tempo_payload_builder_builder_finish_duration_seconds",
+    "reth_tempo_payload_builder_gas_per_second_last",
+    "reth_tempo_payload_builder_hashed_post_state_duration_seconds",
+    "reth_tempo_payload_builder_invalid_pool_transaction_execution_attempts",
+    "reth_tempo_payload_builder_normal_transaction_fill_idle_duration_seconds",
+    "reth_tempo_payload_builder_payload_build_duration_seconds",
+    "reth_tempo_payload_builder_pool_fetch_duration_seconds",
+    "reth_tempo_payload_builder_pool_transactions_skipped_total",
+    "reth_tempo_payload_builder_prepare_system_transactions_duration_seconds",
+    "reth_tempo_payload_builder_rlp_block_size_bytes_last",
+    "reth_tempo_payload_builder_sparse_trie_state_root_wait_duration_seconds",
+    "reth_tempo_payload_builder_state_root_with_updates_duration_seconds",
+    "reth_tempo_payload_builder_state_setup_duration_seconds",
+    "reth_tempo_payload_builder_system_transactions_execution_duration_seconds",
+    "reth_tempo_payload_builder_total_normal_transaction_fill_duration_seconds",
+    "reth_tempo_payload_builder_total_transactions_last",
+    "reth_transaction_pool_aa_2d_pending_transactions",
+    "reth_transaction_pool_aa_2d_queued_transactions",
+    "reth_transaction_pool_basefee_pool_transactions",
+    "reth_transaction_pool_inflight_validation_jobs",
+    "reth_transaction_pool_invalid_transactions",
+    "reth_transaction_pool_maintenance_amm_cache_update_duration_seconds",
+    "reth_transaction_pool_maintenance_block_update_duration_seconds",
+    "reth_transaction_pool_maintenance_expired_eviction_duration_seconds",
+    "reth_transaction_pool_maintenance_expired_transactions_evicted",
+    "reth_transaction_pool_maintenance_invalidation_eviction_duration_seconds",
+    "reth_transaction_pool_maintenance_nonce_pool_update_duration_seconds",
+    "reth_transaction_pool_maintenance_pause_events_duration_seconds",
+    "reth_transaction_pool_maintenance_paused_pool_cap_evicted",
+    "reth_transaction_pool_maintenance_quote_token_revalidated",
+    "reth_transaction_pool_maintenance_transactions_invalidated",
+    "reth_transaction_pool_maintenance_transactions_paused",
+    "reth_transaction_pool_maintenance_transactions_unpaused",
+    "reth_transaction_pool_maintenance_transfer_policy_revalidated",
+    "reth_transaction_pool_pending_pool_transactions",
+    "reth_transaction_pool_queued_pool_transactions",
+    "reth_transaction_pool_total_transactions",
+    "txgen_blocks_failed_total",
+    "txgen_blocks_sent_total",
+    "txgen_blocks_success_total",
+    "txgen_chain_block_gas_limit",
+    "txgen_chain_block_gas_used",
+    "txgen_chain_block_rlp_size_bytes",
+    "txgen_chain_block_time_ms",
+    "txgen_chain_block_tx_count",
+    "txgen_transactions_failed_total",
+    "txgen_transactions_inflight",
+    "txgen_transactions_sent_total",
+    "txgen_transactions_success_total",
+];
+
+fn is_clickhouse_dashboard_metric(name: &str) -> bool {
+    CLICKHOUSE_DASHBOARD_METRICS.binary_search(&name).is_ok()
+}
+
 impl ClickHouseConfig {
     /// Create a ClickHouse config from the reporter URL and user metadata.
     ///
@@ -756,6 +855,7 @@ impl ClickHouseReporter {
     fn build_sample_rows<'a>(&self, samples: &'a [Sample]) -> Vec<ClickHouseMetricSampleRow<'a>> {
         samples
             .iter()
+            .filter(|sample| is_clickhouse_dashboard_metric(&sample.name))
             .map(|s| {
                 let source = if s.name.starts_with("txgen_") { "txgen" } else { "prometheus" };
                 ClickHouseMetricSampleRow {
@@ -971,6 +1071,20 @@ mod tests {
 
     fn sample_report() -> FinalReport {
         FinalReport { bench_metrics: Some(sample_metrics()), ..Default::default() }
+    }
+
+    #[test]
+    fn clickhouse_dashboard_metric_allowlist_is_sorted_and_unique() {
+        assert!(CLICKHOUSE_DASHBOARD_METRICS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn clickhouse_dashboard_metric_filter_rejects_unused_metrics() {
+        assert!(is_clickhouse_dashboard_metric("txgen_transactions_sent_total"));
+        assert!(is_clickhouse_dashboard_metric(
+            "reth_tempo_payload_builder_payload_build_duration_seconds"
+        ));
+        assert!(!is_clickhouse_dashboard_metric("process_start_time_seconds"));
     }
 
     fn sample_report_without_latency() -> FinalReport {
