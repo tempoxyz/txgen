@@ -7,6 +7,7 @@
 //! collecting per-block timing and engine status from [`RethPayloadStatus`].
 
 use crate::{
+    load_metric_names,
     metrics_forwarder::{build_metrics_forwarder, finish_metrics_forwarder, push_samples},
     metrics_url::metrics_scraper_configs,
     send::parse_metadata,
@@ -143,7 +144,9 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let testing_provider =
         RootProvider::<Ethereum>::new_http(args.rpc.parse().wrap_err("invalid RPC URL")?);
 
-    let mut reporters = parse_reporters(&args.reports, "send-blocks", &metadata)?;
+    let clickhouse_metric_names = load_metric_names(args.clickhouse_metrics_file.as_ref())?;
+    let mut reporters =
+        parse_reporters(&args.reports, "send-blocks", &metadata, clickhouse_metric_names)?;
     if reporters.is_empty() {
         reporters.push(Box::new(ConsoleReporter::stderr(false)));
     }
