@@ -1,6 +1,7 @@
 //! `bench send` - Send transactions from file or stdin
 
 use crate::{
+    load_metric_names,
     metrics_forwarder::{build_metrics_forwarder, finish_metrics_forwarder},
     metrics_url::metrics_scraper_configs,
     SendArgs,
@@ -171,7 +172,9 @@ async fn execute_source<S: TxSource>(
         sender = sender.with_receipt_collector(collector.handle());
     }
 
-    let mut reporters = parse_reporters(&args.reports, "send", metadata)?;
+    let clickhouse_metric_names = load_metric_names(args.clickhouse_metrics_file.as_ref())?;
+    let mut reporters =
+        parse_reporters(&args.reports, "send", metadata, clickhouse_metric_names.as_ref())?;
     if reporters.is_empty() {
         reporters.push(Box::new(ConsoleReporter::stderr(true)));
     }

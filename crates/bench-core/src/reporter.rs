@@ -15,7 +15,7 @@ use crate::{
 use eyre::{bail, Context, Result};
 use flate2::{write::GzEncoder, Compression};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     fs::File,
     io::{BufWriter, Write},
@@ -580,6 +580,8 @@ pub struct ClickHouseConfig {
     pub metadata: HashMap<String, String>,
     /// Number of metric sample rows to insert per ClickHouse request.
     pub sample_batch_size: usize,
+    /// Optional metric-name allowlist for sample insertion.
+    pub metric_names: Option<HashSet<String>>,
 }
 
 impl fmt::Debug for ClickHouseConfig {
@@ -603,6 +605,7 @@ impl fmt::Debug for ClickHouseConfig {
             .field("config", &self.config)
             .field("metadata", &self.metadata)
             .field("sample_batch_size", &self.sample_batch_size)
+            .field("metric_names", &self.metric_names)
             .finish()
     }
 }
@@ -671,6 +674,7 @@ impl ClickHouseConfig {
             config,
             metadata: remaining_metadata,
             sample_batch_size,
+            metric_names: None,
         })
     }
 }
@@ -756,6 +760,9 @@ impl ClickHouseReporter {
     fn build_sample_rows<'a>(&self, samples: &'a [Sample]) -> Vec<ClickHouseMetricSampleRow<'a>> {
         samples
             .iter()
+            .filter(|sample| {
+                self.config.metric_names.as_ref().is_none_or(|names| names.contains(&sample.name))
+            })
             .map(|s| {
                 let source = if s.name.starts_with("txgen_") { "txgen" } else { "prometheus" };
                 ClickHouseMetricSampleRow {
@@ -903,6 +910,7 @@ pub fn parse_reporters(
     specs: &[String],
     mode: &str,
     metadata: &HashMap<String, String>,
+    clickhouse_metric_names: Option<&HashSet<String>>,
 ) -> Result<Vec<Box<dyn Reporter>>> {
     let mut reporters: Vec<Box<dyn Reporter>> = Vec::new();
     let benchmark_id = uuid::Uuid::new_v4();
@@ -922,7 +930,8 @@ pub fn parse_reporters(
                     .with_benchmark_id(benchmark_id),
             ));
         } else if let Some(url) = spec.strip_prefix("clickhouse:") {
-            let config = ClickHouseConfig::from_metadata(url, mode, benchmark_id, metadata)?;
+            let mut config = ClickHouseConfig::from_metadata(url, mode, benchmark_id, metadata)?;
+            config.metric_names = clickhouse_metric_names.cloned();
             reporters.push(Box::new(
                 ClickHouseReporter::new(config).wrap_err("failed to create ClickHouse reporter")?,
             ));

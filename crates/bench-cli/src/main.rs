@@ -6,8 +6,8 @@
 //! - `view` - Print an existing JSON report to console
 
 use clap::{Args, Parser, Subcommand};
-use eyre::Result;
-use std::{path::PathBuf, time::Duration};
+use eyre::{bail, Context, Result};
+use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 use crate::metrics_url::{parse_metrics_url, MetricsURL};
 
@@ -16,6 +16,24 @@ mod metrics_url;
 mod send;
 mod send_blocks;
 mod view;
+
+fn load_metric_names(path: Option<&PathBuf>) -> Result<Option<HashSet<String>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let contents = std::fs::read_to_string(path)
+        .wrap_err_with(|| format!("failed to read metric allowlist from {}", path.display()))?;
+    let names = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToOwned::to_owned)
+        .collect::<HashSet<_>>();
+    if names.is_empty() {
+        bail!("metric allowlist {} contains no metric names", path.display());
+    }
+    Ok(Some(names))
+}
 
 /// Arguments for the `send` subcommand.
 #[derive(Args)]
@@ -99,6 +117,10 @@ pub struct SendArgs {
         value_parser = parse_metrics_url
     )]
     pub metrics_url: Vec<MetricsURL>,
+
+    /// File containing metric names to publish to ClickHouse, one per line.
+    #[arg(long, value_name = "PATH")]
+    pub clickhouse_metrics_file: Option<PathBuf>,
 
     /// Scrape interval in milliseconds for the metrics scraper.
     #[arg(long, default_value = "500")]
@@ -194,6 +216,10 @@ pub struct SendBlocksArgs {
         value_parser = parse_metrics_url
     )]
     pub metrics_url: Vec<MetricsURL>,
+
+    /// File containing metric names to publish to ClickHouse, one per line.
+    #[arg(long, value_name = "PATH")]
+    pub clickhouse_metrics_file: Option<PathBuf>,
 
     /// Scrape interval in milliseconds for the metrics scraper.
     #[arg(long, default_value = "500")]
@@ -364,6 +390,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use crate::metrics_url::MetricsURL;
+    use std::io::Write;
 
     #[test]
     fn test_parse_duration_millis_fallback_with_unit() {
@@ -579,5 +606,14 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn load_metric_names_ignores_comments_blanks_and_duplicates() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "# dashboard metrics\nmetric_a\n\nmetric_b\nmetric_a").unwrap();
+
+        let names = load_metric_names(Some(&file.path().to_path_buf())).unwrap().unwrap();
+        assert_eq!(names, HashSet::from(["metric_a".to_string(), "metric_b".to_string()]));
     }
 }
