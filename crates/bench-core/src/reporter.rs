@@ -626,6 +626,7 @@ impl ClickHouseConfig {
         mode: &str,
         run_id: uuid::Uuid,
         metadata: &HashMap<String, String>,
+        metric_names: Option<HashSet<String>>,
     ) -> Result<Self> {
         let missing: Vec<&str> =
             REQUIRED_METADATA.iter().filter(|k| !metadata.contains_key(**k)).copied().collect();
@@ -674,7 +675,7 @@ impl ClickHouseConfig {
             config,
             metadata: remaining_metadata,
             sample_batch_size,
-            metric_names: None,
+            metric_names,
         })
     }
 }
@@ -910,7 +911,7 @@ pub fn parse_reporters(
     specs: &[String],
     mode: &str,
     metadata: &HashMap<String, String>,
-    clickhouse_metric_names: Option<&HashSet<String>>,
+    clickhouse_metric_names: Option<HashSet<String>>,
 ) -> Result<Vec<Box<dyn Reporter>>> {
     let mut reporters: Vec<Box<dyn Reporter>> = Vec::new();
     let benchmark_id = uuid::Uuid::new_v4();
@@ -930,8 +931,13 @@ pub fn parse_reporters(
                     .with_benchmark_id(benchmark_id),
             ));
         } else if let Some(url) = spec.strip_prefix("clickhouse:") {
-            let mut config = ClickHouseConfig::from_metadata(url, mode, benchmark_id, metadata)?;
-            config.metric_names = clickhouse_metric_names.cloned();
+            let config = ClickHouseConfig::from_metadata(
+                url,
+                mode,
+                benchmark_id,
+                metadata,
+                clickhouse_metric_names.clone(),
+            )?;
             reporters.push(Box::new(
                 ClickHouseReporter::new(config).wrap_err("failed to create ClickHouse reporter")?,
             ));

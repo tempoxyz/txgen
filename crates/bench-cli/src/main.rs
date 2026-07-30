@@ -17,24 +17,6 @@ mod send;
 mod send_blocks;
 mod view;
 
-fn load_metric_names(path: Option<&PathBuf>) -> Result<Option<HashSet<String>>> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    let contents = std::fs::read_to_string(path)
-        .wrap_err_with(|| format!("failed to read metric allowlist from {}", path.display()))?;
-    let names = contents
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(ToOwned::to_owned)
-        .collect::<HashSet<_>>();
-    if names.is_empty() {
-        bail!("metric allowlist {} contains no metric names", path.display());
-    }
-    Ok(Some(names))
-}
-
 /// Arguments for the `send` subcommand.
 #[derive(Args)]
 pub struct SendArgs {
@@ -337,6 +319,24 @@ fn parse_wait_for_persistence(s: &str) -> Result<bench_core::WaitForPersistence,
         }
         _ => Err(format!("invalid value '{s}': expected 'always', 'never', or 'every:N'")),
     }
+}
+
+fn load_metric_names(path: Option<&PathBuf>) -> Result<Option<HashSet<String>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let contents = std::fs::read_to_string(path)
+        .wrap_err_with(|| format!("failed to read metric allowlist from {}", path.display()))?;
+    let names = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToOwned::to_owned)
+        .collect::<HashSet<_>>();
+    if names.is_empty() {
+        bail!("metric allowlist {} contains no metric names", path.display());
+    }
+    Ok(Some(names))
 }
 
 fn tracing_env_filter() -> tracing_subscriber::EnvFilter {

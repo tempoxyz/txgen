@@ -173,8 +173,7 @@ async fn execute_source<S: TxSource>(
     }
 
     let clickhouse_metric_names = load_metric_names(args.clickhouse_metrics_file.as_ref())?;
-    let mut reporters =
-        parse_reporters(&args.reports, "send", metadata, clickhouse_metric_names.as_ref())?;
+    let mut reporters = parse_reporters(&args.reports, "send", metadata, clickhouse_metric_names)?;
     if reporters.is_empty() {
         reporters.push(Box::new(ConsoleReporter::stderr(true)));
     }
