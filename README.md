@@ -422,9 +422,15 @@ bench send -i txs.ndjson --metrics-url http://127.0.0.1:9001/metrics --scrape-in
 
 # Scrape multiple nodes and tag each scraped sample with node=<label>
 bench send -i txs.ndjson --metrics-url a:http://node-a:9001/metrics,b:http://node-b:9001/metrics
+
+# Attach canonical validator labels to a scrape endpoint
+bench send -i txs.ndjson \
+  --metrics-url 'validator=v0;validator_pubkey=0xabc;region=us-east-1@http://node-a:9001/metrics'
 ```
 
-For a single endpoint, pass the URL directly. For multiple endpoints, every comma-separated entry must use `node_label:URL`; the label is added to scraped Prometheus samples as `node=<node_label>`.
+For a single endpoint, pass the URL directly. Legacy multiple-endpoint entries use
+`node_label:URL` and add `node=<node_label>`. Rich entries use
+`key=value;key=value@URL` and add each supplied label to the scraped samples.
 
 Internal txgen metrics are snapshotted on the same interval and included alongside node metrics. In `send` mode: `txgen_transactions_sent_total`, `txgen_transactions_success_total`, etc. In `send-blocks` mode: `txgen_blocks_sent_total`, `txgen_blocks_success_total`, `txgen_blocks_failed_total`.
 
