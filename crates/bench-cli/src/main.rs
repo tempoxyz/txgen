@@ -90,11 +90,11 @@ pub struct SendArgs {
 
     /// Prometheus metrics endpoint(s) to scrape during the benchmark.
     ///
-    /// Use a single URL, or comma-separated `node:URL` entries for multiple
-    /// endpoints. Labeled endpoints add `node=<label>` to scraped samples.
+    /// Use a single URL, comma-separated `node:URL` entries, or rich
+    /// `key=value;key=value@URL` entries. Labels are added to scraped samples.
     #[arg(
         long,
-        value_name = "URL|NODE:URL",
+        value_name = "URL|NODE:URL|LABELS@URL",
         value_delimiter = ',',
         value_parser = parse_metrics_url
     )]
@@ -189,11 +189,11 @@ pub struct SendBlocksArgs {
 
     /// Prometheus metrics endpoint(s) to scrape during the benchmark.
     ///
-    /// Use a single URL, or comma-separated `node:URL` entries for multiple
-    /// endpoints. Labeled endpoints add `node=<label>` to scraped samples.
+    /// Use a single URL, comma-separated `node:URL` entries, or rich
+    /// `key=value;key=value@URL` entries. Labels are added to scraped samples.
     #[arg(
         long,
-        value_name = "URL|NODE:URL",
+        value_name = "URL|NODE:URL|LABELS@URL",
         value_delimiter = ',',
         value_parser = parse_metrics_url
     )]
@@ -534,6 +534,33 @@ mod tests {
     }
 
     #[test]
+    fn test_metrics_url_value_parser_rich_labels() {
+        let cli = Cli::try_parse_from([
+            "bench",
+            "send",
+            "--metrics-url",
+            "validator=v0;region=us-east-1@http://127.0.0.1:9001/metrics",
+        ])
+        .unwrap();
+
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+
+        assert_eq!(args.metrics_url.len(), 1);
+        assert_eq!(
+            args.metrics_url[0],
+            MetricsURL::Labeled {
+                labels: std::collections::BTreeMap::from([
+                    ("region".to_string(), "us-east-1".to_string()),
+                    ("validator".to_string(), "v0".to_string()),
+                ]),
+                url: "http://127.0.0.1:9001/metrics".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn test_send_metrics_forward() {
         let cli = Cli::try_parse_from([
             "bench",
@@ -597,11 +624,17 @@ mod tests {
             args.metrics_url,
             vec![
                 MetricsURL::Labeled {
-                    node: "a".to_string(),
+                    labels: std::collections::BTreeMap::from([(
+                        "node".to_string(),
+                        "a".to_string(),
+                    )]),
                     url: "http://node-a:9001/metrics".to_string(),
                 },
                 MetricsURL::Labeled {
-                    node: "b".to_string(),
+                    labels: std::collections::BTreeMap::from([(
+                        "node".to_string(),
+                        "b".to_string(),
+                    )]),
                     url: "http://node-b:9001/metrics".to_string(),
                 },
             ]
