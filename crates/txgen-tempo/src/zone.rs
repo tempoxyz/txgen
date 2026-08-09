@@ -119,7 +119,79 @@ fn configured_portal_address(chain_id: u64, zone_id: u32) -> Result<Address> {
     }
 }
 
+/// Process-lifetime cache of each portal's active encryption key, populated
+/// once and reused by every subsequent `prepare_encrypted_deposit` call.
+///
+/// A benchmark run fans this out to up to dozens of concurrent scenario
+/// instances, each independently calling `active_encryption_key` -- before
+/// this cache existed, that meant every single one repeated the same 3
+/// sequential `eth_call`s (see `fetch_active_encryption_key`) for a value
+/// that had already been fetched moments earlier by another instance on the
+/// same portal, adding a full extra L1 round trip (measured ~450ms against a
+/// real remote RPC endpoint, vs. sub-millisecond against a local devnet --
+/// which is why this was invisible in local-mode benchmarks and only showed
+/// up as a mysterious slowdown against a live network).
+///
+/// `Arc<OnceCell<..>>` per portal (rather than one cell for the whole map)
+/// means concurrent first-time callers for the *same* portal all await one
+/// in-flight fetch instead of racing duplicate requests, while callers for a
+/// *different* portal address are never blocked on it.
+#[cfg(not(test))]
+type ActiveEncryptionKeyCell = std::sync::Arc<tokio::sync::OnceCell<(B256, u8, U256)>>;
+
+#[cfg(not(test))]
+static ACTIVE_ENCRYPTION_KEY_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<Address, ActiveEncryptionKeyCell>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Caching is disabled under test: unit tests reuse the same placeholder
+/// portal address across cases with different mock responses (e.g. one case
+/// expects a key, another expects `NoEncryptionKeySet` from the same
+/// address), and this cache is a process-lifetime global -- Rust's default
+/// test harness runs all cases in one process, so a real cache here would
+/// leak a result from an earlier test into a later, unrelated one. Real
+/// benchmark runs never hit this path; it's pure overhead there in exchange
+/// for correctness against mocks, so it's the right trade for `cfg(test)`.
+#[cfg(test)]
 async fn active_encryption_key(
+    provider: &alloy_provider::DynProvider<alloy_network::AnyNetwork>,
+    portal: Address,
+) -> Result<(B256, u8, U256)> {
+    fetch_active_encryption_key(provider, portal).await
+}
+
+#[cfg(not(test))]
+async fn active_encryption_key(
+    provider: &alloy_provider::DynProvider<alloy_network::AnyNetwork>,
+    portal: Address,
+) -> Result<(B256, u8, U256)> {
+    let cell = {
+        let mut cache =
+            ACTIVE_ENCRYPTION_KEY_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache
+            .entry(portal)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::OnceCell::new()))
+            .clone()
+    };
+    cell.get_or_try_init(|| fetch_active_encryption_key(provider, portal)).await.map(|value| *value)
+}
+
+/// Read the portal's currently active encryption key and its index.
+///
+/// Reads `encryptionKeyCount()` before and after `sequencerEncryptionKey()`
+/// and retries once if they disagree, so a key rotation landing exactly
+/// between the two reads can't pair a stale pubkey with the wrong index (or
+/// vice versa). Cached per portal by [`active_encryption_key`] -- this is
+/// the one place that actually hits the network, and it should only ever
+/// run once per portal per process under normal operation.
+///
+/// Note this cache means a key rotation mid-run won't be picked up until the
+/// process restarts. `ZonePortal.isEncryptionKeyValid` grants a grace period
+/// (the outgoing key stays valid until the new one's `activationBlock`), so
+/// this only matters for benchmark runs long enough to outlast that window --
+/// acceptable here since this is benchmark tooling against a shared staging
+/// network with synthetic funds, not a long-lived production signer.
+async fn fetch_active_encryption_key(
     provider: &alloy_provider::DynProvider<alloy_network::AnyNetwork>,
     portal: Address,
 ) -> Result<(B256, u8, U256)> {
