@@ -53,16 +53,6 @@ impl ReceiptGasRecord {
     }
 }
 
-/// Sum the exact fees from all records that supplied an effective gas price.
-///
-/// Returns `None` when no record has a calculable fee or when the aggregate
-/// exceeds `U256`.
-pub fn total_fees_paid(records: &[ReceiptGasRecord]) -> Option<U256> {
-    let mut fees = records.iter().filter_map(ReceiptGasRecord::fee_paid);
-    let first = fees.next()?;
-    fees.try_fold(first, U256::checked_add)
-}
-
 /// Gas fields retained from a confirmed transaction receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiptGasSample {
@@ -412,6 +402,16 @@ async fn collect_receipt(
         }
         tokio::time::sleep(RECEIPT_POLL_INTERVAL.min(deadline - now)).await;
     }
+}
+
+/// Sum the exact fees from all records that supplied an effective gas price.
+///
+/// Returns `None` when no record has a calculable fee or when the aggregate
+/// exceeds `U256`.
+pub fn total_fees_paid(records: &[ReceiptGasRecord]) -> Option<U256> {
+    let mut fees = records.iter().filter_map(ReceiptGasRecord::fee_paid);
+    let first = fees.next()?;
+    fees.try_fold(first, U256::checked_add)
 }
 
 fn percentile(samples: &[U256], percentile: usize) -> U256 {
