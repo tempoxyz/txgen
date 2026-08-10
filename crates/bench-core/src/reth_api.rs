@@ -178,6 +178,11 @@ pub type RethForkchoiceUpdated = ForkchoiceUpdated;
 /// let status = provider.reth_new_payload(input, None).await?;
 /// let fcu = provider.reth_forkchoice_updated(state).await?;
 /// ```
+// `async_trait` currently triggers a false positive that Clippy does not count as fulfilling the
+// expectation:
+// https://github.com/rust-lang/rust-clippy/issues/17529
+#[allow(unfulfilled_lint_expectations)]
+#[expect(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait RethApi<N: Network>: Send + Sync {
     /// Submit a new payload via `reth_newPayload`.
