@@ -25,6 +25,7 @@ pub(crate) const SCENARIO_ACTIONS: &[&str] = &[PREPARE_ENCRYPTED_DEPOSIT];
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PrepareEncryptedDepositArgs {
     recipient: Address,
+    sender: Address,
     zone_id: u32,
     portal_address: Option<Address>,
     #[serde(default)]
@@ -38,6 +39,7 @@ struct PreparedEncryptedDeposit {
     encrypted: EncryptedDepositOutput,
     key_index: String,
     portal_address: String,
+    sender: String,
     zone_id: u32,
 }
 
@@ -89,6 +91,7 @@ async fn prepare_encrypted_deposit(
         sequencer_y_parity,
         arguments.recipient,
         arguments.memo,
+        arguments.sender,
         portal_address,
         key_index,
     )?;
@@ -104,6 +107,7 @@ async fn prepare_encrypted_deposit(
         },
         key_index: key_index.to_string(),
         portal_address: portal_address.to_string(),
+        sender: arguments.sender.to_string(),
         zone_id: arguments.zone_id,
     })
     .wrap_err("failed to encode prepared encrypted deposit")
@@ -192,6 +196,7 @@ fn encrypt_deposit(
     sequencer_y_parity: u8,
     recipient: Address,
     memo: B256,
+    sender: Address,
     portal: Address,
     key_index: U256,
 ) -> Result<EncryptedDeposit> {
@@ -204,6 +209,7 @@ fn encrypt_deposit(
         sequencer_y_parity,
         recipient,
         memo,
+        sender,
         portal,
         key_index,
         &ephemeral_key,
@@ -217,6 +223,7 @@ fn encrypt_deposit_with_material(
     sequencer_y_parity: u8,
     recipient: Address,
     memo: B256,
+    sender: Address,
     portal: Address,
     key_index: U256,
     ephemeral_key: &SecretKey,
@@ -235,10 +242,11 @@ fn encrypt_deposit_with_material(
     let shared_secret =
         diffie_hellman(ephemeral_key.to_nonzero_scalar(), sequencer_key.as_affine());
 
-    let mut info = [0u8; 84];
+    let mut info = [0u8; 104];
     info[..20].copy_from_slice(portal.as_slice());
     info[20..52].copy_from_slice(&key_index.to_be_bytes::<32>());
-    info[52..].copy_from_slice(ephemeral_pubkey_x.as_slice());
+    info[52..84].copy_from_slice(ephemeral_pubkey_x.as_slice());
+    info[84..].copy_from_slice(sender.as_slice());
     let hkdf = Hkdf::<Sha256>::new(Some(b"ecies-aes-key"), shared_secret.raw_secret_bytes());
     let mut aes_key = [0u8; 32];
     hkdf.expand(&info, &mut aes_key).map_err(|_| eyre::eyre!("HKDF expansion failed"))?;
@@ -282,6 +290,7 @@ mod tests {
             sequencer_public.as_bytes()[0],
             Address::repeat_byte(0xbb),
             B256::repeat_byte(0xcc),
+            Address::repeat_byte(0xdd),
             Address::repeat_byte(0xaa),
             U256::from(42),
             &ephemeral_key,
@@ -298,14 +307,14 @@ mod tests {
         assert_eq!(encrypted.ephemeral_pubkey_y_parity, 3);
         assert_eq!(
             Bytes::from(encrypted.ciphertext),
-            "0x58f85586a516bd0409c41ab5c8efc45e661f91f70baea393931fc594d63947408556017ce245fac8d282ea8a4c8d50eaca515ba10028d997d632f19299db9f62"
+            "0xabf635c21eade9d5e71e418178dc854b707373e194e64e784380f4532eb360ed24271dab9482dc32424257661b89b487c414ebdb22003ae12b67ff3d8bc213f5"
                 .parse::<Bytes>()
                 .unwrap()
         );
         assert_eq!(encrypted.nonce, [0u8; 12]);
         assert_eq!(
             encrypted.tag,
-            hex::decode("ddf522af7a2a95cd6c6ef690dfb0afec").unwrap().as_slice()
+            hex::decode("9687cf944502560139fb6ac8d77e8897").unwrap().as_slice()
         );
     }
 
@@ -329,6 +338,7 @@ mod tests {
             r#"
 portalAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 recipient: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+sender: "0xdddddddddddddddddddddddddddddddddddddddd"
 zoneId: 9
 "#,
         )
@@ -367,6 +377,7 @@ zoneId: 9
             r#"
 portalAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 recipient: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+sender: "0xdddddddddddddddddddddddddddddddddddddddd"
 zoneId: 9
 "#,
         )
@@ -382,6 +393,7 @@ zoneId: 9
 
         assert_eq!(output["chainId"].as_u64(), Some(1));
         assert_eq!(output["keyIndex"].as_str(), Some("42"));
+        assert_eq!(output["sender"].as_str(), Some("0xDDdDddDdDdddDDddDDddDDDDdDdDDdDDdDDDDDDd"));
         assert_eq!(output["zoneId"].as_u64(), Some(9));
         let encrypted = output["encrypted"].as_mapping().unwrap();
         assert!(matches!(encrypted["ephemeralPubkeyYParity"].as_u64(), Some(2 | 3)));
