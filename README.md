@@ -498,6 +498,9 @@ The bench JSON report includes:
 - `samples` — point-in-time metric snapshots (internal + node), stored as a time series
 - `blocks` — factual chain data for each block in the run (tx count, gas used, etc.)
 - `receipt_metrics` — confirmed-transaction `gas_used`, `effective_gas_price`, and `fee_paid` distributions grouped by workload input
+- `total_fees_paid` — exact total paid by confirmed tracked transactions, encoded as a decimal base-unit string
+
+Receipts without `effectiveGasPrice` or legacy `gasPrice` still contribute gas usage to `receipt_metrics`, but are excluded from `total_fees_paid`.
 
 ### Prometheus Reporting
 

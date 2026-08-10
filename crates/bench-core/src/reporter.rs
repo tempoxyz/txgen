@@ -12,6 +12,7 @@ use crate::{
     receipt_metrics::{ReceiptGasRecord, ReceiptMetricGroup},
     sample::{Sample, SampleArchive},
 };
+use alloy_primitives::U256;
 use eyre::{bail, Context, Result};
 use flate2::{write::GzEncoder, Compression};
 use std::{
@@ -42,6 +43,8 @@ pub struct FinalReport {
     pub blocks: Vec<BlockStats>,
     /// Receipt-derived gas metrics grouped by workload input labels.
     pub receipt_metrics: Vec<ReceiptMetricGroup>,
+    /// Exact total fees paid by confirmed tracked transactions, in base units.
+    pub total_fees_paid: Option<U256>,
     /// Receipt-derived gas details for ClickHouse publication.
     pub receipt_records: Vec<ReceiptGasRecord>,
 }
@@ -236,6 +239,9 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
             writeln!(self.writer, "  Duration:        {:>10.2}s", metrics.elapsed.as_secs_f64())?;
             writeln!(self.writer, "  Throughput:      {:>10.2} tx/s", metrics.tps())?;
             writeln!(self.writer, "  Success Rate:    {:>10.1}%", metrics.success_rate())?;
+            if let Some(total_fees_paid) = report.total_fees_paid {
+                writeln!(self.writer, "  Total Fees Paid: {total_fees_paid:>10}")?;
+            }
             if let Some(latency) = &metrics.latency {
                 writeln!(self.writer)?;
                 writeln!(self.writer, "  Latency:")?;
@@ -339,6 +345,9 @@ pub struct JsonReport {
     /// Receipt-derived gas metrics grouped by workload input labels.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub receipt_metrics: Vec<ReceiptMetricGroup>,
+    /// Exact total fees paid, encoded as a decimal base-unit string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_fees_paid: Option<String>,
     /// Unified time-series samples (internal + node metrics).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub samples: Vec<Sample>,
@@ -505,6 +514,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             run_stats: report.run_stats.clone(),
             metadata,
             receipt_metrics: report.receipt_metrics.clone(),
+            total_fees_paid: report.total_fees_paid.map(|fees| fees.to_string()),
             samples: Vec::new(),
         };
 
@@ -1017,16 +1027,19 @@ mod tests {
 
     #[test]
     fn test_console_reporter() {
+        let mut report = sample_report();
+        report.total_fees_paid = Some(U256::from(42_000));
         let mut output = Vec::new();
         {
             let mut reporter = ConsoleReporter::new(&mut output, false);
-            reporter.finalize(&sample_report()).unwrap();
+            reporter.finalize(&report).unwrap();
         }
 
         let output_str = String::from_utf8(output).unwrap();
         assert!(output_str.contains("1000"));
         assert!(output_str.contains("950"));
         assert!(output_str.contains("100.00 tx/s"));
+        assert!(output_str.contains("Total Fees Paid:      42000"));
     }
 
     #[test]
@@ -1057,6 +1070,7 @@ mod tests {
         );
         let mut report = sample_report();
         report.receipt_metrics = accumulator.into_metrics();
+        report.total_fees_paid = Some(U256::from(42_000));
         let mut output = Vec::new();
         JsonReporter::new(&mut output).finalize(&report).unwrap();
 
@@ -1064,6 +1078,7 @@ mod tests {
         assert_eq!(parsed["receipt_metrics"][0]["labels"]["input"], "transfer");
         assert_eq!(parsed["receipt_metrics"][0]["gas_used"]["p95"], 21_000.0);
         assert_eq!(parsed["receipt_metrics"][0]["fee_paid"]["mean"], 42_000.0);
+        assert_eq!(parsed["total_fees_paid"], "42000");
     }
 
     #[test]

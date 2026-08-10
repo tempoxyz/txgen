@@ -11,11 +11,11 @@ use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
-    collect_block_stats, parse_reporters, start_scrapers, trim_trailing_empty_blocks,
-    ConsoleReporter, FileSource, FinalReport, GeneratedTx, MetricsCollector, ProgressState,
-    ReceiptCollector, Reporter, RequestAuthProvider, RpcEndpoint, RpcSubmitter, RunClock, RunStats,
-    SampleStore, ScraperConfig, Sender, SenderConfig, SenderHeaderAuthProvider, StdinSource,
-    TxPhase, TxSource,
+    collect_block_stats, parse_reporters, start_scrapers, total_fees_paid,
+    trim_trailing_empty_blocks, ConsoleReporter, FileSource, FinalReport, GeneratedTx,
+    MetricsCollector, ProgressState, ReceiptCollector, Reporter, RequestAuthProvider, RpcEndpoint,
+    RpcSubmitter, RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig,
+    SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -223,6 +223,7 @@ async fn execute_source<S: TxSource>(
         }
     };
     let receipt_metrics = receipt_collection.metrics;
+    let total_fees_paid = total_fees_paid(&receipt_collection.records);
     let receipt_records = receipt_collection.records;
 
     // Stop the scraper before finalizing.
@@ -262,6 +263,7 @@ async fn execute_source<S: TxSource>(
         time_series: Some(time_series),
         sample_archive: Some(sample_archive),
         receipt_metrics,
+        total_fees_paid,
         receipt_records,
         ..Default::default()
     };

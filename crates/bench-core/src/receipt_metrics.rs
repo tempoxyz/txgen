@@ -53,6 +53,16 @@ impl ReceiptGasRecord {
     }
 }
 
+/// Sum the exact fees from all records that supplied an effective gas price.
+///
+/// Returns `None` when no record has a calculable fee or when the aggregate
+/// exceeds `U256`.
+pub fn total_fees_paid(records: &[ReceiptGasRecord]) -> Option<U256> {
+    let mut fees = records.iter().filter_map(ReceiptGasRecord::fee_paid);
+    let first = fees.next()?;
+    fees.try_fold(first, U256::checked_add)
+}
+
 /// Gas fields retained from a confirmed transaction receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiptGasSample {
@@ -451,6 +461,25 @@ mod tests {
         assert_eq!(collection.metrics[0].labels, labels("transfer"));
         assert_eq!(collection.metrics[0].gas_used.count, 1);
         assert_eq!(collection.metrics[0].fee_paid.mean, Some(42_000.0));
+    }
+
+    #[test]
+    fn totals_exact_fees_and_skips_records_without_prices() {
+        let first = granular_record("transfer", None, Some(U256::from(2)));
+        let second = granular_record("transfer", None, Some(U256::from(3)));
+        let missing_price = granular_record("transfer", None, None);
+
+        assert_eq!(total_fees_paid(&[first, second, missing_price]), Some(U256::from(105_000)));
+        assert_eq!(total_fees_paid(&[]), None);
+    }
+
+    #[test]
+    fn omits_overflowing_fee_total() {
+        let mut first = granular_record("transfer", None, Some(U256::from(1)));
+        first.gas_used = U256::MAX;
+        let second = granular_record("transfer", None, Some(U256::from(1)));
+
+        assert_eq!(total_fees_paid(&[first, second]), None);
     }
 
     #[test]
