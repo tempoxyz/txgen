@@ -944,13 +944,14 @@ Captures the chain's current canonical block cursor. Use it immediately before a
 
 Runs a query-only action supplied by the selected network adapter. `with` values may use runtime expressions, and the adapter's structured result can be saved and passed to later steps. Unsupported action names are rejected before any journey starts.
 
-The Tempo adapter provides `prepare_encrypted_deposit`, which is compatible with viem's `zone.encryptedDeposit.prepareRecipient`: it reads the current ZonePortal encryption key and creates a fresh secp256k1/AES-GCM payload for each invocation. Cryptographic material always comes from the operating system and is intentionally not controlled by the scenario seed. `portalAddress` is optional for Zone IDs known to viem; supply it for other deployments. `memo` is an optional `bytes32` and defaults to zero.
+The Tempo adapter provides `prepare_encrypted_deposit`, which reads the current ZonePortal encryption key and creates a fresh secp256k1/AES-GCM payload for each invocation. `sender` is required and must be the address that will call `ZonePortal.deposit`; it is bound into the encryption key derivation. Cryptographic material always comes from the operating system and is intentionally not controlled by the scenario seed. `portalAddress` is optional for Zone IDs known to viem; supply it for other deployments. `memo` is an optional `bytes32` and defaults to zero.
 
 ```yaml
 - invoke:
     chain: l1
     action: prepare_encrypted_deposit
     with:
+      sender: { var: user.address }
       recipient: { var: user.address }
       zoneId: 9
       portalAddress: ${ZONE_PORTAL_ADDRESS}

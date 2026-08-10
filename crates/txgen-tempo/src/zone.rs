@@ -25,6 +25,7 @@ pub(crate) const SCENARIO_ACTIONS: &[&str] = &[PREPARE_ENCRYPTED_DEPOSIT];
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PrepareEncryptedDepositArgs {
     recipient: Address,
+    sender: Address,
     zone_id: u32,
     portal_address: Option<Address>,
     #[serde(default)]
@@ -89,6 +90,7 @@ async fn prepare_encrypted_deposit(
         sequencer_y_parity,
         arguments.recipient,
         arguments.memo,
+        arguments.sender,
         portal_address,
         key_index,
     )?;
@@ -192,6 +194,7 @@ fn encrypt_deposit(
     sequencer_y_parity: u8,
     recipient: Address,
     memo: B256,
+    sender: Address,
     portal: Address,
     key_index: U256,
 ) -> Result<EncryptedDeposit> {
@@ -204,6 +207,7 @@ fn encrypt_deposit(
         sequencer_y_parity,
         recipient,
         memo,
+        sender,
         portal,
         key_index,
         &ephemeral_key,
@@ -217,6 +221,7 @@ fn encrypt_deposit_with_material(
     sequencer_y_parity: u8,
     recipient: Address,
     memo: B256,
+    sender: Address,
     portal: Address,
     key_index: U256,
     ephemeral_key: &SecretKey,
@@ -235,10 +240,11 @@ fn encrypt_deposit_with_material(
     let shared_secret =
         diffie_hellman(ephemeral_key.to_nonzero_scalar(), sequencer_key.as_affine());
 
-    let mut info = [0u8; 84];
+    let mut info = [0u8; 104];
     info[..20].copy_from_slice(portal.as_slice());
     info[20..52].copy_from_slice(&key_index.to_be_bytes::<32>());
-    info[52..].copy_from_slice(ephemeral_pubkey_x.as_slice());
+    info[52..84].copy_from_slice(ephemeral_pubkey_x.as_slice());
+    info[84..].copy_from_slice(sender.as_slice());
     let hkdf = Hkdf::<Sha256>::new(Some(b"ecies-aes-key"), shared_secret.raw_secret_bytes());
     let mut aes_key = [0u8; 32];
     hkdf.expand(&info, &mut aes_key).map_err(|_| eyre::eyre!("HKDF expansion failed"))?;
@@ -282,6 +288,7 @@ mod tests {
             sequencer_public.as_bytes()[0],
             Address::repeat_byte(0xbb),
             B256::repeat_byte(0xcc),
+            Address::repeat_byte(0xdd),
             Address::repeat_byte(0xaa),
             U256::from(42),
             &ephemeral_key,
@@ -298,15 +305,43 @@ mod tests {
         assert_eq!(encrypted.ephemeral_pubkey_y_parity, 3);
         assert_eq!(
             Bytes::from(encrypted.ciphertext),
-            "0x58f85586a516bd0409c41ab5c8efc45e661f91f70baea393931fc594d63947408556017ce245fac8d282ea8a4c8d50eaca515ba10028d997d632f19299db9f62"
+            "0xabf635c21eade9d5e71e418178dc854b707373e194e64e784380f4532eb360ed24271dab9482dc32424257661b89b487c414ebdb22003ae12b67ff3d8bc213f5"
                 .parse::<Bytes>()
                 .unwrap()
         );
         assert_eq!(encrypted.nonce, [0u8; 12]);
         assert_eq!(
             encrypted.tag,
-            hex::decode("ddf522af7a2a95cd6c6ef690dfb0afec").unwrap().as_slice()
+            hex::decode("9687cf944502560139fb6ac8d77e8897").unwrap().as_slice()
         );
+    }
+
+    #[test]
+    fn binds_encrypted_deposit_to_sender() {
+        let sequencer_key =
+            SecretKey::from_slice(&Sha256::digest(b"test-sequencer-key")).expect("valid test key");
+        let sequencer_public = sequencer_key.public_key().to_encoded_point(true);
+        let ephemeral_key =
+            SecretKey::from_slice(&Sha256::digest(b"test-ephemeral-key")).expect("valid test key");
+        let encrypt_for = |sender| {
+            encrypt_deposit_with_material(
+                B256::from_slice(&sequencer_public.as_bytes()[1..]),
+                sequencer_public.as_bytes()[0],
+                Address::repeat_byte(0xbb),
+                B256::repeat_byte(0xcc),
+                sender,
+                Address::repeat_byte(0xaa),
+                U256::from(42),
+                &ephemeral_key,
+                [0u8; 12],
+            )
+            .unwrap()
+        };
+
+        let alice = encrypt_for(Address::repeat_byte(0xdd));
+        let bob = encrypt_for(Address::repeat_byte(0xee));
+        assert_ne!(alice.ciphertext, bob.ciphertext);
+        assert_ne!(alice.tag, bob.tag);
     }
 
     #[test]
@@ -329,6 +364,7 @@ mod tests {
             r#"
 portalAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 recipient: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+sender: "0xdddddddddddddddddddddddddddddddddddddddd"
 zoneId: 9
 "#,
         )
@@ -343,6 +379,34 @@ zoneId: 9
         .unwrap_err();
 
         assert!(error.to_string().contains("no encryption key"));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn requires_deposit_sender() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new_with_network::<AnyNetwork>()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let arguments = serde_yaml::from_str(
+            r#"
+portalAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+recipient: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+zoneId: 9
+"#,
+        )
+        .unwrap();
+
+        let error = invoke(
+            PREPARE_ENCRYPTED_DEPOSIT,
+            &arguments,
+            ScenarioActionContext { chain: "l1", chain_id: 1, query_provider: &provider },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid prepare_encrypted_deposit arguments"));
+        assert!(format!("{error:?}").contains("missing field `sender`"));
         assert!(asserter.read_q().is_empty());
     }
 
@@ -367,6 +431,7 @@ zoneId: 9
             r#"
 portalAddress: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 recipient: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+sender: "0xdddddddddddddddddddddddddddddddddddddddd"
 zoneId: 9
 "#,
         )
