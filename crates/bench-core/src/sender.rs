@@ -637,7 +637,7 @@ type KeySets = (SchedulingKeys, SchedulingKeys);
 
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
-const PENDING_BACKLOG_FACTOR: usize = 4;
+const PENDING_BACKLOG_FACTOR: usize = 1;
 
 /// A submission RPC provider and the identity exposed to request authentication.
 #[derive(Clone)]
@@ -1632,7 +1632,7 @@ mod tests {
     fn test_max_buffered_transactions_uses_existing_sender_knobs() {
         let config = SenderConfig { rate_limit: 10_000, max_concurrent: 100 };
         let limiter = RateLimiter::new(config.rate_limit);
-        assert_eq!(max_buffered_transactions(&config, Some(&limiter)), 400);
+        assert_eq!(max_buffered_transactions(&config, Some(&limiter)), 200);
 
         let config = SenderConfig { rate_limit: 100_000, max_concurrent: 100 };
         let limiter = RateLimiter::new(config.rate_limit);
