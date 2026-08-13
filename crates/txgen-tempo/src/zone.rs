@@ -2,6 +2,8 @@ use aes_gcm::{
     aead::{AeadInPlace, KeyInit},
     Aes256Gcm, Nonce,
 };
+use alloy_eips::BlockId;
+use alloy_network::TransactionBuilder;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_provider::Provider;
 use eyre::{ensure, Result, WrapErr};
@@ -166,17 +168,13 @@ async fn call_portal(
 ) -> Result<Bytes> {
     let selector = &keccak256(signature.as_bytes())[..4];
     provider
-        .client()
-        .request(
-            "eth_call",
-            (
-                serde_json::json!({
-                    "to": portal,
-                    "data": Bytes::copy_from_slice(selector),
-                }),
-                "latest",
-            ),
+        .call(
+            provider
+                .transaction_request()
+                .with_to(portal)
+                .with_input(Bytes::copy_from_slice(selector)),
         )
+        .block(BlockId::latest())
         .await
         .wrap_err_with(|| format!("failed to call ZonePortal.{signature}"))
 }

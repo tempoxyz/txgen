@@ -7,7 +7,10 @@ use super::{
 use alloy_dyn_abi::{DynSolType, DynSolValue, EventExt, Specifier};
 use alloy_eips::BlockNumberOrTag;
 use alloy_json_abi::{Event, JsonAbi};
-use alloy_network::{primitives::ReceiptResponse, AnyNetwork, AnyTransactionReceipt};
+use alloy_network::{
+    primitives::{BlockResponse, ReceiptResponse},
+    AnyNetwork, AnyRpcBlock, AnyTransactionReceipt,
+};
 use alloy_primitives::{keccak256, Address, TxHash, B256, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder, WsConnect};
 use alloy_rpc_types_eth::{Filter, Log};
@@ -390,7 +393,7 @@ async fn canonical_block(
     let Some(block) = block_by_number(provider, block_number).await? else {
         return Ok(None);
     };
-    if response_block_hash(&block)? != expected_hash {
+    if block.header().hash != expected_hash {
         return Ok(None);
     }
     Ok(Some(CanonicalBlock { timestamp_ms: block_timestamp_ms(&block)? }))
@@ -400,58 +403,45 @@ async fn canonical_block_hash(
     provider: &DynProvider<AnyNetwork>,
     block_number: u64,
 ) -> Result<Option<B256>, StepError> {
-    block_by_number(provider, block_number)
-        .await?
-        .map(|block| response_block_hash(&block))
-        .transpose()
+    Ok(block_by_number(provider, block_number).await?.map(|block| block.header().hash))
 }
 
 async fn block_by_number(
     provider: &DynProvider<AnyNetwork>,
     block_number: u64,
-) -> Result<Option<serde_json::Value>, StepError> {
+) -> Result<Option<AnyRpcBlock>, StepError> {
     provider
-        .client()
-        .request::<_, Option<serde_json::Value>>(
-            "eth_getBlockByNumber",
-            (BlockNumberOrTag::Number(block_number), false),
-        )
+        .get_block_by_number(BlockNumberOrTag::Number(block_number))
         .await
         .map_err(StepError::rpc)
 }
 
-fn response_block_hash(block: &serde_json::Value) -> Result<B256, StepError> {
-    let block_hash = block
-        .get("hash")
-        .cloned()
-        .ok_or_else(|| StepError::rpc("query RPC block response omitted its hash"))?;
-    serde_json::from_value(block_hash)
-        .map_err(|_| StepError::rpc("query RPC block response had an invalid hash"))
-}
-
-fn block_timestamp_ms(block: &serde_json::Value) -> Result<Option<u64>, StepError> {
+fn block_timestamp_ms(block: &AnyRpcBlock) -> Result<Option<u64>, StepError> {
     // Tempo exposes the full millisecond value as `timestampMillis`. Its
     // consensus header also contains `timestampMillisPart`, which is only the
     // 0..999 sub-second component. Prefer the full field whenever present.
-    if let Some(value) = block.get("timestampMillis").filter(|value| !value.is_null()) {
-        return parse_quantity_u64(value)
+    let timestamp_millis = block
+        .other_fields()
+        .and_then(|fields| fields.get_deserialized::<serde_json::Value>("timestampMillis"))
+        .transpose()
+        .map_err(|_| StepError::rpc("query RPC block had an invalid timestampMillis"))?;
+    if let Some(value) = timestamp_millis.filter(|value| !value.is_null()) {
+        return parse_quantity_u64(&value)
             .map(Some)
             .map_err(|_| StepError::rpc("query RPC block had an invalid timestampMillis"));
     }
 
-    let Some(seconds) = block.get("timestamp").filter(|value| !value.is_null()) else {
-        return Ok(None);
-    };
-    let seconds = parse_quantity_u64(seconds)
-        .map_err(|_| StepError::rpc("query RPC block had an invalid timestamp"))?;
     let millis_part = block
-        .get("timestampMillisPart")
+        .other_fields()
+        .and_then(|fields| fields.get_deserialized::<serde_json::Value>("timestampMillisPart"))
+        .transpose()
+        .map_err(|_| StepError::rpc("query RPC block had an invalid timestampMillisPart"))?
         .filter(|value| !value.is_null())
-        .map(parse_quantity_u64)
+        .map(|value| parse_quantity_u64(&value))
         .transpose()
         .map_err(|_| StepError::rpc("query RPC block had an invalid timestampMillisPart"))?
         .unwrap_or(0);
-    Ok(Some(seconds.saturating_mul(1_000).saturating_add(millis_part)))
+    Ok(Some(block.header().timestamp.saturating_mul(1_000).saturating_add(millis_part)))
 }
 
 fn parse_quantity_u64(value: &serde_json::Value) -> Result<u64> {
@@ -1711,9 +1701,38 @@ mod tests {
     fn block_json(hash: B256) -> serde_json::Value {
         serde_json::json!({
             "hash": hash,
+            "parentHash": B256::ZERO,
+            "sha3Uncles": B256::ZERO,
+            "miner": Address::ZERO,
+            "stateRoot": B256::ZERO,
+            "transactionsRoot": B256::ZERO,
+            "receiptsRoot": B256::ZERO,
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "difficulty": "0x0",
+            "number": "0x4",
+            "gasLimit": "0x0",
+            "gasUsed": "0x0",
             "timestamp": "0x64",
+            "extraData": "0x",
+            "transactions": [],
             "timestampMillis": "0x18704"
         })
+    }
+
+    fn typed_block(
+        timestamp_millis: Option<&str>,
+        timestamp_millis_part: Option<&str>,
+    ) -> AnyRpcBlock {
+        let mut block = block_json(B256::ZERO);
+        let object = block.as_object_mut().unwrap();
+        match timestamp_millis {
+            Some(value) => object.insert("timestampMillis".to_string(), value.into()),
+            None => object.remove("timestampMillis"),
+        };
+        if let Some(value) = timestamp_millis_part {
+            object.insert("timestampMillisPart".to_string(), value.into());
+        }
+        serde_json::from_value(block).unwrap()
     }
 
     fn receipt_json(
@@ -1886,26 +1905,11 @@ mod tests {
     #[test]
     fn canonical_timestamp_prefers_full_millis_and_supports_part_fallback() {
         assert_eq!(
-            block_timestamp_ms(&serde_json::json!({
-                "timestamp": "0x64",
-                "timestampMillis": "0x1876b",
-                "timestampMillisPart": "0x1"
-            }))
-            .unwrap(),
+            block_timestamp_ms(&typed_block(Some("0x1876b"), Some("0x1"))).unwrap(),
             Some(100_203)
         );
-        assert_eq!(
-            block_timestamp_ms(&serde_json::json!({
-                "timestamp": "0x64",
-                "timestampMillisPart": "0xcb"
-            }))
-            .unwrap(),
-            Some(100_203)
-        );
-        assert_eq!(
-            block_timestamp_ms(&serde_json::json!({ "timestamp": "0x64" })).unwrap(),
-            Some(100_000)
-        );
+        assert_eq!(block_timestamp_ms(&typed_block(None, Some("0xcb"))).unwrap(), Some(100_203));
+        assert_eq!(block_timestamp_ms(&typed_block(None, None)).unwrap(), Some(100_000));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2451,7 +2455,7 @@ mod tests {
         }))
         .unwrap();
         let asserter = Asserter::new();
-        asserter.push_success(&serde_json::json!({ "hash": B256::repeat_byte(0x99) }));
+        asserter.push_success(&block_json(B256::repeat_byte(0x99)));
         let provider = mocked_provider(asserter);
 
         assert!(!receipt_is_canonical_on_query(&provider, &receipt).await.unwrap());
