@@ -151,7 +151,7 @@ async fn sequencer_encryption_key(
     portal: Address,
 ) -> Result<(B256, u8)> {
     let output = call_portal(provider, portal, "sequencerEncryptionKey()").await?;
-    ensure!(matches!(output.len(), 64 | 96), "invalid sequencerEncryptionKey response length");
+    ensure!(output.len() == 96, "invalid sequencerEncryptionKey response length");
     ensure!(
         output[32..63].iter().all(|byte| *byte == 0),
         "sequencerEncryptionKey returned an invalid y parity"
