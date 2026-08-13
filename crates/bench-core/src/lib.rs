@@ -40,9 +40,9 @@ pub use receipt_clickhouse::{
     DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE,
 };
 pub use receipt_metrics::{
-    total_fees_paid, ReceiptCollection, ReceiptCollector, ReceiptCollectorHandle, ReceiptGasRecord,
-    ReceiptGasSample, ReceiptMetricDistribution, ReceiptMetricGroup, ReceiptMetricLabels,
-    ReceiptMetrics, ReceiptMetricsAccumulator,
+    total_fees_paid, BlockReceiptCollector, ReceiptCollection, ReceiptCollector,
+    ReceiptCollectorHandle, ReceiptGasRecord, ReceiptGasSample, ReceiptMetricDistribution,
+    ReceiptMetricGroup, ReceiptMetricLabels, ReceiptMetrics, ReceiptMetricsAccumulator,
 };
 pub use reporter::{
     parse_reporters, ClickHouseConfig, ClickHouseReporter, ConsoleReporter, FinalReport,

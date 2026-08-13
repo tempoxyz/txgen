@@ -277,7 +277,7 @@ bench send -i txs.ndjson \
 |------|-------------|
 | `-i, --input <PATH>` | Input NDJSON file (default: stdin) |
 | `--rpc-url <URL>` | RPC endpoint URLs, comma-separated or repeated (default: `http://localhost:8545`) |
-| `--query-rpc-url <URL>` | Optional RPC endpoint for block, txpool, and other aggregate queries |
+| `--query-rpc-url <URL>` | Optional RPC endpoint for block, block-receipt, txpool, and other aggregate queries |
 | `--sender-header-name <NAME>` | HTTP header populated from the sender map for sender-scoped requests |
 | `--sender-header-map <PATH>` | JSON file mapping logical transaction senders to secret header values |
 | `--sender-header-reload-interval <DUR>` | How often to check the sender-header map for an atomic replacement (default: 1s) |
@@ -292,10 +292,11 @@ bench send -i txs.ndjson \
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
 | `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url` |
 | `--collect-latencies` | Collect and report aggregate latency stats plus individual request samples under `time_series.latencies` (default: disabled) |
+| `--collect-receipt-metrics` | Collect non-system transaction gas and fee metrics with block-level receipt requests after sending |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 0, set >0 to enable) |
 
-**Required RPC methods:** `eth_sendRawTransaction`, `eth_getTransactionReceipt` (setup and inclusion waits), `eth_blockNumber`, `eth_getBlockByNumber`, `txpool_status` (for `--drain-timeout`)
+**Required RPC methods:** `eth_sendRawTransaction`, `eth_getTransactionReceipt` (setup and inclusion waits), `eth_blockNumber`, `eth_getBlockByNumber`; `eth_getBlockReceipts` for `--collect-receipt-metrics`; `txpool_status` (for `--drain-timeout`)
 
 ##### Per-sender HTTP authentication
 
@@ -314,7 +315,7 @@ Each authenticated transaction must have a `sender` field in its NDJSON record a
 
 Authentication headers are constructed per request while the RPC providers share one HTTP client and connection pool. Submission retries retain the selected header. Receipt polling for setup transactions and inclusion waits stays on the selected submission RPC and uses the same sender context.
 
-When `--query-rpc-url` is set, initial and final block-number reads, block statistics, and `txpool_status` drain checks use that endpoint without sender credentials. Aggregate queries never select a sender mapping. Without a query URL, these operations retain the existing behavior of using the first `--rpc-url` provider.
+When `--query-rpc-url` is set, initial and final block-number reads, block statistics, block-receipt collection, and `txpool_status` drain checks use that endpoint without sender credentials. Aggregate queries never select a sender mapping. Without a query URL, these operations retain the existing behavior of using the first `--rpc-url` provider.
 
 Txgen consumes already-generated credential values; it does not encode, sign, or renew them. Generation-time nonce requests made by `txgen-ethereum generate --rpc` or `txgen-tempo generate --rpc` are not authenticated by these `bench send` options. Use an unrestricted RPC for nonce prefetching, or generate with suitable offline nonce configuration.
 
@@ -453,7 +454,7 @@ This uses the same Prometheus remote write payload and `PROMETHEUS_*` environmen
 
 ### ClickHouse Reporting
 
-The ClickHouse reporter stores common run metadata in `txgen_runs`. Bench runs additionally use `txgen_blocks` and `txgen_metric_samples`; scenario runs use `txgen_scenario_runs` and `txgen_scenario_steps` and do not write `txgen_blocks`. Both `send` and scenario runs write one exact outer-transaction gas row per confirmed tracked receipt to `txgen_receipt_gas`; `send-blocks` writes none. Block data is factual chain data, while metric samples are point-in-time scrape snapshots with no block attribution. Bench reporting requires four metadata keys:
+The ClickHouse reporter stores common run metadata in `txgen_runs`. Bench runs additionally use `txgen_blocks` and `txgen_metric_samples`; scenario runs use `txgen_scenario_runs` and `txgen_scenario_steps` and do not write `txgen_blocks`. Both `send` and scenario runs write one exact outer-transaction gas row per confirmed non-system receipt to `txgen_receipt_gas`; `send-blocks` writes none. Block data is factual chain data, while metric samples are point-in-time scrape snapshots with no block attribution. Bench reporting requires four metadata keys:
 
 ```bash
 bench send -i txs.ndjson \
@@ -498,7 +499,7 @@ The bench JSON report includes:
 - `samples` — point-in-time metric snapshots (internal + node), stored as a time series
 - `blocks` — factual chain data for each block in the run (tx count, gas used, etc.)
 - `receipt_metrics` — confirmed-transaction `gas_used`, `effective_gas_price`, and `fee_paid` distributions grouped by workload input
-- `total_fees_paid` — exact total paid by confirmed tracked transactions, encoded as a decimal base-unit string
+- `total_fees_paid` — exact total paid by confirmed non-system transactions in the benchmark block range, encoded as a decimal base-unit string
 
 Receipts without `effectiveGasPrice` or legacy `gasPrice` still contribute gas usage to `receipt_metrics`, but are excluded from `total_fees_paid`.
 
@@ -1810,7 +1811,8 @@ Summary of which RPC methods are required by each feature:
 | `eth_getStorageAt` | `txgen-tempo scenario run` (Tempo parallel nonce lanes) |
 | `eth_sendRawTransaction` | `bench send`, `scenario run` (workload setup and `submit`), optionally sender-authenticated |
 | `eth_getTransactionByHash` | `scenario run` (sender-scoped submission RPC; reconcile a rejected or uncertain submission) |
-| `eth_getTransactionReceipt` | `bench send`, `scenario run` (workload setup, `submit await: receipt`, `wait_receipt`, and transaction-hash `wait_log`), optionally sender-authenticated |
+| `eth_getTransactionReceipt` | `bench send` (setup and inclusion waits), `scenario run` (workload setup, `submit await: receipt`, `wait_receipt`, and transaction-hash `wait_log`), optionally sender-authenticated |
+| `eth_getBlockReceipts` | `bench send --collect-receipt-metrics` (post-run non-system receipt gas and fee metrics) |
 | `eth_blockNumber` | `bench send` (query RPC when configured; benchmark block range), `scenario run` (`checkpoint`, confirmations, and block-range log polling) |
 | `eth_getBlockByNumber` | `bench send` (query RPC when configured; per-block stats collection), `scenario run` (`checkpoint`) |
 | `eth_getLogs` | `scenario run` (block-range `wait_log`) |
