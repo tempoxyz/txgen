@@ -352,10 +352,10 @@ fn allow_diagnostic_event(metadata: &tracing::Metadata<'_>) -> bool {
     // only suppresses those events; it never raises the configured log level.
     !matches!(
         metadata.target(),
-        "alloy_transport_http::reqwest_transport" |
-            "alloy_transport_http::hyper_transport" |
-            "alloy_transport::layers::retry" |
-            "alloy_json_rpc::result"
+        "alloy_transport_http::reqwest_transport"
+            | "alloy_transport_http::hyper_transport"
+            | "alloy_transport::layers::retry"
+            | "alloy_json_rpc::result"
     )
 }
 
