@@ -1,7 +1,7 @@
 //! Receipt-based transaction gas metric collection and aggregation.
 
-use crate::sender::{decode_receipt_details, RpcReceiptDetails, RpcSubmitter};
-use alloy_eips::BlockNumberOrTag;
+use crate::sender::{RpcReceiptDetails, RpcSubmitter};
+use alloy_eips::BlockId;
 use alloy_network::primitives::ReceiptResponse;
 use alloy_network::AnyNetwork;
 use alloy_primitives::{Address, TxHash, B256, U256};
@@ -365,19 +365,20 @@ async fn fetch_block_receipts(
     provider: &DynProvider<AnyNetwork>,
     block_number: u64,
 ) -> Result<Vec<RpcReceiptDetails>> {
-    let block = BlockNumberOrTag::Number(block_number);
-    let values = provider
-        .client()
-        .request::<_, Option<Vec<serde_json::Value>>>("eth_getBlockReceipts", (block,))
+    let receipts = provider
+        .get_block_receipts(BlockId::number(block_number))
         .await
-        .wrap_err_with(|| format!("failed to fetch receipts for block {block_number}"))?;
+        .wrap_err_with(|| format!("failed to fetch receipts for block {block_number}"))?
+        .unwrap_or_default();
 
-    values
-        .unwrap_or_default()
+    Ok(receipts
         .into_iter()
-        .map(decode_receipt_details)
-        .collect::<Result<Vec<_>>>()
-        .wrap_err_with(|| format!("failed to decode receipts for block {block_number}"))
+        .map(|receipt| RpcReceiptDetails {
+            gas_used: U256::from(receipt.gas_used()),
+            effective_gas_price: Some(U256::from(receipt.effective_gas_price())),
+            receipt,
+        })
+        .collect())
 }
 
 /// Background collector for confirmed transaction receipt gas fields.
