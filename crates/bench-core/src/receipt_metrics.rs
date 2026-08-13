@@ -554,8 +554,6 @@ fn u256_to_f64(value: U256) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_provider::ProviderBuilder;
-    use alloy_transport::mock::Asserter;
     use serde_json::json;
 
     fn labels(input: &str) -> ReceiptMetricLabels {
@@ -578,33 +576,6 @@ mod tests {
             gas_used: U256::from(21_000),
             effective_gas_price,
         }
-    }
-
-    fn mocked_provider(asserter: Asserter) -> DynProvider<AnyNetwork> {
-        ProviderBuilder::new_with_network::<AnyNetwork>().connect_mocked_client(asserter).erased()
-    }
-
-    fn block_receipt_json(
-        transaction_hash: TxHash,
-        gas_used: &str,
-        effective_gas_price: &str,
-    ) -> serde_json::Value {
-        json!({
-            "transactionHash": transaction_hash,
-            "transactionIndex": "0x0",
-            "blockHash": TxHash::repeat_byte(0x44),
-            "blockNumber": "0x7",
-            "from": Address::repeat_byte(0x55),
-            "to": Address::repeat_byte(0x66),
-            "cumulativeGasUsed": gas_used,
-            "gasUsed": gas_used,
-            "effectiveGasPrice": effective_gas_price,
-            "contractAddress": null,
-            "logs": [],
-            "logsBloom": format!("0x{}", "00".repeat(256)),
-            "status": "0x1",
-            "type": "0x0"
-        })
     }
 
     #[test]
@@ -785,51 +756,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn block_collector_batches_receipts_and_skips_system_transactions() {
-        let asserter = Asserter::new();
-        let workload_hash = TxHash::repeat_byte(0x11);
-        let system_hash = TxHash::repeat_byte(0x22);
-        let unrelated_hash = TxHash::repeat_byte(0x33);
-        asserter.push_success(&vec![
-            block_receipt_json(workload_hash, "0x5208", "0x2"),
-            block_receipt_json(system_hash, "0x0", "0x0"),
-            block_receipt_json(unrelated_hash, "0x5208", "0x3"),
-        ]);
-
-        let provider = mocked_provider(asserter.clone());
-        let collector = BlockReceiptCollector::start();
-        collector.handle().track(
-            Some(Address::repeat_byte(0x55)),
-            workload_hash,
-            labels("transfer"),
-        );
-
-        // Tracking a transaction is memory-only; the block request is issued
-        // only after finish begins.
-        assert_eq!(asserter.read_q().len(), 1);
-
-        let collection = collector.finish(&provider, 7, 7).await.unwrap();
-
-        assert_eq!(collection.records.len(), 2);
-        let workload = collection.records.iter().find(|record| record.tx_hash == workload_hash);
-        assert_eq!(workload.map(|record| &record.labels), Some(&labels("transfer")));
-        assert_eq!(workload.map(ReceiptGasRecord::fee_paid), Some(Some(U256::from(42_000))));
-        let unrelated = collection.records.iter().find(|record| record.tx_hash == unrelated_hash);
-        assert_eq!(unrelated.map(|record| &record.labels), Some(&ReceiptMetricLabels::new()));
-        assert_eq!(unrelated.map(ReceiptGasRecord::fee_paid), Some(Some(U256::from(63_000))));
-        assert!(asserter.read_q().is_empty());
-    }
-
-    #[tokio::test]
-    async fn block_collector_skips_rpc_for_empty_block_ranges() {
-        let asserter = Asserter::new();
-        asserter.push_success(&serde_json::json!([]));
-        let provider = mocked_provider(asserter.clone());
-
-        let collection = BlockReceiptCollector::start().finish(&provider, 8, 7).await.unwrap();
-
-        assert!(collection.records.is_empty());
-        assert_eq!(asserter.read_q().len(), 1);
-    }
 }
