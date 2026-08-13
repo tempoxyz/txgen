@@ -410,10 +410,10 @@ async fn block_by_number(
     provider: &DynProvider<AnyNetwork>,
     block_number: u64,
 ) -> Result<Option<AnyRpcBlock>, StepError> {
-    Ok(provider
+    provider
         .get_block_by_number(BlockNumberOrTag::Number(block_number))
         .await
-        .map_err(StepError::rpc)?)
+        .map_err(StepError::rpc)
 }
 
 fn block_timestamp_ms(block: &AnyRpcBlock) -> Result<Option<u64>, StepError> {
