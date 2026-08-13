@@ -151,7 +151,7 @@ async fn sequencer_encryption_key(
     portal: Address,
 ) -> Result<(B256, u8)> {
     let output = call_portal(provider, portal, "sequencerEncryptionKey()").await?;
-    ensure!(output.len() == 64, "invalid sequencerEncryptionKey response length");
+    ensure!(matches!(output.len(), 64 | 96), "invalid sequencerEncryptionKey response length");
     ensure!(
         output[32..63].iter().all(|byte| *byte == 0),
         "sequencerEncryptionKey returned an invalid y parity"
@@ -416,9 +416,10 @@ zoneId: 9
             SecretKey::from_slice(&Sha256::digest(b"test-sequencer-key")).expect("valid test key");
         let sequencer_public = sequencer_key.public_key().to_encoded_point(true);
         let key_count = U256::from(43).to_be_bytes::<32>();
-        let mut key_response = [0u8; 64];
+        let mut key_response = [0u8; 96];
         key_response[..32].copy_from_slice(&sequencer_public.as_bytes()[1..]);
         key_response[63] = sequencer_public.as_bytes()[0];
+        key_response[76..].copy_from_slice(&[0x11; 20]);
 
         let asserter = Asserter::new();
         asserter.push_success(&Bytes::copy_from_slice(&key_count));
