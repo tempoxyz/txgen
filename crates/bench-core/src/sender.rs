@@ -1180,7 +1180,7 @@ async fn submit_raw_rpc(
     Ok(RpcSubmission { tx_hash, acceptance_latency: start.elapsed(), submitted_at })
 }
 
-fn decode_receipt_details(value: serde_json::Value) -> Result<RpcReceiptDetails> {
+pub(crate) fn decode_receipt_details(value: serde_json::Value) -> Result<RpcReceiptDetails> {
     let effective_gas_price = value
         .get("effectiveGasPrice")
         .filter(|value| !value.is_null())

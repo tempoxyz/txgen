@@ -12,10 +12,10 @@ use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     collect_block_stats, parse_reporters, start_scrapers, total_fees_paid,
-    trim_trailing_empty_blocks, ConsoleReporter, FileSource, FinalReport, GeneratedTx,
-    MetricsCollector, ProgressState, ReceiptCollector, Reporter, RequestAuthProvider, RpcEndpoint,
-    RpcSubmitter, RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig,
-    SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
+    trim_trailing_empty_blocks, BlockReceiptCollector, ConsoleReporter, FileSource, FinalReport,
+    GeneratedTx, MetricsCollector, ProgressState, Reporter, RequestAuthProvider, RpcEndpoint,
+    RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, SenderHeaderAuthProvider,
+    StdinSource, TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -156,16 +156,7 @@ async fn execute_source<S: TxSource>(
         Vec::new()
     };
 
-    let receipt_collector = if args.collect_receipt_metrics {
-        let receipt_submitter = RpcSubmitter::new_with_request_auth(
-            endpoints.clone(),
-            SenderConfig { rate_limit: 0, max_concurrent: args.max_concurrent },
-            request_auth.clone(),
-        )?;
-        Some(ReceiptCollector::start(receipt_submitter, args.max_concurrent))
-    } else {
-        None
-    };
+    let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
     let mut sender =
         Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth);
     if let Some(collector) = &receipt_collector {
@@ -204,13 +195,22 @@ async fn execute_source<S: TxSource>(
         tracing::info!(reason = "--drain-timeout=0", "Skipped txpool drain");
     }
 
+    // Snapshot the range before post-processing starts. Receipt collection uses
+    // one block-level request per block rather than polling each transaction.
+    let end_block =
+        query_provider.get_block_number().await.wrap_err("failed to get ending block number")?;
+    tracing::info!(end_block, "Ending block fetched");
+
     let receipt_collection = match receipt_collector {
         Some(collector) => {
-            let collection = collector.finish().await;
+            let collection = collector
+                .finish(&query_provider, start_block.saturating_add(1), end_block)
+                .await
+                .wrap_err("failed to collect block receipts")?;
             tracing::info!(
                 groups = collection.metrics.len(),
                 records = collection.records.len(),
-                "Receipt gas metrics finalized"
+                "Block receipt gas metrics finalized"
             );
             collection
         }
@@ -253,10 +253,6 @@ async fn execute_source<S: TxSource>(
     // the block that was current before sending (start_block is the last
     // existing block at that point, so start_block+1 is the first block that
     // could contain our transactions) and ends at the current latest block.
-    let end_block =
-        query_provider.get_block_number().await.wrap_err("failed to get ending block number")?;
-    tracing::info!(end_block, "Ending block fetched");
-
     let mut report = FinalReport {
         metadata: metadata.clone(),
         bench_metrics: Some(final_metrics),

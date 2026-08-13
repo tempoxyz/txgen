@@ -1,8 +1,12 @@
 //! Receipt-based transaction gas metric collection and aggregation.
 
-use crate::sender::RpcSubmitter;
-use alloy_network::primitives::ReceiptResponse;
+use crate::sender::{RpcReceiptDetails, RpcSubmitter};
+use alloy_eips::BlockId;
+use alloy_network::{primitives::ReceiptResponse, AnyNetwork};
 use alloy_primitives::{Address, TxHash, B256, U256};
+use alloy_provider::{DynProvider, Provider};
+use eyre::{Context, Result};
+use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -16,6 +20,7 @@ use tokio::{
 
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
+const BLOCK_RECEIPT_FETCH_CONCURRENCY: usize = 8;
 
 /// Stable labels used to group receipt metrics by workload or scenario input.
 pub type ReceiptMetricLabels = BTreeMap<String, String>;
@@ -250,6 +255,129 @@ impl ReceiptCollectorHandle {
             tracked_at: tokio::time::Instant::now(),
         });
     }
+}
+
+/// Deferred receipt collector for benchmark-wide gas metrics.
+///
+/// Unlike [`ReceiptCollector`], this collector performs no RPC work while the
+/// workload is running. It only retains the labels attached to accepted
+/// transactions so the post-run block receipts can preserve the existing
+/// report shape. [`finish`](Self::finish) fetches all receipts in the selected
+/// block range and excludes Tempo system transactions.
+pub struct BlockReceiptCollector {
+    handle: ReceiptCollectorHandle,
+    receiver: mpsc::UnboundedReceiver<ReceiptRequest>,
+}
+
+impl BlockReceiptCollector {
+    /// Start a collector that does not issue any requests until [`finish`](Self::finish).
+    pub fn start() -> Self {
+        let (requests, receiver) = mpsc::unbounded_channel();
+        Self { handle: ReceiptCollectorHandle { requests }, receiver }
+    }
+
+    /// Return a cloneable registration handle for submission paths.
+    pub fn handle(&self) -> ReceiptCollectorHandle {
+        self.handle.clone()
+    }
+
+    /// Fetch and aggregate receipts for the block range after submission ends.
+    pub async fn finish(
+        self,
+        provider: &DynProvider<AnyNetwork>,
+        start_block: u64,
+        end_block: u64,
+    ) -> Result<ReceiptCollection> {
+        let Self { handle, mut receiver } = self;
+        drop(handle);
+
+        let mut tracked = BTreeMap::<TxHash, Vec<ReceiptRequest>>::new();
+        let mut seen = BTreeSet::new();
+        while let Some(request) = receiver.recv().await {
+            if seen.insert(request.dedup_key()) {
+                tracked.entry(request.tx_hash).or_default().push(request);
+            }
+        }
+
+        collect_block_receipts(provider, start_block, end_block, tracked).await
+    }
+}
+
+/// Fetch all block receipts in a range and aggregate non-system transactions.
+///
+/// The block range is assumed to contain only the benchmark workload and
+/// protocol system transactions. No transaction-hash filter is applied. Tempo
+/// system transactions consume zero gas and are excluded by their zero
+/// `gasUsed` receipt.
+async fn collect_block_receipts(
+    provider: &DynProvider<AnyNetwork>,
+    start_block: u64,
+    end_block: u64,
+    mut tracked: BTreeMap<TxHash, Vec<ReceiptRequest>>,
+) -> Result<ReceiptCollection> {
+    if start_block > end_block {
+        return Ok(ReceiptCollection::default());
+    }
+
+    let mut blocks = stream::iter(start_block..=end_block)
+        .map(|number| fetch_block_receipts(provider, number))
+        .buffer_unordered(BLOCK_RECEIPT_FETCH_CONCURRENCY);
+
+    let mut records = Vec::new();
+    while let Some(block_receipts) = blocks.next().await {
+        for details in block_receipts? {
+            if details.gas_used.is_zero() {
+                continue;
+            }
+
+            let tx_hash = details.receipt.transaction_hash();
+            let requests = tracked.remove(&tx_hash).unwrap_or_else(|| {
+                vec![ReceiptRequest {
+                    sender: None,
+                    tx_hash,
+                    labels: BTreeMap::new(),
+                    scenario_instance: None,
+                    tracked_at: tokio::time::Instant::now(),
+                }]
+            });
+
+            for request in requests {
+                records.push(ReceiptGasRecord {
+                    tx_hash,
+                    sender: request.sender.or_else(|| Some(details.receipt.from())),
+                    labels: request.labels,
+                    scenario_instance: request.scenario_instance,
+                    success: details.receipt.status(),
+                    block_number: details.receipt.block_number(),
+                    block_hash: details.receipt.block_hash(),
+                    gas_used: details.gas_used,
+                    effective_gas_price: details.effective_gas_price,
+                });
+            }
+        }
+    }
+
+    Ok(ReceiptCollection::from_records(records))
+}
+
+async fn fetch_block_receipts(
+    provider: &DynProvider<AnyNetwork>,
+    block_number: u64,
+) -> Result<Vec<RpcReceiptDetails>> {
+    let receipts = provider
+        .get_block_receipts(BlockId::number(block_number))
+        .await
+        .wrap_err_with(|| format!("failed to fetch receipts for block {block_number}"))?
+        .unwrap_or_default();
+
+    Ok(receipts
+        .into_iter()
+        .map(|receipt| RpcReceiptDetails {
+            gas_used: U256::from(receipt.gas_used()),
+            effective_gas_price: Some(U256::from(receipt.effective_gas_price())),
+            receipt,
+        })
+        .collect())
 }
 
 /// Background collector for confirmed transaction receipt gas fields.

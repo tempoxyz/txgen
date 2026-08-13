@@ -28,10 +28,10 @@ pub struct SendArgs {
     #[arg(long = "rpc-url", value_delimiter = ',', default_values_t = vec!["http://localhost:8545".to_string()])]
     pub rpc_urls: Vec<String>,
 
-    /// Optional RPC endpoint for aggregate block and txpool queries.
+    /// Optional RPC endpoint for aggregate block, block-receipt, and txpool queries.
     ///
-    /// Transaction submission and sender-scoped receipt polling continue to
-    /// use --rpc-url. When omitted, aggregate queries use the first --rpc-url.
+    /// Transaction submission continues to use --rpc-url. When omitted,
+    /// aggregate queries use the first --rpc-url.
     #[arg(long)]
     pub query_rpc_url: Option<String>,
 
@@ -130,9 +130,10 @@ pub struct SendArgs {
     #[arg(long)]
     pub collect_latencies: bool,
 
-    /// Collect receipt-derived gas metrics for every accepted workload transaction.
+    /// Collect receipt-derived gas metrics for non-system transactions in the benchmark block
+    /// range.
     ///
-    /// Disabled by default because receipt polling adds substantial RPC load.
+    /// Receipts are fetched in batches after the workload completes.
     #[arg(long)]
     pub collect_receipt_metrics: bool,
 
