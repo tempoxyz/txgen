@@ -2,8 +2,7 @@
 
 use crate::sender::{RpcReceiptDetails, RpcSubmitter};
 use alloy_eips::BlockId;
-use alloy_network::primitives::ReceiptResponse;
-use alloy_network::AnyNetwork;
+use alloy_network::{primitives::ReceiptResponse, AnyNetwork};
 use alloy_primitives::{Address, TxHash, B256, U256};
 use alloy_provider::{DynProvider, Provider};
 use eyre::{Context, Result};
