@@ -9,13 +9,17 @@ use clap::{Args, Parser, Subcommand};
 use eyre::{bail, Context, Result};
 use std::{collections::HashSet, path::PathBuf, time::Duration};
 
-use crate::metrics_url::{parse_metrics_url, MetricsURL};
+use crate::{
+    metrics_url::{parse_metrics_url, MetricsURL},
+    wait_for_persistence::WaitForPersistence,
+};
 
 mod metrics_forwarder;
 mod metrics_url;
 mod send;
 mod send_blocks;
 mod view;
+mod wait_for_persistence;
 
 /// Arguments for the `send` subcommand.
 #[derive(Args)]
@@ -170,7 +174,7 @@ pub struct SendBlocksArgs {
     /// Controls whether reth_newPayload blocks until the persistence
     /// threshold is crossed. Default is never.
     #[arg(long, default_value = "never", value_parser = parse_wait_for_persistence)]
-    pub wait_for_persistence: bench_core::WaitForPersistence,
+    pub(crate) wait_for_persistence: WaitForPersistence,
 
     /// Minimum interval between block submissions.
     ///
@@ -303,10 +307,10 @@ fn parse_reorg_depth(s: &str) -> Result<usize, String> {
     Ok(depth)
 }
 
-fn parse_wait_for_persistence(s: &str) -> Result<bench_core::WaitForPersistence, String> {
+fn parse_wait_for_persistence(s: &str) -> Result<WaitForPersistence, String> {
     match s {
-        "always" => Ok(bench_core::WaitForPersistence::Always),
-        "never" => Ok(bench_core::WaitForPersistence::Never),
+        "always" => Ok(WaitForPersistence::Always),
+        "never" => Ok(WaitForPersistence::Never),
         s if s.starts_with("every:") => {
             let n = s
                 .strip_prefix("every:")
@@ -316,7 +320,7 @@ fn parse_wait_for_persistence(s: &str) -> Result<bench_core::WaitForPersistence,
             if n == 0 {
                 return Err("every:N requires N > 0".to_string());
             }
-            Ok(bench_core::WaitForPersistence::EveryN(n))
+            Ok(WaitForPersistence::EveryN(n))
         }
         _ => Err(format!("invalid value '{s}': expected 'always', 'never', or 'every:N'")),
     }

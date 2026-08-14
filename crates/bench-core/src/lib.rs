@@ -5,7 +5,6 @@
 //! - [`sender`] - Sending with scheduling key ordering + rate limiting
 //! - [`metrics`] - Collection (sent/success/failed counts, timing)
 //! - [`reporter`] - Output (console, JSON + NDJSON samples, ClickHouse, Prometheus remote write)
-//! - [`reth_api`] - reth custom Engine API types (`reth_newPayload`, `reth_forkchoiceUpdated`)
 
 pub mod auth;
 pub mod clickhouse;
@@ -16,7 +15,6 @@ pub mod prometheus_reporter;
 pub mod receipt_clickhouse;
 pub mod receipt_metrics;
 pub mod reporter;
-pub mod reth_api;
 pub mod sample;
 pub mod scraper;
 pub mod sender;
@@ -48,10 +46,6 @@ pub use reporter::{
     parse_reporters, ClickHouseConfig, ClickHouseReporter, ConsoleReporter, FinalReport,
     JsonLatency, JsonLatencySample, JsonReport, JsonReporter, JsonTimeSeries, ProgressState,
     Reporter,
-};
-pub use reth_api::{
-    BigBlockData, RethApi, RethForkchoiceUpdated, RethNewPayloadInput, RethPayloadStatus,
-    WaitForPersistence, DEFAULT_PERSISTENCE_THRESHOLD,
 };
 pub use sample::{Sample, SampleArchive, SampleStore};
 pub use scraper::{start_scrapers, SampleCallback, ScraperConfig, ScraperHandle};

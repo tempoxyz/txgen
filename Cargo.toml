@@ -33,6 +33,7 @@ alloy-signer-local = "2"
 alloy-consensus = { version = "2", features = ["k256"] }
 alloy-network = "2"
 alloy-provider = { version = "2", features = ["debug-api", "engine-api", "ws"] }
+alloy-reth = "0.2"
 alloy-rpc-types-eth = "2"
 alloy-eips = "2"
 alloy-rlp = "0.3"
