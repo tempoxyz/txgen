@@ -347,6 +347,9 @@ impl RpcSubmitter {
 
     /// Fetch a transaction receipt while preserving optional fee-field
     /// presence from the raw RPC response.
+    ///
+    /// Alloy's typed receipt normalizes absent fee fields to zero, so this
+    /// intentionally decodes the raw response.
     pub async fn get_transaction_receipt_details(
         &self,
         sender: Option<Address>,
@@ -388,12 +391,9 @@ impl RpcSubmitter {
             self.headers_for(&endpoint, "eth_getTransactionByHash", sender, Some(tx_hash))?;
         endpoint
             .provider()
-            .client()
-            .request::<_, Option<serde_json::Value>>("eth_getTransactionByHash", (tx_hash,))
-            .map_meta(|mut meta| {
-                meta.headers_mut().extend(headers);
-                meta
-            })
+            .get_transaction_by_hash(tx_hash)
+            .with_headers(headers)
+            .map_err(|_| eyre::eyre!("typed transaction lookup did not expose request metadata"))?
             .await
             .map(|transaction| transaction.is_some())
             .map_err(|error| {
@@ -1156,6 +1156,16 @@ async fn send_raw_transaction(
     raw: &Bytes,
     headers: HeaderMap,
 ) -> alloy_transport::TransportResult<TxHash> {
+    // `send_raw_transaction` returns a pending-transaction builder rather
+    // than a `ProviderCall`, so authenticated requests need this fallback.
+    if headers.is_empty() {
+        return endpoint
+            .provider()
+            .send_raw_transaction(raw)
+            .await
+            .map(|pending| *pending.tx_hash());
+    }
+
     let encoded = format!("0x{}", hex::encode(raw));
     endpoint
         .provider()
@@ -1236,12 +1246,9 @@ async fn wait_for_receipt(
         };
         let receipt = endpoint
             .provider()
-            .client()
-            .request::<_, Option<AnyTransactionReceipt>>("eth_getTransactionReceipt", (tx_hash,))
-            .map_meta(|mut meta| {
-                meta.headers_mut().extend(headers);
-                meta
-            })
+            .get_transaction_receipt(tx_hash)
+            .with_headers(headers)
+            .map_err(|_| eyre::eyre!("typed receipt lookup did not expose request metadata"))?
             .await?;
         if let Some(receipt) = receipt {
             return Ok(receipt.status());
