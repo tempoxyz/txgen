@@ -4,28 +4,29 @@
 //! lines from stdin or file (produced by `txgen extract`). Lines may include
 //! optional RLP-encoded `bal` bytes. Submits each block via `reth_newPayload`
 //! (as `BlockRlp`) and `reth_forkchoiceUpdated`,
-//! collecting per-block timing and engine status from [`RethPayloadStatus`].
+//! collecting per-block timing and engine status from [`alloy_reth::RethPayloadStatus`].
 
 use crate::{
     load_metric_names,
     metrics_forwarder::{build_metrics_forwarder, finish_metrics_forwarder, push_samples},
     metrics_url::metrics_scraper_configs,
     send::parse_metadata,
+    wait_for_persistence::WaitForPersistence,
     SendBlocksArgs,
 };
 use alloy_consensus::Header as ConsensusHeader;
 use alloy_network::Ethereum;
 use alloy_primitives::{Address, Bytes, B256};
 use alloy_provider::{ext::TestingApi, Provider, RootProvider};
+use alloy_reth::{BigBlockData, RethApi, RethNewPayloadInput, RethNewPayloadParams};
 use alloy_rlp::{Decodable, Header};
 use alloy_rpc_types_engine::{
     ExecutionData, ForkchoiceState, JwtSecret, PayloadAttributes, TestingBuildBlockRequestV1,
 };
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    parse_reporters, start_scrapers, BigBlockData, BlockStats, ConsoleReporter, FinalReport,
-    ProgressState, Reporter, RethApi, RethNewPayloadInput, RunClock, RunStats, Sample, SampleStore,
-    WaitForPersistence,
+    parse_reporters, start_scrapers, BlockStats, ConsoleReporter, FinalReport, ProgressState,
+    Reporter, RunClock, RunStats, Sample, SampleStore,
 };
 use eyre::{Context, Result};
 use std::{
@@ -380,12 +381,17 @@ async fn process_block(
     forkchoice_anchor: Option<B256>,
     persistence_policy: &WaitForPersistence,
 ) -> Result<()> {
-    let input = RethNewPayloadInput::BlockRlp { block: block.raw.clone(), bal: block.bal.clone() };
+    let input: RethNewPayloadInput<()> = match block.bal.clone() {
+        Some(bal) => RethNewPayloadInput::block_rlp_with_bal(block.raw.clone(), bal),
+        None => RethNewPayloadInput::block_rlp(block.raw.clone()),
+    };
     let wait = persistence_policy.should_wait(collector.blocks_submitted());
 
     let new_payload_start = Instant::now();
-    let payload_status =
-        provider.reth_new_payload(input, wait).await.wrap_err("reth_newPayload failed")?;
+    let payload_status = provider
+        .reth_new_payload(RethNewPayloadParams::new(input).with_wait_for_persistence(wait))
+        .await
+        .wrap_err("reth_newPayload failed")?;
     let new_payload_latency = new_payload_start.elapsed();
 
     if !payload_status.status.is_valid() {
@@ -547,7 +553,7 @@ async fn process_synthetic_block(
     block: &BlockLine,
     parent_block_hash: B256,
     branch_point_hash: B256,
-    wait: Option<bool>,
+    wait: bool,
 ) -> Result<B256> {
     let transactions = extract_tx_bytes_from_block_rlp(block.raw.as_ref()).wrap_err_with(|| {
         format!("failed to extract raw transaction bytes from block {}", block.number)
@@ -586,7 +592,10 @@ async fn process_synthetic_block(
     let execution_data = ExecutionData::new(payload, sidecar);
 
     let payload_status = provider
-        .reth_new_payload(RethNewPayloadInput::ExecutionData(Box::new(execution_data)), wait)
+        .reth_new_payload(
+            RethNewPayloadParams::new(RethNewPayloadInput::execution_data(execution_data))
+                .with_wait_for_persistence(wait),
+        )
         .await
         .wrap_err_with(|| {
             format!("reth_newPayload failed for synthetic fork block after block {}", block.number)
@@ -838,11 +847,13 @@ async fn process_big_block(
     let gas_limit = big_block.env_switches.iter().map(|data| data.payload.gas_limit()).sum();
     let wait = persistence_policy.should_wait(collector.blocks_submitted());
 
-    let input = RethNewPayloadInput::BigBlockData(Box::new(big_block.clone()));
+    let input = RethNewPayloadInput::big_block_data(big_block.clone());
 
     let new_payload_start = Instant::now();
-    let payload_status =
-        provider.reth_new_payload(input, wait).await.wrap_err("reth_newPayload failed")?;
+    let payload_status = provider
+        .reth_new_payload(RethNewPayloadParams::new(input).with_wait_for_persistence(wait))
+        .await
+        .wrap_err("reth_newPayload failed")?;
     let new_payload_latency = new_payload_start.elapsed();
 
     if !payload_status.status.is_valid() {

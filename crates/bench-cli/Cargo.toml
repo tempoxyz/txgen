@@ -25,6 +25,7 @@ alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-network.workspace = true
 alloy-provider = { version = "2", features = ["hyper", "txpool-api"] }
+alloy-reth.workspace = true
 alloy-rpc-client = "2"
 alloy-rlp.workspace = true
 alloy-rpc-types-engine = { version = "2", features = ["jwt"] }
