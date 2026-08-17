@@ -949,6 +949,14 @@ async fn wait_for_transaction_log(
         {
             continue;
         }
+        if !canonical.status() {
+            return Err(StepError::new(
+                "reverted_receipt",
+                format!(
+                    "transaction {transaction_hash} reverted before emitting the expected event"
+                ),
+            ));
+        }
         let Some(block) =
             canonical_block(&observation.query_provider, block_number, block_hash).await?
         else {
@@ -1182,6 +1190,14 @@ pub(crate) async fn wait_for_transaction_events(
             canonical.block_number() != Some(block_number)
         {
             continue;
+        }
+        if !canonical.status() {
+            return Err(StepError::new(
+                "reverted_receipt",
+                format!(
+                    "transaction {transaction_hash} reverted before emitting the expected events"
+                ),
+            ));
         }
         let Some(block) =
             canonical_block(&observation.query_provider, block_number, block_hash).await?
@@ -2004,6 +2020,81 @@ mod tests {
         };
         assert!(events.contains_key("processed"));
         assert!(events.contains_key("callback"));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn receipt_scoped_log_reports_reverted_transaction_hash() {
+        let transaction_hash = B256::repeat_byte(0x44);
+        let block_hash = B256::repeat_byte(0x33);
+        let receipt = receipt_json(transaction_hash, block_hash, false, Vec::new());
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        let provider = mocked_provider(asserter.clone());
+        let submitter = mock_submitter(&provider);
+        let observer = ObservationRuntime::polling(provider, Duration::from_millis(1));
+        let matcher =
+            EventMatcher::new(&event_abi(), "Moved", &BTreeMap::new(), &RuntimeContext::empty())
+                .unwrap();
+
+        let result = wait_for_transaction_log(
+            &observer,
+            &submitter,
+            TransactionLogWait {
+                chain: "chain_a",
+                sender: None,
+                transaction_hash,
+                address: None,
+                matcher: &matcher,
+                confirmations: 0,
+                subscription: SubscriptionBehavior::Disabled,
+            },
+        )
+        .await;
+        let Err(error) = result else { panic!("expected reverted receipt error") };
+
+        assert_eq!(error.classification, "reverted_receipt");
+        assert!(error.sanitized_detail().unwrap().contains(&transaction_hash.to_string()));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn grouped_receipt_events_report_reverted_transaction_hash() {
+        let transaction_hash = B256::repeat_byte(0x44);
+        let block_hash = B256::repeat_byte(0x33);
+        let receipt = receipt_json(transaction_hash, block_hash, false, Vec::new());
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        asserter.push_success(&receipt);
+        let provider = mocked_provider(asserter.clone());
+        let submitter = mock_submitter(&provider);
+        let observer = ObservationRuntime::polling(provider, Duration::from_millis(1));
+        let event = prepare_receipt_event(
+            "processed",
+            &event_abi(),
+            "Moved",
+            None,
+            &BTreeMap::new(),
+            &RuntimeContext::empty(),
+        )
+        .unwrap();
+
+        let result = wait_for_transaction_events(
+            &observer,
+            &submitter,
+            "chain_a",
+            None,
+            transaction_hash,
+            &[event],
+            0,
+            SubscriptionBehavior::Disabled,
+        )
+        .await;
+        let Err(error) = result else { panic!("expected reverted receipt error") };
+
+        assert_eq!(error.classification, "reverted_receipt");
+        assert!(error.sanitized_detail().unwrap().contains(&transaction_hash.to_string()));
         assert!(asserter.read_q().is_empty());
     }
 
