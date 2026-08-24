@@ -34,6 +34,10 @@ config.verify_every_steps = 25;
 let result = campaigns.run("zone-backing", config).await?;
 ```
 
+Set `config.continuous = true` (or pass `--continuous` to
+`txgen-tempo-property`) to generate fresh cases until the first failure or
+process shutdown. Fixed case counts remain useful for CI and replay.
+
 Normal runs use `RunConfig::random`, so seed choice is not embedded in workload behavior. An
 explicit `RunConfig::seeded` exists only for replay and tests.
 

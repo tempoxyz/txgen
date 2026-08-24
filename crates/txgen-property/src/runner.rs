@@ -88,6 +88,8 @@ pub trait CampaignHarness<W: WorkloadGenerator> {
 pub struct RunConfig {
     /// Number of independent cases.
     pub cases: u64,
+    /// Keep generating cases until the first failure or process shutdown.
+    pub continuous: bool,
     /// Maximum generated actions per case.
     pub max_steps: usize,
     /// Run the independent verifier every N executed actions. Zero disables
@@ -106,6 +108,7 @@ impl RunConfig {
     pub fn random(cases: u64, max_steps: usize) -> Self {
         Self {
             cases,
+            continuous: false,
             max_steps,
             verify_every_steps: 25,
             swarm: SwarmPolicy::default(),
@@ -118,6 +121,7 @@ impl RunConfig {
     pub fn seeded(cases: u64, max_steps: usize, seed: u64) -> Self {
         Self {
             cases,
+            continuous: false,
             max_steps,
             verify_every_steps: 25,
             swarm: SwarmPolicy::default(),
@@ -173,7 +177,8 @@ where
     let mut abi = AbiValueGenerator::default();
     let mut report = RunReport { seed: config.seed, ..RunReport::default() };
 
-    for case_index in 0..config.cases {
+    let case_limit = if config.continuous { u64::MAX } else { config.cases };
+    for case_index in 0..case_limit {
         harness
             .reset_case()
             .await
