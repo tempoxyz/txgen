@@ -15,6 +15,7 @@ txgen-core = { path = "crates/txgen-core" }
 txgen-ethereum = { path = "crates/txgen-ethereum" }
 txgen-tempo = { path = "crates/txgen-tempo" }
 txgen-cli = { path = "crates/txgen-cli" }
+txgen-property = { path = "crates/txgen-property" }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -37,6 +38,7 @@ alloy-reth = "0.2"
 alloy-rpc-types-eth = "2"
 alloy-eips = "2"
 alloy-rlp = "0.3"
+alloy-sol-types = "1"
 
 # tempo
 tempo-alloy = "1"
@@ -58,3 +60,5 @@ eyre = "0.6"
 tokio = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1"
+abi-fuzz = { git = "https://github.com/tempoxyz/abi-fuzz", rev = "2d8dac35d70fa13072f183ea8c9a90d144e3144f" }
+reqwest = { version = "0.13", features = ["json"] }

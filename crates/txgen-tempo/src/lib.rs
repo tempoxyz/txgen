@@ -1,5 +1,6 @@
 pub mod auth_token_map;
 mod nonce;
+pub mod property;
 mod template;
 mod zone;
 pub mod zone_auth;

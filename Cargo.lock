@@ -3,6 +3,18 @@
 version = 4
 
 [[package]]
+name = "abi-fuzz"
+version = "0.1.0"
+source = "git+https://github.com/tempoxyz/abi-fuzz?rev=2d8dac35d70fa13072f183ea8c9a90d144e3144f#2d8dac35d70fa13072f183ea8c9a90d144e3144f"
+dependencies = [
+ "alloy-dyn-abi",
+ "alloy-json-abi",
+ "alloy-primitives",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2261,6 +2273,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "encoding_rs"
+version = "0.8.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "enum-ordinalize"
 version = "4.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4279,7 +4300,9 @@ checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "encoding_rs",
  "futures-core",
+ "h2",
  "http 1.4.2",
  "http-body",
  "http-body-util",
@@ -4288,6 +4311,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -6060,16 +6084,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "txgen-property"
+version = "0.1.0"
+dependencies = [
+ "abi-fuzz",
+ "alloy-dyn-abi",
+ "eyre",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "txgen-tempo"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "alloy-consensus",
+ "alloy-dyn-abi",
  "alloy-eips",
  "alloy-network",
  "alloy-primitives",
  "alloy-provider",
+ "alloy-rpc-types-eth",
  "alloy-signer",
+ "alloy-sol-types",
  "alloy-transport",
  "axum",
  "clap",
@@ -6078,6 +6120,7 @@ dependencies = [
  "hkdf",
  "k256",
  "rand 0.9.4",
+ "reqwest",
  "rustix",
  "serde",
  "serde_json",
@@ -6088,6 +6131,7 @@ dependencies = [
  "tokio",
  "txgen-cli",
  "txgen-core",
+ "txgen-property",
  "zeroize",
 ]
 
