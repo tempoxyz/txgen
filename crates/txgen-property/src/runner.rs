@@ -5,43 +5,27 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{to_value, Value};
 
-use crate::{AbiValueGenerator, FailureArtifact, FailureStage, GenerateContext, SwarmPolicy};
+use crate::{
+    AbiValueGenerator, ActionArtifact, FailureArtifact, GenerateContext, SwarmPolicy,
+    VerificationTrigger,
+};
 
-/// A model's predicted next state and expected execution outcome.
-#[derive(Clone, Debug, Serialize)]
-pub struct Prediction<S, E> {
-    /// Candidate state to commit after successful verification.
-    pub state: S,
-    /// Model-defined expected execution outcome.
-    pub expected: E,
-}
-
-/// Protocol model driven by the generic property runner.
-pub trait PropertyModel: Sized {
-    /// Stable model name used by registries and failure artifacts.
+/// Stateless action generation for one live property campaign.
+///
+/// A workload generator owns only randomized action construction. It does not
+/// predict transaction outcomes or maintain a parallel copy of protocol state.
+pub trait WorkloadGenerator: Sized {
+    /// Stable campaign name used by registries and failure artifacts.
     const NAME: &'static str;
-    /// Stable model semantics/serialization version.
+    /// Stable campaign semantics/serialization version.
     const VERSION: &'static str;
 
-    /// Complete committed model state.
-    type State: Clone + Debug + Serialize;
     /// Per-case swarm configuration.
     type Swarm: Clone + Debug + DeserializeOwned + Serialize;
     /// Selectable action family.
     type ActionKind: Clone + Debug;
     /// Concrete replayable action.
     type Action: Clone + Debug + DeserializeOwned + Serialize;
-    /// Expected execution classification.
-    type Expected: Clone + Debug + Serialize;
-    /// Harness execution result.
-    type Trace: Clone + Debug + Serialize;
-    /// Model-defined observation request.
-    type ObservationRequest: Clone + Debug;
-    /// Observed protocol state.
-    type Observation: Clone + Debug + Serialize;
-
-    /// Return the last committed state.
-    fn state(&self) -> &Self::State;
 
     /// Generate one swarm configuration.
     fn generate_swarm(
@@ -50,60 +34,53 @@ pub trait PropertyModel: Sized {
         policy: &SwarmPolicy,
     ) -> Result<Self::Swarm>;
 
-    /// Return actions enabled by both the swarm and current model state.
+    /// Return action families enabled by the generated swarm.
     fn enabled_actions(&self, swarm: &Self::Swarm) -> Vec<Self::ActionKind>;
 
-    /// Generate one concrete action.
+    /// Generate one concrete action using ABI-shaped randomized values.
     fn generate_action(
         &self,
         swarm: &Self::Swarm,
         kind: &Self::ActionKind,
         context: &mut GenerateContext<'_>,
     ) -> Result<Self::Action>;
-
-    /// Predict the result without mutating committed state.
-    fn predict(&self, action: &Self::Action) -> Result<Prediction<Self::State, Self::Expected>>;
-
-    /// Describe observations required to verify one transition.
-    fn transition_observation(&self, action: &Self::Action) -> Self::ObservationRequest;
-
-    /// Verify execution and observations against a prediction, returning the
-    /// reconciled state to commit. This permits RPC models to refresh fields
-    /// affected by transaction fees or other observable execution metadata.
-    fn verify_transition(
-        &self,
-        prediction: &Prediction<Self::State, Self::Expected>,
-        action: &Self::Action,
-        trace: &Self::Trace,
-        observation: &Self::Observation,
-    ) -> Result<Self::State>;
-
-    /// Describe observations required for the final full-state check.
-    fn final_observation(&self) -> Self::ObservationRequest;
-
-    /// Verify all global invariants at the end of a case.
-    fn verify_all(&self, observation: &Self::Observation) -> Result<()>;
-
-    /// Commit a state that has passed verification.
-    fn commit(&mut self, state: Self::State);
 }
 
-/// Topology/execution adapter for one model.
-pub trait PropertyHarness<M: PropertyModel> {
-    /// Restore a clean baseline and initialize a fresh model.
-    fn reset_and_initialize(&mut self) -> impl Future<Output = Result<M>> + Send;
+/// Live execution, lifecycle correlation, and independent verification boundary.
+pub trait CampaignHarness<W: WorkloadGenerator> {
+    /// Receipt or execution result returned for an action.
+    type Trace: Clone + Debug + Serialize;
+    /// Actual correlated events proving a terminal lifecycle state.
+    type TerminalEvidence: Clone + Debug + Serialize;
+    /// Complete independent invariant report.
+    type Verification: Clone + Debug + Serialize;
 
-    /// Execute one concrete action.
+    /// Prepare a new case. This may reset an isolated topology or attach to the
+    /// current live topology, but it does not construct protocol model state.
+    fn reset_case(&mut self) -> impl Future<Output = Result<()>> + Send;
+
+    /// Submit one concrete action and return its actual execution evidence.
     fn execute<'a>(
         &'a mut self,
-        action: &'a M::Action,
-    ) -> impl Future<Output = Result<M::Trace>> + Send + 'a;
+        action: &'a W::Action,
+    ) -> impl Future<Output = Result<Self::Trace>> + Send + 'a;
 
-    /// Resolve a model-defined observation request.
-    fn observe<'a>(
+    /// Correlate the action with its terminal cross-layer lifecycle events.
+    /// Return `None` when the action has no terminal lifecycle transition.
+    fn await_terminal<'a>(
         &'a mut self,
-        request: &'a M::ObservationRequest,
-    ) -> impl Future<Output = Result<M::Observation>> + Send + 'a;
+        action: &'a W::Action,
+        trace: &'a Self::Trace,
+    ) -> impl Future<Output = Result<Option<Self::TerminalEvidence>>> + Send + 'a;
+
+    /// Run the independent invariant verifier against chain-derived state.
+    fn verify(
+        &mut self,
+        trigger: VerificationTrigger,
+    ) -> impl Future<Output = Result<Self::Verification>> + Send;
+
+    /// Return an invariant violation contained in a completed report.
+    fn violation(&self, verification: &Self::Verification) -> Option<String>;
 }
 
 /// Controls for one property run.
@@ -113,6 +90,9 @@ pub struct RunConfig {
     pub cases: u64,
     /// Maximum generated actions per case.
     pub max_steps: usize,
+    /// Run the independent verifier every N executed actions. Zero disables
+    /// interval checks; terminal and final verification remain mandatory.
+    pub verify_every_steps: usize,
     /// Swarm selection policy.
     pub swarm: SwarmPolicy,
     /// Run seed. Defaults to OS-seeded randomness through [`RunConfig::random`].
@@ -127,6 +107,7 @@ impl RunConfig {
         Self {
             cases,
             max_steps,
+            verify_every_steps: 25,
             swarm: SwarmPolicy::default(),
             seed: rand::rng().random(),
             failure_directory: None,
@@ -135,7 +116,14 @@ impl RunConfig {
 
     /// Construct a deterministic configuration for debugging and tests.
     pub fn seeded(cases: u64, max_steps: usize, seed: u64) -> Self {
-        Self { cases, max_steps, swarm: SwarmPolicy::default(), seed, failure_directory: None }
+        Self {
+            cases,
+            max_steps,
+            verify_every_steps: 25,
+            swarm: SwarmPolicy::default(),
+            seed,
+            failure_directory: None,
+        }
     }
 
     fn validate(&self) -> Result<()> {
@@ -157,8 +145,10 @@ pub struct RunReport {
     pub seed: u64,
     /// Fully completed cases.
     pub completed_cases: u64,
-    /// Successfully verified transitions.
+    /// Executed actions that reached the verification loop.
     pub completed_steps: u64,
+    /// Independent invariant checks completed successfully.
+    pub completed_verifications: u64,
 }
 
 /// Result of a property run.
@@ -166,17 +156,17 @@ pub struct RunReport {
 pub struct RunResult {
     /// Run counters up to success or failure.
     pub report: RunReport,
-    /// First model failure, if any.
+    /// First invariant failure, if any.
     pub failure: Option<FailureArtifact>,
     /// Written failure path when a directory was configured.
     pub failure_path: Option<PathBuf>,
 }
 
-/// Run independent swarm-generated cases until completion or the first model failure.
-pub async fn run<M, H>(harness: &mut H, config: RunConfig) -> Result<RunResult>
+/// Run independent swarm-generated cases until completion or the first invariant failure.
+pub async fn run<W, H>(workload: &W, harness: &mut H, config: RunConfig) -> Result<RunResult>
 where
-    M: PropertyModel,
-    H: PropertyHarness<M>,
+    W: WorkloadGenerator,
+    H: CampaignHarness<W>,
 {
     config.validate()?;
     let mut rng = StdRng::seed_from_u64(config.seed);
@@ -184,108 +174,147 @@ where
     let mut report = RunReport { seed: config.seed, ..RunReport::default() };
 
     for case_index in 0..config.cases {
-        let mut model = harness
-            .reset_and_initialize()
+        harness
+            .reset_case()
             .await
             .wrap_err_with(|| format!("failed to initialize property case {case_index}"))?;
-        let swarm = executable_swarm(&model, &config.swarm, &mut rng)?;
+        let swarm = executable_swarm(workload, &config.swarm, &mut rng)?;
         let target_steps = rng.random_range(1..=config.max_steps);
         let mut actions = Vec::with_capacity(target_steps);
 
         for step_index in 0..target_steps {
-            let enabled = model.enabled_actions(&swarm);
+            let enabled = workload.enabled_actions(&swarm);
             if enabled.is_empty() {
                 break;
             }
             let kind = enabled[rng.random_range(0..enabled.len())].clone();
-            let action = model.generate_action(
+            let action = workload.generate_action(
                 &swarm,
                 &kind,
                 &mut GenerateContext { rng: &mut rng, abi: &mut abi, case_index, step_index },
             )?;
-            let prediction = model.predict(&action)?;
-            let committed_state = to_json(model.state(), "committed model state")?;
-            actions.push(to_json(&action, "property action")?);
             let trace = harness.execute(&action).await?;
-            let request = model.transition_observation(&action);
-            let observation = harness.observe(&request).await?;
-
-            let reconciled_state =
-                match model.verify_transition(&prediction, &action, &trace, &observation) {
-                    Ok(state) => state,
-                    Err(error) => {
-                        let failure = FailureArtifact {
-                            model: M::NAME.to_string(),
-                            model_version: M::VERSION.to_string(),
-                            seed: config.seed,
-                            case_index,
-                            step_index: Some(step_index),
-                            stage: FailureStage::Transition,
-                            error: format!("{error:#}"),
-                            swarm: to_json(&swarm, "property swarm")?,
-                            actions,
-                            committed_state,
-                            predicted_state: Some(to_json(
-                                &prediction.state,
-                                "predicted model state",
-                            )?),
-                            expected: Some(to_json(&prediction.expected, "expected outcome")?),
-                            trace: Some(to_json(&trace, "execution trace")?),
-                            observation: to_json(&observation, "transition observation")?,
-                        };
-                        return finish_failure(
-                            report,
-                            failure,
-                            config.failure_directory.as_deref(),
-                        );
-                    }
-                };
-
-            model.commit(reconciled_state);
+            let terminal = harness.await_terminal(&action, &trace).await?;
+            actions.push(ActionArtifact {
+                action: to_json(&action, "property action")?,
+                trace: to_json(&trace, "execution trace")?,
+                terminal_evidence: terminal
+                    .as_ref()
+                    .map(|value| to_json(value, "terminal lifecycle evidence"))
+                    .transpose()?,
+            });
             report.completed_steps += 1;
+
+            if terminal.is_some() {
+                if let Some(result) = verify(
+                    workload,
+                    harness,
+                    &config,
+                    &mut report,
+                    case_index,
+                    Some(step_index),
+                    VerificationTrigger::TerminalTransition,
+                    &swarm,
+                    &actions,
+                )
+                .await?
+                {
+                    return Ok(result);
+                }
+            }
+
+            let executed = step_index + 1;
+            if config.verify_every_steps != 0 && executed % config.verify_every_steps == 0 {
+                if let Some(result) = verify(
+                    workload,
+                    harness,
+                    &config,
+                    &mut report,
+                    case_index,
+                    Some(step_index),
+                    VerificationTrigger::Periodic,
+                    &swarm,
+                    &actions,
+                )
+                .await?
+                {
+                    return Ok(result);
+                }
+            }
         }
 
-        let observation = harness.observe(&model.final_observation()).await?;
-        if let Err(error) = model.verify_all(&observation) {
-            let failure = FailureArtifact {
-                model: M::NAME.to_string(),
-                model_version: M::VERSION.to_string(),
-                seed: config.seed,
-                case_index,
-                step_index: None,
-                stage: FailureStage::FinalVerification,
-                error: format!("{error:#}"),
-                swarm: to_json(&swarm, "property swarm")?,
-                actions,
-                committed_state: to_json(model.state(), "committed model state")?,
-                predicted_state: None,
-                expected: None,
-                trace: None,
-                observation: to_json(&observation, "final observation")?,
-            };
-            return finish_failure(report, failure, config.failure_directory.as_deref());
+        if let Some(result) = verify(
+            workload,
+            harness,
+            &config,
+            &mut report,
+            case_index,
+            None,
+            VerificationTrigger::Final,
+            &swarm,
+            &actions,
+        )
+        .await?
+        {
+            return Ok(result);
         }
-
         report.completed_cases += 1;
     }
 
     Ok(RunResult { report, failure: None, failure_path: None })
 }
 
-fn executable_swarm<M: PropertyModel>(
-    model: &M,
+#[allow(clippy::too_many_arguments)]
+async fn verify<W, H>(
+    _workload: &W,
+    harness: &mut H,
+    config: &RunConfig,
+    report: &mut RunReport,
+    case_index: u64,
+    step_index: Option<usize>,
+    trigger: VerificationTrigger,
+    swarm: &W::Swarm,
+    actions: &[ActionArtifact],
+) -> Result<Option<RunResult>>
+where
+    W: WorkloadGenerator,
+    H: CampaignHarness<W>,
+{
+    let verification = harness.verify(trigger).await?;
+    if let Some(error) = harness.violation(&verification) {
+        let failure = FailureArtifact {
+            campaign: W::NAME.to_string(),
+            campaign_version: W::VERSION.to_string(),
+            seed: config.seed,
+            case_index,
+            step_index,
+            trigger,
+            error,
+            swarm: to_json(swarm, "property swarm")?,
+            actions: actions.to_vec(),
+            verification: to_json(&verification, "independent verification report")?,
+        };
+        return finish_failure(report.clone(), failure, config.failure_directory.as_deref())
+            .map(Some);
+    }
+    report.completed_verifications += 1;
+    Ok(None)
+}
+
+fn executable_swarm<W: WorkloadGenerator>(
+    workload: &W,
     policy: &SwarmPolicy,
     rng: &mut dyn rand::RngCore,
-) -> Result<M::Swarm> {
+) -> Result<W::Swarm> {
     for _ in 0..policy.max_resamples {
-        let swarm = model.generate_swarm(rng, policy)?;
-        if !model.enabled_actions(&swarm).is_empty() {
+        let swarm = workload.generate_swarm(rng, policy)?;
+        if !workload.enabled_actions(&swarm).is_empty() {
             return Ok(swarm);
         }
     }
     bail!(
-        "model '{}' did not generate an initially executable swarm in {} attempts",
-        M::NAME,
+        "campaign '{}' did not generate an executable swarm in {} attempts",
+        W::NAME,
         policy.max_resamples
     )
 }

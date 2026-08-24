@@ -1,21 +1,21 @@
-use std::{collections::BTreeMap, fmt, future::Future, marker::PhantomData, pin::Pin};
+use std::{collections::BTreeMap, fmt, future::Future, pin::Pin};
 
 use eyre::{bail, Result};
 use serde::Serialize;
 
-use crate::{run, PropertyHarness, PropertyModel, RunConfig, RunResult};
+use crate::{run, CampaignHarness, RunConfig, RunResult, WorkloadGenerator};
 
-/// Stable identity of a registered Rust property model.
+/// Stable identity of a registered model-free property campaign.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub struct ModelDescriptor {
-    /// CLI-facing model name.
+pub struct CampaignDescriptor {
+    /// CLI-facing campaign name.
     pub name: &'static str,
-    /// Model serialization/semantics version.
+    /// Campaign serialization/semantics version.
     pub version: &'static str,
 }
 
 trait RegisteredProperty {
-    fn descriptor(&self) -> ModelDescriptor;
+    fn descriptor(&self) -> CampaignDescriptor;
 
     fn run<'a>(
         &'a mut self,
@@ -23,79 +23,78 @@ trait RegisteredProperty {
     ) -> Pin<Box<dyn Future<Output = Result<RunResult>> + 'a>>;
 }
 
-struct RegisteredHarness<M, H> {
+struct RegisteredCampaign<W, H> {
+    workload: W,
     harness: H,
-    model: PhantomData<fn() -> M>,
 }
 
-impl<M, H> RegisteredProperty for RegisteredHarness<M, H>
+impl<W, H> RegisteredProperty for RegisteredCampaign<W, H>
 where
-    M: PropertyModel + 'static,
-    H: PropertyHarness<M> + 'static,
+    W: WorkloadGenerator + 'static,
+    H: CampaignHarness<W> + 'static,
 {
-    fn descriptor(&self) -> ModelDescriptor {
-        ModelDescriptor { name: M::NAME, version: M::VERSION }
+    fn descriptor(&self) -> CampaignDescriptor {
+        CampaignDescriptor { name: W::NAME, version: W::VERSION }
     }
 
     fn run<'a>(
         &'a mut self,
         config: RunConfig,
     ) -> Pin<Box<dyn Future<Output = Result<RunResult>> + 'a>> {
-        Box::pin(run::<M, H>(&mut self.harness, config))
+        Box::pin(run(&self.workload, &mut self.harness, config))
     }
 }
 
-/// Executable registry of Rust property models compiled into a txgen binary.
+/// Executable registry of model-free Rust campaigns compiled into a txgen binary.
 #[derive(Default)]
-pub struct ModelRegistry {
-    models: BTreeMap<&'static str, Box<dyn RegisteredProperty>>,
+pub struct CampaignRegistry {
+    campaigns: BTreeMap<&'static str, Box<dyn RegisteredProperty>>,
 }
 
-impl fmt::Debug for ModelRegistry {
+impl fmt::Debug for CampaignRegistry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ModelRegistry")
-            .field("models", &self.models.keys().collect::<Vec<_>>())
+            .debug_struct("CampaignRegistry")
+            .field("campaigns", &self.campaigns.keys().collect::<Vec<_>>())
             .finish()
     }
 }
 
-impl ModelRegistry {
+impl CampaignRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Register a model together with its topology/execution harness.
-    pub fn register<M, H>(&mut self, harness: H) -> Result<&mut Self>
+    /// Register a workload generator together with its live verifier harness.
+    pub fn register<W, H>(&mut self, workload: W, harness: H) -> Result<&mut Self>
     where
-        M: PropertyModel + 'static,
-        H: PropertyHarness<M> + 'static,
+        W: WorkloadGenerator + 'static,
+        H: CampaignHarness<W> + 'static,
     {
-        if self.models.contains_key(M::NAME) {
-            bail!("property model '{}' is already registered", M::NAME);
+        if self.campaigns.contains_key(W::NAME) {
+            bail!("property campaign '{}' is already registered", W::NAME);
         }
-        self.models
-            .insert(M::NAME, Box::new(RegisteredHarness::<M, H> { harness, model: PhantomData }));
+        self.campaigns.insert(W::NAME, Box::new(RegisteredCampaign { workload, harness }));
         Ok(self)
     }
 
-    /// Resolve a registered model descriptor.
-    pub fn get(&self, name: &str) -> Option<ModelDescriptor> {
-        self.models.get(name).map(|model| model.descriptor())
+    /// Resolve a registered campaign descriptor.
+    pub fn get(&self, name: &str) -> Option<CampaignDescriptor> {
+        self.campaigns.get(name).map(|campaign| campaign.descriptor())
     }
 
     /// Iterate registered descriptors in name order.
-    pub fn iter(&self) -> impl Iterator<Item = ModelDescriptor> + '_ {
-        self.models.values().map(|model| model.descriptor())
+    pub fn iter(&self) -> impl Iterator<Item = CampaignDescriptor> + '_ {
+        self.campaigns.values().map(|campaign| campaign.descriptor())
     }
 
-    /// Execute a registered model by its stable CLI-facing name.
+    /// Execute a registered campaign by its stable CLI-facing name.
     pub async fn run(&mut self, name: &str, config: RunConfig) -> Result<RunResult> {
-        let Some(model) = self.models.get_mut(name) else {
-            let available = self.models.keys().copied().collect::<Vec<_>>().join(", ");
-            bail!("unknown property model '{name}'; available models: {available}");
+        let Some(campaign) = self.campaigns.get_mut(name) else {
+            let available = self.campaigns.keys().copied().collect::<Vec<_>>().join(", ");
+            bail!("unknown property campaign '{name}'; available campaigns: {available}");
         };
-        model.run(config).await
+        campaign.run(config).await
     }
 }

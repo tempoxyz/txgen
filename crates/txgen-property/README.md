@@ -1,72 +1,57 @@
 # txgen-property
 
-`txgen-property` is the protocol-agnostic property runner for txgen. It deliberately uses
-randomized swarm configurations and ABI-shaped generation instead of LibAFL or RPC coverage.
+`txgen-property` is the model-free property campaign runner for txgen. It uses randomized swarm
+configurations and ABI-shaped generation instead of LibAFL or RPC coverage.
 
-Each Rust model supplies:
+A workload generator supplies only:
 
-- a serializable committed state;
-- optional behaviors and generator strategies selected independently for each case;
-- currently executable action kinds;
-- pure `predict` logic;
-- transition and full-state invariant checks.
+- optional action families selected independently for each case;
+- ABI-shaped randomized values;
+- concrete replayable actions.
 
-Each harness supplies topology reset, transaction execution, and RPC observations. The runner
-owns the loop:
+A live harness submits those actions, correlates actual terminal lifecycle events, and runs an
+independent chain-derived verifier. It never predicts the next protocol state or expected
+success/revert classification.
 
 ```text
-reset + observe -> generate swarm -> generate action -> predict
-                -> execute -> observe -> verify -> commit
+generate swarm -> generate action -> submit -> collect receipt
+               -> await correlated terminal event -> verify
+               -> periodic verify -> repeat -> final verify
 ```
 
-Failed verification stops the run and can write a concrete YAML artifact containing the seed,
-swarm, generated actions, last committed state, prediction, trace, and observation. There is no
-corpus, fingerprinting, coverage feedback, or shrinking.
+Failed verification stops the run and can write a YAML artifact containing the generated seed,
+swarm, actions, receipts, terminal evidence, and the verifier's complete report. There is no
+corpus, fingerprinting, coverage feedback, shrinking, predicted state, or committed model state.
 
-## Registering a model
-
-A network-specific txgen binary constructs its harness and registers the model by stable name:
+## Registering a campaign
 
 ```rust,ignore
-let mut models = ModelRegistry::new();
-models.register::<ZoneSolvencyModel, _>(ZoneRpcHarness::new(configuration).await?)?;
+let mut campaigns = CampaignRegistry::new();
+campaigns.register(ZoneWorkload::default(), ZoneRpcHarness::new(configuration).await?)?;
 
-let result = models
-    .run("zone-solvency", RunConfig::random(1_000, 100))
-    .await?;
+let mut config = RunConfig::random(1_000, 100);
+config.verify_every_steps = 25;
+let result = campaigns.run("zone-backing", config).await?;
 ```
 
-An explicit `RunConfig::seeded` is intended for tests and replay. Normal runs use
-`RunConfig::random`, so seed choice is not embedded in model behavior.
+Normal runs use `RunConfig::random`, so seed choice is not embedded in workload behavior. An
+explicit `RunConfig::seeded` exists only for replay and tests.
 
-## Live Tempo/Zone runner
+## Tempo/Zones verification
 
-`txgen-tempo-property` registers the concrete `zone-solvency` model with a live RPC harness.
-The harness:
+The Tempo/Zones campaign uses the reusable `zone-portal-backing` library also called by
+`cargo xtask verify-portal-backing`. It reconstructs the authoritative invariant from pinned L1
+and Zone snapshots plus complete event histories:
 
-- signs and submits deposits on Tempo L1 and withdrawals on the public Zone RPC;
-- creates a fresh `X-Authorization-Token` for every private Zone RPC observation;
-- installs portal and outbox allowances once;
-- polls receipts and waits for portal-escrow/Zone-supply convergence;
-- refreshes user balances after every transaction so gas debits are not modeled as bridge value;
-- verifies `portal token balance >= Zone token totalSupply`;
-- runs fee-aware deposit/withdrawal loops that restore Zone supply and retain exactly the
-  withdrawal fee as excess portal collateral.
+```text
+required backing = Zone supply
+                 + pending deposits
+                 + pending withdrawals
+                 + Portal refunds
+                 + Inbox refunds
 
-With a generated Zones configuration:
-
-```bash
-export L1_RPC_URL=http://localhost:8545
-export ZONE_RPC_URL=http://localhost:8546
-export ZONE_PRIVATE_RPC_URL=http://localhost:8544
-export ZONE_TOKEN=0x20C0000000000000000000000000000000000000
-export PRIVATE_KEY=0x...
-
-cargo run -p txgen-tempo --bin txgen-tempo-property -- \
-  --zone-config /path/to/zones/generated/my-zone/zone.json \
-  --cases 100 \
-  --max-steps 50
+Portal balance >= required backing
 ```
 
-The signing key is read from an environment variable and is never included in logs or failure
-artifacts. Use `--private-key-env` to select a variable other than `PRIVATE_KEY`.
+The campaign uses Tempo L1 RPC and the full operator Zone RPC for global verification. The
+authenticated redacted Zone RPC is used only for user-scoped operations and observations.

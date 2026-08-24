@@ -7,47 +7,52 @@ use eyre::{Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Point at which a property case failed.
+/// Reason an independent invariant verification was run.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum FailureStage {
-    /// The executed transition disagreed with the prediction.
-    Transition,
-    /// The final full-state verification failed.
-    FinalVerification,
+pub enum VerificationTrigger {
+    /// An action reached its cross-layer terminal lifecycle state.
+    TerminalTransition,
+    /// The configured long-running workload interval elapsed.
+    Periodic,
+    /// A case completed and received its mandatory final verification.
+    Final,
 }
 
-/// Secret-free, concrete property failure suitable for replay tooling.
+/// One concrete action and the evidence returned by the live harness.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ActionArtifact {
+    /// Generated, replayable action.
+    pub action: Value,
+    /// Receipt or execution trace observed from RPC.
+    pub trace: Value,
+    /// Correlated terminal lifecycle evidence, when the action has a terminal transition.
+    pub terminal_evidence: Option<Value>,
+}
+
+/// Secret-free, concrete invariant failure suitable for replay tooling.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FailureArtifact {
-    /// Registered model name.
-    pub model: String,
-    /// Registered model version.
-    pub model_version: String,
-    /// RNG seed used by the run.
+    /// Registered campaign name.
+    pub campaign: String,
+    /// Registered campaign serialization/semantics version.
+    pub campaign_version: String,
+    /// RNG seed generated for or supplied to the run.
     pub seed: u64,
     /// Zero-based case index.
     pub case_index: u64,
-    /// Step index, absent for a final verification failure.
+    /// Step that triggered verification, absent for final verification.
     pub step_index: Option<usize>,
-    /// Failure stage.
-    pub stage: FailureStage,
-    /// Human-readable verification error.
+    /// Why the verifier ran.
+    pub trigger: VerificationTrigger,
+    /// Human-readable invariant violation.
     pub error: String,
     /// Concrete swarm used for this case.
     pub swarm: Value,
-    /// Concrete actions generated before the failure, including the failing action.
-    pub actions: Vec<Value>,
-    /// Last committed model state.
-    pub committed_state: Value,
-    /// Predicted state for a transition failure.
-    pub predicted_state: Option<Value>,
-    /// Expected outcome for a transition failure.
-    pub expected: Option<Value>,
-    /// Execution trace for a transition failure.
-    pub trace: Option<Value>,
-    /// Observation compared with the model.
-    pub observation: Value,
+    /// All executed actions and their actual chain evidence.
+    pub actions: Vec<ActionArtifact>,
+    /// Complete independent verifier report, including pinned snapshots and liabilities.
+    pub verification: Value,
 }
 
 impl FailureArtifact {
@@ -58,7 +63,7 @@ impl FailureArtifact {
         })?;
         let path = directory.join(format!(
             "{}-seed-{}-case-{}-{}.yml",
-            self.model,
+            self.campaign,
             self.seed,
             self.case_index,
             self.step_index
