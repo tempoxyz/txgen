@@ -5,10 +5,8 @@ use clap::Parser;
 use eyre::{bail, Result, WrapErr};
 use serde::Deserialize;
 use txgen_core::EcdsaSigner;
-use txgen_property::{ModelRegistry, PropertyModel, RunConfig};
-use txgen_tempo::property::{
-    LiveZoneBackend, ZoneLiveConfig, ZonePropertyHarness, ZoneSolvencyModel,
-};
+use txgen_property::{CampaignRegistry, RunConfig, WorkloadGenerator};
+use txgen_tempo::property::{LiveZoneBackend, ZoneLiveConfig, ZonePropertyHarness, ZoneWorkload};
 
 #[derive(Debug, Parser)]
 #[command(name = "txgen-tempo-property", about = "Swarm-based Tempo/Zone solvency property runner")]
@@ -21,11 +19,11 @@ struct Args {
     #[arg(long)]
     l1_rpc_url: Option<String>,
 
-    /// Public Zone HTTP RPC used for transaction submission. Falls back to ZONE_RPC_URL.
+    /// Full operator Zone HTTP RPC used for global verification. Falls back to ZONE_RPC_URL.
     #[arg(long)]
     zone_rpc_url: Option<String>,
 
-    /// Authenticated private Zone HTTP RPC. Falls back to ZONE_PRIVATE_RPC_URL.
+    /// Authenticated redacted Zone HTTP RPC used for user operations.
     #[arg(long)]
     zone_private_rpc_url: Option<String>,
 
@@ -53,6 +51,10 @@ struct Args {
     #[arg(long, default_value_t = 100)]
     cases: u64,
 
+    /// Keep generating fresh swarm cases until the first failure or process shutdown.
+    #[arg(long)]
+    continuous: bool,
+
     /// Maximum actions in one case.
     #[arg(long, default_value_t = 50)]
     max_steps: usize,
@@ -68,6 +70,18 @@ struct Args {
     /// Maximum seconds to wait for receipts and cross-layer convergence.
     #[arg(long, default_value_t = 120)]
     settlement_timeout_secs: u64,
+
+    /// Run the independent backing verifier every N actions; zero disables interval checks.
+    #[arg(long, default_value_t = 25)]
+    verify_every_steps: usize,
+
+    /// First L1 block covering the Portal's complete event history.
+    #[arg(long, default_value_t = 0)]
+    l1_from_block: u64,
+
+    /// First Zone block covering complete Inbox and Outbox event history.
+    #[arg(long, default_value_t = 0)]
+    zone_from_block: u64,
 
     /// Directory for first-failure YAML artifacts.
     #[arg(long, default_value = "property-failures")]
@@ -137,28 +151,34 @@ async fn main() -> Result<()> {
         token,
     );
     live.settlement_timeout = Duration::from_secs(args.settlement_timeout_secs);
+    live.l1_from_block = args.l1_from_block;
+    live.zone_from_block = args.zone_from_block;
 
     let backend = LiveZoneBackend::connect(live, signer).await?;
     let harness = ZonePropertyHarness::new(backend);
-    let mut models = ModelRegistry::new();
-    models.register::<ZoneSolvencyModel, _>(harness)?;
+    let mut campaigns = CampaignRegistry::new();
+    campaigns.register(ZoneWorkload, harness)?;
 
     let mut run = match args.seed {
         Some(seed) => RunConfig::seeded(args.cases, args.max_steps, seed),
         None => RunConfig::random(args.cases, args.max_steps),
     };
     run.swarm.density = args.swarm_density;
+    run.continuous = args.continuous;
+    run.verify_every_steps = args.verify_every_steps;
     run.failure_directory = Some(args.failure_directory);
     eprintln!(
-        "[zone-property] start model={} seed={} cases={} max_steps={} swarm_density={}",
-        ZoneSolvencyModel::NAME,
+        "[zone-property] start campaign={} seed={} cases={} continuous={} max_steps={} swarm_density={} verify_every_steps={}",
+        ZoneWorkload::NAME,
         run.seed,
         run.cases,
+        run.continuous,
         run.max_steps,
-        run.swarm.density
+        run.swarm.density,
+        run.verify_every_steps,
     );
 
-    let result = models.run(ZoneSolvencyModel::NAME, run).await?;
+    let result = campaigns.run(ZoneWorkload::NAME, run).await?;
     if let Some(failure) = result.failure {
         eprintln!(
             "[zone-property] FAIL seed={} case={} step={:?} error={}",
@@ -171,8 +191,11 @@ async fn main() -> Result<()> {
     }
 
     eprintln!(
-        "[zone-property] PASS seed={} completed_cases={} verified_steps={}",
-        result.report.seed, result.report.completed_cases, result.report.completed_steps
+        "[zone-property] PASS seed={} completed_cases={} completed_steps={} verifications={}",
+        result.report.seed,
+        result.report.completed_cases,
+        result.report.completed_steps,
+        result.report.completed_verifications,
     );
     Ok(())
 }

@@ -18,6 +18,7 @@ path = "src/bin/property.rs"
 txgen-core.workspace = true
 txgen-cli.workspace = true
 txgen-property.workspace = true
+zone-portal-backing = { git = "https://github.com/tempoxyz/zones", rev = "b9e822438be6415dc667bef7391f359a7d07c7ac" }
 
 # serde
 serde.workspace = true
