@@ -2270,7 +2270,8 @@ scenario:
             "        mode: subscription\n        poll_interval: 100ms",
             1,
         );
-        let error = ScenarioSpec::parse(&yaml).unwrap_err().to_string();
+        let error = ScenarioSpec::parse(&yaml).unwrap_err();
+        let error = format!("{error:#}");
         assert!(error.contains("unknown field `mode`"), "unexpected error: {error}");
     }
 
