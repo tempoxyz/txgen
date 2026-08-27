@@ -6005,6 +6005,7 @@ dependencies = [
  "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
  "alloy-transport",
+ "axum",
  "bench-core",
  "clap",
  "eyre",

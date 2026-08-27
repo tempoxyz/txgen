@@ -318,7 +318,7 @@ scenario:
       timeout: 90s
 ```
 
-For a private Zone, keep `rpc_url` as the authenticated submission endpoint, add an unauthenticated `query_rpc_url`, and configure `request_auth.sender_header` with `name`, `map`, and optional `reload_interval`. The sender field above selects the credential for standalone receipt-based waits; submit steps select it from the materialized transaction automatically. Configure `observation.mode` as `auto`, `subscription`, or `poll`; `auto` uses `observation.websocket_url` when supplied and otherwise falls back to `observation.poll_interval`, whose default is `50ms`.
+For a private Zone, keep `rpc_url` as the authenticated submission endpoint, add an unauthenticated `query_rpc_url`, and configure `request_auth.sender_header` with `name`, `map`, and optional `reload_interval`. The sender field above selects the credential for standalone receipt-based waits; submit steps select it from the materialized transaction automatically. Configure `observation.mode` as `auto`, `subscription`, or `poll`; `auto` uses `observation.websocket_url` when supplied and otherwise falls back to `observation.poll_interval`, whose default is `50ms`. All active `wait_log` steps on one chain share a single log poller regardless of how many scenario instances are running: the shared scan polls at the fastest requested interval with the union of the active event filters, so RPC load does not grow with instance count.
 
 Existing step lists remain sequential. Opt into a DAG when independent waits or transactions should overlap:
 

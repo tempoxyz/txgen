@@ -42,3 +42,7 @@ alloy-rpc-types-engine = "2"
 alloy-transport = "2"
 hex.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "rt", "sync", "time", "test-util"] }
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { workspace = true, features = ["net"] }

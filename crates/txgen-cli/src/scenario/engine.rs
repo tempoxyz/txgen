@@ -259,25 +259,12 @@ where
             let input = chain_inputs
                 .remove(name)
                 .expect("every scenario chain was loaded during preflight");
-            let subscription_required = spec.scenario.steps.iter().any(|step| {
-                if step.action.chain() != name {
-                    return false;
-                }
-                match &step.action {
-                    StepAction::WaitReceipt(wait) => {
-                        wait.mode == Some(ObservationMode::Subscription)
-                    }
-                    StepAction::WaitLog(wait) => wait.mode == Some(ObservationMode::Subscription),
-                    _ => false,
-                }
-            });
             let chain = ChainRuntime::<A>::prepare(
                 name,
                 definition,
                 input,
                 config.transaction_rate,
                 config.max_rpc_in_flight,
-                subscription_required,
             )
             .await
             .wrap_err_with(|| format!("failed to preflight scenario chain '{name}'"))?;
@@ -1018,8 +1005,7 @@ where
                     .map(|value| wait::expression_address(value, context))
                     .transpose()
                     .map_err(StepError::expression)?;
-                let observation =
-                    chain.observation.for_step(wait_receipt.mode, wait_receipt.poll_interval);
+                let observation = chain.observation.for_step(wait_receipt.poll_interval);
                 let receipt = wait::wait_for_receipt_observed(
                     &observation,
                     &chain.submitter,
@@ -1027,7 +1013,7 @@ where
                     sender,
                     hash,
                     wait_receipt.confirmations.unwrap_or(0),
-                    observation.default_subscription(),
+                    observation.subscription_behavior(),
                 )
                 .await?;
                 let milestone = observation_milestone(
@@ -1044,8 +1030,8 @@ where
                 Ok(StepExecution { value: receipt.value, milestones: vec![milestone] })
             }
             StepAction::WaitLog(wait_log) => {
-                let observation = chain.observation.for_step(wait_log.mode, wait_log.poll_interval);
-                let behavior = observation.default_subscription();
+                let observation = chain.observation.for_step(wait_log.poll_interval);
+                let behavior = observation.subscription_behavior();
                 let (result, event_names) = if wait_log.events.is_empty() {
                     let abi = chain
                         .artifacts
@@ -1685,7 +1671,6 @@ where
         input: ChainInput,
         transaction_rate: u64,
         max_rpc_in_flight: usize,
-        subscription_required: bool,
     ) -> Result<PreparedChain<A>> {
         let ChainInput {
             workload_path,
@@ -1702,15 +1687,12 @@ where
         let query_provider = ProviderBuilder::new_with_network::<AnyNetwork>()
             .connect_http(query_rpc_url.clone())
             .erased();
-        let observation = wait::ObservationRuntime::from_config(
-            query_provider.clone(),
-            &definition.observation,
-            subscription_required,
-        )
-        .await
-        .map_err(|error| {
-            eyre::eyre!("failed to configure observation for chain '{name}': {error}")
-        })?;
+        let observation =
+            wait::ObservationRuntime::from_config(query_provider.clone(), &definition.observation)
+                .await
+                .map_err(|error| {
+                    eyre::eyre!("failed to configure observation for chain '{name}': {error}")
+                })?;
         let observation_subscription_configured = observation.has_subscription();
         let rpc_chain_id =
             tokio::time::timeout(FALLBACK_STEP_TIMEOUT, query_provider.get_chain_id())
@@ -1987,7 +1969,7 @@ where
                     Some(materialized.sender),
                     submission.tx_hash,
                     0,
-                    self.observation.default_subscription(),
+                    self.observation.subscription_behavior(),
                 ),
             )
             .await
