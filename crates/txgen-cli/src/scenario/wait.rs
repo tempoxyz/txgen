@@ -1,5 +1,6 @@
 use super::{
     error::StepError,
+    log_hub::{LogInterest, LogPollHub, LogWindowSubscription},
     report::unix_ms,
     schema::{ObservationDef, ObservationMode, WaitLogStep},
     value::{coerce_event_filter, eval_expression, RuntimeContext, RuntimeValue},
@@ -20,14 +21,14 @@ use futures::{Stream, StreamExt};
 use std::{
     collections::BTreeMap,
     pin::Pin,
+    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
 pub(crate) const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) const DEFAULT_MAX_BLOCK_RANGE: u64 = 1_000;
-const RECENT_LOG_RESCAN_BLOCKS: u64 = 64;
 
-type WakeStream = Pin<Box<dyn Stream<Item = ()> + Send>>;
+pub(crate) type WakeStream = Pin<Box<dyn Stream<Item = ()> + Send>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubscriptionBehavior {
@@ -58,6 +59,10 @@ pub(crate) struct ObservationRuntime {
     websocket_provider: Option<DynProvider<AnyNetwork>>,
     poll_interval: Duration,
     default_subscription: SubscriptionBehavior,
+    /// Shared per-chain log scanner. All step-level clones of this runtime
+    /// reuse the same hub, so a chain never runs more than one log poller
+    /// regardless of how many `wait_log` steps are active.
+    log_hub: Arc<LogPollHub>,
 }
 
 impl ObservationRuntime {
@@ -68,6 +73,7 @@ impl ObservationRuntime {
         poll_interval: Duration,
     ) -> Self {
         Self {
+            log_hub: Arc::new(LogPollHub::new(query_provider.clone(), None)),
             query_provider,
             websocket_provider: None,
             poll_interval,
@@ -129,6 +135,7 @@ impl ObservationRuntime {
             None => None,
         };
         Ok(Self {
+            log_hub: Arc::new(LogPollHub::new(query_provider.clone(), websocket_provider.clone())),
             query_provider,
             websocket_provider,
             poll_interval,
@@ -202,31 +209,8 @@ impl ObservationRuntime {
         }
     }
 
-    async fn subscribe_logs(
-        &self,
-        filter: &Filter,
-        behavior: SubscriptionBehavior,
-    ) -> Result<Option<WakeStream>, StepError> {
-        if behavior == SubscriptionBehavior::Disabled {
-            return Ok(None);
-        }
-        let require_subscription = behavior == SubscriptionBehavior::Require;
-        let Some(provider) = &self.websocket_provider else {
-            if require_subscription {
-                return Err(StepError::new(
-                    "configuration_error",
-                    "subscription observation mode has no connected WebSocket",
-                ));
-            }
-            return Ok(None);
-        };
-        match provider.subscribe_logs(filter).await {
-            Ok(subscription) => {
-                Ok(Some(Box::pin(subscription.into_stream().map(|_| ())) as WakeStream))
-            }
-            Err(error) if require_subscription => Err(StepError::rpc(error)),
-            Err(_) => Ok(None),
-        }
+    fn log_hub(&self) -> &Arc<LogPollHub> {
+        &self.log_hub
     }
 }
 
@@ -237,7 +221,7 @@ pub(crate) struct ObservationPoint {
 }
 
 impl ObservationPoint {
-    fn now() -> Self {
+    pub(crate) fn now() -> Self {
         Self { monotonic: Instant::now(), wall: SystemTime::now() }
     }
 
@@ -399,7 +383,7 @@ async fn canonical_block(
     Ok(Some(CanonicalBlock { timestamp_ms: block_timestamp_ms(&block)? }))
 }
 
-async fn canonical_block_hash(
+pub(crate) async fn canonical_block_hash(
     provider: &DynProvider<AnyNetwork>,
     block_number: u64,
 ) -> Result<Option<B256>, StepError> {
@@ -548,7 +532,7 @@ async fn current_confirmation_depth(
     Ok((current >= target).then(|| current.saturating_sub(block_number)))
 }
 
-async fn wait_for_wake(wake: &mut Option<WakeStream>, poll_interval: Duration) {
+pub(crate) async fn wait_for_wake(wake: &mut Option<WakeStream>, poll_interval: Duration) {
     let Some(stream) = wake.as_mut() else {
         tokio::time::sleep(poll_interval).await;
         return;
@@ -653,174 +637,178 @@ pub(crate) async fn wait_for_log_observed(
     }
 
     let start_block = from_block.expect("checked above");
-    let mut cursor = start_block;
     let max_range = step.max_block_range.unwrap_or(DEFAULT_MAX_BLOCK_RANGE);
-    let subscription_filter = matcher.subscription_filter(address);
-    let mut wake = observation.subscribe_logs(&subscription_filter, subscription).await?;
-    let mut scanned_checkpoint = None::<(u64, B256)>;
-    'observe: loop {
-        let head = observation.query_provider.get_block_number().await.map_err(StepError::rpc)?;
-        let Some(head_hash_before) =
-            canonical_block_hash(&observation.query_provider, head).await?
-        else {
-            wait_for_wake(&mut wake, poll_interval).await;
-            continue;
-        };
-        if let Some((number, hash)) = scanned_checkpoint {
-            let checkpoint_hash = if number == head {
-                Some(head_hash_before)
-            } else if number < head {
-                canonical_block_hash(&observation.query_provider, number).await?
-            } else {
-                None
-            };
-            if checkpoint_hash != Some(hash) {
-                cursor = start_block;
-                scanned_checkpoint = None;
+    if subscription == SubscriptionBehavior::Require && !observation.has_subscription() {
+        return Err(StepError::new(
+            "configuration_error",
+            "subscription observation mode has no connected WebSocket",
+        ));
+    }
+
+    // All log waits on this chain feed one shared poller. This step only
+    // issues its own RPC calls for blocks below the shared window and to
+    // canonically verify a candidate the shared scan surfaced.
+    let mut window_sub = observation.log_hub().subscribe(LogInterest {
+        topic0: (!matcher.event.anonymous).then(|| matcher.event.selector()),
+        address,
+        start_block,
+        poll_interval,
+        max_block_range: max_range,
+    });
+    let mut current_epoch = None::<u64>;
+    let mut next_unscanned = start_block;
+    loop {
+        let window = window_sub.next_window().await?;
+        if current_epoch != Some(window.epoch) {
+            // A reorg may have changed history below the shared window, so
+            // everything from the requested start must be rescanned.
+            current_epoch = Some(window.epoch);
+            next_unscanned = start_block;
+        }
+
+        if window.coverage_start > next_unscanned &&
+            let Some((canonical, canonical_decoded)) = find_first_canonical_log(
+                &observation.query_provider,
+                &matcher,
+                address,
+                transaction_hash,
+                next_unscanned,
+                window.coverage_start - 1,
+                max_range,
+            )
+            .await? &&
+            let Some(result) = finalize_canonical_log(
+                observation,
+                &mut window_sub,
+                chain,
+                &matcher,
+                canonical,
+                canonical_decoded,
+                ObservationPoint::now(),
+                confirmations,
+            )
+            .await?
+        {
+            return Ok(result);
+        }
+
+        for candidate in window.logs.iter() {
+            if candidate.removed ||
+                !window_sub.interest().matches(candidate) ||
+                transaction_hash
+                    .is_some_and(|expected| candidate.transaction_hash != Some(expected))
+            {
                 continue;
             }
-        }
-        let scan_start = cursor;
-
-        while cursor <= head {
-            let end = bounded_range_end(cursor, head, max_range);
-            let filter = matcher.rpc_filter(cursor, end, address);
-            let mut logs =
-                observation.query_provider.get_logs(&filter).await.map_err(StepError::rpc)?;
-            sort_logs(&mut logs);
-            let first_observed = ObservationPoint::now();
-
-            for candidate in logs {
-                if candidate.removed ||
-                    transaction_hash
-                        .is_some_and(|expected| candidate.transaction_hash != Some(expected))
-                {
-                    continue;
-                }
-                let Some(_) = matcher.decode_if_matches(&candidate).map_err(StepError::abi)? else {
-                    continue;
-                };
-
-                let block_number = candidate
-                    .block_number
-                    .ok_or_else(|| StepError::missing("matching log omitted block_number"))?;
-                // A stable checkpoint proves its ancestors unchanged, so only
-                // re-query the increment since that checkpoint. If it moved,
-                // discard this candidate and backfill from the requested start.
-                let recheck_start = match scanned_checkpoint {
-                    Some((number, hash)) => {
-                        if canonical_block_hash(&observation.query_provider, number).await? !=
-                            Some(hash)
-                        {
-                            cursor = start_block;
-                            scanned_checkpoint = None;
-                            continue 'observe;
-                        }
-                        scan_start
-                    }
-                    None => start_block,
-                };
-                if let Some((canonical, canonical_decoded)) = find_first_canonical_log(
-                    &observation.query_provider,
-                    &matcher,
-                    address,
-                    transaction_hash,
-                    recheck_start,
-                    block_number,
-                    max_range,
-                )
-                .await?
-                {
-                    if let Some((number, hash)) = scanned_checkpoint &&
-                        canonical_block_hash(&observation.query_provider, number).await? !=
-                            Some(hash)
-                    {
-                        cursor = start_block;
-                        scanned_checkpoint = None;
-                        continue 'observe;
-                    }
-                    let candidate_first_observed = if same_log_identity(&candidate, &canonical) {
-                        first_observed
-                    } else {
-                        // A reorg can replace the candidate between the initial
-                        // scan and canonical backfill. Do not attribute the
-                        // replacement to an observation that preceded it.
-                        ObservationPoint::now()
-                    };
-                    let canonical_number = canonical
-                        .block_number
-                        .ok_or_else(|| StepError::missing("matching log omitted block_number"))?;
-                    let canonical_hash = canonical
-                        .block_hash
-                        .ok_or_else(|| StepError::missing("matching log omitted block_hash"))?;
-                    wait_for_confirmations(observation, canonical_number, confirmations, &mut wake)
-                        .await?;
-                    let Some(block) = canonical_block(
-                        &observation.query_provider,
-                        canonical_number,
-                        canonical_hash,
-                    )
-                    .await?
-                    else {
-                        continue;
-                    };
-                    let Some(confirmation_depth) =
-                        current_confirmation_depth(observation, canonical_number, confirmations)
-                            .await?
-                    else {
-                        wait_for_wake(&mut wake, poll_interval).await;
-                        cursor = start_block;
-                        continue 'observe;
-                    };
-                    let confirmed = ObservationPoint::now();
-                    return Ok(LogResult {
-                        observation: log_observation_metadata(
-                            &canonical,
-                            candidate_first_observed,
-                            block.timestamp_ms,
-                            confirmation_depth,
-                        )?,
-                        value: log_runtime_value(
-                            chain,
-                            &matcher.event,
-                            &canonical,
-                            canonical_decoded,
-                            candidate_first_observed,
-                            confirmed,
-                            block.timestamp_ms,
-                            confirmation_depth,
-                        )
-                        .map_err(StepError::abi)?,
-                    });
-                }
+            if matcher.decode_if_matches(candidate).map_err(StepError::abi)?.is_none() {
+                continue;
             }
-
-            cursor = end.saturating_add(1);
-        }
-
-        // Commit the incremental scan only if both its endpoint and the
-        // previously scanned checkpoint stayed canonical for its duration.
-        // A changed descendant hash proves that some ancestor changed, so the
-        // next pass backfills the complete requested range. This catches deep
-        // reorgs without issuing a historical eth_getLogs query every 50ms.
-        let head_hash_after = canonical_block_hash(&observation.query_provider, head).await?;
-        let checkpoint_still_canonical = match scanned_checkpoint {
-            Some((number, hash)) if number == head => head_hash_after == Some(hash),
-            Some((number, hash)) if number < head => {
-                canonical_block_hash(&observation.query_provider, number).await? == Some(hash)
+            let candidate_block = candidate
+                .block_number
+                .ok_or_else(|| StepError::missing("matching log omitted block_number"))?;
+            // Re-derive the first canonical match over the complete requested
+            // range so an earlier log the shared window no longer covers is
+            // still preferred over this candidate.
+            let Some((canonical, canonical_decoded)) = find_first_canonical_log(
+                &observation.query_provider,
+                &matcher,
+                address,
+                transaction_hash,
+                start_block,
+                candidate_block,
+                max_range,
+            )
+            .await?
+            else {
+                continue;
+            };
+            let candidate_first_observed = if same_log_identity(candidate, &canonical) {
+                window.observed
+            } else {
+                // A reorg can replace the candidate between the shared scan
+                // and canonical backfill. Do not attribute the replacement to
+                // an observation that preceded it.
+                ObservationPoint::now()
+            };
+            if let Some(result) = finalize_canonical_log(
+                observation,
+                &mut window_sub,
+                chain,
+                &matcher,
+                canonical,
+                canonical_decoded,
+                candidate_first_observed,
+                confirmations,
+            )
+            .await?
+            {
+                return Ok(result);
             }
-            Some(_) => false,
-            None => true,
-        };
-        if head_hash_after != Some(head_hash_before) || !checkpoint_still_canonical {
-            cursor = start_block;
-            scanned_checkpoint = None;
-            continue;
         }
-        scanned_checkpoint = Some((head, head_hash_before));
-        cursor = head.saturating_sub(RECENT_LOG_RESCAN_BLOCKS.saturating_sub(1)).max(start_block);
-        wait_for_wake(&mut wake, poll_interval).await;
+
+        next_unscanned = next_unscanned.max(window.head.saturating_add(1));
     }
+}
+
+/// Confirm and package a canonically verified log match. Returns `Ok(None)`
+/// when the chain moved underneath the match (block no longer canonical, or
+/// the head regressed below the confirmation target), in which case the
+/// caller resumes waiting on the shared window stream.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_canonical_log(
+    observation: &ObservationRuntime,
+    window_sub: &mut LogWindowSubscription,
+    chain: &str,
+    matcher: &EventMatcher,
+    canonical: Log,
+    canonical_decoded: Vec<DynSolValue>,
+    first_observed: ObservationPoint,
+    confirmations: u64,
+) -> Result<Option<LogResult>, StepError> {
+    let canonical_number = canonical
+        .block_number
+        .ok_or_else(|| StepError::missing("matching log omitted block_number"))?;
+    let canonical_hash = canonical
+        .block_hash
+        .ok_or_else(|| StepError::missing("matching log omitted block_hash"))?;
+    if confirmations > 0 {
+        window_sub.wait_for_head(canonical_number.saturating_add(confirmations)).await?;
+    }
+    let Some(block) =
+        canonical_block(&observation.query_provider, canonical_number, canonical_hash).await?
+    else {
+        return Ok(None);
+    };
+    let confirmation_depth = if confirmations == 0 {
+        0
+    } else {
+        match window_sub.latest_head() {
+            Some(head) if head >= canonical_number.saturating_add(confirmations) => {
+                head.saturating_sub(canonical_number)
+            }
+            _ => return Ok(None),
+        }
+    };
+    let confirmed = ObservationPoint::now();
+    Ok(Some(LogResult {
+        observation: log_observation_metadata(
+            &canonical,
+            first_observed,
+            block.timestamp_ms,
+            confirmation_depth,
+        )?,
+        value: log_runtime_value(
+            chain,
+            &matcher.event,
+            &canonical,
+            canonical_decoded,
+            first_observed,
+            confirmed,
+            block.timestamp_ms,
+            confirmation_depth,
+        )
+        .map_err(StepError::abi)?,
+    }))
 }
 
 fn same_log_identity(left: &Log, right: &Log) -> bool {
@@ -831,7 +819,7 @@ fn same_log_identity(left: &Log, right: &Log) -> bool {
         left.log_index == right.log_index
 }
 
-fn bounded_range_end(start: u64, through: u64, max_range: u64) -> u64 {
+pub(crate) fn bounded_range_end(start: u64, through: u64, max_range: u64) -> u64 {
     start.saturating_add(max_range.saturating_sub(1)).min(through)
 }
 
@@ -1642,7 +1630,7 @@ fn expression_u64(value: &serde_yaml::Value, context: &RuntimeContext) -> Result
     }
 }
 
-fn sort_logs(logs: &mut [Log]) {
+pub(crate) fn sort_logs(logs: &mut [Log]) {
     logs.sort_by_key(|log| {
         (log.block_number.unwrap_or(u64::MAX), log.log_index.unwrap_or(u64::MAX))
     });
@@ -1659,6 +1647,7 @@ mod tests {
     use alloy_provider::ProviderBuilder;
     use alloy_transport::mock::Asserter;
     use bench_core::SenderConfig;
+    use std::sync::Mutex as StdMutex;
 
     fn mocked_provider(asserter: Asserter) -> DynProvider<AnyNetwork> {
         ProviderBuilder::new_with_network::<AnyNetwork>().connect_mocked_client(asserter).erased()
@@ -1666,6 +1655,135 @@ mod tests {
 
     fn mock_submitter(provider: &DynProvider<AnyNetwork>) -> RpcSubmitter {
         RpcSubmitter::new(vec![provider.clone()], SenderConfig::default()).unwrap()
+    }
+
+    /// Stateful JSON-RPC chain mock. Unlike the FIFO [`Asserter`], responses
+    /// are derived from mutable chain state, which is required now that log
+    /// waits are served by a background poller shared across consumers whose
+    /// request interleaving is not deterministic.
+    #[derive(Default)]
+    struct MockNode {
+        head: u64,
+        hashes: BTreeMap<u64, B256>,
+        logs: Vec<Log>,
+        /// Logs withheld from the first `reveal_hidden_after` `eth_getLogs`
+        /// responses, emulating lagging RPC log indexing.
+        hidden_logs: Vec<Log>,
+        reveal_hidden_after: usize,
+        block_number_calls: usize,
+        get_logs_calls: usize,
+        get_logs_ranges: Vec<(u64, u64)>,
+        get_logs_topics: Vec<serde_json::Value>,
+    }
+
+    impl MockNode {
+        fn with_head(head: u64) -> Self {
+            Self { head, ..Default::default() }
+        }
+
+        fn hash(&self, number: u64) -> B256 {
+            self.hashes
+                .get(&number)
+                .copied()
+                .unwrap_or_else(|| B256::left_padding_from(&(number + 1).to_be_bytes()))
+        }
+    }
+
+    fn parse_hex_quantity(value: Option<&serde_json::Value>) -> Option<u64> {
+        let value = value?.as_str()?;
+        u64::from_str_radix(value.trim_start_matches("0x"), 16).ok()
+    }
+
+    fn mock_block_json(number: u64, hash: B256) -> serde_json::Value {
+        let mut block = block_json(hash);
+        block["number"] = serde_json::json!(format!("0x{number:x}"));
+        block
+    }
+
+    async fn handle_mock_rpc(
+        axum::extract::State(node): axum::extract::State<Arc<StdMutex<MockNode>>>,
+        axum::Json(request): axum::Json<serde_json::Value>,
+    ) -> axum::Json<serde_json::Value> {
+        let id = request.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let method = request.get("method").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let params = request.get("params").cloned().unwrap_or_else(|| serde_json::json!([]));
+        let mut node = node.lock().expect("mock node lock");
+        let result = match method {
+            "eth_blockNumber" => {
+                node.block_number_calls += 1;
+                serde_json::json!(format!("0x{:x}", node.head))
+            }
+            "eth_getBlockByNumber" => {
+                let number = parse_hex_quantity(params.get(0)).unwrap_or(node.head);
+                mock_block_json(number, node.hash(number))
+            }
+            "eth_getLogs" => {
+                node.get_logs_calls += 1;
+                let filter = params.get(0).cloned().unwrap_or_default();
+                let from = parse_hex_quantity(filter.get("fromBlock")).unwrap_or(0);
+                let to = parse_hex_quantity(filter.get("toBlock")).unwrap_or(u64::MAX);
+                node.get_logs_ranges.push((from, to));
+                node.get_logs_topics
+                    .push(filter.get("topics").cloned().unwrap_or(serde_json::Value::Null));
+                let include_hidden = node.get_logs_calls > node.reveal_hidden_after;
+                let logs: Vec<&Log> = node
+                    .logs
+                    .iter()
+                    .chain(node.hidden_logs.iter().filter(|_| include_hidden))
+                    .filter(|log| {
+                        log.block_number.is_some_and(|number| number >= from && number <= to)
+                    })
+                    .collect();
+                serde_json::to_value(&logs).expect("serialize mock logs")
+            }
+            _ => {
+                return axum::Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32601, "message": format!("unsupported method {method}") }
+                }));
+            }
+        };
+        axum::Json(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+    }
+
+    async fn spawn_mock_node(
+        node: Arc<StdMutex<MockNode>>,
+    ) -> (DynProvider<AnyNetwork>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind mock RPC");
+        let address = listener.local_addr().expect("mock RPC address");
+        let app =
+            axum::Router::new().route("/", axum::routing::post(handle_mock_rpc)).with_state(node);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve mock RPC");
+        });
+        let url: url::Url = format!("http://{address}").parse().expect("mock RPC URL");
+        let provider = ProviderBuilder::new_with_network::<AnyNetwork>().connect_http(url).erased();
+        (provider, server)
+    }
+
+    fn wait_log_step(
+        event: &str,
+        from_block: u64,
+        poll_interval: Duration,
+        confirmations: u64,
+        max_block_range: u64,
+    ) -> WaitLogStep {
+        WaitLogStep {
+            chain: "chain_a".to_string(),
+            from_block: Some(serde_yaml::Value::Number(serde_yaml::Number::from(from_block))),
+            address: None,
+            transaction_hash: None,
+            sender: None,
+            abi: "events".to_string(),
+            event: event.to_string(),
+            where_value: BTreeMap::new(),
+            events: BTreeMap::new(),
+            mode: None,
+            poll_interval: Some(poll_interval),
+            confirmations: Some(confirmations),
+            max_block_range: Some(max_block_range),
+        }
     }
 
     fn event_abi() -> JsonAbi {
@@ -2082,46 +2200,36 @@ mod tests {
 
     #[tokio::test]
     async fn wait_log_backfills_before_polling() {
-        let asserter = Asserter::new();
         let log = encoded_log();
-        asserter.push_success(&10u64);
-        asserter.push_success(&block_json(B256::repeat_byte(0x10)));
-        asserter.push_success(&vec![log.clone()]);
-        asserter.push_success(&block_json(log.block_hash.unwrap()));
-        asserter.push_success(&vec![log.clone()]);
-        asserter.push_success(&block_json(log.block_hash.unwrap()));
-        asserter.push_success(&block_json(log.block_hash.unwrap()));
-        let provider = mocked_provider(asserter.clone());
+        let node = Arc::new(StdMutex::new(MockNode::with_head(10)));
+        {
+            let mut node = node.lock().unwrap();
+            node.hashes.insert(4, log.block_hash.unwrap());
+            node.logs.push(log);
+        }
+        let (provider, server) = spawn_mock_node(node.clone()).await;
         let submitter = mock_submitter(&provider);
-        let step = WaitLogStep {
-            chain: "chain_a".to_string(),
-            from_block: Some(serde_yaml::Value::Number(serde_yaml::Number::from(4))),
-            address: None,
-            transaction_hash: None,
-            sender: None,
-            abi: "events".to_string(),
-            event: "Moved".to_string(),
-            where_value: BTreeMap::new(),
-            events: BTreeMap::new(),
-            mode: None,
-            poll_interval: Some(Duration::from_millis(1)),
-            confirmations: Some(0),
-            max_block_range: Some(100),
-        };
+        let step = wait_log_step("Moved", 4, Duration::from_millis(5), 0, 100);
 
-        let saved = wait_for_log(
-            &provider,
-            &submitter,
-            "chain_a",
-            &event_abi(),
-            &step,
-            &RuntimeContext::empty(),
+        let saved = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_log(
+                &provider,
+                &submitter,
+                "chain_a",
+                &event_abi(),
+                &step,
+                &RuntimeContext::empty(),
+            ),
         )
         .await
+        .expect("wait_log timed out")
         .unwrap();
         let RuntimeValue::Object(saved) = saved else { panic!("expected object") };
         assert_eq!(saved["block_number"], RuntimeValue::Uint(U256::from(4)));
-        assert!(asserter.read_q().is_empty());
+        // The shared window scan is clamped to the requested start block.
+        assert_eq!(node.lock().unwrap().get_logs_ranges.first(), Some(&(4, 10)));
+        server.abort();
     }
 
     #[tokio::test]
@@ -2134,255 +2242,383 @@ mod tests {
         earlier.log_index = Some(3);
         earlier.block_hash = Some(B256::repeat_byte(0x55));
 
-        let asserter = Asserter::new();
-        asserter.push_success(&10u64);
-        asserter.push_success(&block_json(later.block_hash.unwrap()));
-        asserter.push_success(&vec![later.clone()]);
-        asserter.push_success(&block_json(later.block_hash.unwrap()));
-        asserter.push_success(&vec![later, earlier.clone()]);
-        asserter.push_success(&block_json(B256::repeat_byte(0x33)));
-        asserter.push_success(&block_json(earlier.block_hash.unwrap()));
-        let provider = mocked_provider(asserter.clone());
+        let node = Arc::new(StdMutex::new(MockNode::with_head(10)));
+        {
+            let mut node = node.lock().unwrap();
+            node.hashes.insert(10, later.block_hash.unwrap());
+            node.hashes.insert(5, earlier.block_hash.unwrap());
+            node.logs.push(later);
+            // Withhold the earlier log from the first query so the canonical
+            // recheck of the later candidate is what discovers it.
+            node.hidden_logs.push(earlier);
+            node.reveal_hidden_after = 1;
+        }
+        let (provider, server) = spawn_mock_node(node).await;
         let submitter = mock_submitter(&provider);
-        let step = WaitLogStep {
-            chain: "chain_a".to_string(),
-            from_block: Some(serde_yaml::Value::Number(serde_yaml::Number::from(0))),
-            address: None,
-            transaction_hash: None,
-            sender: None,
-            abi: "events".to_string(),
-            event: "Moved".to_string(),
-            where_value: BTreeMap::new(),
-            events: BTreeMap::new(),
-            mode: None,
-            poll_interval: Some(Duration::from_millis(1)),
-            confirmations: Some(0),
-            max_block_range: Some(100),
-        };
+        let step = wait_log_step("Moved", 0, Duration::from_millis(5), 0, 100);
 
-        let saved = wait_for_log(
-            &provider,
-            &submitter,
-            "chain_a",
-            &event_abi(),
-            &step,
-            &RuntimeContext::empty(),
+        let saved = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_log(
+                &provider,
+                &submitter,
+                "chain_a",
+                &event_abi(),
+                &step,
+                &RuntimeContext::empty(),
+            ),
         )
         .await
+        .expect("wait_log timed out")
         .unwrap();
         let RuntimeValue::Object(saved) = saved else { panic!("expected object") };
         assert_eq!(saved["block_number"], RuntimeValue::Uint(U256::from(5)));
-        assert!(asserter.read_q().is_empty());
+        server.abort();
     }
 
     #[tokio::test]
     async fn wait_log_records_first_observation_before_confirmation_wait() {
-        let asserter = Asserter::new();
         let log = encoded_log();
-        asserter.push_success(&4u64);
-        asserter.push_success(&block_json(log.block_hash.unwrap()));
-        asserter.push_success(&vec![log.clone()]);
-        asserter.push_success(&block_json(log.block_hash.unwrap()));
-        asserter.push_success(&vec![log.clone()]);
-        asserter.push_success(&block_json(log.block_hash.unwrap()));
-        asserter.push_success(&4u64);
-        asserter.push_success(&5u64);
-        asserter.push_success(&block_json(log.block_hash.unwrap()));
-        asserter.push_success(&5u64);
-        let provider = mocked_provider(asserter.clone());
+        let node = Arc::new(StdMutex::new(MockNode::with_head(4)));
+        {
+            let mut node = node.lock().unwrap();
+            node.hashes.insert(4, log.block_hash.unwrap());
+            node.logs.push(log);
+        }
+        let (provider, server) = spawn_mock_node(node.clone()).await;
         let submitter = mock_submitter(&provider);
-        let observation = ObservationRuntime::polling(provider, Duration::from_millis(20));
-        let step = WaitLogStep {
-            chain: "chain_a".to_string(),
-            from_block: Some(serde_yaml::Value::Number(serde_yaml::Number::from(4))),
-            address: None,
-            transaction_hash: None,
-            sender: None,
-            abi: "events".to_string(),
-            event: "Moved".to_string(),
-            where_value: BTreeMap::new(),
-            events: BTreeMap::new(),
-            mode: None,
-            poll_interval: Some(Duration::from_millis(20)),
-            confirmations: Some(1),
-            max_block_range: Some(100),
-        };
+        let observation = ObservationRuntime::polling(provider, Duration::from_millis(5));
+        let step = wait_log_step("Moved", 4, Duration::from_millis(5), 1, 100);
 
-        let result = wait_for_log_observed(
-            &observation,
-            &submitter,
-            "chain_a",
-            &event_abi(),
-            &step,
-            &RuntimeContext::empty(),
-            SubscriptionBehavior::Disabled,
+        // Hold the head at the inclusion block long enough for the log to be
+        // observed, then release the confirmation block.
+        let advanced_at = Arc::new(StdMutex::new(None::<Instant>));
+        let advance = tokio::spawn({
+            let node = node.clone();
+            let advanced_at = advanced_at.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                *advanced_at.lock().unwrap() = Some(Instant::now());
+                node.lock().unwrap().head = 5;
+            }
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_log_observed(
+                &observation,
+                &submitter,
+                "chain_a",
+                &event_abi(),
+                &step,
+                &RuntimeContext::empty(),
+                SubscriptionBehavior::Disabled,
+            ),
         )
         .await
+        .expect("wait_log timed out")
         .unwrap();
+        advance.await.unwrap();
 
         assert_eq!(result.observation.confirmation_depth, 1);
+        let advanced_at = advanced_at.lock().unwrap().expect("head was advanced");
         assert!(
-            result.observation.first_observed.monotonic.elapsed() >= Duration::from_millis(20),
+            result.observation.first_observed.monotonic < advanced_at,
             "first observation must precede the confirmation wait"
         );
-        assert!(asserter.read_q().is_empty());
+        server.abort();
     }
 
     #[tokio::test]
     async fn wait_log_rescans_recent_blocks_after_reorg() {
-        let asserter = Asserter::new();
         let log = encoded_log();
-        let old_head_hash = B256::repeat_byte(0x66);
-        let new_head_hash = log.block_hash.unwrap();
-        asserter.push_success(&4u64);
-        asserter.push_success(&block_json(old_head_hash));
-        asserter.push_success(&Vec::<Log>::new());
-        asserter.push_success(&block_json(old_head_hash));
-        asserter.push_success(&4u64);
-        asserter.push_success(&block_json(new_head_hash));
-        asserter.push_success(&4u64);
-        asserter.push_success(&block_json(new_head_hash));
-        asserter.push_success(&vec![log.clone()]);
-        asserter.push_success(&block_json(new_head_hash));
-        asserter.push_success(&vec![log.clone()]);
-        asserter.push_success(&block_json(new_head_hash));
-        asserter.push_success(&block_json(new_head_hash));
-        let provider = mocked_provider(asserter.clone());
+        let node = Arc::new(StdMutex::new(MockNode::with_head(4)));
+        node.lock().unwrap().hashes.insert(4, B256::repeat_byte(0x66));
+        let (provider, server) = spawn_mock_node(node.clone()).await;
         let submitter = mock_submitter(&provider);
-        let step = WaitLogStep {
-            chain: "chain_a".to_string(),
-            from_block: Some(serde_yaml::Value::Number(serde_yaml::Number::from(4))),
-            address: None,
-            transaction_hash: None,
-            sender: None,
-            abi: "events".to_string(),
-            event: "Moved".to_string(),
-            where_value: BTreeMap::new(),
-            events: BTreeMap::new(),
-            mode: None,
-            poll_interval: Some(Duration::from_millis(1)),
-            confirmations: Some(0),
-            max_block_range: Some(100),
-        };
+        let step = wait_log_step("Moved", 4, Duration::from_millis(5), 0, 100);
 
-        let saved = wait_for_log(
-            &provider,
-            &submitter,
-            "chain_a",
-            &event_abi(),
-            &step,
-            &RuntimeContext::empty(),
+        // Let the empty pre-reorg chain be scanned first, then replace the
+        // head block with one that contains the event.
+        let reorg = tokio::spawn({
+            let node = node.clone();
+            let log = log.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let mut node = node.lock().unwrap();
+                node.hashes.insert(4, log.block_hash.unwrap());
+                node.logs.push(log);
+            }
+        });
+
+        let saved = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_log(
+                &provider,
+                &submitter,
+                "chain_a",
+                &event_abi(),
+                &step,
+                &RuntimeContext::empty(),
+            ),
         )
         .await
+        .expect("wait_log timed out")
         .unwrap();
+        reorg.await.unwrap();
         let RuntimeValue::Object(saved) = saved else { panic!("expected object") };
         assert_eq!(saved["block_number"], RuntimeValue::Uint(U256::from(4)));
-        assert!(asserter.read_q().is_empty());
+        assert!(node.lock().unwrap().get_logs_calls >= 2, "reorg must trigger a rescan");
+        server.abort();
     }
 
     #[tokio::test]
     async fn wait_log_deep_reorg_resets_before_the_recent_window() {
-        let asserter = Asserter::new();
         let mut log = encoded_log();
         log.block_number = Some(10);
         log.block_hash = Some(B256::repeat_byte(0x77));
-        let old_head_hash = B256::repeat_byte(0x66);
-        let new_head_hash = B256::repeat_byte(0x88);
-        asserter.push_success(&100u64);
-        asserter.push_success(&block_json(old_head_hash));
-        asserter.push_success(&Vec::<Log>::new());
-        asserter.push_success(&block_json(old_head_hash));
-        asserter.push_success(&100u64);
-        asserter.push_success(&block_json(new_head_hash));
-        asserter.push_success(&100u64);
-        asserter.push_success(&block_json(new_head_hash));
-        asserter.push_success(&vec![log.clone()]);
-        asserter.push_success(&block_json(log.block_hash.unwrap()));
-        asserter.push_success(&vec![log.clone()]);
-        asserter.push_success(&block_json(log.block_hash.unwrap()));
-        asserter.push_success(&block_json(log.block_hash.unwrap()));
-        let provider = mocked_provider(asserter.clone());
+        let node = Arc::new(StdMutex::new(MockNode::with_head(100)));
+        node.lock().unwrap().hashes.insert(100, B256::repeat_byte(0x66));
+        let (provider, server) = spawn_mock_node(node.clone()).await;
         let submitter = mock_submitter(&provider);
-        let step = WaitLogStep {
-            chain: "chain_a".to_string(),
-            from_block: Some(serde_yaml::Value::Number(serde_yaml::Number::from(0))),
-            address: None,
-            transaction_hash: None,
-            sender: None,
-            abi: "events".to_string(),
-            event: "Moved".to_string(),
-            where_value: BTreeMap::new(),
-            events: BTreeMap::new(),
-            mode: None,
-            poll_interval: Some(Duration::from_millis(1)),
-            confirmations: Some(0),
-            max_block_range: Some(200),
-        };
+        let step = wait_log_step("Moved", 0, Duration::from_millis(5), 0, 200);
 
-        let saved = wait_for_log(
-            &provider,
-            &submitter,
-            "chain_a",
-            &event_abi(),
-            &step,
-            &RuntimeContext::empty(),
+        // After the empty chain is scanned end to end, reorg deep history: a
+        // new head hash plus an event well below the recent rescan window.
+        let reorg = tokio::spawn({
+            let node = node.clone();
+            let log = log.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                let mut node = node.lock().unwrap();
+                node.hashes.insert(100, B256::repeat_byte(0x88));
+                node.hashes.insert(10, log.block_hash.unwrap());
+                node.logs.push(log);
+            }
+        });
+
+        let saved = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_log(
+                &provider,
+                &submitter,
+                "chain_a",
+                &event_abi(),
+                &step,
+                &RuntimeContext::empty(),
+            ),
         )
         .await
+        .expect("wait_log timed out")
         .unwrap();
+        reorg.await.unwrap();
         let RuntimeValue::Object(saved) = saved else { panic!("expected object") };
         assert_eq!(saved["block_number"], RuntimeValue::Uint(U256::from(10)));
-        assert!(asserter.read_q().is_empty());
+        // The pre-window history was rescanned from the requested start.
+        let ranges = node.lock().unwrap().get_logs_ranges.clone();
+        assert!(
+            ranges.iter().filter(|(from, to)| *from == 0 && *to == 36).count() >= 2,
+            "history below the shared window must be rescanned after the reorg: {ranges:?}"
+        );
+        server.abort();
     }
 
     #[tokio::test]
     async fn wait_log_retries_recent_blocks_when_rpc_indexing_lags() {
-        let asserter = Asserter::new();
         let log = encoded_log();
-        let head_hash = log.block_hash.unwrap();
-        asserter.push_success(&4u64);
-        asserter.push_success(&block_json(head_hash));
-        asserter.push_success(&Vec::<Log>::new());
-        asserter.push_success(&block_json(head_hash));
-        asserter.push_success(&4u64);
-        asserter.push_success(&block_json(head_hash));
-        asserter.push_success(&vec![log.clone()]);
-        asserter.push_success(&block_json(head_hash));
-        asserter.push_success(&block_json(head_hash));
-        asserter.push_success(&vec![log.clone()]);
-        asserter.push_success(&block_json(head_hash));
-        asserter.push_success(&block_json(head_hash));
-        asserter.push_success(&block_json(head_hash));
-        let provider = mocked_provider(asserter.clone());
+        let node = Arc::new(StdMutex::new(MockNode::with_head(4)));
+        {
+            let mut node = node.lock().unwrap();
+            node.hashes.insert(4, log.block_hash.unwrap());
+            // The chain never reorgs, but the RPC only starts returning the
+            // log from the third query onward.
+            node.hidden_logs.push(log);
+            node.reveal_hidden_after = 2;
+        }
+        let (provider, server) = spawn_mock_node(node.clone()).await;
         let submitter = mock_submitter(&provider);
-        let step = WaitLogStep {
-            chain: "chain_a".to_string(),
-            from_block: Some(serde_yaml::Value::Number(serde_yaml::Number::from(4))),
-            address: None,
-            transaction_hash: None,
-            sender: None,
-            abi: "events".to_string(),
-            event: "Moved".to_string(),
-            where_value: BTreeMap::new(),
-            events: BTreeMap::new(),
-            mode: None,
-            poll_interval: Some(Duration::from_millis(1)),
-            confirmations: Some(0),
-            max_block_range: Some(100),
-        };
+        let step = wait_log_step("Moved", 4, Duration::from_millis(5), 0, 100);
 
-        let saved = wait_for_log(
-            &provider,
-            &submitter,
-            "chain_a",
-            &event_abi(),
-            &step,
-            &RuntimeContext::empty(),
+        let saved = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_log(
+                &provider,
+                &submitter,
+                "chain_a",
+                &event_abi(),
+                &step,
+                &RuntimeContext::empty(),
+            ),
         )
         .await
+        .expect("wait_log timed out")
         .unwrap();
         let RuntimeValue::Object(saved) = saved else { panic!("expected object") };
         assert_eq!(saved["block_number"], RuntimeValue::Uint(U256::from(4)));
-        assert!(asserter.read_q().is_empty());
+        assert!(node.lock().unwrap().get_logs_calls >= 3, "recent blocks must be retried");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_wait_logs_share_a_single_poller() {
+        let poll_interval = Duration::from_millis(10);
+        let node = Arc::new(StdMutex::new(MockNode::with_head(100)));
+        node.lock().unwrap().hashes.insert(95, B256::repeat_byte(0x33));
+        let (provider, server) = spawn_mock_node(node.clone()).await;
+        let submitter = mock_submitter(&provider);
+        let observation = ObservationRuntime::polling(provider, poll_interval);
+        let started = Instant::now();
+
+        let waiters: Vec<_> = (0..8)
+            .map(|_| {
+                let observation = observation.clone();
+                let submitter = submitter.clone();
+                tokio::spawn(async move {
+                    let step = wait_log_step("Moved", 90, poll_interval, 0, 1_000);
+                    wait_for_log_observed(
+                        &observation,
+                        &submitter,
+                        "chain_a",
+                        &event_abi(),
+                        &step,
+                        &RuntimeContext::empty(),
+                        SubscriptionBehavior::Disabled,
+                    )
+                    .await
+                })
+            })
+            .collect();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        {
+            let mut node = node.lock().unwrap();
+            let mut log = encoded_log();
+            log.block_number = Some(95);
+            node.logs.push(log);
+        }
+        for waiter in waiters {
+            let result = tokio::time::timeout(Duration::from_secs(10), waiter)
+                .await
+                .expect("wait_log timed out")
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.observation.block_number, 95);
+        }
+
+        // All eight waiters must be served by one poller: the total request
+        // volume tracks elapsed polling ticks, not the number of consumers.
+        let elapsed_ticks = started.elapsed().as_millis() / poll_interval.as_millis();
+        let node = node.lock().unwrap();
+        let allowed_polls = elapsed_ticks + 20;
+        assert!(
+            (node.block_number_calls as u128) <= allowed_polls,
+            "{} eth_blockNumber calls exceed one poller's budget of {allowed_polls}",
+            node.block_number_calls
+        );
+        // One window fetch per tick plus one canonical recheck per consumer.
+        let allowed_log_queries = elapsed_ticks + 8 + 20;
+        assert!(
+            (node.get_logs_calls as u128) <= allowed_log_queries,
+            "{} eth_getLogs calls exceed one poller's budget of {allowed_log_queries}",
+            node.get_logs_calls
+        );
+        server.abort();
+    }
+
+    fn jumped_abi() -> JsonAbi {
+        serde_json::from_str(
+            r#"[{"type":"event","name":"Jumped","anonymous":false,"inputs":[{"name":"height","type":"uint256","indexed":false}]}]"#,
+        )
+        .unwrap()
+    }
+
+    fn jumped_log(block_number: u64) -> Log {
+        let event = resolve_event(&jumped_abi(), "Jumped").unwrap().clone();
+        Log {
+            inner: alloy_primitives::Log {
+                address: Address::repeat_byte(0x23),
+                data: LogData::new_unchecked(
+                    vec![event.selector()],
+                    Bytes::from(DynSolValue::Uint(U256::from(9), 256).abi_encode()),
+                ),
+            },
+            block_hash: Some(B256::repeat_byte(0x34)),
+            block_number: Some(block_number),
+            transaction_hash: Some(B256::repeat_byte(0x45)),
+            log_index: Some(0),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn heterogeneous_waits_share_the_union_filter() {
+        let poll_interval = Duration::from_millis(10);
+        let moved = encoded_log();
+        let jumped = jumped_log(6);
+        let node = Arc::new(StdMutex::new(MockNode::with_head(10)));
+        {
+            let mut node = node.lock().unwrap();
+            node.hashes.insert(4, moved.block_hash.unwrap());
+            node.hashes.insert(6, jumped.block_hash.unwrap());
+        }
+        let (provider, server) = spawn_mock_node(node.clone()).await;
+        let submitter = mock_submitter(&provider);
+        let observation = ObservationRuntime::polling(provider, poll_interval);
+
+        let mut waiters = Vec::new();
+        for (abi, event) in [(event_abi(), "Moved"), (jumped_abi(), "Jumped")] {
+            let observation = observation.clone();
+            let submitter = submitter.clone();
+            waiters.push(tokio::spawn(async move {
+                let step = wait_log_step(event, 0, poll_interval, 0, 1_000);
+                wait_for_log_observed(
+                    &observation,
+                    &submitter,
+                    "chain_a",
+                    &abi,
+                    &step,
+                    &RuntimeContext::empty(),
+                    SubscriptionBehavior::Disabled,
+                )
+                .await
+            }));
+        }
+
+        // Publish both events only after both waiters are subscribed so the
+        // discovering scan must have carried the union of both signatures.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let mut node = node.lock().unwrap();
+            node.logs.push(moved);
+            node.logs.push(jumped);
+        }
+        let mut blocks = Vec::new();
+        for waiter in waiters {
+            let result = tokio::time::timeout(Duration::from_secs(10), waiter)
+                .await
+                .expect("wait_log timed out")
+                .unwrap()
+                .unwrap();
+            blocks.push(result.observation.block_number);
+        }
+        assert_eq!(blocks, vec![4, 6]);
+
+        let moved_selector =
+            format!("{:?}", resolve_event(&event_abi(), "Moved").unwrap().selector());
+        let jumped_selector =
+            format!("{:?}", resolve_event(&jumped_abi(), "Jumped").unwrap().selector());
+        let node = node.lock().unwrap();
+        let unioned = node.get_logs_topics.iter().any(|topics| {
+            let Some(topic0) = topics.get(0) else { return false };
+            let rendered = topic0.to_string();
+            rendered.contains(&moved_selector) && rendered.contains(&jumped_selector)
+        });
+        assert!(
+            unioned,
+            "some shared scan must carry both event signatures: {:?}",
+            node.get_logs_topics
+        );
+        server.abort();
     }
 
     #[tokio::test]

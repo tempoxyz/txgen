@@ -14,6 +14,7 @@ mod clickhouse;
 mod composition;
 mod engine;
 mod error;
+mod log_hub;
 mod report;
 pub mod schema;
 pub mod value;

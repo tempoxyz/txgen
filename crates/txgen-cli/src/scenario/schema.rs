@@ -416,13 +416,15 @@ pub struct WaitLogStep {
     /// Per-step observation mode override.
     #[serde(default)]
     pub mode: Option<ObservationMode>,
-    /// Polling interval override.
+    /// Polling interval override. Active log waits on one chain share a
+    /// single poller, which runs at the fastest interval among them.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub poll_interval: Option<Duration>,
     /// Required canonical confirmation count when explicitly configured.
     #[serde(default)]
     pub confirmations: Option<u64>,
     /// Maximum inclusive block span requested from `eth_getLogs` at once.
+    /// The shared chain poller honors the smallest span among active waits.
     #[serde(default, alias = "block_range")]
     pub max_block_range: Option<u64>,
 }
