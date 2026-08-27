@@ -726,7 +726,7 @@ The selected header is attached only to `eth_sendRawTransaction` and sender-scop
     sender: { var: publish.sender }
 ```
 
-`observation.mode` is `auto`, `subscription`, or `poll`. `auto` prefers WebSocket new-head and log subscriptions when `websocket_url` is available, performs canonical backfill and verification around subscription setup, and falls back to polling. `subscription` requires the WebSocket transport. `poll` always uses RPC polling. `poll_interval` is the chain fallback interval for scenario waits and defaults to `50ms`; an individual `wait_receipt` or `wait_log` may override it with its own `mode` and `poll_interval`. Subscription wakeups are paired with canonical backfill so receipts and logs produced before or during setup are not lost.
+`observation.mode` is `auto`, `subscription`, or `poll`. `auto` prefers WebSocket new-head wakeups when `websocket_url` is available, performs canonical backfill and verification around subscription setup, and falls back to polling. `subscription` requires the WebSocket transport. `poll` always uses RPC polling. `poll_interval` is the chain fallback interval for scenario waits and defaults to `50ms`; an individual `wait_receipt` or `wait_log` may override the interval. Subscription wakeups are paired with canonical backfill so receipts and logs produced before or during setup are not lost.
 
 ### Reusable fragments and composition
 
@@ -999,7 +999,6 @@ Observes a supplied transaction hash using the chain's configured observation mo
     chain: origin
     transaction_hash: { var: publish.tx_hash }
     sender: { var: publish.sender }
-    mode: auto
     poll_interval: 50ms
     confirmations: 2
   save: publish_receipt
@@ -1009,7 +1008,7 @@ Observes a supplied transaction hash using the chain's configured observation mo
 
 Loads an ABI artifact from the selected chain's workload and resolves `event` by name or exact signature. It decodes indexed and unindexed arguments, then returns the first canonical match in block-number/log-index order.
 
-A log wait must provide `from_block` or `transaction_hash`. Optional `address`, `transaction_hash`, and `where` fields narrow the match. Each `where` entry compares one decoded argument to a resolved, typed runtime value. The default fallback poll interval is `50ms`, with zero additional confirmations and at most 1,000 blocks per `eth_getLogs` request. The waiter backfills from the starting cursor, uses the selected subscription or polling mode, honors confirmations, and discards removed or reorged candidates after canonical verification.
+A log wait must provide `from_block` or `transaction_hash`. Optional `address`, `transaction_hash`, and `where` fields narrow the match. Each `where` entry compares one decoded argument to a resolved, typed runtime value. The default fallback poll interval is `50ms`, with zero additional confirmations and at most 1,000 blocks per `eth_getLogs` request. The waiter backfills from the starting cursor, uses the chain's configured subscription or polling mode, honors confirmations, and discards removed or reorged candidates after canonical verification.
 
 ```yaml
 - wait_log:
@@ -1018,7 +1017,6 @@ A log wait must provide `from_block` or `transaction_hash`. Optional `address`, 
     address: ${DESTINATION_RELAY_ADDRESS}
     abi: Relay
     event: "MessageDelivered(bytes32,address)"
-    mode: auto
     where:
       messageId: { var: message_published.args.messageId }
     max_block_range: 1000

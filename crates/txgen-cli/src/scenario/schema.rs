@@ -371,9 +371,6 @@ pub struct WaitReceiptStep {
     /// Accept a reverted receipt rather than failing the scenario step.
     #[serde(default)]
     pub allow_revert: bool,
-    /// Per-step observation mode override.
-    #[serde(default)]
-    pub mode: Option<ObservationMode>,
     /// Polling interval override.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
     pub poll_interval: Option<Duration>,
@@ -413,9 +410,6 @@ pub struct WaitLogStep {
     /// Multiple required events decoded from one canonical transaction receipt.
     #[serde(default)]
     pub events: BTreeMap<String, ReceiptEventDef>,
-    /// Per-step observation mode override.
-    #[serde(default)]
-    pub mode: Option<ObservationMode>,
     /// Polling interval override. Active log waits on one chain share a
     /// single poller, which runs at the fastest interval among them.
     #[serde(default, deserialize_with = "deserialize_optional_duration")]
@@ -929,13 +923,6 @@ impl ScenarioSpec {
             }
             StepAction::WaitReceipt(wait) => {
                 validate_optional_duration(wait.poll_interval, &label, "poll_interval")?;
-                if wait.mode == Some(ObservationMode::Subscription) &&
-                    self.chains[chain].observation.websocket_url.is_none()
-                {
-                    bail!(
-                        "{label} observation mode `subscription` requires chain '{chain}' to configure `observation.websocket_url`"
-                    );
-                }
                 validate_expression_type(
                     &wait.transaction_hash,
                     StaticValueType::Bytes32,
@@ -1013,13 +1000,6 @@ impl ScenarioSpec {
                 }
                 validate_optional_nonzero(wait.max_block_range, &label, "max_block_range")?;
                 validate_optional_duration(wait.poll_interval, &label, "poll_interval")?;
-                if wait.mode == Some(ObservationMode::Subscription) &&
-                    self.chains[chain].observation.websocket_url.is_none()
-                {
-                    bail!(
-                        "{label} observation mode `subscription` requires chain '{chain}' to configure `observation.websocket_url`"
-                    );
-                }
                 if let Some(from_block) = &wait.from_block {
                     validate_expression_type(
                         from_block,
@@ -2264,21 +2244,34 @@ scenario:
     }
 
     #[test]
-    fn subscription_step_requires_chain_websocket_configuration() {
+    fn subscription_chain_requires_websocket_configuration() {
+        let yaml = BASE.replacen(
+            "    workload: ./l1.yml",
+            "    observation:\n      mode: subscription\n    workload: ./l1.yml",
+            1,
+        );
+        let error = ScenarioSpec::parse(&yaml).unwrap_err().to_string();
+        assert!(
+            error.contains("chain 'l1' observation mode `subscription` requires `websocket_url`")
+        );
+
+        let yaml = yaml.replacen(
+            "      mode: subscription",
+            "      mode: subscription\n      websocket_url: ws://l1.invalid",
+            1,
+        );
+        ScenarioSpec::parse(&yaml).unwrap();
+    }
+
+    #[test]
+    fn step_observation_mode_is_rejected() {
         let yaml = BASE.replacen(
             "        poll_interval: 100ms",
             "        mode: subscription\n        poll_interval: 100ms",
             1,
         );
         let error = ScenarioSpec::parse(&yaml).unwrap_err().to_string();
-        assert!(error.contains("requires chain 'l1' to configure `observation.websocket_url`"));
-
-        let yaml = yaml.replacen(
-            "    workload: ./l1.yml",
-            "    workload: ./l1.yml\n    observation:\n      mode: auto\n      websocket_url: ws://l1.invalid",
-            1,
-        );
-        ScenarioSpec::parse(&yaml).unwrap();
+        assert!(error.contains("unknown field `mode`"), "unexpected error: {error}");
     }
 
     #[test]

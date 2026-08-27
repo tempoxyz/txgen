@@ -12,7 +12,7 @@
 use super::{
     error::StepError,
     wait::{
-        bounded_range_end, canonical_block_hash, sort_logs, wait_for_wake, ObservationPoint,
+        bounded_range_end, canonical_block_hash, sort_logs, ObservationPoint, SubscriptionBehavior,
         WakeStream,
     },
 };
@@ -103,7 +103,9 @@ struct TickPlan {
 pub(crate) struct LogPollHub {
     provider: DynProvider<AnyNetwork>,
     websocket_provider: Option<DynProvider<AnyNetwork>>,
+    subscription_behavior: SubscriptionBehavior,
     state: Mutex<HubState>,
+    registry_updates: watch::Sender<u64>,
     updates: watch::Sender<Option<WindowUpdate>>,
 }
 
@@ -111,10 +113,12 @@ impl LogPollHub {
     pub(crate) fn new(
         provider: DynProvider<AnyNetwork>,
         websocket_provider: Option<DynProvider<AnyNetwork>>,
+        subscription_behavior: SubscriptionBehavior,
     ) -> Self {
         Self {
             provider,
             websocket_provider,
+            subscription_behavior,
             state: Mutex::new(HubState {
                 next_id: 0,
                 generation: 0,
@@ -122,6 +126,7 @@ impl LogPollHub {
                 running: false,
                 interests: BTreeMap::new(),
             }),
+            registry_updates: watch::channel(0).0,
             updates: watch::channel(None).0,
         }
     }
@@ -137,6 +142,7 @@ impl LogPollHub {
         let spawn = !state.running;
         state.running = true;
         drop(state);
+        self.registry_updates.send_replace(generation);
         if spawn {
             tokio::spawn(Arc::clone(self).run());
         }
@@ -168,15 +174,10 @@ impl LogPollHub {
 
     async fn run(self: Arc<Self>) {
         let mut checkpoint = None::<(u64, B256)>;
-        let mut wake = match &self.websocket_provider {
-            Some(provider) => match provider.subscribe_blocks().await {
-                Ok(subscription) => {
-                    Some(Box::pin(subscription.into_stream().map(|_| ())) as WakeStream)
-                }
-                Err(_) => None,
-            },
-            None => None,
-        };
+        let mut wake = None;
+        let mut registry_updates = self.registry_updates.subscribe();
+        let mut subscription_initialized =
+            self.subscription_behavior == SubscriptionBehavior::Disabled;
         loop {
             let Some(plan) = self.tick_plan() else { return };
             let interval = plan
@@ -185,6 +186,22 @@ impl LogPollHub {
                 .map(|interest| interest.poll_interval)
                 .min()
                 .expect("tick plan is non-empty");
+            if !subscription_initialized {
+                match self.subscribe_wake().await {
+                    Ok(stream) => {
+                        wake = stream;
+                        subscription_initialized = true;
+                    }
+                    Err(error) => {
+                        let _ = self.updates.send(Some(WindowUpdate {
+                            generation: plan.generation,
+                            result: Err(error),
+                        }));
+                        self.wait_for_next_tick(&mut wake, &mut registry_updates, interval).await;
+                        continue;
+                    }
+                }
+            }
             let update = match self.scan(&plan, &mut checkpoint).await {
                 Ok(Some(window)) => Some(Ok(window)),
                 Ok(None) => None,
@@ -194,7 +211,53 @@ impl LogPollHub {
                 let _ =
                     self.updates.send(Some(WindowUpdate { generation: plan.generation, result }));
             }
-            wait_for_wake(&mut wake, interval).await;
+            self.wait_for_next_tick(&mut wake, &mut registry_updates, interval).await;
+        }
+    }
+
+    async fn wait_for_next_tick(
+        &self,
+        wake: &mut Option<WakeStream>,
+        registry_updates: &mut watch::Receiver<u64>,
+        interval: Duration,
+    ) {
+        let Some(stream) = wake.as_mut() else {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = registry_updates.changed() => {}
+            }
+            return;
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = registry_updates.changed() => {}
+            notification = stream.next() => {
+                if notification.is_none() {
+                    *wake = None;
+                }
+            }
+        }
+    }
+
+    async fn subscribe_wake(&self) -> Result<Option<WakeStream>, String> {
+        if self.subscription_behavior == SubscriptionBehavior::Disabled {
+            return Ok(None);
+        }
+        let Some(provider) = &self.websocket_provider else {
+            return if self.subscription_behavior == SubscriptionBehavior::Require {
+                Err("subscription observation mode has no connected WebSocket".to_string())
+            } else {
+                Ok(None)
+            };
+        };
+        match provider.subscribe_blocks().await {
+            Ok(subscription) => {
+                Ok(Some(Box::pin(subscription.into_stream().map(|_| ())) as WakeStream))
+            }
+            Err(error) if self.subscription_behavior == SubscriptionBehavior::Require => {
+                Err(error.to_string())
+            }
+            Err(_) => Ok(None),
         }
     }
 
@@ -363,6 +426,12 @@ impl LogWindowSubscription {
 impl Drop for LogWindowSubscription {
     fn drop(&mut self) {
         let mut state = self.hub.state.lock().expect("log hub state lock");
-        state.interests.remove(&self.id);
+        if state.interests.remove(&self.id).is_none() {
+            return;
+        }
+        state.generation += 1;
+        let generation = state.generation;
+        drop(state);
+        self.hub.registry_updates.send_replace(generation);
     }
 }

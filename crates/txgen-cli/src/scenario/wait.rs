@@ -58,7 +58,7 @@ pub(crate) struct ObservationRuntime {
     query_provider: DynProvider<AnyNetwork>,
     websocket_provider: Option<DynProvider<AnyNetwork>>,
     poll_interval: Duration,
-    default_subscription: SubscriptionBehavior,
+    subscription_behavior: SubscriptionBehavior,
     /// Shared per-chain log scanner. All step-level clones of this runtime
     /// reuse the same hub, so a chain never runs more than one log poller
     /// regardless of how many `wait_log` steps are active.
@@ -73,50 +73,49 @@ impl ObservationRuntime {
         poll_interval: Duration,
     ) -> Self {
         Self {
-            log_hub: Arc::new(LogPollHub::new(query_provider.clone(), None)),
+            log_hub: Arc::new(LogPollHub::new(
+                query_provider.clone(),
+                None,
+                SubscriptionBehavior::Disabled,
+            )),
             query_provider,
             websocket_provider: None,
             poll_interval,
-            default_subscription: SubscriptionBehavior::Disabled,
+            subscription_behavior: SubscriptionBehavior::Disabled,
         }
     }
 
     pub(crate) async fn from_config(
         query_provider: DynProvider<AnyNetwork>,
         config: &ObservationDef,
-        require_subscription: bool,
     ) -> Result<Self, StepError> {
         let behavior = SubscriptionBehavior::from(config.mode);
-        let require_subscription =
-            require_subscription || behavior == SubscriptionBehavior::Require;
-        let mut runtime = Self::connect(
+        Self::connect(
             query_provider,
             config.websocket_url.as_deref(),
             config.poll_interval,
-            require_subscription,
+            behavior,
         )
-        .await?;
-        runtime.default_subscription = behavior;
-        Ok(runtime)
+        .await
     }
 
     /// Connect an optional WebSocket observation endpoint.
     ///
-    /// `require_subscription` is used for explicit subscription mode. Auto
-    /// mode passes `false`, allowing a connection failure to fall back to
-    /// canonical HTTP polling.
+    /// Auto mode allows a connection failure to fall back to canonical HTTP
+    /// polling. Poll mode does not connect to the WebSocket endpoint at all.
     pub(crate) async fn connect(
         query_provider: DynProvider<AnyNetwork>,
         websocket_url: Option<&str>,
         poll_interval: Duration,
-        require_subscription: bool,
+        behavior: SubscriptionBehavior,
     ) -> Result<Self, StepError> {
-        let websocket_provider = match websocket_url {
-            Some(url) => {
+        let websocket_provider = match (behavior, websocket_url) {
+            (SubscriptionBehavior::Disabled, _) => None,
+            (_, Some(url)) => {
                 let connect = WsConnect::new(url);
                 match ProviderBuilder::new_with_network::<AnyNetwork>().connect_ws(connect).await {
                     Ok(provider) => Some(provider.erased()),
-                    Err(error) if require_subscription => {
+                    Err(error) if behavior == SubscriptionBehavior::Require => {
                         let _ = error;
                         return Err(StepError::new(
                             "configuration_error",
@@ -126,24 +125,24 @@ impl ObservationRuntime {
                     Err(_) => None,
                 }
             }
-            None if require_subscription => {
+            (SubscriptionBehavior::Require, None) => {
                 return Err(StepError::new(
                     "configuration_error",
                     "subscription observation mode requires a websocket_url",
                 ));
             }
-            None => None,
+            (SubscriptionBehavior::Prefer, None) => None,
         };
         Ok(Self {
-            log_hub: Arc::new(LogPollHub::new(query_provider.clone(), websocket_provider.clone())),
+            log_hub: Arc::new(LogPollHub::new(
+                query_provider.clone(),
+                websocket_provider.clone(),
+                behavior,
+            )),
             query_provider,
             websocket_provider,
             poll_interval,
-            default_subscription: if require_subscription {
-                SubscriptionBehavior::Require
-            } else {
-                SubscriptionBehavior::Prefer
-            },
+            subscription_behavior: behavior,
         })
     }
 
@@ -155,20 +154,8 @@ impl ObservationRuntime {
         self.poll_interval
     }
 
-    pub(crate) fn subscription_behavior(
-        &self,
-        step_override: Option<ObservationMode>,
-    ) -> SubscriptionBehavior {
-        step_override.map(SubscriptionBehavior::from).unwrap_or(self.default_subscription)
-    }
-
-    pub(crate) fn for_step(
-        &self,
-        mode: Option<ObservationMode>,
-        poll_interval: Option<Duration>,
-    ) -> Self {
+    pub(crate) fn for_step(&self, poll_interval: Option<Duration>) -> Self {
         let mut runtime = self.clone();
-        runtime.default_subscription = self.subscription_behavior(mode);
         if let Some(poll_interval) = poll_interval {
             runtime.poll_interval = poll_interval;
         }
@@ -179,8 +166,8 @@ impl ObservationRuntime {
         self.websocket_provider.is_some()
     }
 
-    pub(crate) fn default_subscription(&self) -> SubscriptionBehavior {
-        self.default_subscription
+    pub(crate) fn subscription_behavior(&self) -> SubscriptionBehavior {
+        self.subscription_behavior
     }
 
     async fn subscribe_heads(
@@ -1779,7 +1766,6 @@ mod tests {
             event: event.to_string(),
             where_value: BTreeMap::new(),
             events: BTreeMap::new(),
-            mode: None,
             poll_interval: Some(poll_interval),
             confirmations: Some(confirmations),
             max_block_range: Some(max_block_range),
@@ -2522,6 +2508,78 @@ mod tests {
             "{} eth_getLogs calls exceed one poller's budget of {allowed_log_queries}",
             node.get_logs_calls
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn faster_waiter_wakes_poller_sleeping_on_a_long_interval() {
+        let long_interval = Duration::from_secs(30);
+        let node = Arc::new(StdMutex::new(MockNode::with_head(10)));
+        let (provider, server) = spawn_mock_node(node.clone()).await;
+        let submitter = mock_submitter(&provider);
+        let observation = ObservationRuntime::polling(provider, long_interval);
+
+        let long_wait = tokio::spawn({
+            let observation = observation.clone();
+            let submitter = submitter.clone();
+            async move {
+                let abi = event_abi();
+                let step = wait_log_step("Moved", 0, long_interval, 0, 100);
+                wait_for_log_observed(
+                    &observation,
+                    &submitter,
+                    "chain_a",
+                    &abi,
+                    &step,
+                    &RuntimeContext::empty(),
+                    SubscriptionBehavior::Disabled,
+                )
+                .await
+            }
+        });
+
+        // Wait until the first consumer's initial scan has started. Its hub
+        // will otherwise sleep for 30 seconds before rebuilding the plan.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if node.lock().unwrap().get_logs_calls > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initial shared scan did not start");
+
+        let jumped = jumped_log(6);
+        {
+            let mut node = node.lock().unwrap();
+            node.hashes.insert(6, jumped.block_hash.unwrap());
+            node.logs.push(jumped);
+        }
+
+        let short_interval = Duration::from_millis(5);
+        let short_observation = observation.for_step(Some(short_interval));
+        let short_step = wait_log_step("Jumped", 0, short_interval, 0, 100);
+        let jumped_abi = jumped_abi();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_log_observed(
+                &short_observation,
+                &submitter,
+                "chain_a",
+                &jumped_abi,
+                &short_step,
+                &RuntimeContext::empty(),
+                SubscriptionBehavior::Disabled,
+            ),
+        )
+        .await
+        .expect("new interest did not wake the shared poller")
+        .unwrap();
+
+        assert_eq!(result.observation.block_number, 6);
+        long_wait.abort();
         server.abort();
     }
 
