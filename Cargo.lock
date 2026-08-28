@@ -1399,6 +1399,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
+ "txgen-tempo",
 ]
 
 [[package]]
@@ -6065,6 +6066,7 @@ dependencies = [
  "alloy-signer",
  "alloy-transport",
  "axum",
+ "bench-core",
  "clap",
  "eyre",
  "hex",

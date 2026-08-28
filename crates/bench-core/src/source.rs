@@ -48,6 +48,10 @@ impl SourceTx {
             .parse::<Bytes>()
             .context("invalid raw tx hex")?;
 
+        if self.late_sign.is_some() && !raw.is_empty() {
+            eyre::bail!("deferred transactions must leave `raw` empty");
+        }
+
         let submission_keys = dedup_scheduling_keys(self.submission_keys);
         let inclusion_keys = dedup_scheduling_keys(self.inclusion_keys);
 
@@ -184,5 +188,39 @@ mod tests {
 
         let generated = source_tx.into_generated_tx().unwrap();
         assert_eq!(generated.sender, Some(Address::repeat_byte(0x33)));
+    }
+
+    #[test]
+    fn parses_deferred_signing_metadata() {
+        let source_tx: SourceTx = serde_json::from_str(
+            r#"{
+                "raw": "0x",
+                "late_sign": {"format": "test", "payload": {"ttl": 25}},
+                "submission_keys": [
+                    "0x1111111111111111111111111111111111111111"
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let generated = source_tx.into_generated_tx().unwrap();
+        assert!(generated.raw.is_empty());
+        assert_eq!(generated.late_sign.as_ref().unwrap().format, "test");
+    }
+
+    #[test]
+    fn rejects_deferred_signing_with_raw_bytes() {
+        let source_tx: SourceTx = serde_json::from_str(
+            r#"{
+                "raw": "0x02f870",
+                "late_sign": {"format": "test", "payload": {}},
+                "submission_keys": [
+                    "0x1111111111111111111111111111111111111111"
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(source_tx.into_generated_tx().is_err());
     }
 }

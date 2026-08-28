@@ -271,11 +271,17 @@ bench send -i txs.ndjson \
   --query-rpc-url http://query.example:8546 \
   --sender-header-name X-Authorization-Token \
   --sender-header-map /run/secrets/sender-auth.json
+
+# Tempo relative-expiry transactions from a file or a pipe
+txgen-tempo generate -s workload.yaml -n 1000 > txs.ndjson
+bench send -i txs.ndjson --late-signing-spec workload.yaml
+txgen-tempo generate -s workload.yaml -n 1000 | bench send --late-signing-spec workload.yaml
 ```
 
 | Flag | Description |
 |------|-------------|
 | `-i, --input <PATH>` | Input NDJSON file (default: stdin) |
+| `--late-signing-spec <PATH>` | Workload spec used to sign deferred Tempo transactions at submission time |
 | `--rpc-url <URL>` | RPC endpoint URLs, comma-separated or repeated (default: `http://localhost:8545`) |
 | `--query-rpc-url <URL>` | Optional RPC endpoint for block, block-receipt, txpool, and other aggregate queries |
 | `--sender-header-name <NAME>` | HTTP header populated from the sender map for sender-scoped requests |
@@ -1171,7 +1177,8 @@ Transactions are output as NDJSON with scheduling keys split by release policy:
 |-------|-------------|
 | `phase` | `setup` or `workload`; missing phase is treated as `workload` by `bench` |
 | `id` | Optional diagnostic identifier |
-| `raw` | RLP-encoded signed transaction (EIP-2718 envelope) |
+| `raw` | RLP-encoded signed transaction (EIP-2718 envelope); empty when `late_sign` is present |
+| `late_sign` | Optional network-specific signing instructions for materializing `raw` at submission time |
 | `sender` | Logical on-chain transaction sender used for request-scoped authentication |
 | `submission_keys` | 20-byte ordering constraints released after RPC submission succeeds |
 | `inclusion_keys` | 20-byte ordering constraints released after the transaction is included in a block |
@@ -1703,7 +1710,7 @@ templates:
     # Tempo-specific replay protection
     nonce_key: "42"              # 2D nonce lane (0 = protocol nonce)
     expiring_nonce: true         # TIP-1009 expiring nonce mode
-    valid_for_secs: 25           # Relative expiry window, resolved at generation time
+    valid_for_secs: 25           # Relative expiry window for standard/sponsored txs
     valid_before: 1700100000     # Absolute expiry timestamp (alternative to valid_for_secs)
     fee_token: "0x..."           # Pay gas in stablecoin
     valid_after: 1700000000      # Scheduled: valid after timestamp
@@ -1725,15 +1732,15 @@ templates:
 **Expiring nonces:** Set `expiring_nonce: true` to generate TIP-1009 transactions. txgen will set `nonce_key = U256::MAX` and `nonce = 0` automatically. You must provide either:
 
 - `valid_before`: an absolute Unix timestamp in seconds
-- `valid_for_secs`: a relative TTL in seconds, resolved when the transaction is generated
+- `valid_for_secs`: a relative TTL in seconds for standard/sponsored transactions, resolved immediately before submission
 
 `valid_for_secs` must be `<= 30`, matching Tempo's expiring nonce validity window.
 
-For streamed benchmark pipelines such as `txgen-tempo generate | bench send`, txgen also applies a deterministic per-transaction bump to `max_fee_per_gas` before sponsor signing and sender signing. This guarantees that otherwise identical expiring transactions still produce unique signed payloads, avoiding hash-based replay collisions. `max_priority_fee_per_gas` remains exactly as configured, including zero.
+For relative expiry on standard or sponsored transactions, `txgen-tempo generate` emits a deferred-signing record with an empty `raw` field. `bench send --late-signing-spec workload.yaml` resolves the account references and signs each record immediately before the RPC request. The same option works for a pre-generated file and for a pipe; the workload spec supplies signing keys and is never embedded in the NDJSON output. Txgen still applies a deterministic per-transaction bump to `max_fee_per_gas` before the final sender and sponsor signatures, so otherwise identical expiring transactions have unique signed payloads. `max_priority_fee_per_gas` remains exactly as configured, including zero. Tempo keychain-auth records retain the existing generation-time signing path.
 
 Recommended benchmark setting: `valid_for_secs: 25`. This matches `tempo-bench`'s default behavior and stays inside Tempo's 30-second protocol limit while leaving some propagation slack.
 
-**Benchmarking caveat:** Expiring nonce transactions are still time-bounded by `valid_before <= now + 30s`. Streamed generation/send pipelines are practical because txgen builds and signs each transaction immediately before emitting it, but pre-generating a large expiring-tx file and replaying it later is still unsafe because many transactions will expire before submission.
+**Benchmarking caveat:** Expiring nonce transactions are still time-bounded by `valid_before <= now + 30s`. Relative-expiry records can be pre-generated and replayed later because the validity window starts when `bench send` signs them; absolute `valid_before` records retain their existing pre-signed behavior and must be submitted before their timestamp.
 
 **Keychain access keys:** Tempo templates can sign workload transactions with an AccountKeychain access key while keeping the logical sender as `from`. Add a setup step to pre-authorize one deterministic access key per account, then reference that setup step from workload templates:
 
