@@ -217,8 +217,8 @@ impl TempoAdapter {
         address: Address,
         nonce_key: U256,
     ) -> Result<u64> {
-        if !ctx.nonces.contains(&scheduling_key)
-            && let Some(nonce_rpc) = self.nonce_rpc.get()
+        if !ctx.nonces.contains(&scheduling_key) &&
+            let Some(nonce_rpc) = self.nonce_rpc.get()
         {
             if nonce_rpc.pending {
                 bail!(
@@ -325,10 +325,10 @@ impl TempoAdapter {
         selected: &SelectedSigner,
         key_type: SignatureType,
     ) -> Result<EcdsaSigner> {
-        if auth.expiry.is_some()
-            || auth.limits.is_some()
-            || auth.allowed_calls.is_some()
-            || auth.witness.is_some()
+        if auth.expiry.is_some() ||
+            auth.limits.is_some() ||
+            auth.allowed_calls.is_some() ||
+            auth.witness.is_some()
         {
             bail!(
                 "`auth.mode: keychain` uses restrictions from its setup step; put expiry, limits, allowed_calls, and witness on the setup or use `key_authorization`"
@@ -415,8 +415,8 @@ impl NetworkAdapter for TempoAdapter {
             bail!("Tempo keychain auth is only supported for `type: tempo` templates");
         }
         let nonce_mode = resolve_nonce_mode(&template, is_tempo, ctx)?;
-        if !matches!(nonce_mode, TempoNonceMode::Expiring)
-            && let Some(valid_for_secs) = template.valid_for_secs
+        if !matches!(nonce_mode, TempoNonceMode::Expiring) &&
+            let Some(valid_for_secs) = template.valid_for_secs
         {
             bail!(
                 "`valid_for_secs` is only supported for expiring Tempo transactions (got {valid_for_secs}s on {:?})",
@@ -428,8 +428,8 @@ impl NetworkAdapter for TempoAdapter {
             bail!("`nonce` must not be set for an expiring Tempo transaction");
         }
         let nonce = if let Some(nonce) = template.nonce {
-            if !matches!(nonce_mode, TempoNonceMode::Expiring)
-                && self.nonce_rpc.get().is_some_and(|rpc| rpc.pending)
+            if !matches!(nonce_mode, TempoNonceMode::Expiring) &&
+                self.nonce_rpc.get().is_some_and(|rpc| rpc.pending)
             {
                 let expected = self.next_nonce_lazy(
                     ctx,
@@ -483,8 +483,10 @@ impl NetworkAdapter for TempoAdapter {
                 req.calls = calls;
 
                 let is_expiring = matches!(nonce_mode, TempoNonceMode::Expiring);
-                let is_late_sign =
-                    is_expiring && template.valid_for_secs.is_some() && template.auth.is_none();
+                let is_late_sign = ctx.defer_signing() &&
+                    is_expiring &&
+                    template.valid_for_secs.is_some() &&
+                    template.auth.is_none();
                 let valid_before = match nonce_mode {
                     TempoNonceMode::Protocol => template.valid_before,
                     TempoNonceMode::Parallel(nonce_key) => {
@@ -1252,9 +1254,7 @@ mod tests {
     use alloy_provider::{Provider, ProviderBuilder};
     use alloy_transport::mock::Asserter;
     use rand::{rngs::StdRng, SeedableRng};
-    use std::{
-        collections::HashMap,
-    };
+    use std::collections::HashMap;
     use tempo_primitives::TEMPO_TX_TYPE_ID;
     use txgen_core::{
         AccountManager, AccountPoolDef, AccountRef, ArtifactManager, GasConfig, GenValue,
@@ -1821,6 +1821,25 @@ nonce_key:
     }
 
     #[test]
+    fn test_expiring_nonce_valid_for_secs_is_signed_by_default() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let mut template = base_template(TempoTxType::Tempo);
+        template.expiring_nonce = true;
+        template.valid_for_secs = Some(25);
+
+        let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
+
+        assert!(tx_req.request.valid_before.is_some());
+        assert!(tx_req.late_sign.is_none());
+    }
+
+    #[test]
     fn test_expiring_nonce_valid_for_secs_is_deferred_until_submission() {
         let accounts = test_accounts();
         let artifacts = ArtifactManager::empty();
@@ -1829,6 +1848,7 @@ nonce_key:
         let mut rng = StdRng::seed_from_u64(42);
 
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        ctx.set_defer_signing(true);
 
         let mut template = base_template(TempoTxType::Tempo);
         template.expiring_nonce = true;

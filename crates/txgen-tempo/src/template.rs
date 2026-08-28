@@ -97,7 +97,7 @@ pub struct TempoTemplate {
     pub valid_before: Option<u64>,
 
     /// Relative expiry window in seconds for standard and sponsored transactions.
-    /// These transactions resolve it immediately before submission.
+    /// With `--defer-signing`, these resolve it immediately before submission.
     ///
     /// Only used with `expiring_nonce: true`.
     #[serde(default)]

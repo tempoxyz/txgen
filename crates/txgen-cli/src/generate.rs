@@ -69,6 +69,13 @@ pub struct GenerateArgs {
     /// Number of worker threads used to sign and encode workload transactions.
     #[arg(long, visible_alias = "workers", default_value_t = default_signing_workers())]
     pub signing_workers: usize,
+
+    /// Emit deferred-signing envelopes instead of signed workload transactions.
+    ///
+    /// The output must be consumed by a sender configured with the matching
+    /// network-specific signing key material.
+    #[arg(long)]
+    pub defer_signing: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +91,7 @@ pub struct GenerateContext {
     rng: StdRng,
     limit: GenerationLimit,
     signing_workers: usize,
+    defer_signing: bool,
 }
 
 impl GenerateContext {
@@ -113,6 +121,7 @@ impl GenerateContext {
             rng,
             limit,
             signing_workers: args.signing_workers,
+            defer_signing: args.defer_signing,
         })
     }
 
@@ -933,6 +942,7 @@ where
         &mut ctx.nonces,
         &mut ctx.rng,
     );
+    build_ctx.set_defer_signing(ctx.defer_signing);
 
     match output {
         Some(path) => {
