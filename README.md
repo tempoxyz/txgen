@@ -273,9 +273,9 @@ bench send -i txs.ndjson \
   --sender-header-map /run/secrets/sender-auth.json
 
 # Tempo relative-expiry transactions from a file or a pipe
-txgen-tempo generate -s workload.yaml -n 1000 > txs.ndjson
+txgen-tempo generate -s workload.yaml -n 1000 --defer-signing > txs.ndjson
 bench send -i txs.ndjson --late-signing-spec workload.yaml
-txgen-tempo generate -s workload.yaml -n 1000 | bench send --late-signing-spec workload.yaml
+txgen-tempo generate -s workload.yaml -n 1000 --defer-signing | bench send --late-signing-spec workload.yaml
 ```
 
 | Flag | Description |
@@ -1736,7 +1736,7 @@ templates:
 
 `valid_for_secs` must be `<= 30`, matching Tempo's expiring nonce validity window.
 
-For relative expiry on standard or sponsored transactions, `txgen-tempo generate` emits a deferred-signing record with an empty `raw` field. `bench send --late-signing-spec workload.yaml` resolves the account references and signs each record immediately before the RPC request. The same option works for a pre-generated file and for a pipe; the workload spec supplies signing keys and is never embedded in the NDJSON output. Txgen still applies a deterministic per-transaction bump to `max_fee_per_gas` before the final sender and sponsor signatures, so otherwise identical expiring transactions have unique signed payloads. `max_priority_fee_per_gas` remains exactly as configured, including zero. Tempo keychain-auth records retain the existing generation-time signing path.
+With `--defer-signing`, relative expiry on standard or sponsored transactions emits a deferred-signing record with an empty `raw` field. `bench send --late-signing-spec workload.yaml` resolves the account references and signs each record immediately before the RPC request. The same option works for a pre-generated file and for a pipe; the workload spec supplies signing keys and is never embedded in the NDJSON output. Without `--defer-signing`, generation retains the existing signed output. Txgen still applies a deterministic per-transaction bump to `max_fee_per_gas` before the final sender and sponsor signatures, so otherwise identical expiring transactions have unique signed payloads. `max_priority_fee_per_gas` remains exactly as configured, including zero. Tempo keychain-auth records retain the existing generation-time signing path.
 
 Recommended benchmark setting: `valid_for_secs: 25`. This matches `tempo-bench`'s default behavior and stays inside Tempo's 30-second protocol limit while leaving some propagation slack.
 

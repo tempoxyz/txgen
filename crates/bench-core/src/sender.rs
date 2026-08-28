@@ -180,10 +180,10 @@ fn submission_may_have_been_accepted(error: &alloy_transport::TransportError) ->
 
 fn known_transaction_error(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
-    message.contains("already known")
-        || message.starts_with("known transaction")
-        || message.contains("transaction already known")
-        || message.contains("already imported")
+    message.contains("already known") ||
+        message.starts_with("known transaction") ||
+        message.contains("transaction already known") ||
+        message.contains("already imported")
 }
 
 impl std::fmt::Display for RpcSubmitError {
@@ -404,8 +404,8 @@ impl RpcSubmitter {
             })?;
 
         let details = value.map(decode_receipt_details).transpose()?;
-        if let Some(details) = &details
-            && details.receipt.transaction_hash() != tx_hash
+        if let Some(details) = &details &&
+            details.receipt.transaction_hash() != tx_hash
         {
             eyre::bail!("receipt lookup returned a different transaction hash");
         }
@@ -499,8 +499,8 @@ impl RpcSubmitter {
                 .await
                 .map_err(|_| eyre::eyre!("RPC submitter semaphore closed"))?;
 
-            if let Some(limiter) = &self.rate_limiter
-                && let Some(delay) = limiter.try_acquire_or_delay().await
+            if let Some(limiter) = &self.rate_limiter &&
+                let Some(delay) = limiter.try_acquire_or_delay().await
             {
                 drop(permit);
                 tokio::time::sleep(delay).await;
@@ -842,8 +842,8 @@ impl Sender {
             .checked_add(1)
             .ok_or_else(|| eyre::eyre!("sender transaction queue identity overflowed"))?;
         let GeneratedTx { phase, id, raw, late_sign, sender, submission_keys, inclusion_keys } = tx;
-        if let Some(spec) = &late_sign
-            && self.late_signer.is_none()
+        if let Some(spec) = &late_sign &&
+            self.late_signer.is_none()
         {
             eyre::bail!(
                 "transaction has `late_sign` envelope (format `{}`) but sender has no late signer registered",
@@ -903,8 +903,8 @@ impl Sender {
             match self.completion_rx.recv().await {
                 Some(keys) => {
                     self.release_keys(&keys);
-                    if first_error.is_none()
-                        && let Err(failure) = self.pump().await
+                    if first_error.is_none() &&
+                        let Err(failure) = self.pump().await
                     {
                         self.pending.clear();
                         first_error = Some(failure.error);
@@ -977,8 +977,8 @@ impl Sender {
                 break;
             };
 
-            if let Some(limiter) = &self.rate_limiter
-                && let Some(delay) = limiter.try_acquire_or_delay().await
+            if let Some(limiter) = &self.rate_limiter &&
+                let Some(delay) = limiter.try_acquire_or_delay().await
             {
                 drop(permit);
                 tokio::time::sleep(delay).await;
@@ -1664,12 +1664,9 @@ mod tests {
         let signer = Arc::new(StaticLateSigner { raw, calls: StdMutex::new(0) });
         let provider = mocked_provider(asserter.clone());
         let metrics = MetricsCollector::new(RunClock::new());
-        let mut sender = Sender::new(
-            vec![provider],
-            SenderConfig { rate_limit: 0, max_concurrent: 1 },
-            metrics,
-        )
-        .with_late_signer(signer.clone());
+        let mut sender =
+            Sender::new(vec![provider], SenderConfig { rate_limit: 0, max_concurrent: 1 }, metrics)
+                .with_late_signer(signer.clone());
 
         sender
             .send(GeneratedTx {

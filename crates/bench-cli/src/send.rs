@@ -129,6 +129,7 @@ fn build_request_auth(args: &SendArgs) -> Result<Option<Arc<dyn RequestAuthProvi
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_source<S: TxSource>(
     args: &SendArgs,
     metadata: &HashMap<String, String>,

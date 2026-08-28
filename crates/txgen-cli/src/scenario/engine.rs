@@ -1349,9 +1349,8 @@ impl SubmissionLanes {
         has_ordered_nonces: bool,
         keys: &BTreeSet<[u8; 20]>,
     ) -> bool {
-        has_ordered_nonces
-            && self
-                .ambiguous
+        has_ordered_nonces &&
+            self.ambiguous
                 .lock()
                 .expect("submission lane ambiguity mutex poisoned")
                 .iter()
@@ -1517,6 +1516,7 @@ where
             },
         )
         .await?;
+        context.set_defer_signing(true);
 
         for (index, submit) in statically_replayable_submissions(scenario, &self.name)? {
             let label = scenario.scenario.steps[index].diagnostic_label(index);
@@ -1834,16 +1834,16 @@ where
             Ok(submission) => submission,
             Err(error) => {
                 let transaction_hash = error.tx_hash().or(prepared_hash);
-                if error.kind() == RpcSubmitFailureKind::Ambiguous {
-                    if let Some(transaction_hash) = transaction_hash {
-                        self.track_receipt_metrics(
-                            instance,
-                            step_name,
-                            &submit.template,
-                            materialized.sender,
-                            transaction_hash,
-                        );
-                    }
+                if error.kind() == RpcSubmitFailureKind::Ambiguous &&
+                    let Some(transaction_hash) = transaction_hash
+                {
+                    self.track_receipt_metrics(
+                        instance,
+                        step_name,
+                        &submit.template,
+                        materialized.sender,
+                        transaction_hash,
+                    );
                 }
                 let lookup = match error.kind() {
                     RpcSubmitFailureKind::BeforeSend => None,
@@ -1919,8 +1919,8 @@ where
                     if has_ordered_nonces {
                         self.submission_lanes.mark_ambiguous(&submission_lanes.keys);
                     }
-                    let classification = if error.kind() == RpcSubmitFailureKind::Rejected
-                        && lookup.as_ref().is_some_and(|result| {
+                    let classification = if error.kind() == RpcSubmitFailureKind::Rejected &&
+                        lookup.as_ref().is_some_and(|result| {
                             result.as_ref().is_ok_and(|transaction| !*transaction)
                         }) {
                         "submission_rejected"
@@ -1991,9 +1991,7 @@ where
                     return Err(error.with_milestones(vec![submit_milestone.clone()]));
                 }
                 Err(_) => {
-                    return Err(
-                        StepError::timeout().with_milestones(vec![submit_milestone.clone()])
-                    );
+                    return Err(StepError::timeout().with_milestones(vec![submit_milestone.clone()]));
                 }
             };
             let milestone = observation_milestone(
@@ -2303,6 +2301,7 @@ where
             &mut nonces,
             rng,
         );
+        build_context.set_defer_signing(true);
         build_context.set_unique_nonce_hint(unique_nonce_hint);
         if let Some(hint) = dense_unique_nonce_hint {
             build_context.set_dense_unique_nonce_hint(hint);
@@ -2528,8 +2527,8 @@ impl LeasePool {
             let reduced = instance % u64::try_from(len).unwrap_or(u64::MAX);
             usize::try_from(reduced).unwrap_or(0)
         });
-        base.wrapping_mul(self.slots_per_instance).wrapping_add(slot).wrapping_add(self.offset)
-            % len
+        base.wrapping_mul(self.slots_per_instance).wrapping_add(slot).wrapping_add(self.offset) %
+            len
     }
 
     async fn acquire_index(&self, index: usize) -> Result<OwnedSemaphorePermit, StepError> {
@@ -2641,8 +2640,8 @@ fn build_binding_runtimes(
             continue;
         };
         let addresses = pool_addresses[&account.pool].clone();
-        if let AccountSelection::Index(index) = account.select
-            && index >= addresses.len()
+        if let AccountSelection::Index(index) = account.select &&
+            index >= addresses.len()
         {
             bail!(
                 "account binding '{name}' selects index {index}, but pool '{}' has {} accounts",
