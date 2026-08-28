@@ -847,12 +847,9 @@ where
                 let BindingRuntime::Account { selection, lease_pool, .. } = binding else {
                     return None;
                 };
-                (*selection == AccountSelection::Lease).then_some((
-                    **address,
-                    *name,
-                    lease_pool.as_ref().expect("lease binding has pool"),
-                    *index,
-                ))
+                (*selection == AccountSelection::Lease).then(|| {
+                    (**address, *name, lease_pool.as_ref().expect("lease binding has pool"), *index)
+                })
             })
             .collect::<Vec<_>>();
         lease_requests.sort_by_key(|(address, _, _, _)| *address);
