@@ -193,4 +193,27 @@ mod tests {
         writer.write(&tx).unwrap();
         assert_eq!(writer.count(), 2);
     }
+
+    #[test]
+    fn test_deferred_signing_output() {
+        let mut buf = Vec::new();
+        let mut writer = NdjsonWriter::new(&mut buf);
+        let tx = GeneratedTx {
+            phase: TxPhase::Workload,
+            id: Some("deferred".to_string()),
+            raw: Bytes::new(),
+            late_sign: Some(LateSignSpec {
+                format: "test".to_string(),
+                payload: serde_json::json!({"ttl": 25}),
+            }),
+            sender: None,
+            submission_keys: vec![SchedulingKey::from([0xab; 20])],
+            inclusion_keys: Vec::new(),
+        };
+
+        writer.write(&tx).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("\"raw\":\"0x\""));
+        assert!(output.contains("\"late_sign\":{\"format\":\"test\",\"payload\":{\"ttl\":25}}"));
+    }
 }

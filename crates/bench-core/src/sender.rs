@@ -107,6 +107,7 @@ pub struct RpcSubmitError {
     kind: RpcSubmitFailureKind,
     timed_out: bool,
     diagnostic: String,
+    tx_hash: Option<TxHash>,
 }
 
 impl RpcSubmitError {
@@ -120,26 +121,40 @@ impl RpcSubmitError {
         self.timed_out
     }
 
+    /// Hash of the payload when signing completed before the submission failed.
+    pub const fn tx_hash(&self) -> Option<TxHash> {
+        self.tx_hash
+    }
+
     fn before_send(error: impl std::fmt::Display) -> Self {
         Self {
             kind: RpcSubmitFailureKind::BeforeSend,
             timed_out: false,
             diagnostic: error.to_string(),
+            tx_hash: None,
         }
     }
 
-    fn deadline(kind: RpcSubmitFailureKind, diagnostic: &'static str) -> Self {
-        Self { kind, timed_out: true, diagnostic: diagnostic.to_string() }
+    fn deadline(
+        kind: RpcSubmitFailureKind,
+        diagnostic: &'static str,
+        tx_hash: Option<TxHash>,
+    ) -> Self {
+        Self { kind, timed_out: true, diagnostic: diagnostic.to_string(), tx_hash }
     }
 
-    fn from_transport(error: alloy_transport::TransportError, redact: bool) -> Self {
+    fn from_transport(
+        error: alloy_transport::TransportError,
+        redact: bool,
+        tx_hash: TxHash,
+    ) -> Self {
         let kind = classify_transport_failure(&error);
         let diagnostic = if redact {
             "authenticated RPC submission failed".to_string()
         } else {
             error.to_string()
         };
-        Self { kind, timed_out: false, diagnostic }
+        Self { kind, timed_out: false, diagnostic, tx_hash: Some(tx_hash) }
     }
 }
 
@@ -165,10 +180,10 @@ fn submission_may_have_been_accepted(error: &alloy_transport::TransportError) ->
 
 fn known_transaction_error(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
-    message.contains("already known") ||
-        message.starts_with("known transaction") ||
-        message.contains("transaction already known") ||
-        message.contains("already imported")
+    message.contains("already known")
+        || message.starts_with("known transaction")
+        || message.contains("transaction already known")
+        || message.contains("already imported")
 }
 
 impl std::fmt::Display for RpcSubmitError {
@@ -281,6 +296,7 @@ impl RpcSubmitter {
                     RpcSubmitError::deadline(
                         RpcSubmitFailureKind::BeforeSend,
                         "submission deadline elapsed before dispatch",
+                        None,
                     )
                 })?
             }
@@ -293,6 +309,7 @@ impl RpcSubmitter {
                     RpcSubmitError::deadline(
                         RpcSubmitFailureKind::BeforeSend,
                         "submission deadline elapsed before dispatch",
+                        None,
                     )
                 })?
                 .map_err(RpcSubmitError::before_send)?,
@@ -315,13 +332,14 @@ impl RpcSubmitter {
                         RpcSubmitError::deadline(
                             RpcSubmitFailureKind::Ambiguous,
                             "submission deadline elapsed after RPC dispatch; acceptance is unknown",
+                            Some(expected_hash),
                         )
                     })?
-                    .map_err(|error| RpcSubmitError::from_transport(error, redact))?
+                    .map_err(|error| RpcSubmitError::from_transport(error, redact, expected_hash))?
             }
             None => submit_raw_rpc(&endpoint, &raw, headers)
                 .await
-                .map_err(|error| RpcSubmitError::from_transport(error, redact))?,
+                .map_err(|error| RpcSubmitError::from_transport(error, redact, expected_hash))?,
         };
         drop(permit);
 
@@ -386,8 +404,8 @@ impl RpcSubmitter {
             })?;
 
         let details = value.map(decode_receipt_details).transpose()?;
-        if let Some(details) = &details &&
-            details.receipt.transaction_hash() != tx_hash
+        if let Some(details) = &details
+            && details.receipt.transaction_hash() != tx_hash
         {
             eyre::bail!("receipt lookup returned a different transaction hash");
         }
@@ -481,8 +499,8 @@ impl RpcSubmitter {
                 .await
                 .map_err(|_| eyre::eyre!("RPC submitter semaphore closed"))?;
 
-            if let Some(limiter) = &self.rate_limiter &&
-                let Some(delay) = limiter.try_acquire_or_delay().await
+            if let Some(limiter) = &self.rate_limiter
+                && let Some(delay) = limiter.try_acquire_or_delay().await
             {
                 drop(permit);
                 tokio::time::sleep(delay).await;
@@ -823,16 +841,10 @@ impl Sender {
             .next_queue_id
             .checked_add(1)
             .ok_or_else(|| eyre::eyre!("sender transaction queue identity overflowed"))?;
-        let GeneratedTx {
-            phase,
-            id,
-            raw,
-            late_sign,
-            sender,
-            submission_keys,
-            inclusion_keys,
-        } = tx;
-        if let Some(spec) = &late_sign && self.late_signer.is_none() {
+        let GeneratedTx { phase, id, raw, late_sign, sender, submission_keys, inclusion_keys } = tx;
+        if let Some(spec) = &late_sign
+            && self.late_signer.is_none()
+        {
             eyre::bail!(
                 "transaction has `late_sign` envelope (format `{}`) but sender has no late signer registered",
                 spec.format
@@ -891,8 +903,8 @@ impl Sender {
             match self.completion_rx.recv().await {
                 Some(keys) => {
                     self.release_keys(&keys);
-                    if first_error.is_none() &&
-                        let Err(failure) = self.pump().await
+                    if first_error.is_none()
+                        && let Err(failure) = self.pump().await
                     {
                         self.pending.clear();
                         first_error = Some(failure.error);
@@ -965,8 +977,8 @@ impl Sender {
                 break;
             };
 
-            if let Some(limiter) = &self.rate_limiter &&
-                let Some(delay) = limiter.try_acquire_or_delay().await
+            if let Some(limiter) = &self.rate_limiter
+                && let Some(delay) = limiter.try_acquire_or_delay().await
             {
                 drop(permit);
                 tokio::time::sleep(delay).await;
@@ -1409,6 +1421,18 @@ mod tests {
         endpoints: StdMutex<Vec<String>>,
     }
 
+    struct StaticLateSigner {
+        raw: Bytes,
+        calls: StdMutex<usize>,
+    }
+
+    impl LateSigner for StaticLateSigner {
+        fn sign(&self, _spec: &LateSignSpec) -> Result<Bytes> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(self.raw.clone())
+        }
+    }
+
     impl RequestAuthProvider for RecordingAuth {
         fn headers_for(&self, context: &RpcRequestContext<'_>) -> Result<HeaderMap> {
             if context.sender != Some(Address::repeat_byte(0x11)) {
@@ -1593,6 +1617,78 @@ mod tests {
 
         assert_eq!(submission.tx_hash, tx_hash);
         assert!(submission.submitted_at.duration_since(std::time::UNIX_EPOCH).is_ok());
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rpc_submitter_signs_deferred_transaction_before_submission() {
+        let asserter = Asserter::new();
+        let raw = Bytes::from_static(&[0x76, 0x01, 0x02]);
+        let tx_hash = keccak256(&raw);
+        asserter.push_success(&tx_hash);
+        let signer = Arc::new(StaticLateSigner { raw, calls: StdMutex::new(0) });
+        let submitter = RpcSubmitter::new(
+            vec![mocked_provider(asserter.clone())],
+            SenderConfig { rate_limit: 0, max_concurrent: 1 },
+        )
+        .unwrap()
+        .with_late_signer(signer.clone());
+
+        let submission = submitter
+            .submit(&GeneratedTx {
+                phase: TxPhase::Workload,
+                id: Some("deferred".to_string()),
+                sender: None,
+                raw: Bytes::new(),
+                late_sign: Some(LateSignSpec {
+                    format: "test".to_string(),
+                    payload: serde_json::json!({}),
+                }),
+                submission_keys: vec![SchedulingKey::from([0x11; 20])],
+                inclusion_keys: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(submission.tx_hash, tx_hash);
+        assert_eq!(*signer.calls.lock().unwrap(), 1);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sender_signs_deferred_transaction_in_worker() {
+        let asserter = Asserter::new();
+        let raw = Bytes::from_static(&[0x76, 0x03, 0x04]);
+        let tx_hash = keccak256(&raw);
+        asserter.push_success(&tx_hash);
+        let signer = Arc::new(StaticLateSigner { raw, calls: StdMutex::new(0) });
+        let provider = mocked_provider(asserter.clone());
+        let metrics = MetricsCollector::new(RunClock::new());
+        let mut sender = Sender::new(
+            vec![provider],
+            SenderConfig { rate_limit: 0, max_concurrent: 1 },
+            metrics,
+        )
+        .with_late_signer(signer.clone());
+
+        sender
+            .send(GeneratedTx {
+                phase: TxPhase::Workload,
+                id: Some("deferred".to_string()),
+                sender: None,
+                raw: Bytes::new(),
+                late_sign: Some(LateSignSpec {
+                    format: "test".to_string(),
+                    payload: serde_json::json!({}),
+                }),
+                submission_keys: vec![SchedulingKey::from([0x22; 20])],
+                inclusion_keys: Vec::new(),
+            })
+            .await
+            .unwrap();
+        sender.flush().await.unwrap();
+
+        assert_eq!(*signer.calls.lock().unwrap(), 1);
         assert!(asserter.read_q().is_empty());
     }
 
