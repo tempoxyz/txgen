@@ -945,6 +945,7 @@ fn sign_keychain_request(
         phase,
         id: Some(name),
         raw,
+        late_sign: None,
         sender: Some(user_address),
         submission_keys: vec![SchedulingKey::from(key)],
         inclusion_keys,

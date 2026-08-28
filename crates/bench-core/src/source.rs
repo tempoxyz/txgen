@@ -8,7 +8,7 @@ use alloy_primitives::{Address, Bytes};
 use eyre::{Context, Result};
 use std::{io::BufRead, path::Path};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey, TxPhase};
+use txgen_core::{dedup_scheduling_keys, GeneratedTx, LateSignSpec, SchedulingKey, TxPhase};
 
 /// A transaction read from a source.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -21,6 +21,9 @@ pub struct SourceTx {
     pub id: Option<String>,
     /// Raw transaction bytes (hex-encoded with 0x prefix).
     pub raw: String,
+    /// Optional network-specific instructions for signing `raw` at submission time.
+    #[serde(default)]
+    pub late_sign: Option<LateSignSpec>,
     /// Logical on-chain transaction sender.
     ///
     /// This is optional for compatibility with NDJSON generated before sender
@@ -56,6 +59,7 @@ impl SourceTx {
             phase: self.phase,
             id: self.id,
             raw,
+            late_sign: self.late_sign,
             sender: self.sender,
             submission_keys,
             inclusion_keys,
@@ -145,7 +149,7 @@ mod tests {
     fn parses_submission_and_inclusion_keys() {
         let source_tx: SourceTx = serde_json::from_str(
             r#"{
-                "raw": "0x02f870",
+            "raw": "0x02f870",
                 "submission_keys": [
                     "0x1111111111111111111111111111111111111111",
                     "0x1111111111111111111111111111111111111111"
@@ -162,6 +166,7 @@ mod tests {
         assert_eq!(generated.sender, None);
         assert_eq!(generated.submission_keys, vec![SchedulingKey::from([0x11; 20])]);
         assert_eq!(generated.inclusion_keys, vec![SchedulingKey::from([0x22; 20])]);
+        assert!(generated.late_sign.is_none());
     }
 
     #[test]

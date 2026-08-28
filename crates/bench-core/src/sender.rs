@@ -26,7 +26,14 @@ use tokio::{
     sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
 };
-use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey, TxPhase};
+use txgen_core::{dedup_scheduling_keys, GeneratedTx, LateSignSpec, SchedulingKey, TxPhase};
+
+/// Materializes raw transaction bytes from a network-specific deferred-signing
+/// envelope immediately before submission.
+pub trait LateSigner: Send + Sync {
+    /// Sign one deferred transaction.
+    fn sign(&self, spec: &LateSignSpec) -> Result<Bytes>;
+}
 
 /// Configuration for the sender.
 #[derive(Debug, Clone)]
@@ -187,6 +194,7 @@ pub struct RpcSubmitter {
     semaphore: Arc<Semaphore>,
     rate_limiter: Option<Arc<RateLimiter>>,
     ordering: Arc<RpcOrdering>,
+    late_signer: Option<Arc<dyn LateSigner>>,
 }
 
 impl RpcSubmitter {
@@ -220,7 +228,14 @@ impl RpcSubmitter {
             semaphore: Arc::new(Semaphore::new(config.max_concurrent)),
             rate_limiter,
             ordering: Arc::new(RpcOrdering::default()),
+            late_signer: None,
         })
+    }
+
+    /// Register the signer used for deferred transactions.
+    pub fn with_late_signer(mut self, signer: Arc<dyn LateSigner>) -> Self {
+        self.late_signer = Some(signer);
+        self
     }
 
     /// Submit a generated transaction and wait until an RPC endpoint accepts it.
@@ -284,7 +299,9 @@ impl RpcSubmitter {
             None => self.acquire_permit().await.map_err(RpcSubmitError::before_send)?,
         };
 
-        let expected_hash = keccak256(&tx.raw);
+        let raw = resolve_raw(&tx.raw, tx.late_sign.as_ref(), self.late_signer.as_deref())
+            .map_err(RpcSubmitError::before_send)?;
+        let expected_hash = keccak256(&raw);
         let endpoint = self.endpoint_for_hash(expected_hash);
         let headers = self
             .headers_for(&endpoint, "eth_sendRawTransaction", tx.sender, None)
@@ -292,7 +309,7 @@ impl RpcSubmitter {
         let redact = self.request_auth.is_some();
         let submission = match deadline {
             Some(deadline) => {
-                tokio::time::timeout_at(deadline, submit_raw_rpc(&endpoint, &tx.raw, headers))
+                tokio::time::timeout_at(deadline, submit_raw_rpc(&endpoint, &raw, headers))
                     .await
                     .map_err(|_| {
                         RpcSubmitError::deadline(
@@ -302,7 +319,7 @@ impl RpcSubmitter {
                     })?
                     .map_err(|error| RpcSubmitError::from_transport(error, redact))?
             }
-            None => submit_raw_rpc(&endpoint, &tx.raw, headers)
+            None => submit_raw_rpc(&endpoint, &raw, headers)
                 .await
                 .map_err(|error| RpcSubmitError::from_transport(error, redact))?,
         };
@@ -675,6 +692,7 @@ struct PendingTx {
     phase: TxPhase,
     id: Option<String>,
     raw: Bytes,
+    late_sign: Option<LateSignSpec>,
     sender: Option<Address>,
     submission_keys: SchedulingKeys,
     inclusion_keys: SchedulingKeys,
@@ -713,6 +731,8 @@ pub struct Sender {
     deferred_errors: VecDeque<eyre::Report>,
     /// Optional receipt collector for workload gas reporting.
     receipt_collector: Option<ReceiptCollectorHandle>,
+    /// Optional signer for deferred transactions.
+    late_signer: Option<Arc<dyn LateSigner>>,
 }
 
 impl Sender {
@@ -764,7 +784,14 @@ impl Sender {
             next_queue_id: 0,
             deferred_errors: VecDeque::new(),
             receipt_collector: None,
+            late_signer: None,
         }
+    }
+
+    /// Register the signer used for deferred transactions.
+    pub fn with_late_signer(mut self, signer: Arc<dyn LateSigner>) -> Self {
+        self.late_signer = Some(signer);
+        self
     }
 
     /// Attach receipt collection for every RPC-accepted workload transaction.
@@ -796,7 +823,21 @@ impl Sender {
             .next_queue_id
             .checked_add(1)
             .ok_or_else(|| eyre::eyre!("sender transaction queue identity overflowed"))?;
-        let GeneratedTx { phase, id, raw, sender, submission_keys, inclusion_keys } = tx;
+        let GeneratedTx {
+            phase,
+            id,
+            raw,
+            late_sign,
+            sender,
+            submission_keys,
+            inclusion_keys,
+        } = tx;
+        if let Some(spec) = &late_sign && self.late_signer.is_none() {
+            eyre::bail!(
+                "transaction has `late_sign` envelope (format `{}`) but sender has no late signer registered",
+                spec.format
+            );
+        }
         let (submission_keys, inclusion_keys) =
             normalize_key_sets(submission_keys, inclusion_keys)?;
         self.pending.push_back(PendingTx {
@@ -804,6 +845,7 @@ impl Sender {
             phase,
             id,
             raw,
+            late_sign,
             sender,
             submission_keys,
             inclusion_keys,
@@ -1017,6 +1059,7 @@ impl Sender {
         let completion_tx = self.completion_tx.clone();
         let request_auth = self.request_auth.clone();
         let receipt_collector = self.receipt_collector.clone();
+        let late_signer = self.late_signer.clone();
 
         self.worker_tasks.spawn(async move {
             submit_tx(
@@ -1028,6 +1071,7 @@ impl Sender {
                 metrics,
                 permit,
                 completion_tx,
+                late_signer,
             )
             .await;
         });
@@ -1073,6 +1117,7 @@ async fn submit_tx(
     metrics: Arc<MetricsCollector>,
     permit: OwnedSemaphorePermit,
     completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
+    late_signer: Option<Arc<dyn LateSigner>>,
 ) {
     let release_all_keys = || {
         let mut keys = pending.submission_keys.clone();
@@ -1082,9 +1127,24 @@ async fn submit_tx(
 
     metrics.record_sent();
 
-    let expected_hash = keccak256(&pending.raw);
+    let raw = match resolve_raw(&pending.raw, pending.late_sign.as_ref(), late_signer.as_deref()) {
+        Ok(raw) => raw,
+        Err(error) => {
+            tracing::error!(
+                id = pending.id.as_deref(),
+                phase = ?pending.phase,
+                error = %error,
+                "failed to materialize deferred transaction",
+            );
+            metrics.record_failure();
+            drop(permit);
+            release_keys(&completion_tx, release_all_keys());
+            return;
+        }
+    };
+    let expected_hash = keccak256(&raw);
     let start = Instant::now();
-    let tx_hash = match send_raw_transaction(&endpoint, &pending.raw, submission_headers).await {
+    let tx_hash = match send_raw_transaction(&endpoint, &raw, submission_headers).await {
         Ok(tx_hash) => {
             metrics.record_success(start.elapsed());
             tx_hash
@@ -1132,6 +1192,24 @@ async fn submit_tx(
     }
 
     release_keys(&completion_tx, pending.inclusion_keys);
+}
+
+fn resolve_raw(
+    raw: &Bytes,
+    late_sign: Option<&LateSignSpec>,
+    late_signer: Option<&dyn LateSigner>,
+) -> Result<Bytes> {
+    match late_sign {
+        Some(spec) => late_signer
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "transaction has `late_sign` envelope (format `{}`) but sender has no late signer registered",
+                    spec.format
+                )
+            })?
+            .sign(spec),
+        None => Ok(raw.clone()),
+    }
 }
 
 fn track_workload_receipt(
@@ -1421,6 +1499,7 @@ mod tests {
                 id: Some("transfer".to_string()),
                 sender: Some(Address::repeat_byte(0x55)),
                 raw,
+                late_sign: None,
                 submission_keys: vec![SchedulingKey::from([0x11; 20])],
                 inclusion_keys: Vec::new(),
             })
@@ -1531,6 +1610,7 @@ mod tests {
             id: None,
             sender: None,
             raw: Bytes::from_static(&[0x02, 0xf8, 0x70]),
+            late_sign: None,
             submission_keys: vec![SchedulingKey::from([0x11; 20])],
             inclusion_keys: Vec::new(),
         };
