@@ -32,6 +32,12 @@ use tokio::sync::watch;
 /// late-indexed logs near the head are observed without a historical rescan.
 pub(crate) const RECENT_LOG_RESCAN_BLOCKS: u64 = 64;
 
+/// A shared scan error affects every active waiter, so tolerate a short burst
+/// of RPC failures before treating the scanner as permanently unavailable.
+const SCAN_RETRY_ATTEMPTS: u32 = 5;
+const SCAN_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const SCAN_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(2);
+
 /// One `wait_log` consumer's standing interest in the shared scan.
 #[derive(Debug, Clone)]
 pub(crate) struct LogInterest {
@@ -174,6 +180,7 @@ impl LogPollHub {
 
     async fn run(self: Arc<Self>) {
         let mut checkpoint = None::<(u64, B256)>;
+        let mut consecutive_scan_failures = 0;
         let mut wake = None;
         let mut registry_updates = self.registry_updates.subscribe();
         let mut subscription_initialized =
@@ -202,16 +209,34 @@ impl LogPollHub {
                     }
                 }
             }
-            let update = match self.scan(&plan, &mut checkpoint).await {
-                Ok(Some(window)) => Some(Ok(window)),
-                Ok(None) => None,
-                Err(error) => Some(Err(error)),
+            let (update, next_tick) = match self.scan(&plan, &mut checkpoint).await {
+                Ok(Some(window)) => {
+                    consecutive_scan_failures = 0;
+                    (Some(Ok(window)), interval)
+                }
+                Ok(None) => {
+                    consecutive_scan_failures = 0;
+                    (None, interval)
+                }
+                Err(error) => {
+                    consecutive_scan_failures += 1;
+                    if consecutive_scan_failures >= SCAN_RETRY_ATTEMPTS {
+                        consecutive_scan_failures = 0;
+                        (Some(Err(error)), interval)
+                    } else {
+                        let exponent = consecutive_scan_failures.saturating_sub(1);
+                        let backoff = SCAN_RETRY_INITIAL_BACKOFF
+                            .saturating_mul(2u32.saturating_pow(exponent))
+                            .min(SCAN_RETRY_MAX_BACKOFF);
+                        (None, backoff)
+                    }
+                }
             };
             if let Some(result) = update {
                 let _ =
                     self.updates.send(Some(WindowUpdate { generation: plan.generation, result }));
             }
-            self.wait_for_next_tick(&mut wake, &mut registry_updates, interval).await;
+            self.wait_for_next_tick(&mut wake, &mut registry_updates, next_tick).await;
         }
     }
 
@@ -379,8 +404,8 @@ impl LogWindowSubscription {
     }
 
     /// Next committed window whose union filter includes this subscriber.
-    /// Scanner RPC failures propagate as step errors, matching the failure
-    /// semantics of the per-step pollers this replaces.
+    /// Scanner RPC failures propagate only after the shared retry budget is
+    /// exhausted, preventing one transient error from failing every waiter.
     pub(crate) async fn next_window(&mut self) -> Result<LogWindow, StepError> {
         loop {
             self.receiver

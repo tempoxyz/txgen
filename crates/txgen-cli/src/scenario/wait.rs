@@ -1657,6 +1657,8 @@ mod tests {
         /// responses, emulating lagging RPC log indexing.
         hidden_logs: Vec<Log>,
         reveal_hidden_after: usize,
+        /// Transient JSON-RPC errors returned by the next `eth_getLogs` calls.
+        get_logs_failures_remaining: usize,
         block_number_calls: usize,
         get_logs_calls: usize,
         get_logs_ranges: Vec<(u64, u64)>,
@@ -1706,6 +1708,14 @@ mod tests {
             }
             "eth_getLogs" => {
                 node.get_logs_calls += 1;
+                if node.get_logs_failures_remaining > 0 {
+                    node.get_logs_failures_remaining -= 1;
+                    return axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32000, "message": "transient log scan failure" }
+                    }));
+                }
                 let filter = params.get(0).cloned().unwrap_or_default();
                 let from = parse_hex_quantity(filter.get("fromBlock")).unwrap_or(0);
                 let to = parse_hex_quantity(filter.get("toBlock")).unwrap_or(u64::MAX);
@@ -2508,6 +2518,52 @@ mod tests {
             "{} eth_getLogs calls exceed one poller's budget of {allowed_log_queries}",
             node.get_logs_calls
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_log_poller_retries_transient_scan_error_for_all_waiters() {
+        let poll_interval = Duration::from_millis(5);
+        let log = encoded_log();
+        let node = Arc::new(StdMutex::new(MockNode::with_head(10)));
+        {
+            let mut node = node.lock().unwrap();
+            node.hashes.insert(4, log.block_hash.unwrap());
+            node.logs.push(log);
+            node.get_logs_failures_remaining = 1;
+        }
+        let (provider, server) = spawn_mock_node(node.clone()).await;
+        let submitter = mock_submitter(&provider);
+        let observation = ObservationRuntime::polling(provider, poll_interval);
+
+        let waiters: Vec<_> = (0..8)
+            .map(|_| {
+                let observation = observation.clone();
+                let submitter = submitter.clone();
+                tokio::spawn(async move {
+                    wait_for_log_observed(
+                        &observation,
+                        &submitter,
+                        "chain_a",
+                        &event_abi(),
+                        &wait_log_step("Moved", 4, poll_interval, 0, 100),
+                        &RuntimeContext::empty(),
+                        SubscriptionBehavior::Disabled,
+                    )
+                    .await
+                })
+            })
+            .collect();
+
+        for waiter in waiters {
+            let result = tokio::time::timeout(Duration::from_secs(10), waiter)
+                .await
+                .expect("wait_log timed out")
+                .unwrap()
+                .expect("transient shared scan error reached a waiter");
+            assert_eq!(result.observation.block_number, 4);
+        }
+        assert!(node.lock().unwrap().get_logs_calls >= 2, "scan was not retried");
         server.abort();
     }
 
