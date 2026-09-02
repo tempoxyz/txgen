@@ -29,17 +29,17 @@ jobs:
         run: echo "shortsha=$(echo "$GITHUB_SHA" | cut -c1-7)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        uses: tempoxyz/gh-actions/vendor/docker/setup-buildx-action@6f436eb3a168279692739e8c0c9fdb52b94bfae7
 
       - name: Log in to Container Registry
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        uses: tempoxyz/gh-actions/vendor/docker/login-action@6f436eb3a168279692739e8c0c9fdb52b94bfae7
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        uses: tempoxyz/gh-actions/vendor/docker/build-push-action@6f436eb3a168279692739e8c0c9fdb52b94bfae7
         with:
           context: .
           push: true
