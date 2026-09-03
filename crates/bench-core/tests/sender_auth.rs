@@ -281,6 +281,7 @@ fn transaction(raw: u8, sender: Option<Address>, key: u8, wait_for_receipt: bool
         phase: TxPhase::Workload,
         id: Some(format!("tx-{raw}")),
         raw: Bytes::from(vec![raw]),
+        late_sign: None,
         sender,
         submission_keys: vec![SchedulingKey::from([key; 20])],
         inclusion_keys: wait_for_receipt

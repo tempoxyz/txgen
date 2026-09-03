@@ -1513,6 +1513,7 @@ where
             },
         )
         .await?;
+        context.set_defer_signing(true);
 
         for (index, submit) in statically_replayable_submissions(scenario, &self.name)? {
             let label = scenario.scenario.steps[index].diagnostic_label(index);
@@ -1730,11 +1731,17 @@ where
             .wrap_err_with(|| {
                 format!("failed to configure request authentication for chain '{name}'")
             })?;
-        let submitter = RpcSubmitter::new_with_request_auth(
+        let late_signer = adapter
+            .late_signer(&spec)
+            .wrap_err_with(|| format!("failed to configure late signing for chain '{name}'"))?;
+        let mut submitter = RpcSubmitter::new_with_request_auth(
             vec![RpcEndpoint::new(format!("{name}-submission"), submission_provider)],
             SenderConfig { rate_limit: transaction_rate, max_concurrent: max_rpc_in_flight },
             request_auth,
         )?;
+        if let Some(late_signer) = late_signer {
+            submitter = submitter.with_late_signer(late_signer);
+        }
         Ok(PreparedChain {
             name: name.to_string(),
             chain_id,
@@ -1815,6 +1822,7 @@ where
         }
         let attempt_started_at = SystemTime::now();
         let attempt_started = Instant::now();
+        let prepared_hash = (materialized.tx_hash != B256::ZERO).then_some(materialized.tx_hash);
         let submission = match self
             .submitter
             .submit_classified_until(&materialized.generated, deadline)
@@ -1822,24 +1830,28 @@ where
         {
             Ok(submission) => submission,
             Err(error) => {
-                if error.kind() == RpcSubmitFailureKind::Ambiguous {
+                let transaction_hash = error.tx_hash().or(prepared_hash);
+                if error.kind() == RpcSubmitFailureKind::Ambiguous &&
+                    let Some(transaction_hash) = transaction_hash
+                {
                     self.track_receipt_metrics(
                         instance,
                         step_name,
                         &submit.template,
                         materialized.sender,
-                        materialized.tx_hash,
+                        transaction_hash,
                     );
                 }
                 let lookup = match error.kind() {
                     RpcSubmitFailureKind::BeforeSend => None,
                     RpcSubmitFailureKind::Rejected | RpcSubmitFailureKind::Ambiguous => {
+                        let Some(transaction_hash) = transaction_hash else {
+                            return Err(StepError::new("submission_ambiguous", error.to_string()));
+                        };
                         let lookup = tokio::time::timeout_at(
                             deadline,
-                            self.submitter.transaction_exists(
-                                Some(materialized.sender),
-                                materialized.tx_hash,
-                            ),
+                            self.submitter
+                                .transaction_exists(Some(materialized.sender), transaction_hash),
                         )
                         .await;
                         match lookup {
@@ -1868,7 +1880,7 @@ where
                     .is_some_and(|result| result.as_ref().is_ok_and(|transaction| *transaction))
                 {
                     RpcSubmission {
-                        tx_hash: materialized.tx_hash,
+                        tx_hash: transaction_hash.expect("transaction lookup requires a hash"),
                         acceptance_latency: attempt_started.elapsed(),
                         submitted_at: attempt_started_at,
                     }
@@ -1921,9 +1933,9 @@ where
             step_name,
             &submit.template,
             materialized.sender,
-            materialized.tx_hash,
+            submission.tx_hash,
         );
-        if submission.tx_hash != materialized.tx_hash {
+        if prepared_hash.is_some_and(|prepared_hash| submission.tx_hash != prepared_hash) {
             if has_ordered_nonces {
                 self.submission_lanes.mark_ambiguous(&submission_lanes.keys);
             }
@@ -2286,6 +2298,7 @@ where
             &mut nonces,
             rng,
         );
+        build_context.set_defer_signing(true);
         build_context.set_unique_nonce_hint(unique_nonce_hint);
         if let Some(hint) = dense_unique_nonce_hint {
             build_context.set_dense_unique_nonce_hint(hint);

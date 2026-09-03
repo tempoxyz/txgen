@@ -19,8 +19,9 @@ use std::{
 };
 use txgen_core::{
     dedup_scheduling_keys, merge_yaml, AbiEncodePackedDef, AbiHashDef, AccountManager,
-    AddressPoolManager, ArtifactManager, BuildContext, EcdsaSigner, GeneratedTx, MixItem,
-    NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase, WorkloadSpec,
+    AddressPoolManager, ArtifactManager, BuildContext, EcdsaSigner, GeneratedTx, LateSignSpec,
+    MixItem, NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase,
+    WorkloadSpec,
 };
 
 fn default_signing_workers() -> usize {
@@ -68,6 +69,13 @@ pub struct GenerateArgs {
     /// Number of worker threads used to sign and encode workload transactions.
     #[arg(long, visible_alias = "workers", default_value_t = default_signing_workers())]
     pub signing_workers: usize,
+
+    /// Emit deferred-signing envelopes instead of signed workload transactions.
+    ///
+    /// The output must be consumed by a sender configured with the matching
+    /// network-specific signing key material.
+    #[arg(long)]
+    pub defer_signing: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +91,7 @@ pub struct GenerateContext {
     rng: StdRng,
     limit: GenerationLimit,
     signing_workers: usize,
+    defer_signing: bool,
 }
 
 impl GenerateContext {
@@ -112,6 +121,7 @@ impl GenerateContext {
             rng,
             limit,
             signing_workers: args.signing_workers,
+            defer_signing: args.defer_signing,
         })
     }
 
@@ -146,6 +156,8 @@ pub struct TxRequest<R, C = ()> {
     /// access-key signer and authorized user address without adding
     /// Tempo-specific branches to the generic generation loop.
     pub sign_context: C,
+    /// Optional opaque instructions for signing at submission time.
+    pub late_sign: Option<LateSignSpec>,
 }
 
 /// One network-adapter template materialized, signed, and ready for submission.
@@ -159,7 +171,7 @@ pub struct MaterializedTx {
     pub generated: GeneratedTx,
     /// Sender selected while materializing the template.
     pub sender: Address,
-    /// Hash of the signed EIP-2718 payload.
+    /// Hash of the signed EIP-2718 payload, or zero until a deferred payload is signed.
     pub tx_hash: B256,
     /// Nonce populated by the adapter, when present.
     pub nonce: Option<u64>,
@@ -277,6 +289,7 @@ where
         phase,
         id: Some(name),
         raw,
+        late_sign: None,
         sender: Some(sender),
         submission_keys: vec![SchedulingKey::from(key)],
         inclusion_keys,
@@ -384,11 +397,28 @@ where
         nonce_reservations,
         created_address,
     } = prepared;
-    let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context } = tx_req;
+    let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context, late_sign } =
+        tx_req;
     let expected_keys = std::iter::once(key)
         .chain(inclusion_keys.iter().map(|key| key.into_inner()))
         .collect::<BTreeSet<_>>();
-    let generated = sign_context.sign_request(name, phase, request, signer, key, inclusion_keys)?;
+    let generated = match late_sign {
+        Some(late_sign) => {
+            if phase == TxPhase::Setup {
+                bail!("deferred signing is not supported for setup transactions");
+            }
+            GeneratedTx {
+                phase,
+                id: Some(name),
+                raw: Bytes::new(),
+                late_sign: Some(late_sign),
+                sender: Some(sender),
+                submission_keys: vec![SchedulingKey::from(key)],
+                inclusion_keys,
+            }
+        }
+        None => sign_context.sign_request(name, phase, request, signer, key, inclusion_keys)?,
+    };
     let generated_keys = generated
         .submission_keys
         .iter()
@@ -398,7 +428,8 @@ where
     if generated_keys != expected_keys {
         bail!("transaction signer changed the prepared scheduling keys");
     }
-    let tx_hash = keccak256(&generated.raw);
+    let tx_hash =
+        if generated.late_sign.is_some() { B256::ZERO } else { keccak256(&generated.raw) };
     Ok(MaterializedTx { generated, sender, tx_hash, nonce, nonce_reservations, created_address })
 }
 
@@ -705,6 +736,14 @@ pub trait NetworkAdapter: Send + Sync {
         Ok(None)
     }
 
+    /// Build the network-specific signer used for deferred transaction envelopes.
+    fn late_signer(
+        &self,
+        _spec: &WorkloadSpec,
+    ) -> Result<Option<std::sync::Arc<dyn bench_core::LateSigner>>> {
+        Ok(None)
+    }
+
     /// Prepare asynchronous state needed before synchronous request building.
     ///
     /// Ordinary adapters need no hook. Online adapters can use it to populate
@@ -903,6 +942,7 @@ where
         &mut ctx.nonces,
         &mut ctx.rng,
     );
+    build_ctx.set_defer_signing(ctx.defer_signing);
 
     match output {
         Some(path) => {
@@ -1403,9 +1443,26 @@ where
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
     let SigningJob { sequence: _, name, phase, tx_req, signer, inclusion_keys } = job;
-    let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context } = tx_req;
+    let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context, late_sign } =
+        tx_req;
 
-    sign_context.sign_request(name, phase, request, signer, key, inclusion_keys)
+    match late_sign {
+        Some(late_sign) => {
+            if phase == TxPhase::Setup {
+                bail!("deferred signing is not supported for setup transactions");
+            }
+            Ok(GeneratedTx {
+                phase,
+                id: Some(name),
+                raw: Bytes::new(),
+                late_sign: Some(late_sign),
+                sender: Some(signer.address()),
+                submission_keys: vec![SchedulingKey::from(key)],
+                inclusion_keys,
+            })
+        }
+        None => sign_context.sign_request(name, phase, request, signer, key, inclusion_keys),
+    }
 }
 
 fn generate_txs<A, W: Write>(
@@ -1964,6 +2021,7 @@ mod tests {
                 phase,
                 id: Some(name),
                 raw: Bytes::new(),
+                late_sign: None,
                 sender: Some(signer.address()),
                 submission_keys: vec![SchedulingKey::from([0x99; 20])],
                 inclusion_keys: Vec::new(),
@@ -2094,6 +2152,7 @@ call:
                 signer_index: 0,
                 key: [0x11; 20],
                 sign_context: MutatingKeySignContext,
+                late_sign: None,
             },
             signer: signer.clone(),
             inclusion_keys: vec![SchedulingKey::from([0x22; 20])],

@@ -13,12 +13,13 @@ use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     collect_block_stats, parse_reporters, start_scrapers, total_fees_paid,
     trim_trailing_empty_blocks, BlockReceiptCollector, ConsoleReporter, FileSource, FinalReport,
-    GeneratedTx, MetricsCollector, ProgressState, Reporter, RequestAuthProvider, RpcEndpoint,
-    RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, SenderHeaderAuthProvider,
-    StdinSource, TxPhase, TxSource,
+    GeneratedTx, LateSigner, MetricsCollector, ProgressState, Reporter, RequestAuthProvider,
+    RpcEndpoint, RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig,
+    SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, sync::Arc, time::Duration};
+use txgen_tempo::TempoLateSigner;
 
 const SETUP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -63,6 +64,13 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         None => providers[0].clone(),
     };
     let request_auth = build_request_auth(&args)?;
+    let late_signer = args
+        .late_signing_spec
+        .as_deref()
+        .map(TempoLateSigner::from_workload_file)
+        .transpose()
+        .wrap_err("failed to configure deferred signing")?
+        .map(|signer| Arc::new(signer) as Arc<dyn LateSigner>);
 
     match &args.input {
         Some(path) => {
@@ -73,6 +81,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
                 endpoints,
                 query_provider,
                 request_auth,
+                late_signer.clone(),
                 &mut source,
                 &scraper_configs,
             )
@@ -86,6 +95,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
                 endpoints,
                 query_provider,
                 request_auth,
+                late_signer,
                 &mut source,
                 &scraper_configs,
             )
@@ -119,19 +129,28 @@ fn build_request_auth(args: &SendArgs) -> Result<Option<Arc<dyn RequestAuthProvi
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_source<S: TxSource>(
     args: &SendArgs,
     metadata: &HashMap<String, String>,
     endpoints: Vec<RpcEndpoint>,
     query_provider: DynProvider<AnyNetwork>,
     request_auth: Option<Arc<dyn RequestAuthProvider>>,
+    late_signer: Option<Arc<dyn LateSigner>>,
     source: &mut S,
     scraper_configs: &[ScraperConfig],
 ) -> Result<()> {
     let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
 
-    let first_workload =
-        run_setup_phase(args, source, &endpoints, request_auth.clone(), &config).await?;
+    let first_workload = run_setup_phase(
+        args,
+        source,
+        &endpoints,
+        request_auth.clone(),
+        late_signer.clone(),
+        &config,
+    )
+    .await?;
 
     let clock = if let Some(start) = args.metrics_align {
         RunClock::new_with_start_unix_ms(start)
@@ -159,6 +178,9 @@ async fn execute_source<S: TxSource>(
     let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
     let mut sender =
         Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth);
+    if let Some(late_signer) = late_signer {
+        sender = sender.with_late_signer(late_signer);
+    }
     if let Some(collector) = &receipt_collector {
         sender = sender.with_receipt_collector(collector.handle());
     }
@@ -330,6 +352,7 @@ async fn run_setup_phase<S: TxSource>(
     source: &mut S,
     endpoints: &[RpcEndpoint],
     request_auth: Option<Arc<dyn RequestAuthProvider>>,
+    late_signer: Option<Arc<dyn LateSigner>>,
     config: &SenderConfig,
 ) -> Result<Option<GeneratedTx>> {
     let setup_clock = RunClock::new();
@@ -340,6 +363,9 @@ async fn run_setup_phase<S: TxSource>(
         setup_metrics.clone(),
         request_auth,
     );
+    if let Some(late_signer) = late_signer {
+        setup_sender = setup_sender.with_late_signer(late_signer);
+    }
     let mut setup_seen = 0u64;
 
     while let Some(tx) = source.next_tx().await? {
