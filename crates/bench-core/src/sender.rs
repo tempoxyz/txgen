@@ -561,9 +561,12 @@ fn next_ready_order_index(
     pending: &VecDeque<RpcPendingOrder>,
     active_keys: &HashSet<SchedulingKey>,
 ) -> Option<usize> {
-    let mut blocked_keys = active_keys.clone();
+    let mut blocked_keys = HashSet::new();
     for (index, pending) in pending.iter().enumerate() {
-        if pending.scheduling_keys().any(|key| blocked_keys.contains(key)) {
+        if pending
+            .scheduling_keys()
+            .any(|key| active_keys.contains(key) || blocked_keys.contains(key))
+        {
             blocked_keys.extend(pending.scheduling_keys().copied());
         } else {
             return Some(index);
@@ -964,10 +967,14 @@ impl Sender {
     }
 
     fn next_ready_index(&self) -> Option<usize> {
-        let mut blocked_keys = self.active_keys.clone();
+        // Track only keys blocked by earlier queued transactions. Active keys remain
+        // borrowed so independent transactions do not copy the entire in-flight set.
+        let mut blocked_keys = HashSet::new();
 
         for (index, pending) in self.pending.iter().enumerate() {
-            let is_blocked = pending.scheduling_keys().any(|key| blocked_keys.contains(key));
+            let is_blocked = pending
+                .scheduling_keys()
+                .any(|key| self.active_keys.contains(key) || blocked_keys.contains(key));
 
             if is_blocked {
                 for key in pending.scheduling_keys() {
@@ -1343,6 +1350,67 @@ mod tests {
 
     fn mocked_provider(asserter: Asserter) -> DynProvider<AnyNetwork> {
         ProviderBuilder::new_with_network::<AnyNetwork>().connect_mocked_client(asserter).erased()
+    }
+
+    #[tokio::test]
+    async fn ready_queues_preserve_older_key_dependencies() {
+        let key_sets: Vec<Vec<SchedulingKey>> = (1u8..8)
+            .map(|mask| {
+                (0..3)
+                    .filter(|bit| mask & (1 << bit) != 0)
+                    .map(|bit| SchedulingKey::from([bit; 20]))
+                    .collect()
+            })
+            .collect();
+        let mut sender = Sender::new(
+            vec![mocked_provider(Asserter::new())],
+            SenderConfig::default(),
+            MetricsCollector::new(RunClock::new()),
+        );
+        for active_mask in 0u8..8 {
+            sender.active_keys = (0..3)
+                .filter(|bit| active_mask & (1 << bit) != 0)
+                .map(|bit| SchedulingKey::from([bit; 20]))
+                .collect();
+            for first in &key_sets {
+                for second in &key_sets {
+                    for third in &key_sets {
+                        let queued = [first, second, third];
+                        // A transaction may proceed only when no active transaction or older
+                        // queued transaction holds one of its keys, including inclusion keys.
+                        let expected = (0..queued.len()).find(|&index| {
+                            queued[index].iter().all(|key| {
+                                !sender.active_keys.contains(key) &&
+                                    queued[..index].iter().all(|older| !older.contains(key))
+                            })
+                        });
+                        let orders: VecDeque<_> = queued
+                            .iter()
+                            .enumerate()
+                            .map(|(index, keys)| RpcPendingOrder {
+                                id: index as u64,
+                                submission_keys: keys[..1].to_vec(),
+                                inclusion_keys: keys[1..].to_vec(),
+                            })
+                            .collect();
+                        sender.pending = orders
+                            .iter()
+                            .map(|order| PendingTx {
+                                queue_id: order.id,
+                                phase: TxPhase::Workload,
+                                id: None,
+                                raw: Bytes::new(),
+                                sender: None,
+                                submission_keys: order.submission_keys.clone(),
+                                inclusion_keys: order.inclusion_keys.clone(),
+                            })
+                            .collect();
+                        assert_eq!(next_ready_order_index(&orders, &sender.active_keys), expected);
+                        assert_eq!(sender.next_ready_index(), expected);
+                    }
+                }
+            }
+        }
     }
 
     fn receipt_json(
