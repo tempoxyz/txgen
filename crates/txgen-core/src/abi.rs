@@ -574,6 +574,15 @@ fn yaml_to_sol_value(
 
     // Direct value conversion
     match sol_type {
+        // Match arrays before scalar prefixes: bytes[] is not fixed bytes, and
+        // uint256[]/int8[] are not scalar integer literals.
+        t if t.ends_with("[]") => {
+            let inner_type = &t[..t.len() - 2];
+            let arr: Vec<serde_yaml::Value> = serde_yaml::from_value(value.clone())?;
+            let values: Result<Vec<_>> =
+                arr.iter().map(|v| yaml_to_sol_value(v, inner_type, resolver)).collect();
+            Ok(DynSolValue::Array(values?))
+        }
         "address" => {
             let s: String = serde_yaml::from_value(value.clone())?;
             let addr: Address = s.parse()?;
@@ -612,14 +621,6 @@ fn yaml_to_sol_value(
             let mut fixed = [0u8; 32];
             fixed[..size].copy_from_slice(&bytes);
             Ok(DynSolValue::FixedBytes(B256::from(fixed), size))
-        }
-        t if t.ends_with("[]") => {
-            // Dynamic array
-            let inner_type = &t[..t.len() - 2];
-            let arr: Vec<serde_yaml::Value> = serde_yaml::from_value(value.clone())?;
-            let values: Result<Vec<_>> =
-                arr.iter().map(|v| yaml_to_sol_value(v, inner_type, resolver)).collect();
-            Ok(DynSolValue::Array(values?))
         }
         _ => {
             bail!("unsupported Solidity type: {}", sol_type);
@@ -675,6 +676,82 @@ mod tests {
     fn test_artifact_manager_empty() {
         let manager = ArtifactManager::empty();
         assert!(manager.get("nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_constructor_dynamic_arrays_preserve_element_types() -> Result<()> {
+        let mut fixed = [0u8; 32];
+        fixed[..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        let cases = [
+            (
+                "bytes[]",
+                r#"["0x1234", "0xab"]"#,
+                DynSolValue::Array(vec![
+                    DynSolValue::Bytes(vec![0x12, 0x34]),
+                    DynSolValue::Bytes(vec![0xab]),
+                ]),
+            ),
+            (
+                "uint256[]",
+                "[1, 2]",
+                DynSolValue::Array(vec![
+                    DynSolValue::Uint(U256::from(1), 256),
+                    DynSolValue::Uint(U256::from(2), 256),
+                ]),
+            ),
+            (
+                "int8[]",
+                "[-1, 2]",
+                DynSolValue::Array(vec![
+                    DynSolValue::Int(alloy_primitives::I256::try_from(-1)?, 8),
+                    DynSolValue::Int(alloy_primitives::I256::try_from(2)?, 8),
+                ]),
+            ),
+            (
+                "bytes4[]",
+                r#"["0x11223344"]"#,
+                DynSolValue::Array(vec![DynSolValue::FixedBytes(B256::from(fixed), 4)]),
+            ),
+            (
+                "address[]",
+                r#"["0x0000000000000000000000000000000000000001"]"#,
+                DynSolValue::Array(vec![DynSolValue::Address(Address::from_word(B256::from(
+                    U256::from(1),
+                )))]),
+            ),
+            (
+                "bytes[][]",
+                r#"[["0x1234"], []]"#,
+                DynSolValue::Array(vec![
+                    DynSolValue::Array(vec![DynSolValue::Bytes(vec![0x12, 0x34])]),
+                    DynSolValue::Array(vec![]),
+                ]),
+            ),
+            ("uint256[]", "[]", DynSolValue::Array(vec![])),
+        ];
+        for (kind, yaml, expected) in cases {
+            let abi = serde_json::from_value(serde_json::json!([{
+                "type": "constructor", "stateMutability": "nonpayable",
+                "inputs": [{"name": "values", "type": kind}]
+            }]))?;
+            let manager = ArtifactManager {
+                artifacts: HashMap::from([(
+                    "contract".to_owned(),
+                    Artifact { abi, bytecode: Some(Bytes::from_static(&[0x60, 0x00])) },
+                )]),
+            };
+            let accounts = AccountManager::empty();
+            let address_pools = AddressPoolManager::empty();
+            let mut rng = rand::rng();
+            let mut resolver =
+                ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+            let arg = serde_yaml::from_str(yaml)?;
+            let actual = manager.encode_constructor("contract", &[arg], &mut resolver)?;
+            let mut expected_initcode = vec![0x60, 0x00];
+            expected_initcode.extend(DynSolValue::Tuple(vec![expected]).abi_encode_params());
+            assert_eq!(actual.as_ref(), expected_initcode, "{kind}");
+        }
+        Ok(())
     }
 
     #[test]
