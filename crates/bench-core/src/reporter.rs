@@ -1153,6 +1153,8 @@ mod tests {
                 new_payload_server_latency_us: None,
                 persistence_wait_us: None,
                 execution_cache_wait_us: None,
+                ok_count: None,
+                err_count: None,
                 sparse_trie_wait_us: None,
             }];
             reporter.finalize(&report).unwrap();
@@ -1162,6 +1164,21 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&output_str).unwrap();
         assert_eq!(parsed["blocks"][0]["number"], 100);
         assert_eq!(parsed["blocks"][0]["tx_count"], 10);
+        assert!(parsed["blocks"][0].get("ok_count").is_none());
+        assert!(parsed["blocks"][0].get("err_count").is_none());
+        // Old JSON still deserializes with unknown outcomes. Explicit counts
+        // survive the full reporter path instead of becoming submission stats.
+        let mut block: BlockStats = serde_json::from_value(parsed["blocks"][0].clone()).unwrap();
+        assert_eq!(block.ok_count, None);
+        block.ok_count = Some(8);
+        block.err_count = Some(2);
+        let mut output = Vec::new();
+        JsonReporter::new(&mut output)
+            .finalize(&FinalReport { blocks: vec![block], ..Default::default() })
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["blocks"][0]["ok_count"], 8);
+        assert_eq!(parsed["blocks"][0]["err_count"], 2);
     }
 
     #[test]

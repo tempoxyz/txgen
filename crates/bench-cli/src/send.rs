@@ -11,11 +11,11 @@ use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
-    collect_block_stats, parse_reporters, start_scrapers, total_fees_paid,
-    trim_trailing_empty_blocks, BlockReceiptCollector, ConsoleReporter, FileSource, FinalReport,
-    GeneratedTx, MetricsCollector, ProgressState, Reporter, RequestAuthProvider, RpcEndpoint,
-    RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, SenderHeaderAuthProvider,
-    StdinSource, TxPhase, TxSource,
+    collect_block_stats, collect_block_stats_with_receipts, parse_reporters, start_scrapers,
+    total_fees_paid, trim_trailing_empty_blocks, BlockReceiptCollector, ConsoleReporter,
+    FileSource, FinalReport, GeneratedTx, MetricsCollector, ProgressState, Reporter,
+    RequestAuthProvider, RpcEndpoint, RunClock, RunStats, SampleStore, ScraperConfig, Sender,
+    SenderConfig, SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -266,8 +266,11 @@ async fn execute_source<S: TxSource>(
 
     if end_block > start_block {
         let block_range_start = start_block + 1;
-        let mut block_stats =
-            collect_block_stats(&query_provider, block_range_start, end_block).await?;
+        let mut block_stats = if args.collect_receipt_outcomes {
+            collect_block_stats_with_receipts(&query_provider, block_range_start, end_block).await?
+        } else {
+            collect_block_stats(&query_provider, block_range_start, end_block).await?
+        };
         tracing::info!(
             start = block_range_start,
             end = end_block,
