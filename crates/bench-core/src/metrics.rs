@@ -8,7 +8,11 @@
 use crate::{clock::RunClock, sample::Sample};
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockNumberOrTag;
-use alloy_network::{primitives::BlockResponse, Network};
+use alloy_network::{
+    primitives::{BlockResponse, HeaderResponse, ReceiptResponse},
+    Network,
+};
+use alloy_primitives::B256;
 use alloy_provider::Provider;
 
 use eyre::{Context, Result};
@@ -175,6 +179,13 @@ pub struct BlockStats {
     pub timestamp_ms: u64,
     /// Total transactions in the block.
     pub tx_count: usize,
+    /// Successful receipts, including protocol transactions. Absent unless all
+    /// receipts were reconciled with this block after the workload finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok_count: Option<u64>,
+    /// Reverted receipts. Absent when receipt outcomes were not collected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub err_count: Option<u64>,
     /// Gas used by the block.
     pub gas_used: u64,
     /// Gas limit of the block.
@@ -323,6 +334,26 @@ pub async fn collect_block_stats<N: Network, P: Provider<N>>(
     start_block: u64,
     end_block: u64,
 ) -> Result<Vec<BlockStats>> {
+    collect_block_stats_inner(provider, start_block, end_block, false).await
+}
+
+/// Collect block statistics and reconcile every receipt with the corresponding
+/// block hash, transaction order, count and gas total. Missing or inconsistent
+/// receipts fail collection rather than producing a misleading success rate.
+pub async fn collect_block_stats_with_receipts<N: Network, P: Provider<N>>(
+    provider: &P,
+    start_block: u64,
+    end_block: u64,
+) -> Result<Vec<BlockStats>> {
+    collect_block_stats_inner(provider, start_block, end_block, true).await
+}
+
+async fn collect_block_stats_inner<N: Network, P: Provider<N>>(
+    provider: &P,
+    start_block: u64,
+    end_block: u64,
+    collect_receipts: bool,
+) -> Result<Vec<BlockStats>> {
     let blocks = stream::iter(start_block..=end_block)
         .map(|number| async move {
             let block = provider
@@ -333,6 +364,32 @@ pub async fn collect_block_stats<N: Network, P: Provider<N>>(
 
             let timestamp_secs = block.header().timestamp();
             let timestamp_ms = extract_timestamp_ms(&block, timestamp_secs);
+            let outcomes = if collect_receipts {
+                let receipts = provider
+                    .get_block_receipts(BlockNumberOrTag::Number(number).into())
+                    .await
+                    .wrap_err_with(|| format!("failed to fetch receipts for block {number}"))?
+                    .ok_or_else(|| eyre::eyre!("receipts for block {number} unavailable"))?;
+                let receipt_data = receipts
+                    .iter()
+                    .map(|receipt| BlockReceiptOutcome {
+                        block_number: receipt.block_number(),
+                        block_hash: receipt.block_hash(),
+                        tx_hash: receipt.transaction_hash(),
+                        gas_used: receipt.gas_used(),
+                        success: receipt.status(),
+                    })
+                    .collect::<Vec<_>>();
+                Some(reconcile_block_receipts(
+                    number,
+                    block.header().hash(),
+                    &block.transactions().hashes().collect::<Vec<_>>(),
+                    block.header().gas_used(),
+                    &receipt_data,
+                )?)
+            } else {
+                None
+            };
 
             Ok::<_, eyre::Report>((
                 number,
@@ -340,6 +397,7 @@ pub async fn collect_block_stats<N: Network, P: Provider<N>>(
                 block.transactions().len(),
                 block.header().gas_used(),
                 block.header().gas_limit(),
+                outcomes,
             ))
         })
         .buffered(BLOCK_STATS_FETCH_CONCURRENCY)
@@ -349,7 +407,7 @@ pub async fn collect_block_stats<N: Network, P: Provider<N>>(
     let mut stats = Vec::with_capacity(blocks.len());
     let mut prev_timestamp_ms: Option<u64> = None;
 
-    for (number, timestamp_ms, tx_count, gas_used, gas_limit) in blocks {
+    for (number, timestamp_ms, tx_count, gas_used, gas_limit, outcomes) in blocks {
         let block_time_ms = prev_timestamp_ms.map(|prev| timestamp_ms.saturating_sub(prev));
         prev_timestamp_ms = Some(timestamp_ms);
 
@@ -357,6 +415,8 @@ pub async fn collect_block_stats<N: Network, P: Provider<N>>(
             number,
             timestamp_ms,
             tx_count,
+            ok_count: outcomes.map(|(ok, _)| ok),
+            err_count: outcomes.map(|(_, err)| err),
             gas_used,
             gas_limit,
             block_time_ms,
@@ -370,6 +430,178 @@ pub async fn collect_block_stats<N: Network, P: Provider<N>>(
     }
 
     Ok(stats)
+}
+
+#[derive(Clone)]
+struct BlockReceiptOutcome {
+    block_number: Option<u64>,
+    block_hash: Option<B256>,
+    tx_hash: B256,
+    gas_used: u64,
+    success: bool,
+}
+
+fn reconcile_block_receipts(
+    number: u64,
+    hash: B256,
+    tx_hashes: &[B256],
+    gas_used: u64,
+    receipts: &[BlockReceiptOutcome],
+) -> Result<(u64, u64)> {
+    eyre::ensure!(receipts.len() == tx_hashes.len(), "receipt count mismatch for block {number}");
+    let mut ok = 0;
+    let mut total_gas = 0u128;
+    for (receipt, tx_hash) in receipts.iter().zip(tx_hashes) {
+        eyre::ensure!(
+            receipt.block_number == Some(number) &&
+                receipt.block_hash == Some(hash) &&
+                receipt.tx_hash == *tx_hash,
+            "receipt identity mismatch for block {number}"
+        );
+        ok += u64::from(receipt.success);
+        total_gas += u128::from(receipt.gas_used);
+    }
+    eyre::ensure!(total_gas == u128::from(gas_used), "receipt gas mismatch for block {number}");
+    Ok((ok, receipts.len() as u64 - ok))
+}
+
+#[cfg(test)]
+mod receipt_outcome_tests {
+    use super::*;
+    use alloy_network::AnyNetwork;
+    use alloy_provider::ProviderBuilder;
+    use alloy_transport::mock::Asserter;
+    use serde_json::{json, Value};
+
+    fn fixture() -> (Vec<B256>, Vec<BlockReceiptOutcome>) {
+        let hashes = vec![B256::repeat_byte(1), B256::repeat_byte(2), B256::repeat_byte(3)];
+        let receipts = hashes
+            .iter()
+            .enumerate()
+            .map(|(i, tx_hash)| BlockReceiptOutcome {
+                block_number: Some(7),
+                block_hash: Some(B256::repeat_byte(7)),
+                tx_hash: *tx_hash,
+                gas_used: if i == 0 { 0 } else { 21_000 },
+                success: i != 2,
+            })
+            .collect();
+        (hashes, receipts)
+    }
+
+    fn check(hashes: &[B256], receipts: &[BlockReceiptOutcome]) -> Result<(u64, u64)> {
+        reconcile_block_receipts(7, B256::repeat_byte(7), hashes, 42_000, receipts)
+    }
+
+    #[test]
+    fn includes_zero_gas_and_reverted_receipts() {
+        let (hashes, receipts) = fixture();
+        assert_eq!(check(&hashes, &receipts).unwrap(), (2, 1));
+    }
+
+    #[test]
+    fn rejects_missing_duplicate_and_reordered_receipts() {
+        let (hashes, mut receipts) = fixture();
+        assert!(check(&hashes, &receipts[..2]).is_err());
+        receipts.swap(0, 1);
+        assert!(check(&hashes, &receipts).is_err());
+        receipts[0] = receipts[1].clone();
+        assert!(check(&hashes, &receipts).is_err());
+    }
+
+    #[test]
+    fn rejects_wrong_or_missing_block_identity() {
+        let (hashes, receipts) = fixture();
+        for hash in [None, Some(B256::repeat_byte(8))] {
+            let mut changed = receipts.clone();
+            changed[0].block_hash = hash;
+            assert!(check(&hashes, &changed).is_err());
+        }
+        for number in [None, Some(8)] {
+            let mut changed = receipts.clone();
+            changed[0].block_number = number;
+            assert!(check(&hashes, &changed).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_gas_mismatch() {
+        let (hashes, mut receipts) = fixture();
+        receipts[1].gas_used += 1;
+        assert!(check(&hashes, &receipts).is_err());
+    }
+
+    #[test]
+    fn accepts_complete_empty_block() {
+        assert_eq!(reconcile_block_receipts(7, B256::repeat_byte(7), &[], 0, &[]).unwrap(), (0, 0));
+    }
+
+    fn rpc_fixture() -> (Value, Value) {
+        let (hashes, outcomes) = fixture();
+        let block = json!({
+            "number": "0x7", "hash": B256::repeat_byte(7),
+            "parentHash": B256::ZERO, "sha3Uncles": B256::ZERO,
+            "miner": alloy_primitives::Address::ZERO,
+            "stateRoot": B256::ZERO, "transactionsRoot": B256::ZERO,
+            "receiptsRoot": B256::ZERO, "logsBloom": format!("0x{}", "00".repeat(256)),
+            "difficulty": "0x0", "gasLimit": "0x1c9c380", "gasUsed": "0xa410",
+            "timestamp": "0x7", "extraData": "0x", "mixHash": B256::ZERO,
+            "nonce": "0x0000000000000000", "transactions": hashes, "uncles": []
+        });
+        let receipts = outcomes
+            .iter()
+            .enumerate()
+            .map(|(i, receipt)| {
+                json!({
+                    "type": "0x0", "status": if receipt.success { "0x1" } else { "0x0" },
+                    "transactionHash": receipt.tx_hash, "transactionIndex": format!("0x{i:x}"),
+                    "blockHash": receipt.block_hash, "blockNumber": "0x7",
+                    "from": alloy_primitives::Address::ZERO, "to": alloy_primitives::Address::ZERO,
+                    "contractAddress": null, "gasUsed": format!("0x{:x}", receipt.gas_used),
+                    "cumulativeGasUsed": format!("0x{:x}", i * 21_000),
+                    "effectiveGasPrice": "0x1", "logs": [],
+                    "logsBloom": format!("0x{}", "00".repeat(256))
+                })
+            })
+            .collect::<Vec<_>>();
+        (block, json!(receipts))
+    }
+
+    #[tokio::test]
+    async fn rpc_collection_preserves_known_and_unknown_json_outcomes() {
+        let (block, receipts) = rpc_fixture();
+        let asserter = Asserter::new();
+        asserter.push_success(&block);
+        asserter.push_success(&receipts);
+        let provider =
+            ProviderBuilder::new_with_network::<AnyNetwork>().connect_mocked_client(asserter);
+        let stats = collect_block_stats_with_receipts(&provider, 7, 7).await.unwrap();
+        assert_eq!(stats[0].ok_count, Some(2));
+        assert_eq!(stats[0].err_count, Some(1));
+        assert_eq!(stats[0].tx_count, 3);
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json[0]["ok_count"], 2);
+        let asserter = Asserter::new();
+        asserter.push_success(&block);
+        let provider =
+            ProviderBuilder::new_with_network::<AnyNetwork>().connect_mocked_client(asserter);
+        let stats = collect_block_stats(&provider, 7, 7).await.unwrap();
+        assert_eq!(stats[0].ok_count, None);
+        assert!(serde_json::to_value(&stats).unwrap()[0].get("ok_count").is_none());
+    }
+
+    #[tokio::test]
+    async fn rpc_collection_rejects_unavailable_and_partial_receipts() {
+        let (block, receipts) = rpc_fixture();
+        for response in [Value::Null, json!([]), json!([receipts[0]])] {
+            let asserter = Asserter::new();
+            asserter.push_success(&block);
+            asserter.push_success(&response);
+            let provider =
+                ProviderBuilder::new_with_network::<AnyNetwork>().connect_mocked_client(asserter);
+            assert!(collect_block_stats_with_receipts(&provider, 7, 7).await.is_err());
+        }
+    }
 }
 
 /// Trim trailing empty blocks from collected block stats.
@@ -859,6 +1091,8 @@ mod tests {
                 new_payload_server_latency_us: None,
                 persistence_wait_us: None,
                 execution_cache_wait_us: None,
+                ok_count: None,
+                err_count: None,
                 sparse_trie_wait_us: None,
             },
             BlockStats {
@@ -873,6 +1107,8 @@ mod tests {
                 new_payload_server_latency_us: None,
                 persistence_wait_us: None,
                 execution_cache_wait_us: None,
+                ok_count: None,
+                err_count: None,
                 sparse_trie_wait_us: None,
             },
             BlockStats {
@@ -887,6 +1123,8 @@ mod tests {
                 new_payload_server_latency_us: None,
                 persistence_wait_us: None,
                 execution_cache_wait_us: None,
+                ok_count: None,
+                err_count: None,
                 sparse_trie_wait_us: None,
             },
         ];
@@ -915,6 +1153,8 @@ mod tests {
                 new_payload_server_latency_us: None,
                 persistence_wait_us: None,
                 execution_cache_wait_us: None,
+                ok_count: None,
+                err_count: None,
                 sparse_trie_wait_us: None,
             },
             BlockStats {
@@ -929,6 +1169,8 @@ mod tests {
                 new_payload_server_latency_us: None,
                 persistence_wait_us: None,
                 execution_cache_wait_us: None,
+                ok_count: None,
+                err_count: None,
                 sparse_trie_wait_us: None,
             },
         ];
@@ -1077,6 +1319,8 @@ mod tests {
             new_payload_server_latency_us: None,
             persistence_wait_us: None,
             execution_cache_wait_us: None,
+            ok_count: None,
+            err_count: None,
             sparse_trie_wait_us: None,
         }
     }

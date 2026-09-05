@@ -24,9 +24,9 @@ pub use auth::{RequestAuthProvider, RpcRequestContext, SenderHeaderAuthProvider}
 pub use clickhouse::ClickHouseClient;
 pub use clock::RunClock;
 pub use metrics::{
-    collect_block_stats, compute_latency_stats, trim_trailing_empty_blocks, BenchMetrics,
-    BlockStats, LatencySample, LatencyStats, MetricsCollector, MetricsCollectorOptions, RunStats,
-    ThroughputSample, TimeSeriesMetrics,
+    collect_block_stats, collect_block_stats_with_receipts, compute_latency_stats,
+    trim_trailing_empty_blocks, BenchMetrics, BlockStats, LatencySample, LatencyStats,
+    MetricsCollector, MetricsCollectorOptions, RunStats, ThroughputSample, TimeSeriesMetrics,
 };
 pub use prometheus::parse_prometheus_text;
 pub use prometheus_reporter::{

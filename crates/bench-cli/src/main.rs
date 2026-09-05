@@ -141,6 +141,11 @@ pub struct SendArgs {
     #[arg(long)]
     pub collect_receipt_metrics: bool,
 
+    /// Reconcile all block receipts after sending and report per-block success/failure counts.
+    /// Includes zero-gas protocol transactions; missing or inconsistent receipts fail the run.
+    #[arg(long)]
+    pub collect_receipt_outcomes: bool,
+
     /// Skip setup-phase transactions in the input stream.
     #[arg(long)]
     pub skip_setup: bool,
@@ -504,6 +509,17 @@ mod tests {
             panic!("expected send command");
         };
 
+        assert!(!args.collect_receipt_metrics);
+        assert!(!args.collect_receipt_outcomes);
+    }
+
+    #[test]
+    fn test_send_collect_receipt_outcomes_enabled() {
+        let cli = Cli::try_parse_from(["bench", "send", "--collect-receipt-outcomes"]).unwrap();
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+        assert!(args.collect_receipt_outcomes);
         assert!(!args.collect_receipt_metrics);
     }
 
