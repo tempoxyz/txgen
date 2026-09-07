@@ -28,6 +28,8 @@ use tokio::{
 };
 
 const BLOCK_STATS_FETCH_CONCURRENCY: usize = 32;
+const BLOCK_STATS_FETCH_ATTEMPTS: u32 = 3;
+const BLOCK_STATS_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Metrics collected during a benchmark run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,11 +327,29 @@ pub async fn collect_block_stats<N: Network, P: Provider<N>>(
 ) -> Result<Vec<BlockStats>> {
     let blocks = stream::iter(start_block..=end_block)
         .map(|number| async move {
-            let block = provider
-                .get_block(BlockNumberOrTag::Number(number).into())
-                .await
-                .wrap_err_with(|| format!("failed to fetch block {number}"))?
-                .ok_or_else(|| eyre::eyre!("block {number} not found"))?;
+            // Reporting happens after load generation. Retry transient RPC failures here
+            // without changing submission behavior or accepting incomplete block statistics.
+            let mut attempt = 1;
+            let block = loop {
+                let result = provider
+                    .get_block(BlockNumberOrTag::Number(number).into())
+                    .await
+                    .wrap_err_with(|| format!("failed to fetch block {number}"))
+                    .and_then(|block| block.ok_or_else(|| eyre::eyre!("block {number} not found")));
+                match result {
+                    Ok(block) => break block,
+                    Err(error) if attempt == BLOCK_STATS_FETCH_ATTEMPTS => {
+                        return Err(error.wrap_err(format!(
+                            "failed to collect block {number} after {attempt} attempts"
+                        )));
+                    }
+                    Err(error) => {
+                        tracing::warn!(number, attempt, %error, "retrying block statistics fetch");
+                        tokio::time::sleep(BLOCK_STATS_RETRY_BACKOFF * attempt).await;
+                        attempt += 1;
+                    }
+                }
+            };
 
             let timestamp_secs = block.header().timestamp();
             let timestamp_ms = extract_timestamp_ms(&block, timestamp_secs);
@@ -773,6 +793,64 @@ mod duration_serde {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_network::Ethereum;
+    use alloy_provider::ProviderBuilder;
+    use alloy_transport::mock::Asserter;
+
+    #[tokio::test]
+    async fn block_stats_recovers_from_transient_fetch_failures() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("temporary RPC failure");
+        asserter.push_failure_msg("temporary RPC failure");
+        let mut block = <Ethereum as Network>::BlockResponse::default();
+        block.header.inner.number = 80;
+        block.header.inner.timestamp = 123;
+        block.header.inner.gas_used = 21_000;
+        asserter.push_success(&block);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let stats = collect_block_stats(&provider, 80, 80).await.unwrap();
+
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].number, 80);
+        assert_eq!(stats[0].timestamp_ms, 123_000);
+        assert_eq!(stats[0].gas_used, 21_000);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn block_stats_fails_after_three_fetch_attempts() {
+        let asserter = Asserter::new();
+        for _ in 0..3 {
+            asserter.push_failure_msg("persistent RPC failure");
+        }
+        // A fourth response must remain unused: retries are bounded, not indefinite.
+        asserter.push_success(&<Ethereum as Network>::BlockResponse::default());
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let error = collect_block_stats(&provider, 80, 80).await.unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(error.contains("failed to collect block 80 after 3 attempts"), "{error}");
+        assert!(error.contains("persistent RPC failure"), "{error}");
+        assert_eq!(asserter.read_q().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn block_stats_does_not_skip_missing_blocks() {
+        let asserter = Asserter::new();
+        for _ in 0..3 {
+            asserter.push_success(&serde_json::Value::Null);
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let error = collect_block_stats(&provider, 80, 80).await.unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(error.contains("failed to collect block 80 after 3 attempts"), "{error}");
+        assert!(error.contains("block 80 not found"), "{error}");
+        assert!(asserter.read_q().is_empty());
+    }
 
     #[tokio::test]
     async fn test_metrics_collection() {
