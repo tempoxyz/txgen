@@ -1365,14 +1365,14 @@ mod tests {
                 MetricsCollector::new(RunClock::new()),
                 Some(auth.clone()),
             );
-            for _ in 0..25 {
+            for index in 0..25 {
                 sender
                     .send(GeneratedTx {
                         phase: TxPhase::Workload,
                         id: None,
                         sender: Some(Address::repeat_byte(0x11)),
                         raw: raw.clone(),
-                        submission_keys: Vec::new(),
+                        submission_keys: vec![SchedulingKey::from([index; 20])],
                         inclusion_keys: Vec::new(),
                     })
                     .await
