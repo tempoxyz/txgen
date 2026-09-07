@@ -28,7 +28,7 @@ pub struct SendArgs {
     #[arg(short, long)]
     pub input: Option<PathBuf>,
 
-    /// RPC endpoint URLs (comma-separated or repeated)
+    /// RPC endpoint URLs, used round-robin (comma-separated or repeated)
     #[arg(long = "rpc-url", value_delimiter = ',', default_values_t = vec!["http://localhost:8545".to_string()])]
     pub rpc_urls: Vec<String>,
 

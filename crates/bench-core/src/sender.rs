@@ -14,7 +14,6 @@ use alloy_primitives::{keccak256, Address, Bytes, TxHash, U256};
 use alloy_provider::{DynProvider, Provider};
 use alloy_transport::RpcError;
 use eyre::{Context, Result};
-use rand::seq::IndexedRandom;
 use reqwest::header::HeaderMap;
 use std::{
     collections::{HashSet, VecDeque},
@@ -689,6 +688,8 @@ impl PendingTx {
 /// Transaction sender.
 pub struct Sender {
     endpoints: Vec<RpcEndpoint>,
+    /// Next RPC endpoint in round-robin dispatch order.
+    next_endpoint: usize,
     request_auth: Option<Arc<dyn RequestAuthProvider>>,
     metrics: Arc<MetricsCollector>,
     semaphore: Arc<Semaphore>,
@@ -751,6 +752,7 @@ impl Sender {
 
         Self {
             endpoints,
+            next_endpoint: 0,
             request_auth,
             metrics,
             semaphore,
@@ -935,11 +937,7 @@ impl Sender {
             // transactions observe a freshly reloaded sender map. Do this while
             // the transaction is still queued so any error is propagated and no
             // HTTP request is made.
-            let endpoint = self
-                .endpoints
-                .choose(&mut rand::rng())
-                .expect("sender has at least one endpoint")
-                .clone();
+            let endpoint = self.endpoints[self.next_endpoint].clone();
             let pending = self.pending.get(index).expect("pending index exists");
             let id = pending.id.as_deref().unwrap_or("<unnamed>").to_string();
             let submission_headers = match self
@@ -957,6 +955,7 @@ impl Sender {
 
             let pending = self.pending.remove(index).expect("pending index exists");
             self.activate_keys(&pending);
+            self.next_endpoint = (self.next_endpoint + 1) % self.endpoints.len();
             self.dispatch(pending, endpoint, submission_headers, permit);
         }
 
@@ -1343,6 +1342,47 @@ mod tests {
 
     fn mocked_provider(asserter: Asserter) -> DynProvider<AnyNetwork> {
         ProviderBuilder::new_with_network::<AnyNetwork>().connect_mocked_client(asserter).erased()
+    }
+
+    #[tokio::test]
+    async fn sender_round_robins_across_all_endpoints() {
+        for endpoint_count in [1, 10] {
+            let raw = Bytes::from_static(&[0x02, 0xf8, 0x70]);
+            let tx_hash = keccak256(&raw);
+            let endpoints = (0..endpoint_count)
+                .map(|index| {
+                    let asserter = Asserter::new();
+                    for _ in 0..25 {
+                        asserter.push_success(&tx_hash);
+                    }
+                    RpcEndpoint::new(format!("rpc-{index}"), mocked_provider(asserter))
+                })
+                .collect();
+            let auth = Arc::new(RecordingAuth::default());
+            let mut sender = Sender::new_with_request_auth(
+                endpoints,
+                SenderConfig { rate_limit: 0, max_concurrent: 3 },
+                MetricsCollector::new(RunClock::new()),
+                Some(auth.clone()),
+            );
+            for _ in 0..25 {
+                sender
+                    .send(GeneratedTx {
+                        phase: TxPhase::Workload,
+                        id: None,
+                        sender: Some(Address::repeat_byte(0x11)),
+                        raw: raw.clone(),
+                        submission_keys: Vec::new(),
+                        inclusion_keys: Vec::new(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            sender.flush().await.unwrap();
+            let expected =
+                (0..25).map(|index| format!("rpc-{}", index % endpoint_count)).collect::<Vec<_>>();
+            assert_eq!(*auth.endpoints.lock().unwrap(), expected);
+        }
     }
 
     fn receipt_json(
