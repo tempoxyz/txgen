@@ -27,7 +27,10 @@ use tokio::{
     task::JoinHandle,
 };
 
-const BLOCK_STATS_FETCH_CONCURRENCY: usize = 32;
+// Reports may fetch large blocks through a single bandwidth-limited RPC tunnel.
+// Keep this separate from transaction submission concurrency: these reads happen
+// after the workload window and should not saturate the tunnel and time out.
+const BLOCK_STATS_FETCH_CONCURRENCY: usize = 4;
 
 /// Metrics collected during a benchmark run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
