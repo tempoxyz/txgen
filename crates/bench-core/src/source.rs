@@ -4,63 +4,20 @@
 //! - file (reads NDJSON from a file)
 //! - stdin (reads NDJSON from stdin)
 
-use alloy_primitives::{Address, Bytes};
 use eyre::{Context, Result};
 use std::{io::BufRead, path::Path};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey, TxPhase};
+use txgen_core::{dedup_scheduling_keys, GeneratedTx};
 
-/// A transaction read from a source.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct SourceTx {
-    /// Stream phase for this transaction.
-    #[serde(default)]
-    pub phase: TxPhase,
-    /// Optional human-readable transaction identifier for diagnostics.
-    #[serde(default)]
-    pub id: Option<String>,
-    /// Raw transaction bytes (hex-encoded with 0x prefix).
-    pub raw: String,
-    /// Logical on-chain transaction sender.
-    ///
-    /// This is optional for compatibility with NDJSON generated before sender
-    /// metadata was introduced.
-    #[serde(default)]
-    pub sender: Option<Address>,
-    /// Scheduling keys released once RPC submission succeeds (hex-encoded with 0x prefix).
-    pub submission_keys: Vec<SchedulingKey>,
-    /// Scheduling keys released once a transaction receipt is observed (hex-encoded with 0x
-    /// prefix).
-    #[serde(default)]
-    pub inclusion_keys: Vec<SchedulingKey>,
-}
-
-impl SourceTx {
-    /// Parse into a [`GeneratedTx`].
-    pub fn into_generated_tx(self) -> Result<GeneratedTx> {
-        let raw = self
-            .raw
-            .strip_prefix("0x")
-            .unwrap_or(&self.raw)
-            .parse::<Bytes>()
-            .context("invalid raw tx hex")?;
-
-        let submission_keys = dedup_scheduling_keys(self.submission_keys);
-        let inclusion_keys = dedup_scheduling_keys(self.inclusion_keys);
-
-        if submission_keys.is_empty() && inclusion_keys.is_empty() {
-            eyre::bail!("transactions must have at least one submission or inclusion key");
-        }
-
-        Ok(GeneratedTx {
-            phase: self.phase,
-            id: self.id,
-            raw,
-            sender: self.sender,
-            submission_keys,
-            inclusion_keys,
-        })
+fn parse_transaction(line: &str) -> Result<GeneratedTx> {
+    let mut transaction: GeneratedTx =
+        serde_json::from_str(line).context("failed to parse NDJSON line")?;
+    transaction.submission_keys = dedup_scheduling_keys(transaction.submission_keys);
+    transaction.inclusion_keys = dedup_scheduling_keys(transaction.inclusion_keys);
+    if transaction.submission_keys.is_empty() && transaction.inclusion_keys.is_empty() {
+        eyre::bail!("transactions must have at least one submission or inclusion key");
     }
+    Ok(transaction)
 }
 
 /// Transaction source trait.
@@ -88,11 +45,7 @@ impl FileSource {
 impl TxSource for FileSource {
     async fn next_tx(&mut self) -> Result<Option<GeneratedTx>> {
         match self.lines.next() {
-            Some(Ok(line)) => {
-                let source_tx: SourceTx =
-                    serde_json::from_str(&line).context("failed to parse NDJSON line")?;
-                Ok(Some(source_tx.into_generated_tx()?))
-            }
+            Some(Ok(line)) => Ok(Some(parse_transaction(&line)?)),
             Some(Err(e)) => Err(e).context("failed to read line"),
             None => Ok(None),
         }
@@ -131,19 +84,18 @@ impl TxSource for StdinSource {
             return Ok(None);
         }
 
-        let source_tx: SourceTx =
-            serde_json::from_str(&self.line_buf).context("failed to parse NDJSON line")?;
-        Ok(Some(source_tx.into_generated_tx()?))
+        Ok(Some(parse_transaction(&self.line_buf)?))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use txgen_core::{SchedulingKey, TxPhase};
 
     #[test]
     fn parses_submission_and_inclusion_keys() {
-        let source_tx: SourceTx = serde_json::from_str(
+        let generated = parse_transaction(
             r#"{
                 "raw": "0x02f870",
                 "submission_keys": [
@@ -157,7 +109,6 @@ mod tests {
         )
         .unwrap();
 
-        let generated = source_tx.into_generated_tx().unwrap();
         assert_eq!(generated.phase, TxPhase::Workload);
         assert_eq!(generated.sender, None);
         assert_eq!(generated.submission_keys, vec![SchedulingKey::from([0x11; 20])]);
@@ -166,7 +117,7 @@ mod tests {
 
     #[test]
     fn parses_sender_metadata() {
-        let source_tx: SourceTx = serde_json::from_str(
+        let generated = parse_transaction(
             r#"{
                 "raw": "0x02f870",
                 "sender": "0x3333333333333333333333333333333333333333",
@@ -177,7 +128,6 @@ mod tests {
         )
         .unwrap();
 
-        let generated = source_tx.into_generated_tx().unwrap();
-        assert_eq!(generated.sender, Some(Address::repeat_byte(0x33)));
+        assert_eq!(generated.sender, Some(alloy_primitives::Address::repeat_byte(0x33)));
     }
 }

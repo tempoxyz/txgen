@@ -53,5 +53,5 @@ pub use sender::{
     RpcEndpoint, RpcReceiptDetails, RpcSubmission, RpcSubmitError, RpcSubmitFailureKind,
     RpcSubmitter, Sender, SenderConfig,
 };
-pub use source::{FileSource, SourceTx, StdinSource, TxSource};
+pub use source::{FileSource, StdinSource, TxSource};
 pub use txgen_core::{GeneratedTx, TxPhase};

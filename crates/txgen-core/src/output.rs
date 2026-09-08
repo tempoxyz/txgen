@@ -17,11 +17,13 @@ pub enum TxPhase {
 }
 
 /// A generated transaction ready for output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedTx {
     /// Stream phase for this transaction.
+    #[serde(default)]
     pub phase: TxPhase,
     /// Optional human-readable transaction identifier for diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// RLP-encoded signed transaction (EIP-2718 envelope).
     pub raw: Bytes,
@@ -30,6 +32,7 @@ pub struct GeneratedTx {
     /// Generated transactions always populate this field. It remains optional so
     /// bench can continue to consume legacy NDJSON streams that predate sender
     /// metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<Address>,
     /// Scheduling keys released once the transaction is accepted by the RPC endpoint.
     ///
@@ -41,20 +44,8 @@ pub struct GeneratedTx {
     ///
     /// Use these for cross-lane dependencies where submission order alone does not
     /// guarantee execution order, such as transaction sequences.
+    #[serde(default)]
     pub inclusion_keys: Vec<SchedulingKey>,
-}
-
-/// JSON output format for NDJSON stream.
-#[derive(Serialize)]
-struct OutputTx<'a> {
-    phase: TxPhase,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<&'a str>,
-    raw: &'a Bytes,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sender: Option<&'a Address>,
-    submission_keys: &'a [SchedulingKey],
-    inclusion_keys: &'a [SchedulingKey],
 }
 
 /// Writes generated transactions as newline-delimited JSON.
@@ -71,16 +62,7 @@ impl<W: Write> NdjsonWriter<W> {
 
     /// Write a generated transaction.
     pub fn write(&mut self, tx: &GeneratedTx) -> Result<()> {
-        let out = OutputTx {
-            phase: tx.phase,
-            id: tx.id.as_deref(),
-            raw: &tx.raw,
-            sender: tx.sender.as_ref(),
-            submission_keys: &tx.submission_keys,
-            inclusion_keys: &tx.inclusion_keys,
-        };
-
-        serde_json::to_writer(&mut self.writer, &out)?;
+        serde_json::to_writer(&mut self.writer, tx)?;
         self.writer.write_all(b"\n")?;
         self.count += 1;
 
@@ -150,6 +132,7 @@ mod tests {
             output.contains("\"inclusion_keys\":[\"0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\"]")
         );
         assert!(output.ends_with('\n'));
+        assert_eq!(serde_json::from_str::<GeneratedTx>(output.trim()).unwrap(), tx);
     }
 
     #[test]

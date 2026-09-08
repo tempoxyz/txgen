@@ -437,9 +437,8 @@ where
         .wrap_err("setup transaction stream was not UTF-8")?
         .lines()
         .map(|line| {
-            serde_json::from_str::<bench_core::SourceTx>(line)
-                .wrap_err("failed to parse materialized setup transaction")?
-                .into_generated_tx()
+            serde_json::from_str::<GeneratedTx>(line)
+                .wrap_err("failed to parse materialized setup transaction")
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(MaterializedSetup { transactions, bindings })
