@@ -964,6 +964,11 @@ impl Sender {
     }
 
     fn next_ready_index(&self) -> Option<usize> {
+        let first = self.pending.front()?;
+        if first.scheduling_keys().all(|key| !self.active_keys.contains(key)) {
+            return Some(0);
+        }
+
         let mut blocked_keys = self.active_keys.clone();
 
         for (index, pending) in self.pending.iter().enumerate() {
@@ -1325,6 +1330,46 @@ mod tests {
     use crate::{ReceiptCollector, RunClock};
     use alloy_provider::ProviderBuilder;
     use alloy_transport::mock::Asserter;
+
+    #[tokio::test]
+    async fn sender_ready_index_preserves_transitive_key_ordering() {
+        let provider = mocked_provider(Asserter::new());
+        let mut sender = Sender::new(
+            vec![provider],
+            SenderConfig { rate_limit: 0, max_concurrent: 5_000 },
+            MetricsCollector::new(RunClock::new()),
+        );
+        let [a, b, c, d] = [1, 2, 3, 4].map(|byte| SchedulingKey::from([byte; 20]));
+        sender.active_keys.insert(a);
+        assert_eq!(sender.next_ready_index(), None);
+
+        for (submission_keys, inclusion_keys) in
+            [(vec![a], vec![b]), (vec![b], vec![c]), (vec![c], vec![]), (vec![d], vec![])]
+        {
+            sender.pending.push_back(PendingTx {
+                queue_id: 0,
+                phase: TxPhase::Workload,
+                id: None,
+                raw: Bytes::new(),
+                sender: None,
+                submission_keys,
+                inclusion_keys,
+            });
+        }
+
+        // A blocked transaction reserves all its keys for ordering, including
+        // inclusion keys. Only the unrelated fourth transaction may pass.
+        assert_eq!(sender.next_ready_index(), Some(3));
+        sender.pending.pop_back();
+        assert_eq!(sender.next_ready_index(), None);
+
+        sender.active_keys.clear();
+        assert_eq!(sender.next_ready_index(), Some(0));
+        sender.active_keys.insert(b);
+        assert_eq!(sender.next_ready_index(), None);
+        sender.active_keys.clear();
+        assert_eq!(sender.next_ready_index(), Some(0));
+    }
 
     #[derive(Default)]
     struct RecordingAuth {
