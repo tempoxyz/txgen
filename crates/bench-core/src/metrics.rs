@@ -385,15 +385,28 @@ pub async fn collect_block_stats<N: Network, P: Provider<N>>(
 /// if no blocks with user transactions were found (in which case the
 /// blocks are left unmodified).
 pub fn trim_trailing_empty_blocks(blocks: &mut Vec<BlockStats>) -> Option<u64> {
-    let last_real_idx = blocks.iter().rposition(|b| b.gas_used > 0)?;
+    blocks.iter().rposition(|b| b.gas_used > 0)?;
+    Some(trim_trailing_empty_blocks_after(blocks, 0))
+}
 
-    let trimmed = blocks.len() - (last_real_idx + 1);
+/// Remove empty drain blocks while retaining every block timestamped during the workload.
+///
+/// Returns a sample cutoff no earlier than `workload_end_ms`. A lagging query node may return
+/// a latest block timestamp older than the end of sending; its telemetry must still cover
+/// the complete workload, including the interval when that node stopped advancing.
+pub fn trim_trailing_empty_blocks_after(blocks: &mut Vec<BlockStats>, workload_end_ms: u64) -> u64 {
+    let retained = blocks
+        .iter()
+        .rposition(|b| b.gas_used > 0 || b.timestamp_ms <= workload_end_ms)
+        .map_or(0, |index| index + 1);
+
+    let trimmed = blocks.len() - retained;
     if trimmed > 0 {
         tracing::info!(trimmed, "Trimmed trailing empty blocks");
-        blocks.truncate(last_real_idx + 1);
+        blocks.truncate(retained);
     }
 
-    blocks.last().map(|b| b.timestamp_ms)
+    blocks.last().map_or(workload_end_ms, |b| b.timestamp_ms.max(workload_end_ms))
 }
 
 /// Extract a millisecond-precision timestamp from a block response.
@@ -1079,6 +1092,47 @@ mod tests {
             execution_cache_wait_us: None,
             sparse_trie_wait_us: None,
         }
+    }
+
+    #[test]
+    fn trim_drain_preserves_empty_workload_blocks() {
+        let mut blocks = vec![
+            make_block(100, 1_000_000, 1_000),
+            make_block(101, 0, 1_500),
+            make_block(102, 0, 2_000),
+            make_block(103, 0, 2_500),
+        ];
+        assert_eq!(trim_trailing_empty_blocks_after(&mut blocks, 2_000), 2_000);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks.last().unwrap().number, 102);
+    }
+
+    #[test]
+    fn trim_drain_keeps_telemetry_after_a_stalled_head() {
+        let mut blocks = vec![make_block(100, 1_000_000, 1_000)];
+        assert_eq!(trim_trailing_empty_blocks_after(&mut blocks, 17_000), 17_000);
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn trim_drain_retains_late_inclusions() {
+        let mut blocks = vec![
+            make_block(100, 1_000_000, 1_000),
+            make_block(101, 0, 1_500),
+            make_block(102, 1_000_000, 2_500),
+            make_block(103, 0, 3_000),
+        ];
+        assert_eq!(trim_trailing_empty_blocks_after(&mut blocks, 2_000), 2_500);
+        assert_eq!(blocks.len(), 3);
+    }
+
+    #[test]
+    fn trim_drain_preserves_an_empty_workload() {
+        let mut blocks =
+            vec![make_block(100, 0, 1_000), make_block(101, 0, 1_500), make_block(102, 0, 2_500)];
+        assert_eq!(trim_trailing_empty_blocks_after(&mut blocks, 2_000), 2_000);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(trim_trailing_empty_blocks_after(&mut Vec::new(), 2_000), 2_000);
     }
 
     #[test]
