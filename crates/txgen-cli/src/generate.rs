@@ -946,6 +946,7 @@ enum ResolvedBinding {
     U256(U256),
     U64(u64),
     String(String),
+    SignedTx { raw: Bytes, tx_hash: B256, sender: Address },
     SetupTx { address: Option<Address>, tx_hash: B256, sender: Address, nonce: u64 },
 }
 
@@ -1214,6 +1215,20 @@ struct SigningPool {
 }
 
 impl SigningPool {
+    fn submit_ready<W: Write>(
+        &mut self,
+        sequence: u64,
+        tx: GeneratedTx,
+        writer: &mut NdjsonWriter<W>,
+    ) -> Result<()> {
+        self.drain_available(writer)?;
+        while self.in_flight >= self.max_in_flight {
+            self.recv_one(writer)?;
+        }
+        self.in_flight += 1;
+        self.handle_result(SigningResult { sequence, result: Ok(tx) }, writer)
+    }
+
     fn new(worker_count: usize) -> Result<Self> {
         if worker_count == 0 {
             bail!("signing worker count must be at least 1");
@@ -1477,13 +1492,19 @@ where
                     .checked_add(1)
                     .ok_or_else(|| eyre::eyre!("sequence instance counter overflowed u64"))?;
                 let sequence_key = compute_sequence_key(&name, sequence_instance);
-                let bindings = resolve_sequence_bindings(&sequence.bindings, ctx, setup_bindings)
-                    .wrap_err_with(|| {
-                    format!("failed to resolve bindings for sequence '{name}'")
-                })?;
+                let mut bindings =
+                    resolve_sequence_bindings(&sequence.bindings, ctx, setup_bindings)
+                        .wrap_err_with(|| {
+                            format!("failed to resolve bindings for sequence '{name}'")
+                        })?;
 
                 for (idx, step) in sequence.steps.iter().enumerate() {
                     let label = step.name.as_deref().unwrap_or(&step.template);
+                    if let Some(save) = &step.save &&
+                        (save.is_empty() || save.contains('.') || bindings.contains_key(save))
+                    {
+                        bail!("sequence '{name}' step '{label}' has invalid or duplicate save '{save}'");
+                    }
                     let base = spec
                         .templates
                         .get(&step.template)
@@ -1503,7 +1524,24 @@ where
                         sequence,
                         ctx,
                     )?;
-                    signing_pool.submit(job, writer)?;
+                    if let Some(save) = &step.save {
+                        // The next step may depend on these signed bytes. Sign this
+                        // step now, retaining the pool's ordered, bounded output.
+                        let tx = sign_workload_job::<A>(job)?;
+                        bindings.insert(
+                            save.clone(),
+                            ResolvedBinding::SignedTx {
+                                raw: tx.raw.clone(),
+                                tx_hash: keccak256(&tx.raw),
+                                sender: tx.sender.ok_or_else(|| {
+                                    eyre::eyre!("saved transaction has no sender")
+                                })?,
+                            },
+                        );
+                        signing_pool.submit_ready(sequence, tx, writer)?;
+                    } else {
+                        signing_pool.submit(job, writer)?;
+                    }
                     written += 1;
                 }
             }
@@ -1852,6 +1890,18 @@ fn binding_to_value(
         (ResolvedBinding::U256(value), None) => Ok(serde_yaml::Value::String(value.to_string())),
         (ResolvedBinding::U64(value), None) => Ok(serde_yaml::to_value(value)?),
         (ResolvedBinding::String(value), None) => Ok(serde_yaml::Value::String(value.clone())),
+        (ResolvedBinding::SignedTx { raw, .. }, Some("raw")) => {
+            Ok(serde_yaml::Value::String(raw.to_string()))
+        }
+        (ResolvedBinding::SignedTx { tx_hash, .. }, Some("tx_hash")) => {
+            Ok(serde_yaml::Value::String(tx_hash.to_string()))
+        }
+        (ResolvedBinding::SignedTx { sender, .. }, Some("sender")) => {
+            Ok(serde_yaml::Value::String(sender.to_string()))
+        }
+        (ResolvedBinding::SignedTx { .. }, None) => {
+            bail!("signed transaction binding '{name}' requires a field");
+        }
         (ResolvedBinding::SetupTx { address: Some(address), .. }, Some("address")) => {
             Ok(serde_yaml::Value::String(address.to_string()))
         }
@@ -1917,6 +1967,30 @@ mod tests {
     use alloy_rpc_types_eth::TransactionRequest;
     use std::collections::HashMap;
     use txgen_core::{derive_mnemonic_signer, GasConfig};
+
+    #[test]
+    fn signed_transaction_bindings_expose_only_offline_outputs() {
+        let raw = Bytes::from_static(&[0x76, 0x01]);
+        let hash = keccak256(&raw);
+        let sender = Address::repeat_byte(7);
+        let bindings = HashMap::from([(
+            "opened".to_string(),
+            ResolvedBinding::SignedTx { raw: raw.clone(), tx_hash: hash, sender },
+        )]);
+        for (field, value) in [
+            ("raw", raw.to_string()),
+            ("tx_hash", hash.to_string()),
+            ("sender", sender.to_string()),
+        ] {
+            assert_eq!(
+                binding_to_value(&format!("opened.{field}"), &bindings).unwrap(),
+                serde_yaml::Value::String(value)
+            );
+        }
+        assert!(binding_to_value("opened", &bindings).is_err());
+        assert!(binding_to_value("opened.receipt", &bindings).is_err());
+        assert!(binding_to_value("future.raw", &bindings).is_err());
+    }
 
     struct PendingPrepareAdapter;
     struct MutatingKeyAdapter;

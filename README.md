@@ -1632,6 +1632,13 @@ Supported binding references:
 | `u64` | `<name>` |
 | `string` | `<name>` |
 
+Add `save: <name>` to a sequence step to expose its signed transaction to later
+steps as `<name>.raw` (EIP-2718 bytes), `<name>.tx_hash`, and `<name>.sender`.
+Saved names must be nonempty, contain no dots, and not collide with another
+binding or saved step in that instance. These outputs are derived offline, not
+from receipts or return values. Only saved steps are signed synchronously;
+other steps retain parallel signing and ordered output.
+
 Sequences also expose `{ var: chain_id }` as the top-level workload `chain_id` unless a binding named `chain_id` is defined.
 
 Hash bindings can reference other sequence bindings and are resolved once per sequence instance. For deterministic IDs that contracts compute with `keccak256(abi.encode(...))` (such as Tempo MPP channel IDs), use `abi_hash`:
@@ -1664,6 +1671,52 @@ Each emitted sequence step gets its natural nonce-lane key as a `submission_key`
 When set, `txgen generate -n` counts emitted transactions, not sequence instances. txgen never emits a partial sequence; if no remaining mix entry fits the remaining transaction budget or `--duration` elapses before the next workload item starts, generation stops early.
 
 See `examples/sequence.yaml` for a small syntax example, `examples/tip20-sequence.yaml` for a Tempo TIP20 `approve -> transferFrom` sequence whose second transaction depends on the first, and `examples/tip20-mpp.yaml` for TIP20 transfers mixed with deterministic MPP channel `open -> close` sequences.
+
+#### Native MPP settlement
+
+For the native TIP-20 Channel Reserve at
+`0x4d50500000000000000000000000000000000000`, save the signed opening transaction
+and use a Tempo `mpp_settle` template for the next step:
+
+```yaml
+templates:
+  # mpp_open calls the native reserve's open(payee, operator, token, deposit,
+  # salt, authorizedSigner), with payer.ref as from and payee.address as payee.
+  mpp_settle:
+    type: tempo
+    from: { var: payee.ref }
+    gas_limit: 1000000
+    expiring_nonce: true
+    valid_for_secs: 25
+    mpp_settle:
+      open_transaction: { var: opened.raw }
+      voucher_signer: { var: payer.ref }
+      cumulative_amount: 1
+
+sequences:
+  mpp_open_settle:
+    bindings:
+      payer: { account: { pool: users, select: random } }
+      payee: { account: { pool: users, select: random } }
+    steps:
+      - template: mpp_open
+        save: opened
+      - template: mpp_settle
+```
+
+The adapter decodes the signed open, recovers the payer, derives its transaction
+context hash and channel descriptor, and signs the reserve's EIP-712 voucher.
+This includes the opening transaction's actual nonce, validity window, and
+signing context; a salt alone is not sufficient to derive the native channel ID.
+No RPC receipt lookup is required, and sequence scheduling still enforces order.
+
+`call_index` selects the open in a batched transaction (default `0`). The
+settlement sender must be the payee or operator; `voucher_signer` must select the
+authorized signer, or the payer if `authorizedSigner` was zero. The helper
+supports a positive initial settlement up to the opening deposit, not a
+top-up-dependent cumulative amount. It requires `type: tempo` and cannot be
+combined with `call`, `calls`, `to`, `input`, or a nonzero `value`.
+Settlement pays the cumulative amount but does not close the channel.
 
 ## Supported Chains
 

@@ -24,6 +24,7 @@ clap.workspace = true
 
 # alloy
 alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
 alloy-consensus.workspace = true
 alloy-signer.workspace = true
 alloy-network.workspace = true
