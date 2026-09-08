@@ -1,4 +1,5 @@
 pub mod auth_token_map;
+mod mpp;
 mod nonce;
 mod template;
 mod zone;
@@ -455,7 +456,25 @@ impl NetworkAdapter for TempoAdapter {
             }
         };
 
-        let (to, value, input, calls) = resolve_call_data(&template, is_tempo, ctx)?;
+        let (to, value, input, calls) = if let Some(settle) = &template.mpp_settle {
+            if !is_tempo ||
+                template.call.is_some() ||
+                template.calls.is_some() ||
+                template.to.is_some() ||
+                template.input.is_some() ||
+                ctx.resolve_value(&template.value)? != U256::ZERO
+            {
+                bail!("mpp_settle requires type: tempo and cannot be combined with call/calls/to/input/value");
+            }
+            (
+                TxKind::Create,
+                U256::ZERO,
+                Bytes::new(),
+                vec![mpp::settlement_call(settle, selected.address, ctx)?],
+            )
+        } else {
+            resolve_call_data(&template, is_tempo, ctx)?
+        };
 
         let mut req = TempoTransactionRequest::default();
         req.set_chain_id(ctx.chain_id);
@@ -1242,6 +1261,7 @@ mod tests {
 
     fn base_template(tx_type: TempoTxType) -> TempoTemplate {
         TempoTemplate {
+            mpp_settle: None,
             tx_type,
             from: AccountRef { pool: "users".to_string(), select: SelectMode::Index(0) },
             gas_limit: 21000,

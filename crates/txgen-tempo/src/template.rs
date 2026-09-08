@@ -21,6 +21,9 @@ pub enum TempoTxType {
 /// fee tokens, and batched calls.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TempoTemplate {
+    /// Native Channel Reserve settlement built from a prior signed opening transaction.
+    #[serde(default)]
+    pub mpp_settle: Option<crate::mpp::MppSettleDef>,
     /// Transaction type.
     #[serde(rename = "type")]
     pub tx_type: TempoTxType,

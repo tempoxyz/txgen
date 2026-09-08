@@ -163,6 +163,10 @@ pub struct SequenceStep {
     /// Optional human-readable step name for diagnostics.
     #[serde(default)]
     pub name: Option<String>,
+    /// Save the signed transaction for subsequent steps as `<save>.raw`,
+    /// `<save>.tx_hash`, and `<save>.sender`. This does not submit the transaction.
+    #[serde(default)]
+    pub save: Option<String>,
     /// Template name to instantiate for this step.
     pub template: String,
     /// Per-step YAML overlay applied over the referenced template.

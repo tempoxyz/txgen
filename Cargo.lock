@@ -6071,6 +6071,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-provider",
  "alloy-signer",
+ "alloy-sol-types",
  "alloy-transport",
  "axum",
  "clap",
