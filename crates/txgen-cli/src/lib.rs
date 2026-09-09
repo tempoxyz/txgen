@@ -18,10 +18,10 @@ use extract::{run_extract, run_extract_big_blocks};
 pub use extract::{ExtractArgs, ExtractBigBlocksArgs, ExtractFormat};
 use generate::run_generate;
 pub use generate::{
-    fetch_pending_protocol_nonces, fetch_protocol_nonces, materialize_and_sign_template,
-    materialize_setup, materialize_setup_online, sign_standard_request, GenerateArgs,
-    GenerateContext, MaterializedSetup, MaterializedTx, NetworkAdapter, RequestSignContext,
-    ScenarioActionContext, TxRequest,
+    fetch_pending_protocol_nonces, fetch_protocol_nonces, generate_transactions,
+    materialize_and_sign_template, materialize_setup, materialize_setup_online,
+    sign_standard_request, GenerateArgs, GenerateContext, MaterializedSetup, MaterializedTx,
+    NetworkAdapter, RequestSignContext, ScenarioActionContext, TxRequest,
 };
 use scenario::run_scenario_command;
 pub use scenario::{ScenarioArgs, ScenarioRenderArgs, ScenarioRunArgs, ScenarioValidateArgs};

@@ -794,6 +794,63 @@ where
     Ok(())
 }
 
+/// Materialize a complete transaction stream without going through a CLI or subprocess.
+///
+/// Setup and workload transactions are returned in their execution order with all scheduling
+/// metadata intact. `args.output` is ignored because ownership of persistence belongs to the
+/// caller. RPC nonce preparation, count and duration limits, deterministic seeding, and the
+/// signing worker pipeline have the same behavior as the `generate` command.
+pub async fn generate_transactions<A>(
+    mut adapter: A,
+    mut args: GenerateArgs,
+) -> Result<Vec<GeneratedTx>>
+where
+    A: NetworkAdapter + 'static,
+    <A::Network as Network>::TransactionRequest: Send + 'static,
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    args.output = None;
+    let rpc = args.rpc.clone();
+    let mut ctx = GenerateContext::from_args(&args)?;
+    if let Some(rpc) = rpc.as_deref() {
+        adapter.prefetch_nonces(&mut ctx, rpc).await?;
+    }
+    if ctx.spec.total_weight() == 0 {
+        bail!("no workload entries in mix (total weight is 0)");
+    }
+    let mut encoded = Vec::new();
+    {
+        let mut build_ctx = BuildContext::new_with_address_pools(
+            ctx.spec.chain_id,
+            &ctx.spec.gas,
+            &ctx.accounts,
+            &ctx.address_pools,
+            &ctx.artifacts,
+            &mut ctx.nonces,
+            &mut ctx.rng,
+        );
+        let mut writer = NdjsonWriter::new(&mut encoded);
+        let setup_bindings = emit_setup(&mut adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+        generate_txs(
+            &mut adapter,
+            &ctx.spec,
+            ctx.limit,
+            ctx.signing_workers,
+            &setup_bindings,
+            &mut build_ctx,
+            &mut writer,
+        )?;
+        writer.flush()?;
+    }
+    std::str::from_utf8(&encoded)
+        .wrap_err("generated transaction stream was not UTF-8")?
+        .lines()
+        .map(|line| serde_json::from_str(line).wrap_err("decode generated transaction"))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Public helpers — used by per-network generate implementations
 // ---------------------------------------------------------------------------
