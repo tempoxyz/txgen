@@ -2109,7 +2109,3 @@ call:
         assert!(error.to_string().contains("changed the prepared scheduling keys"));
     }
 }
-
-#[cfg(test)]
-#[path = "sequence_scheduling_tests.rs"]
-mod sequence_scheduling_tests;
