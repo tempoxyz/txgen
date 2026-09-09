@@ -12,15 +12,15 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    io::Write,
     path::PathBuf,
     sync::mpsc,
     time::{Duration, Instant},
 };
 use txgen_core::{
     dedup_scheduling_keys, merge_yaml, AbiEncodePackedDef, AbiHashDef, AccountManager,
-    AddressPoolManager, ArtifactManager, BuildContext, EcdsaSigner, GeneratedTx, MixItem,
-    NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase, WorkloadSpec,
+    AddressPoolManager, ArtifactManager, BuildContext, EcdsaSigner, GeneratedTx, GeneratedTxSink,
+    MixItem, NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase,
+    WorkloadSpec,
 };
 
 fn default_signing_workers() -> usize {
@@ -800,10 +800,7 @@ where
 /// metadata intact. `args.output` is ignored because ownership of persistence belongs to the
 /// caller. RPC nonce preparation, count and duration limits, deterministic seeding, and the
 /// signing worker pipeline have the same behavior as the `generate` command.
-pub async fn generate_transactions<A>(
-    mut adapter: A,
-    mut args: GenerateArgs,
-) -> Result<Vec<GeneratedTx>>
+pub async fn generate_transactions<A>(adapter: A, args: GenerateArgs) -> Result<Vec<GeneratedTx>>
 where
     A: NetworkAdapter + 'static,
     <A::Network as Network>::TransactionRequest: Send + 'static,
@@ -811,7 +808,29 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    args.output = None;
+    let mut transactions = Vec::new();
+    generate_transactions_into(adapter, args, &mut transactions).await?;
+    Ok(transactions)
+}
+
+/// Generate transactions into a caller-owned sink as soon as each ordered result is available.
+///
+/// A bounded sink can apply backpressure without accumulating the complete workload in memory.
+/// Generation order and behavior are identical to [`generate_transactions`] and the `generate`
+/// command. `args.output` is ignored because the sink owns persistence.
+pub async fn generate_transactions_into<A, S>(
+    mut adapter: A,
+    args: GenerateArgs,
+    sink: &mut S,
+) -> Result<()>
+where
+    A: NetworkAdapter + 'static,
+    <A::Network as Network>::TransactionRequest: Send + 'static,
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+    S: GeneratedTxSink,
+{
     let rpc = args.rpc.clone();
     let mut ctx = GenerateContext::from_args(&args)?;
     if let Some(rpc) = rpc.as_deref() {
@@ -820,35 +839,26 @@ where
     if ctx.spec.total_weight() == 0 {
         bail!("no workload entries in mix (total weight is 0)");
     }
-    let mut encoded = Vec::new();
-    {
-        let mut build_ctx = BuildContext::new_with_address_pools(
-            ctx.spec.chain_id,
-            &ctx.spec.gas,
-            &ctx.accounts,
-            &ctx.address_pools,
-            &ctx.artifacts,
-            &mut ctx.nonces,
-            &mut ctx.rng,
-        );
-        let mut writer = NdjsonWriter::new(&mut encoded);
-        let setup_bindings = emit_setup(&mut adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
-        generate_txs(
-            &mut adapter,
-            &ctx.spec,
-            ctx.limit,
-            ctx.signing_workers,
-            &setup_bindings,
-            &mut build_ctx,
-            &mut writer,
-        )?;
-        writer.flush()?;
-    }
-    std::str::from_utf8(&encoded)
-        .wrap_err("generated transaction stream was not UTF-8")?
-        .lines()
-        .map(|line| serde_json::from_str(line).wrap_err("decode generated transaction"))
-        .collect()
+    let mut build_ctx = BuildContext::new_with_address_pools(
+        ctx.spec.chain_id,
+        &ctx.spec.gas,
+        &ctx.accounts,
+        &ctx.address_pools,
+        &ctx.artifacts,
+        &mut ctx.nonces,
+        &mut ctx.rng,
+    );
+    let setup_bindings = emit_setup(&mut adapter, &ctx.spec, &mut build_ctx, sink)?;
+    generate_txs(
+        &adapter,
+        &ctx.spec,
+        ctx.limit,
+        ctx.signing_workers,
+        &setup_bindings,
+        &mut build_ctx,
+        sink,
+    )?;
+    sink.flush()
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,11 +1079,11 @@ struct EmittedTxInfo {
     created_address: Option<Address>,
 }
 
-fn emit_setup<A: NetworkAdapter, W: Write>(
+fn emit_setup<A: NetworkAdapter, S: GeneratedTxSink>(
     adapter: &mut A,
     spec: &WorkloadSpec,
     ctx: &mut BuildContext<'_>,
-    writer: &mut NdjsonWriter<W>,
+    writer: &mut S,
 ) -> Result<std::collections::HashMap<String, ResolvedBinding>>
 where
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
@@ -1110,13 +1120,13 @@ where
     Ok(bindings)
 }
 
-fn emit_setup_step<A: NetworkAdapter, W: Write>(
+fn emit_setup_step<A: NetworkAdapter, S: GeneratedTxSink>(
     adapter: &mut A,
     step: &SetupStep,
     setup_bindings: &mut std::collections::HashMap<String, ResolvedBinding>,
     setup_key: SchedulingKey,
     ctx: &mut BuildContext<'_>,
-    writer: &mut NdjsonWriter<W>,
+    writer: &mut S,
 ) -> Result<()>
 where
     A::SignContext: RequestSignContext<A::Network>,
@@ -1303,10 +1313,10 @@ impl SigningPool {
         Ok(sequence)
     }
 
-    fn submit<A: NetworkAdapter + 'static, W: Write>(
+    fn submit<A: NetworkAdapter + 'static, S: GeneratedTxSink>(
         &mut self,
         job: SigningJob<A>,
-        writer: &mut NdjsonWriter<W>,
+        writer: &mut S,
     ) -> Result<()>
     where
         NetworkRequest<A>: Send + 'static,
@@ -1326,14 +1336,14 @@ impl SigningPool {
         Ok(())
     }
 
-    fn finish<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
+    fn finish<S: GeneratedTxSink>(&mut self, writer: &mut S) -> Result<()> {
         while self.in_flight > 0 {
             self.recv_one(writer)?;
         }
         Ok(())
     }
 
-    fn drain_available<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
+    fn drain_available<S: GeneratedTxSink>(&mut self, writer: &mut S) -> Result<()> {
         loop {
             match self.result_rx.try_recv() {
                 Ok(result) => self.handle_result(result, writer)?,
@@ -1349,7 +1359,7 @@ impl SigningPool {
         Ok(())
     }
 
-    fn recv_one<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
+    fn recv_one<S: GeneratedTxSink>(&mut self, writer: &mut S) -> Result<()> {
         let result = self
             .result_rx
             .recv()
@@ -1357,10 +1367,10 @@ impl SigningPool {
         self.handle_result(result, writer)
     }
 
-    fn handle_result<W: Write>(
+    fn handle_result<S: GeneratedTxSink>(
         &mut self,
         result: SigningResult,
-        writer: &mut NdjsonWriter<W>,
+        writer: &mut S,
     ) -> Result<()> {
         let tx = result.result?;
         if self.completed.insert(result.sequence, tx).is_some() {
@@ -1369,12 +1379,12 @@ impl SigningPool {
         self.write_ready(writer)
     }
 
-    fn write_ready<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
+    fn write_ready<S: GeneratedTxSink>(&mut self, writer: &mut S) -> Result<()> {
         while let Some(tx) = self.completed.remove(&self.next_to_write) {
             if self.in_flight == 0 {
                 bail!("received unexpected signing result");
             }
-            writer.write(&tx)?;
+            writer.emit(tx)?;
             self.in_flight -= 1;
             self.next_to_write = self
                 .next_to_write
@@ -1464,14 +1474,14 @@ where
     sign_context.sign_request(name, phase, request, signer, key, inclusion_keys)
 }
 
-fn generate_txs<A, W: Write>(
+fn generate_txs<A, S: GeneratedTxSink>(
     adapter: &A,
     spec: &WorkloadSpec,
     limit: GenerationLimit,
     signing_workers: usize,
     setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
     ctx: &mut BuildContext<'_>,
-    writer: &mut NdjsonWriter<W>,
+    writer: &mut S,
 ) -> Result<u64>
 where
     A: NetworkAdapter + 'static,
@@ -1581,14 +1591,14 @@ where
     Ok(written)
 }
 
-fn emit_template_value<A: NetworkAdapter, W: Write>(
+fn emit_template_value<A: NetworkAdapter, S: GeneratedTxSink>(
     adapter: &A,
     name: &str,
     value: serde_yaml::Value,
     phase: TxPhase,
     inclusion_keys: &[SchedulingKey],
     ctx: &mut BuildContext<'_>,
-    writer: &mut NdjsonWriter<W>,
+    writer: &mut S,
 ) -> Result<Option<EmittedTxInfo>>
 where
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
@@ -1611,7 +1621,7 @@ where
         None
     };
 
-    writer.write(&materialized.generated)?;
+    writer.emit(materialized.generated)?;
     Ok(info)
 }
 

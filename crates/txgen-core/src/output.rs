@@ -48,6 +48,19 @@ pub struct GeneratedTx {
     pub inclusion_keys: Vec<SchedulingKey>,
 }
 
+/// Receives generated transactions in deterministic execution order.
+///
+/// Implementations may persist transactions, apply bounded backpressure, or retain them in memory.
+pub trait GeneratedTxSink {
+    /// Accept one fully signed transaction.
+    fn emit(&mut self, transaction: GeneratedTx) -> Result<()>;
+
+    /// Finish any buffered output.
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// Writes generated transactions as newline-delimited JSON.
 pub struct NdjsonWriter<W: Write> {
     writer: W,
@@ -83,6 +96,23 @@ impl<W: Write> NdjsonWriter<W> {
     /// Consume the writer and return the inner writer.
     pub fn into_inner(self) -> W {
         self.writer
+    }
+}
+
+impl<W: Write> GeneratedTxSink for NdjsonWriter<W> {
+    fn emit(&mut self, transaction: GeneratedTx) -> Result<()> {
+        self.write(&transaction)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Self::flush(self)
+    }
+}
+
+impl GeneratedTxSink for Vec<GeneratedTx> {
+    fn emit(&mut self, transaction: GeneratedTx) -> Result<()> {
+        self.push(transaction);
+        Ok(())
     }
 }
 

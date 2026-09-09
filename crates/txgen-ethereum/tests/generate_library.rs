@@ -1,5 +1,6 @@
 use std::path::PathBuf;
-use txgen_cli::{generate_transactions, GenerateArgs};
+use txgen_cli::{generate_transactions, generate_transactions_into, GenerateArgs};
+use txgen_core::{GeneratedTx, NdjsonWriter};
 use txgen_ethereum::EthereumAdapter;
 
 fn args(seed: u64) -> GenerateArgs {
@@ -26,4 +27,18 @@ async fn library_generation_is_deterministic_and_materialized() {
             transaction.sender.is_some() &&
             !transaction.submission_keys.is_empty()
     }));
+}
+
+#[tokio::test]
+async fn typed_and_ndjson_sinks_emit_identical_transactions() {
+    let expected = generate_transactions(EthereumAdapter, args(9)).await.unwrap();
+    let mut writer = NdjsonWriter::new(Vec::new());
+    generate_transactions_into(EthereumAdapter, args(9), &mut writer).await.unwrap();
+
+    let encoded = String::from_utf8(writer.into_inner()).unwrap();
+    let decoded = encoded
+        .lines()
+        .map(|line| serde_json::from_str::<GeneratedTx>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(decoded, expected);
 }
