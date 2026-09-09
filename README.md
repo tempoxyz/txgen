@@ -528,8 +528,16 @@ Connection knobs are read from environment variables to keep secrets off the com
 | `PROMETHEUS_TENANT_ID` | Cluster VM `accountID` query parameter |
 | `PROMETHEUS_BATCH_SIZE` | Samples per HTTP request (default: `50000`) |
 | `PROMETHEUS_ENCODE_WORKERS` | Parallel workers used to build and compress final report requests (default: up to `8`) |
+| `PROMETHEUS_UPLOAD_WORKERS` | Parallel final report upload shards (default: `4`; use `1` for serial uploads) |
 | `PROMETHEUS_TIMEOUT_SECS` | Per-request HTTP timeout in seconds (default: `60`) |
 | `PROMETHEUS_QUEUE_SIZE` | Real-time forwarder queue size in scrape batches (default: `16`) |
+
+Final report uploads partition samples by their exported metric name and labels.
+Each series stays on one sequential worker, preserving its input order across
+requests while independent shards upload concurrently. Each worker buffers at
+most one queued batch, one active batch, and one batch being filled; encoding is
+also limited by `PROMETHEUS_ENCODE_WORKERS`. HTTP or encoding failures fail the
+report. The real-time forwarder remains sequential.
 
 Example with auth:
 
