@@ -30,6 +30,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         skip_setup = args.skip_setup,
         collect_latencies = args.collect_latencies,
         collect_receipt_metrics = args.collect_receipt_metrics,
+        skip_receipt_wait = args.skip_receipt_wait,
         retries = args.retries.map_or("forever".to_string(), |retries| retries.to_string()),
         "Starting send"
     );
@@ -158,7 +159,8 @@ async fn execute_source<S: TxSource>(
 
     let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
     let mut sender =
-        Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth);
+        Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth)
+            .with_workload_receipt_wait(!args.skip_receipt_wait);
     if let Some(collector) = &receipt_collector {
         sender = sender.with_receipt_collector(collector.handle());
     }

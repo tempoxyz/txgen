@@ -294,6 +294,7 @@ bench send -i txs.ndjson \
 | `--collect-latencies` | Collect and report aggregate latency stats plus individual request samples under `time_series.latencies` (default: disabled) |
 | `--collect-receipt-metrics` | Collect non-system transaction gas and fee metrics with block-level receipt requests after sending |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
+| `--skip-receipt-wait` | Release workload inclusion dependencies on RPC acceptance instead of confirmation; setup still waits for receipts. May break workloads that require confirmed state. Incompatible with `--collect-receipt-metrics`. |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 0, set >0 to enable) |
 
 **Required RPC methods:** `eth_sendRawTransaction`, `eth_getTransactionReceipt` (setup and inclusion waits), `eth_blockNumber`, `eth_getBlockByNumber`; `eth_getBlockReceipts` for `--collect-receipt-metrics`; `txpool_status` (for `--drain-timeout`)

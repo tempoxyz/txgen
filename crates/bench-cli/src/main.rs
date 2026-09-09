@@ -141,6 +141,13 @@ pub struct SendArgs {
     #[arg(long)]
     pub collect_receipt_metrics: bool,
 
+    /// Skip workload receipt waits, releasing inclusion dependencies on RPC acceptance.
+    ///
+    /// Setup transactions still wait for receipts. Workloads that depend on confirmed
+    /// state may fail in this mode; successful submission does not imply inclusion.
+    #[arg(long, conflicts_with = "collect_receipt_metrics")]
+    pub skip_receipt_wait: bool,
+
     /// Skip setup-phase transactions in the input stream.
     #[arg(long)]
     pub skip_setup: bool,
@@ -483,6 +490,25 @@ mod tests {
         };
 
         assert!(!args.collect_latencies);
+    }
+
+    #[test]
+    fn test_skip_receipt_wait_is_opt_in_and_independent_of_latency_collection() {
+        let cli = Cli::try_parse_from(["bench", "send"]).unwrap();
+        let Command::Send(args) = cli.command else { panic!("expected send") };
+        assert!(!args.skip_receipt_wait);
+        let cli =
+            Cli::try_parse_from(["bench", "send", "--skip-receipt-wait", "--collect-latencies"])
+                .unwrap();
+        let Command::Send(args) = cli.command else { panic!("expected send") };
+        assert!(args.skip_receipt_wait && args.collect_latencies);
+        assert!(Cli::try_parse_from([
+            "bench",
+            "send",
+            "--skip-receipt-wait",
+            "--collect-receipt-metrics",
+        ])
+        .is_err());
     }
 
     #[test]

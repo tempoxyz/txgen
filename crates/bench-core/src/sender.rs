@@ -713,6 +713,8 @@ pub struct Sender {
     deferred_errors: VecDeque<eyre::Report>,
     /// Optional receipt collector for workload gas reporting.
     receipt_collector: Option<ReceiptCollectorHandle>,
+    /// Whether workload inclusion keys are held until receipt confirmation.
+    workload_receipt_wait: bool,
 }
 
 impl Sender {
@@ -764,12 +766,22 @@ impl Sender {
             next_queue_id: 0,
             deferred_errors: VecDeque::new(),
             receipt_collector: None,
+            workload_receipt_wait: true,
         }
     }
 
     /// Attach receipt collection for every RPC-accepted workload transaction.
     pub fn with_receipt_collector(mut self, collector: ReceiptCollectorHandle) -> Self {
         self.receipt_collector = Some(collector);
+        self
+    }
+
+    /// Control workload receipt waiting (enabled by default).
+    ///
+    /// When disabled, workload inclusion keys become submission keys: shared-key
+    /// ordering is preserved through RPC acceptance only. Setup still confirms receipts.
+    pub fn with_workload_receipt_wait(mut self, enabled: bool) -> Self {
+        self.workload_receipt_wait = enabled;
         self
     }
 
@@ -796,7 +808,10 @@ impl Sender {
             .next_queue_id
             .checked_add(1)
             .ok_or_else(|| eyre::eyre!("sender transaction queue identity overflowed"))?;
-        let GeneratedTx { phase, id, raw, sender, submission_keys, inclusion_keys } = tx;
+        let GeneratedTx { phase, id, raw, sender, mut submission_keys, mut inclusion_keys } = tx;
+        if phase == TxPhase::Workload && !self.workload_receipt_wait {
+            submission_keys.append(&mut inclusion_keys);
+        }
         let (submission_keys, inclusion_keys) =
             normalize_key_sets(submission_keys, inclusion_keys)?;
         self.pending.push_back(PendingTx {
@@ -1448,6 +1463,53 @@ mod tests {
         assert_eq!(config.rate_limit, 0);
         assert_eq!(config.max_concurrent, 100);
         assert!(config.validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn workload_receipt_wait_can_be_disabled_without_skipping_setup() {
+        for phase in [TxPhase::Setup, TxPhase::Workload] {
+            for wait in [true, false] {
+                let asserter = Asserter::new();
+                let confirms = phase == TxPhase::Setup || wait;
+                // A reverted receipt makes confirmation observable in the failure counter.
+                for byte in [0x70, 0x71] {
+                    let hash = keccak256([0x02, 0xf8, byte]);
+                    asserter.push_success(&hash);
+                    if confirms {
+                        let mut receipt = receipt_json(hash, None);
+                        receipt["status"] = serde_json::json!("0x0");
+                        asserter.push_success(&receipt);
+                    }
+                }
+                let metrics = MetricsCollector::new(RunClock::new());
+                let mut sender = Sender::new(
+                    vec![mocked_provider(asserter.clone())],
+                    SenderConfig::default(),
+                    metrics.clone(),
+                )
+                .with_workload_receipt_wait(wait);
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    for byte in [0x70, 0x71] {
+                        sender
+                            .send(GeneratedTx {
+                                phase,
+                                id: None,
+                                sender: None,
+                                raw: Bytes::from(vec![0x02, 0xf8, byte]),
+                                submission_keys: Vec::new(),
+                                inclusion_keys: vec![SchedulingKey::from([0x11; 20])],
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    sender.flush().await.unwrap();
+                })
+                .await
+                .expect("shared inclusion keys must be released without hanging");
+                assert_eq!(metrics.counts(), (2, 2, if confirms { 2 } else { 0 }));
+                assert!(asserter.read_q().is_empty());
+            }
+        }
     }
 
     #[test]
