@@ -1477,6 +1477,8 @@ where
                     .checked_add(1)
                     .ok_or_else(|| eyre::eyre!("sequence instance counter overflowed u64"))?;
                 let sequence_key = compute_sequence_key(&name, sequence_instance);
+                // A single step has no dependent transaction to wait for its inclusion.
+                let inclusion_keys = (sequence.steps.len() > 1).then_some(sequence_key);
                 let bindings = resolve_sequence_bindings(&sequence.bindings, ctx, setup_bindings)
                     .wrap_err_with(|| {
                     format!("failed to resolve bindings for sequence '{name}'")
@@ -1499,7 +1501,7 @@ where
                         format!("{name}.{label}"),
                         materialized,
                         TxPhase::Workload,
-                        &[sequence_key],
+                        inclusion_keys.as_slice(),
                         sequence,
                         ctx,
                     )?;
@@ -2107,3 +2109,7 @@ call:
         assert!(error.to_string().contains("changed the prepared scheduling keys"));
     }
 }
+
+#[cfg(test)]
+#[path = "sequence_scheduling_tests.rs"]
+mod sequence_scheduling_tests;
