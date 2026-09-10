@@ -388,12 +388,9 @@ impl RpcSubmitter {
             self.headers_for(&endpoint, "eth_getTransactionByHash", sender, Some(tx_hash))?;
         endpoint
             .provider()
-            .client()
-            .request::<_, Option<serde_json::Value>>("eth_getTransactionByHash", (tx_hash,))
-            .map_meta(|mut meta| {
-                meta.headers_mut().extend(headers);
-                meta
-            })
+            .get_transaction_by_hash(tx_hash)
+            .with_headers(headers)
+            .map_err(|_| eyre::eyre!("cannot attach request headers to eth_getTransactionByHash"))?
             .await
             .map(|transaction| transaction.is_some())
             .map_err(|error| {
@@ -1236,12 +1233,9 @@ async fn wait_for_receipt(
         };
         let receipt = endpoint
             .provider()
-            .client()
-            .request::<_, Option<AnyTransactionReceipt>>("eth_getTransactionReceipt", (tx_hash,))
-            .map_meta(|mut meta| {
-                meta.headers_mut().extend(headers);
-                meta
-            })
+            .get_transaction_receipt(tx_hash)
+            .with_headers(headers)
+            .map_err(|_| eyre::eyre!("cannot attach request headers to eth_getTransactionReceipt"))?
             .await?;
         if let Some(receipt) = receipt {
             return Ok(receipt.status());
