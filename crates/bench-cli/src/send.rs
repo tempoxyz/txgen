@@ -13,9 +13,9 @@ use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     collect_block_stats, parse_reporters, start_scrapers, total_fees_paid,
     trim_trailing_empty_blocks, BlockReceiptCollector, ConsoleReporter, FileSource, FinalReport,
-    GeneratedTx, LateSigner, MetricsCollector, ProgressState, Reporter, RequestAuthProvider,
-    RpcEndpoint, RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig,
-    SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
+    GeneratedTx, LateSigner, MetricsCollector, ProgressState, ReceiptTracker, Reporter,
+    RequestAuthProvider, RpcEndpoint, RunClock, RunStats, SampleStore, ScraperConfig, Sender,
+    SenderConfig, SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -142,6 +142,7 @@ async fn execute_source<S: TxSource>(
 ) -> Result<()> {
     let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
 
+    let receipt_tracker = ReceiptTracker::new(query_provider.clone());
     let first_workload = run_setup_phase(
         args,
         source,
@@ -149,6 +150,7 @@ async fn execute_source<S: TxSource>(
         request_auth.clone(),
         late_signer.clone(),
         &config,
+        receipt_tracker.clone(),
     )
     .await?;
 
@@ -177,7 +179,8 @@ async fn execute_source<S: TxSource>(
 
     let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
     let mut sender =
-        Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth);
+        Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth)
+            .with_receipt_tracker(receipt_tracker);
     if let Some(late_signer) = late_signer {
         sender = sender.with_late_signer(late_signer);
     }
@@ -354,6 +357,7 @@ async fn run_setup_phase<S: TxSource>(
     request_auth: Option<Arc<dyn RequestAuthProvider>>,
     late_signer: Option<Arc<dyn LateSigner>>,
     config: &SenderConfig,
+    receipt_tracker: ReceiptTracker,
 ) -> Result<Option<GeneratedTx>> {
     let setup_clock = RunClock::new();
     let setup_metrics = MetricsCollector::new_with_latencies(setup_clock, false);
@@ -362,7 +366,8 @@ async fn run_setup_phase<S: TxSource>(
         config.clone(),
         setup_metrics.clone(),
         request_auth,
-    );
+    )
+    .with_receipt_tracker(receipt_tracker);
     if let Some(late_signer) = late_signer {
         setup_sender = setup_sender.with_late_signer(late_signer);
     }

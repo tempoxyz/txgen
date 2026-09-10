@@ -14,6 +14,7 @@ pub mod prometheus;
 pub mod prometheus_reporter;
 pub mod receipt_clickhouse;
 pub mod receipt_metrics;
+pub mod receipt_tracker;
 pub mod reporter;
 pub mod sample;
 pub mod scraper;
@@ -42,6 +43,7 @@ pub use receipt_metrics::{
     ReceiptCollectorHandle, ReceiptGasRecord, ReceiptGasSample, ReceiptMetricDistribution,
     ReceiptMetricGroup, ReceiptMetricLabels, ReceiptMetrics, ReceiptMetricsAccumulator,
 };
+pub use receipt_tracker::ReceiptTracker;
 pub use reporter::{
     parse_reporters, ClickHouseConfig, ClickHouseReporter, ConsoleReporter, FinalReport,
     JsonLatency, JsonLatencySample, JsonReport, JsonReporter, JsonTimeSeries, ProgressState,
