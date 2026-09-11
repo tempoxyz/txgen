@@ -447,6 +447,8 @@ async fn process_block(
         new_payload_server_latency_us: Some(payload_status.latency_us),
         persistence_wait_us: payload_status.persistence_wait_us,
         execution_cache_wait_us: payload_status.execution_cache_wait_us,
+        ok_count: None,
+        err_count: None,
         sparse_trie_wait_us: payload_status.sparse_trie_wait_us,
     };
 
@@ -904,6 +906,8 @@ async fn process_big_block(
         new_payload_server_latency_us: Some(payload_status.latency_us),
         persistence_wait_us: payload_status.persistence_wait_us,
         execution_cache_wait_us: payload_status.execution_cache_wait_us,
+        ok_count: None,
+        err_count: None,
         sparse_trie_wait_us: payload_status.sparse_trie_wait_us,
     };
 

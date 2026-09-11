@@ -293,10 +293,13 @@ bench send -i txs.ndjson \
 | `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url` |
 | `--collect-latencies` | Collect and report aggregate latency stats plus individual request samples under `time_series.latencies` (default: disabled) |
 | `--collect-receipt-metrics` | Collect non-system transaction gas and fee metrics with block-level receipt requests after sending |
+| `--collect-receipt-outcomes` | Reconcile every block receipt after sending and emit `ok_count` / `err_count` per block, including zero-gas protocol transactions |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 0, set >0 to enable) |
 
-**Required RPC methods:** `eth_sendRawTransaction`, `eth_getTransactionReceipt` (setup and inclusion waits), `eth_blockNumber`, `eth_getBlockByNumber`; `eth_getBlockReceipts` for `--collect-receipt-metrics`; `txpool_status` (for `--drain-timeout`)
+**Required RPC methods:** `eth_sendRawTransaction`, `eth_getTransactionReceipt` (setup and inclusion waits), `eth_blockNumber`, `eth_getBlockByNumber`; `eth_getBlockReceipts` for `--collect-receipt-metrics` or `--collect-receipt-outcomes`; `txpool_status` (for `--drain-timeout`)
+
+Receipt outcomes are optional and fetched after the sending phase. When enabled, receipt block identities, transaction order/count and summed gas must match each fetched block; missing or inconsistent receipts fail post-processing. When disabled, `ok_count` and `err_count` are omitted, not assumed successful. These counts include all transactions in the selected blocks, including protocol transactions, and describe outer receipt status rather than success of every nested call. They are independent of submission-success metrics and the non-system gas distributions from `--collect-receipt-metrics`.
 
 ##### Per-sender HTTP authentication
 
@@ -1810,7 +1813,7 @@ Summary of which RPC methods are required by each feature:
 | `eth_sendRawTransaction` | `bench send`, `scenario run` (workload setup and `submit`), optionally sender-authenticated |
 | `eth_getTransactionByHash` | `scenario run` (sender-scoped submission RPC; reconcile a rejected or uncertain submission) |
 | `eth_getTransactionReceipt` | `bench send` (setup and inclusion waits), `scenario run` (workload setup, `submit await: receipt`, `wait_receipt`, and transaction-hash `wait_log`), optionally sender-authenticated |
-| `eth_getBlockReceipts` | `bench send --collect-receipt-metrics` (post-run non-system receipt gas and fee metrics) |
+| `eth_getBlockReceipts` | `bench send --collect-receipt-metrics` (non-system gas/fees) or `--collect-receipt-outcomes` (all receipt statuses), both post-run |
 | `eth_blockNumber` | `bench send` (query RPC when configured; benchmark block range), `scenario run` (`checkpoint`, confirmations, and block-range log polling) |
 | `eth_getBlockByNumber` | `bench send` (query RPC when configured; per-block stats collection), `scenario run` (`checkpoint`) |
 | `eth_getLogs` | `scenario run` (block-range `wait_log`) |
