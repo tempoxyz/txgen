@@ -42,6 +42,7 @@ pub struct BuildContext<'a> {
 
     unique_nonce_hint: Option<u64>,
     dense_unique_nonce_hint: Option<u64>,
+    defer_signing: bool,
 
     /// Random number generator.
     pub rng: &'a mut StdRng,
@@ -94,7 +95,18 @@ impl<'a> BuildContext<'a> {
             nonce_reservations: Vec::new(),
             unique_nonce_hint: None,
             dense_unique_nonce_hint: None,
+            defer_signing: false,
         }
+    }
+
+    /// Select deferred signing for adapters that support it.
+    pub fn set_defer_signing(&mut self, defer_signing: bool) {
+        self.defer_signing = defer_signing;
+    }
+
+    /// Whether the caller requested deferred signing.
+    pub const fn defer_signing(&self) -> bool {
+        self.defer_signing
     }
 
     /// Set a deterministic transaction identity for consume-once nonce reservations.

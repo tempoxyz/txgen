@@ -118,7 +118,7 @@ impl NetworkAdapter for ProbeAdapter {
         template: Self::Template,
         ctx: &mut BuildContext<'_>,
     ) -> Result<TxRequest<TempoTransactionRequest, Self::SignContext>> {
-        let TxRequest { request, signer_pool, signer_index, key, sign_context } =
+        let TxRequest { request, signer_pool, signer_index, key, sign_context, late_sign } =
             self.0.build_request(template, ctx)?;
         Ok(TxRequest {
             request,
@@ -126,6 +126,7 @@ impl NetworkAdapter for ProbeAdapter {
             signer_index,
             key,
             sign_context: ProbeSignContext(sign_context),
+            late_sign,
         })
     }
 

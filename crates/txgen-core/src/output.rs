@@ -16,6 +16,18 @@ pub enum TxPhase {
     Workload,
 }
 
+/// Opaque network-specific instructions for signing a transaction at submit time.
+///
+/// The producer and the sender only agree on the format discriminator. The
+/// payload remains owned and interpreted by the network adapter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LateSignSpec {
+    /// Network-specific payload format.
+    pub format: String,
+    /// Network-specific signing payload.
+    pub payload: serde_json::Value,
+}
+
 /// A generated transaction ready for output.
 #[derive(Debug, Clone)]
 pub struct GeneratedTx {
@@ -24,7 +36,11 @@ pub struct GeneratedTx {
     /// Optional human-readable transaction identifier for diagnostics.
     pub id: Option<String>,
     /// RLP-encoded signed transaction (EIP-2718 envelope).
+    ///
+    /// This is empty when [`Self::late_sign`] is set.
     pub raw: Bytes,
+    /// Optional instructions for materializing `raw` immediately before RPC submission.
+    pub late_sign: Option<LateSignSpec>,
     /// Logical on-chain sender recovered from the signed transaction.
     ///
     /// Generated transactions always populate this field. It remains optional so
@@ -52,6 +68,8 @@ struct OutputTx<'a> {
     id: Option<&'a str>,
     raw: &'a Bytes,
     #[serde(skip_serializing_if = "Option::is_none")]
+    late_sign: Option<&'a LateSignSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     sender: Option<&'a Address>,
     submission_keys: &'a [SchedulingKey],
     inclusion_keys: &'a [SchedulingKey],
@@ -75,6 +93,7 @@ impl<W: Write> NdjsonWriter<W> {
             phase: tx.phase,
             id: tx.id.as_deref(),
             raw: &tx.raw,
+            late_sign: tx.late_sign.as_ref(),
             sender: tx.sender.as_ref(),
             submission_keys: &tx.submission_keys,
             inclusion_keys: &tx.inclusion_keys,
@@ -131,6 +150,7 @@ mod tests {
             phase: TxPhase::Workload,
             id: None,
             raw: Bytes::from(vec![0x02, 0xf8, 0x70]),
+            late_sign: None,
             sender: Some(Address::repeat_byte(0x11)),
             submission_keys: vec![SchedulingKey::from([0xab; 20])],
             inclusion_keys: vec![SchedulingKey::from([0xcd; 20])],
@@ -161,6 +181,7 @@ mod tests {
             phase: TxPhase::Workload,
             id: None,
             raw: Bytes::from(vec![0x00]),
+            late_sign: None,
             sender: Some(Address::ZERO),
             submission_keys: vec![SchedulingKey::from([0x00; 20])],
             inclusion_keys: Vec::new(),
@@ -171,5 +192,28 @@ mod tests {
         assert_eq!(writer.count(), 1);
         writer.write(&tx).unwrap();
         assert_eq!(writer.count(), 2);
+    }
+
+    #[test]
+    fn test_deferred_signing_output() {
+        let mut buf = Vec::new();
+        let mut writer = NdjsonWriter::new(&mut buf);
+        let tx = GeneratedTx {
+            phase: TxPhase::Workload,
+            id: Some("deferred".to_string()),
+            raw: Bytes::new(),
+            late_sign: Some(LateSignSpec {
+                format: "test".to_string(),
+                payload: serde_json::json!({"ttl": 25}),
+            }),
+            sender: None,
+            submission_keys: vec![SchedulingKey::from([0xab; 20])],
+            inclusion_keys: Vec::new(),
+        };
+
+        writer.write(&tx).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("\"raw\":\"0x\""));
+        assert!(output.contains("\"late_sign\":{\"format\":\"test\",\"payload\":{\"ttl\":25}}"));
     }
 }

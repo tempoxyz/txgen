@@ -1,9 +1,14 @@
 pub mod auth_token_map;
+pub mod late_sign;
 mod nonce;
 mod template;
 mod zone;
 pub mod zone_auth;
 
+pub use late_sign::{
+    sign_tempo_expiring, SignerLocator, TempoExpiringPayload, TempoLateSigner,
+    FORMAT_TEMPO_EXPIRING_RELATIVE,
+};
 pub use nonce::{prefetch_parallel_nonces, NONCE_PRECOMPILE};
 pub use txgen_cli::fetch_protocol_nonces;
 
@@ -464,6 +469,7 @@ impl NetworkAdapter for TempoAdapter {
         let mut sign_context = TempoSignContext::Standard;
         let mut deferred_key_authorization = None;
         let mut deferred_sponsor = None;
+        let mut late_sign = None;
 
         match template.tx_type {
             TempoTxType::Tempo => {
@@ -477,6 +483,10 @@ impl NetworkAdapter for TempoAdapter {
                 req.calls = calls;
 
                 let is_expiring = matches!(nonce_mode, TempoNonceMode::Expiring);
+                let is_late_sign = ctx.defer_signing() &&
+                    is_expiring &&
+                    template.valid_for_secs.is_some() &&
+                    template.auth.is_none();
                 let valid_before = match nonce_mode {
                     TempoNonceMode::Protocol => template.valid_before,
                     TempoNonceMode::Parallel(nonce_key) => {
@@ -485,7 +495,12 @@ impl NetworkAdapter for TempoAdapter {
                     }
                     TempoNonceMode::Expiring => {
                         req.set_nonce_key(TEMPO_EXPIRING_NONCE_KEY);
-                        Some(resolve_expiring_valid_before(&template)?)
+                        if is_late_sign {
+                            validate_expiring_valid_for_secs(&template)?;
+                            None
+                        } else {
+                            Some(resolve_expiring_valid_before(&template)?)
+                        }
                     }
                 };
 
@@ -521,8 +536,43 @@ impl NetworkAdapter for TempoAdapter {
 
                 if let Some(ref sponsor_ref) = template.sponsor {
                     let sponsor = ctx.select_signer(sponsor_ref)?;
-                    deferred_sponsor =
-                        Some(ctx.accounts.get_by_index(&sponsor.pool, sponsor.index)?.clone());
+                    if is_late_sign {
+                        late_sign = Some(
+                            TempoExpiringPayload {
+                                signer: SignerLocator {
+                                    pool: selected.pool.clone(),
+                                    index: selected.index,
+                                },
+                                sponsor: Some(SignerLocator {
+                                    pool: sponsor.pool,
+                                    index: sponsor.index,
+                                }),
+                                valid_for_secs: template
+                                    .valid_for_secs
+                                    .expect("late signing requires valid_for_secs"),
+                                request: req.clone(),
+                            }
+                            .into_spec()?,
+                        );
+                    } else {
+                        deferred_sponsor =
+                            Some(ctx.accounts.get_by_index(&sponsor.pool, sponsor.index)?.clone());
+                    }
+                } else if is_late_sign {
+                    late_sign = Some(
+                        TempoExpiringPayload {
+                            signer: SignerLocator {
+                                pool: selected.pool.clone(),
+                                index: selected.index,
+                            },
+                            sponsor: None,
+                            valid_for_secs: template
+                                .valid_for_secs
+                                .expect("late signing requires valid_for_secs"),
+                            request: req.clone(),
+                        }
+                        .into_spec()?,
+                    );
                 }
             }
             TempoTxType::Legacy => {
@@ -572,7 +622,15 @@ impl NetworkAdapter for TempoAdapter {
             signer_index: selected.index,
             key: scheduling_key,
             sign_context,
+            late_sign,
         })
+    }
+
+    fn late_signer(
+        &self,
+        spec: &txgen_core::WorkloadSpec,
+    ) -> Result<Option<std::sync::Arc<dyn bench_core::LateSigner>>> {
+        Ok(Some(std::sync::Arc::new(TempoLateSigner::from_spec(spec)?)))
     }
 
     fn scenario_unique_nonce_group(
@@ -786,6 +844,27 @@ fn resolve_expiring_valid_before(template: &TempoTemplate) -> Result<u64> {
     }
 }
 
+fn validate_expiring_valid_for_secs(template: &TempoTemplate) -> Result<()> {
+    if template.valid_before.is_some() {
+        bail!(
+            "expiring nonce templates must set either `valid_before` or `valid_for_secs`, not both"
+        );
+    }
+    let valid_for_secs = template
+        .valid_for_secs
+        .ok_or_else(|| eyre::eyre!("expiring nonce templates require `valid_for_secs`"))?;
+    if valid_for_secs == 0 {
+        bail!("expiring nonce templates require `valid_for_secs` to be greater than 0");
+    }
+    if valid_for_secs > TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS {
+        bail!(
+            "expiring nonce templates require `valid_for_secs` <= {} seconds",
+            TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS
+        );
+    }
+    Ok(())
+}
+
 /// Deterministically perturb the maximum fee so expiring nonce transactions never
 /// produce identical signed payloads within one generation run.
 ///
@@ -945,6 +1024,7 @@ fn sign_keychain_request(
         phase,
         id: Some(name),
         raw,
+        late_sign: None,
         sender: Some(user_address),
         submission_keys: vec![SchedulingKey::from(key)],
         inclusion_keys,
@@ -1174,10 +1254,7 @@ mod tests {
     use alloy_provider::{Provider, ProviderBuilder};
     use alloy_transport::mock::Asserter;
     use rand::{rngs::StdRng, SeedableRng};
-    use std::{
-        collections::HashMap,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::collections::HashMap;
     use tempo_primitives::TEMPO_TX_TYPE_ID;
     use txgen_core::{
         AccountManager, AccountPoolDef, AccountRef, ArtifactManager, GasConfig, GenValue,
@@ -1213,7 +1290,8 @@ mod tests {
     ) -> GeneratedTx {
         let signer =
             ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index).unwrap().clone();
-        let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context } = tx_req;
+        let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context, late_sign: _ } =
+            tx_req;
         sign_context
             .sign_request(name.to_string(), TxPhase::Workload, request, signer, key, Vec::new())
             .unwrap()
@@ -1743,7 +1821,26 @@ nonce_key:
     }
 
     #[test]
-    fn test_expiring_nonce_valid_for_secs_is_resolved_at_build_time() {
+    fn test_expiring_nonce_valid_for_secs_is_signed_by_default() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let mut template = base_template(TempoTxType::Tempo);
+        template.expiring_nonce = true;
+        template.valid_for_secs = Some(25);
+
+        let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
+
+        assert!(tx_req.request.valid_before.is_some());
+        assert!(tx_req.late_sign.is_none());
+    }
+
+    #[test]
+    fn test_expiring_nonce_valid_for_secs_is_deferred_until_submission() {
         let accounts = test_accounts();
         let artifacts = ArtifactManager::empty();
         let gas = GasConfig::default();
@@ -1751,18 +1848,21 @@ nonce_key:
         let mut rng = StdRng::seed_from_u64(42);
 
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        ctx.set_defer_signing(true);
 
         let mut template = base_template(TempoTxType::Tempo);
         template.expiring_nonce = true;
         template.valid_for_secs = Some(25);
 
-        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
-        let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-        let valid_before = tx_req.request.valid_before.unwrap();
-        assert!(valid_before.get() >= before + 25);
-        assert!(valid_before.get() <= after + 25);
+        assert!(tx_req.request.valid_before.is_none());
+        let late_sign = tx_req.late_sign.expect("relative expiry should be deferred");
+        let payload = TempoExpiringPayload::from_spec(&late_sign).unwrap();
+        assert_eq!(payload.valid_for_secs, 25);
+        assert_eq!(payload.request.nonce_key, Some(TEMPO_EXPIRING_NONCE_KEY));
+        let raw = sign_tempo_expiring(&payload, &accounts).unwrap();
+        assert_eq!(raw[0], TEMPO_TX_TYPE_ID);
     }
 
     #[test]

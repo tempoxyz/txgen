@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 # workspace
 bench-core.workspace = true
+txgen-tempo.workspace = true
 
 # CLI
 clap.workspace = true

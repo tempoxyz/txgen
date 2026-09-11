@@ -14,7 +14,7 @@ pub use accounts::{
     AddressPoolManager, EcdsaSigner, FastAddressPoolDef, SelectMode, SignerExt,
 };
 pub use nonce::{NonceReservation, NonceReservationKind, NonceTracker};
-pub use output::{GeneratedTx, NdjsonWriter, TxPhase};
+pub use output::{GeneratedTx, LateSignSpec, NdjsonWriter, TxPhase};
 pub use plugin::{BuildContext, SelectedSigner};
 pub use scheduling_key::{dedup_scheduling_keys, SchedulingKey};
 pub use spec::{

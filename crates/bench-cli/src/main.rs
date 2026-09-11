@@ -28,6 +28,13 @@ pub struct SendArgs {
     #[arg(short, long)]
     pub input: Option<PathBuf>,
 
+    /// Workload specification used to sign deferred transaction envelopes.
+    ///
+    /// Required only when the input contains `late_sign` records. Currently
+    /// supports standard and sponsored Tempo deferred-signing envelopes.
+    #[arg(long, value_name = "PATH")]
+    pub late_signing_spec: Option<PathBuf>,
+
     /// RPC endpoint URLs (comma-separated or repeated)
     #[arg(long = "rpc-url", value_delimiter = ',', default_values_t = vec!["http://localhost:8545".to_string()])]
     pub rpc_urls: Vec<String>,
