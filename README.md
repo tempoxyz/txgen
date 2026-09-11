@@ -251,6 +251,8 @@ txgen-ethereum extract-big-blocks \
 
 Send pre-generated transactions from NDJSON file or stdin.
 
+When multiple `--rpc-url` endpoints are supplied, transactions are dispatched to them in round-robin order.
+
 After sending completes, queries the node for per-block statistics (transaction count, gas used) and includes them in the report.
 
 ```bash
