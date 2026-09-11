@@ -22,23 +22,32 @@
 //! | `PROMETHEUS_TENANT_ID`        | Cluster tenant / accountID query param               |
 //! | `PROMETHEUS_BATCH_SIZE`       | Samples per HTTP request (default: 50_000)           |
 //! | `PROMETHEUS_ENCODE_WORKERS`   | Parallel final-report encode workers (default: up to 8) |
+//! | `PROMETHEUS_UPLOAD_WORKERS`   | Parallel final-report upload shards (default: 4; 1 for serial uploads) |
 //! | `PROMETHEUS_TIMEOUT_SECS`     | Per-request timeout in seconds (default: 60)         |
 //! | `PROMETHEUS_QUEUE_SIZE`       | Real-time forwarder queue size (default: 16 batches) |
 
 use crate::{reporter::FinalReport, sample::Sample, Reporter};
 use eyre::{bail, eyre, Context, Result};
+use futures::future::try_join_all;
 use prometheus_remote_write::{
     Label, Sample as PromSample, TimeSeries, WriteRequest, CONTENT_TYPE,
     HEADER_NAME_REMOTE_WRITE_VERSION, LABEL_NAME, REMOTE_WRITE_VERSION_01,
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-use std::{collections::BTreeMap, time::Duration};
-use tokio::{sync::mpsc, task::JoinSet};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::sync::{mpsc, Semaphore};
 
 /// Default samples per ingestion request.
 const DEFAULT_BATCH_SIZE: usize = 50_000;
 /// Maximum default number of CPU workers used to prepare final-report batches.
 const MAX_DEFAULT_ENCODE_WORKERS: usize = 8;
+/// Default number of independent final-report upload shards.
+const DEFAULT_UPLOAD_WORKERS: usize = 4;
 /// Default per-request HTTP timeout.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// Default number of scrape batches buffered by the real-time forwarder.
@@ -59,6 +68,8 @@ pub struct PrometheusConfig {
     pub batch_size: usize,
     /// Parallel workers used to build and compress final-report remote-write requests.
     pub encode_workers: usize,
+    /// Independent final-report upload shards; each time series stays on one shard.
+    pub upload_workers: usize,
     /// Per-request HTTP timeout.
     pub timeout: Duration,
 }
@@ -97,6 +108,11 @@ impl PrometheusConfig {
             .and_then(|s| s.parse().ok())
             .filter(|n: &u64| *n > 0)
             .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let upload_workers = std::env::var("PROMETHEUS_UPLOAD_WORKERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n: &usize| *n > 0)
+            .unwrap_or(DEFAULT_UPLOAD_WORKERS);
 
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -105,6 +121,7 @@ impl PrometheusConfig {
             tenant_id,
             batch_size,
             encode_workers,
+            upload_workers,
             timeout: Duration::from_secs(timeout_secs),
         })
     }
@@ -223,81 +240,78 @@ impl PrometheusReporter {
         Ok(())
     }
 
-    /// Push final-report samples with parallel encode/compress workers and ordered upload.
+    /// Push final-report samples with bounded parallel uploads, ordered within each series.
     fn push_report(&self, report: &FinalReport) -> Result<usize> {
         let rt = tokio::runtime::Handle::current();
         tokio::task::block_in_place(|| rt.block_on(self.push_report_async(report)))
     }
 
     async fn push_report_async(&self, report: &FinalReport) -> Result<usize> {
-        let mut chunks = report.sample_chunks(self.config.batch_size)?.enumerate();
-        let workers = self.config.encode_workers.max(1);
-        let mut tasks = JoinSet::new();
-        let mut prepared: BTreeMap<usize, PreparedBatch> = BTreeMap::new();
-        let mut next_upload = 0usize;
-        let mut pushed = 0usize;
-        let mut input_done = false;
-
-        loop {
-            fill_encode_tasks(&mut chunks, &mut tasks, workers, &mut input_done)?;
-
-            if let Some(batch) = prepared.remove(&next_upload) {
-                pushed += batch.samples;
-                let send = self.send_prepared_batch_async(batch);
-                tokio::pin!(send);
-                loop {
-                    tokio::select! {
-                        result = &mut send => {
-                            result?;
-                            break;
-                        }
-                        result = tasks.join_next(), if !tasks.is_empty() => {
-                            let batch = result
-                                .expect("join_next returned None despite non-empty task set")
-                                .wrap_err("remote write encode worker panicked")??;
-                            prepared.insert(batch.idx, batch);
-                            fill_encode_tasks(&mut chunks, &mut tasks, workers, &mut input_done)?;
-                        }
-                    }
-                }
-                next_upload += 1;
-                continue;
-            }
-
-            if input_done && tasks.is_empty() && prepared.is_empty() {
-                break;
-            }
-
-            if let Some(result) = tasks.join_next().await {
-                let batch = result.wrap_err("remote write encode worker panicked")??;
-                prepared.insert(batch.idx, batch);
-            }
+        let workers = self.config.upload_workers.max(1);
+        let batch_size = self.config.batch_size.max(1);
+        let encoders = Arc::new(Semaphore::new(self.config.encode_workers.max(1)));
+        let mut senders = Vec::with_capacity(workers);
+        let mut uploads = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            // One queued batch plus one active batch per shard. Backpressure keeps
+            // slow endpoints from causing the entire archive to accumulate in RAM.
+            let (tx, rx) = mpsc::channel(1);
+            senders.push(tx);
+            uploads.push(self.upload_shard(rx, encoders.clone()));
         }
 
+        let produce = async move {
+            let mut batches = vec![Vec::new(); workers];
+            let mut idx = 0;
+            for sample in report.iter_samples()? {
+                let sample = sample?;
+                let shard = series_shard(&sample, workers);
+                batches[shard].push(sample);
+                if batches[shard].len() == batch_size {
+                    senders[shard]
+                        .send((idx, std::mem::take(&mut batches[shard])))
+                        .await
+                        .map_err(|_| eyre!("remote write upload worker stopped"))?;
+                    idx += 1;
+                }
+            }
+            for (tx, batch) in senders.iter().zip(batches) {
+                if !batch.is_empty() {
+                    tx.send((idx, batch))
+                        .await
+                        .map_err(|_| eyre!("remote write upload worker stopped"))?;
+                    idx += 1;
+                }
+            }
+            Ok::<_, eyre::Report>(())
+        };
+
+        // These futures are scoped: a producer/HTTP/encoding error drops the
+        // other upload futures rather than leaving detached HTTP tasks running.
+        let (_, counts) = futures::try_join!(produce, try_join_all(uploads))?;
+        Ok(counts.into_iter().sum())
+    }
+
+    async fn upload_shard(
+        &self,
+        mut rx: mpsc::Receiver<(usize, Vec<Sample>)>,
+        encoders: Arc<Semaphore>,
+    ) -> Result<usize> {
+        let mut pushed = 0;
+        while let Some((idx, samples)) = rx.recv().await {
+            let permit = encoders.clone().acquire_owned().await?;
+            let batch = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                prepare_owned_batch(samples, idx)
+            })
+            .await
+            .wrap_err("remote write encode worker panicked")??;
+            let count = batch.samples;
+            self.send_prepared_batch_async(batch).await?;
+            pushed += count;
+        }
         Ok(pushed)
     }
-}
-
-fn fill_encode_tasks<I>(
-    chunks: &mut I,
-    tasks: &mut JoinSet<Result<PreparedBatch>>,
-    workers: usize,
-    input_done: &mut bool,
-) -> Result<()>
-where
-    I: Iterator<Item = (usize, Result<Vec<Sample>>)>,
-{
-    while !*input_done && tasks.len() < workers {
-        match chunks.next() {
-            Some((idx, Ok(chunk))) => {
-                tasks.spawn_blocking(move || prepare_owned_batch(chunk, idx));
-            }
-            Some((_, Err(err))) => return Err(err),
-            None => *input_done = true,
-        }
-    }
-
-    Ok(())
 }
 
 impl Reporter for PrometheusReporter {
@@ -307,13 +321,11 @@ impl Reporter for PrometheusReporter {
             return Ok(());
         }
 
-        let total_batches = report.sample_count().div_ceil(self.config.batch_size);
-
         tracing::info!(
             samples = report.sample_count(),
-            batches = total_batches,
             batch_size = self.config.batch_size,
             encode_workers = self.config.encode_workers,
+            upload_workers = self.config.upload_workers,
             url = %self.import_url,
             "Pushing samples via Prometheus remote write"
         );
@@ -459,17 +471,7 @@ fn build_write_request(samples: &[Sample]) -> WriteRequest {
             continue;
         }
 
-        // Build the label set: __name__ + user labels.
-        let mut labels: Vec<Label> = Vec::with_capacity(s.labels.len() + 1);
-        labels.push(Label { name: LABEL_NAME.to_string(), value: s.name.clone() });
-        for (k, v) in &s.labels {
-            let key = sanitize_label_name(k);
-            if !key.is_empty() {
-                labels.push(Label { name: key, value: v.clone() });
-            }
-        }
-        // Labels must be sorted by name per the remote write spec.
-        labels.sort_by(|a, b| a.name.cmp(&b.name));
+        let labels = sample_labels(s);
 
         // Build a stable key for grouping.
         let series_key: String =
@@ -494,6 +496,33 @@ fn build_write_request(samples: &[Sample]) -> WriteRequest {
         .collect();
 
     WriteRequest { timeseries }
+}
+
+/// Use the exported identity, including label sanitization, for both encoding
+/// and sharding. Raw labels such as `git-sha` and `git_sha` can name one series.
+fn sample_labels(sample: &Sample) -> Vec<Label> {
+    let mut labels = Vec::with_capacity(sample.labels.len() + 1);
+    labels.push(Label { name: LABEL_NAME.to_string(), value: sample.name.clone() });
+    for (key, value) in &sample.labels {
+        let name = sanitize_label_name(key);
+        if !name.is_empty() {
+            labels.push(Label { name, value: value.clone() });
+        }
+    }
+    labels.sort_by(|a, b| a.name.cmp(&b.name));
+    labels
+}
+
+fn series_shard(sample: &Sample, workers: usize) -> usize {
+    if workers == 1 {
+        return 0;
+    }
+    let mut hasher = DefaultHasher::new();
+    for label in sample_labels(sample) {
+        label.name.hash(&mut hasher);
+        label.value.hash(&mut hasher);
+    }
+    (hasher.finish() % workers as u64) as usize
 }
 
 /// Whether a metric name matches `[a-zA-Z_:][a-zA-Z0-9_:]*`.
@@ -686,7 +715,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn final_report_uploads_parallel_prepared_batches_in_order() {
+    async fn final_report_serial_uploads_preserve_batch_order() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
@@ -718,6 +747,7 @@ mod tests {
             PrometheusConfig::from_metadata(&base_url, &std::collections::HashMap::new()).unwrap();
         cfg.batch_size = 1;
         cfg.encode_workers = 2;
+        cfg.upload_workers = 1;
         cfg.timeout = Duration::from_secs(5);
 
         let mut reporter = PrometheusReporter::new(cfg).unwrap();
