@@ -12,10 +12,10 @@ use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     collect_block_stats, parse_reporters, start_scrapers, total_fees_paid,
-    trim_trailing_empty_blocks, BlockReceiptCollector, ConsoleReporter, FileSource, FinalReport,
-    GeneratedTx, MetricsCollector, ProgressState, Reporter, RequestAuthProvider, RpcEndpoint,
-    RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, SenderHeaderAuthProvider,
-    StdinSource, TxPhase, TxSource,
+    trim_trailing_empty_blocks_after, BlockReceiptCollector, ConsoleReporter, FileSource,
+    FinalReport, GeneratedTx, MetricsCollector, ProgressState, Reporter, RequestAuthProvider,
+    RpcEndpoint, RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig,
+    SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -181,6 +181,7 @@ async fn execute_source<S: TxSource>(
     send_workload_from_source(source, &mut sender, &metrics, &config, &mut reporters).await?;
 
     sender.flush().await?;
+    let workload_end_ms = clock.unix_ms();
     drop(sender);
 
     let (sent, success, failed) = metrics.counts();
@@ -275,20 +276,16 @@ async fn execute_source<S: TxSource>(
             "Block stats collected"
         );
 
-        // Trim trailing empty blocks (system-only, gas_used == 0) that
-        // accumulated during the txpool drain wait. Also trim metric
-        // samples captured after the last real block.
-        let cutoff_ms = trim_trailing_empty_blocks(&mut block_stats);
-        if let Some(cutoff_ms) = cutoff_ms {
-            report.retain_samples_until(cutoff_ms)?;
-            if let Some(ts) = report.time_series.as_mut() {
-                ts.latencies
-                    .retain(|l| l.offset_ms <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
-                ts.throughput
-                    .retain(|t| t.second * 1000 <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
-            }
+        // Remove empty drain blocks, but keep workload blocks and samples even
+        // when the queried execution node's latest block is stale.
+        let cutoff_ms = trim_trailing_empty_blocks_after(&mut block_stats, workload_end_ms);
+        report.retain_samples_until(cutoff_ms)?;
+        if let Some(ts) = report.time_series.as_mut() {
+            ts.latencies.retain(|l| l.offset_ms <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
+            ts.throughput
+                .retain(|t| t.second * 1000 <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
         }
-        tracing::info!(cutoff_ms = ?cutoff_ms, "Report trimmed");
+        tracing::info!(cutoff_ms, workload_end_ms, "Report trimmed");
 
         for block in &block_stats {
             for reporter in reporters.iter_mut() {
