@@ -43,6 +43,8 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ env.REGISTRY }}/txgen:${{ steps.shortsha.outputs.shortsha }},${{ env.REGISTRY }}/txgen:latest
+          tags: |
+            ${{ env.REGISTRY }}/txgen:${{ steps.shortsha.outputs.shortsha }}
+            ${{ github.ref == 'refs/heads/main' && format('{0}/txgen:latest', env.REGISTRY) || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=full
