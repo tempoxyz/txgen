@@ -1738,7 +1738,8 @@ where
             vec![RpcEndpoint::new(format!("{name}-submission"), submission_provider)],
             SenderConfig { rate_limit: transaction_rate, max_concurrent: max_rpc_in_flight },
             request_auth,
-        )?;
+        )?
+        .with_receipt_tracker(bench_core::ReceiptTracker::new(query_provider.clone()));
         if let Some(late_signer) = late_signer {
             submitter = submitter.with_late_signer(late_signer);
         }

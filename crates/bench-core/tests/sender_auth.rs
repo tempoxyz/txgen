@@ -1,11 +1,11 @@
 use alloy_network::{AnyNetwork, AnyTransactionReceipt};
-use alloy_primitives::{Address, Bytes, TxHash};
+use alloy_primitives::{keccak256, Address, Bytes, TxHash};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
-    MetricsCollector, RequestAuthProvider, RpcEndpoint, RpcRequestContext, RunClock, Sender,
-    SenderConfig, SenderHeaderAuthProvider,
+    LateSigner, MetricsCollector, ReceiptTracker, RequestAuthProvider, RpcEndpoint,
+    RpcRequestContext, RpcSubmitter, RunClock, Sender, SenderConfig, SenderHeaderAuthProvider,
 };
 use eyre::Result;
 use reqwest::header::HeaderMap;
@@ -23,7 +23,7 @@ use std::{
     time::Duration,
 };
 use tempfile::TempDir;
-use txgen_core::{GeneratedTx, SchedulingKey, TxPhase};
+use txgen_core::{GeneratedTx, LateSignSpec, SchedulingKey, TxPhase};
 
 const AUTH_HEADER: &str = "x-fixture-sender-auth";
 const SENDER_ONE_VALUE: &str = "fixture-value-for-sender-one";
@@ -42,9 +42,35 @@ struct MockState {
     attempts: Mutex<HashMap<String, usize>>,
     sends_in_flight: AtomicUsize,
     concurrent_sends: AtomicBool,
+    automine: AtomicBool,
+    response_delay_ms: AtomicUsize,
+    head_delay_ms: AtomicUsize,
+    head_ready: AtomicBool,
+    chain: Mutex<MockChain>,
+}
+
+#[derive(Default)]
+struct MockChain {
+    pending: Vec<TxHash>,
+    blocks: Vec<Vec<Value>>,
 }
 
 impl MockState {
+    fn mine(&self) {
+        let mut chain = self.chain.lock().unwrap();
+        let number = chain.blocks.len() + 1;
+        let receipts = chain
+            .pending
+            .drain(..)
+            .map(|hash| {
+                let mut value = receipt(hash);
+                value["blockNumber"] = json!(format!("0x{number:x}"));
+                value
+            })
+            .collect();
+        chain.blocks.push(receipts);
+    }
+
     fn respond(&self, request: RecordedRequest) -> HttpResponse {
         self.requests.lock().unwrap().push(request.clone());
 
@@ -69,16 +95,30 @@ impl MockState {
                     return HttpResponse::new(429, json!({ "error": "fixture rate limit" }));
                 }
 
-                let hash = if raw == "0x01" {
-                    TxHash::repeat_byte(0x11)
-                } else {
-                    TxHash::repeat_byte(0x22)
-                };
+                let hash = keccak256(hex::decode(raw.trim_start_matches("0x")).unwrap());
+                self.chain.lock().unwrap().pending.push(hash);
+                if self.automine.load(Ordering::SeqCst) {
+                    self.mine();
+                }
+                thread::sleep(Duration::from_millis(
+                    self.response_delay_ms.load(Ordering::SeqCst) as u64
+                ));
                 HttpResponse::ok(json!(hash))
             }
-            "eth_getTransactionReceipt" => {
-                let hash: TxHash = serde_json::from_value(request.params[0].clone()).unwrap();
-                HttpResponse::ok(receipt(hash))
+            "eth_blockNumber" => {
+                thread::sleep(Duration::from_millis(
+                    self.head_delay_ms.load(Ordering::SeqCst) as u64
+                ));
+                self.head_ready.store(true, Ordering::SeqCst);
+                HttpResponse::ok(json!(format!("0x{:x}", self.chain.lock().unwrap().blocks.len())))
+            }
+            "eth_getBlockReceipts" => {
+                let number = usize::from_str_radix(
+                    request.params[0].as_str().unwrap().trim_start_matches("0x"),
+                    16,
+                )
+                .unwrap();
+                HttpResponse::ok(json!(self.chain.lock().unwrap().blocks.get(number - 1)))
             }
             other => panic!("unexpected RPC method: {other}"),
         }
@@ -117,6 +157,7 @@ impl MockRpc {
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let state = Arc::new(MockState::default());
+        state.automine.store(true, Ordering::SeqCst);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_state = state.clone();
         let thread_stop = stop.clone();
@@ -150,6 +191,8 @@ impl Drop for MockRpc {
 }
 
 fn serve_connection(mut stream: TcpStream, state: Arc<MockState>) {
+    // Accepted sockets can inherit the listener's nonblocking mode on macOS.
+    stream.set_nonblocking(false).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let (headers, body) = read_http_request(&mut stream);
     let request_json: Value = serde_json::from_slice(&body).unwrap();
@@ -308,7 +351,7 @@ fn sender(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_senders_keep_headers_through_retry_and_receipt_polling() {
+async fn concurrent_senders_keep_submission_headers_and_share_aggregate_receipts() {
     let rpc = MockRpc::start();
     let temp = TempDir::new().unwrap();
     let mut sender = sender(&rpc, Some(auth(&auth_file(&temp))), 2);
@@ -335,15 +378,14 @@ async fn concurrent_senders_keep_headers_through_retry_and_receipt_polling() {
 
     let receipts = requests
         .iter()
-        .filter(|request| request.method == "eth_getTransactionReceipt")
+        .filter(|request| request.method == "eth_getBlockReceipts")
         .collect::<Vec<_>>();
     assert_eq!(receipts.len(), 2);
-    for request in receipts {
-        let hash: TxHash = serde_json::from_value(request.params[0].clone()).unwrap();
-        let expected =
-            if hash == TxHash::repeat_byte(0x11) { SENDER_ONE_VALUE } else { SENDER_TWO_VALUE };
-        assert_eq!(request.auth.as_deref(), Some(expected));
-    }
+    assert!(requests
+        .iter()
+        .filter(|r| r.method != "eth_sendRawTransaction")
+        .all(|r| r.auth.is_none()));
+    assert!(requests.iter().all(|r| r.method != "eth_getTransactionReceipt"));
 }
 
 #[tokio::test]
@@ -505,4 +547,184 @@ async fn deferred_authentication_failure_rejects_the_next_send_before_submission
 
     let requests = rpc.state.requests();
     assert!(requests.iter().all(|request| request.params[0] != "0x04"));
+}
+
+async fn wait_for_pending(rpc: &MockRpc, count: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if rpc.state.chain.lock().unwrap().pending.len() == count {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("transactions were not submitted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sequences_share_one_receipt_request_per_block_and_wait_for_inclusion() {
+    let rpc = MockRpc::start();
+    rpc.state.automine.store(false, Ordering::SeqCst);
+
+    let mut sender = sender(&rpc, None, 32);
+
+    for key in 1..=32 {
+        for raw in [key + 2, key + 100] {
+            let mut tx = transaction(raw, None, key, true);
+            tx.submission_keys.clear();
+            tx.inclusion_keys = vec![SchedulingKey::from([key; 20])];
+
+            sender.send(tx).await.unwrap();
+        }
+    }
+
+    let flush = tokio::spawn(async move { sender.flush().await.unwrap() });
+    wait_for_pending(&rpc, 32).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let requests = rpc.state.requests();
+    assert_eq!(requests.iter().filter(|r| r.method == "eth_sendRawTransaction").count(), 32);
+    assert_eq!(requests.iter().filter(|r| r.method == "eth_getBlockReceipts").count(), 0);
+
+    rpc.state.mine();
+    wait_for_pending(&rpc, 32).await;
+
+    let requests = rpc.state.requests();
+    assert_eq!(requests.iter().filter(|r| r.method == "eth_getBlockReceipts").count(), 1);
+    assert!(!flush.is_finished(), "successors still need inclusion");
+
+    rpc.state.mine();
+    tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap().unwrap();
+
+    let requests = rpc.state.requests();
+    assert_eq!(requests.iter().filter(|r| r.method == "eth_getBlockReceipts").count(), 2);
+    assert!(requests.iter().all(|r| r.method != "eth_getTransactionReceipt"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpc_submitter_uses_query_tracker_before_releasing_inclusion_keys() {
+    let rpc = MockRpc::start();
+    rpc.state.automine.store(false, Ordering::SeqCst);
+
+    let submission = provider(&rpc.url, reqwest::Client::new());
+    let query = provider(&rpc.url, reqwest::Client::new());
+    let submitter = RpcSubmitter::new(vec![submission], SenderConfig::default())
+        .unwrap()
+        .with_receipt_tracker(ReceiptTracker::new(query));
+
+    submitter.submit(&transaction(2, None, 1, true)).await.unwrap();
+
+    let second = tokio::spawn(async move {
+        submitter.submit(&transaction(3, None, 1, true)).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    assert!(!second.is_finished());
+    assert_eq!(rpc.state.chain.lock().unwrap().pending.len(), 1);
+
+    rpc.state.mine();
+    tokio::time::timeout(Duration::from_secs(5), second).await.unwrap().unwrap();
+    assert_eq!(rpc.state.chain.lock().unwrap().pending.len(), 1);
+
+    rpc.state.mine();
+    assert!(rpc.state.requests().iter().all(|r| r.method != "eth_getTransactionReceipt"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn setup_receipt_arriving_before_submission_response_is_retained() {
+    let rpc = MockRpc::start();
+    rpc.state.response_delay_ms.store(300, Ordering::SeqCst);
+
+    let mut sender = sender(&rpc, None, 1);
+
+    // Setup without inclusion keys must still wait for its receipt.
+    let mut tx = transaction(2, None, 1, false);
+    tx.phase = TxPhase::Setup;
+
+    sender.send(tx).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), sender.flush()).await.unwrap().unwrap();
+
+    let requests = rpc.state.requests();
+    assert_eq!(requests.iter().filter(|r| r.method == "eth_getBlockReceipts").count(), 1);
+    assert!(requests.iter().all(|r| r.method != "eth_getTransactionReceipt"));
+}
+
+struct DeferredSigner {
+    state: Arc<MockState>,
+    calls: AtomicUsize,
+}
+
+impl LateSigner for DeferredSigner {
+    fn sign(&self, spec: &LateSignSpec) -> Result<Bytes> {
+        assert!(self.state.head_ready.load(Ordering::SeqCst), "signed before tracker was ready");
+
+        self.calls.fetch_add(1, Ordering::SeqCst);
+
+        Ok(Bytes::from(vec![spec.payload.as_u64().unwrap() as u8]))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_sequences_wait_for_tracker_before_signing_and_track_signed_hashes() {
+    for use_rpc_submitter in [false, true] {
+        let rpc = MockRpc::start();
+        rpc.state.automine.store(false, Ordering::SeqCst);
+        rpc.state.head_delay_ms.store(200, Ordering::SeqCst);
+
+        let signer =
+            Arc::new(DeferredSigner { state: rpc.state.clone(), calls: AtomicUsize::new(0) });
+
+        let txs: Vec<_> = [2, 3]
+            .into_iter()
+            .map(|raw| {
+                let mut tx = transaction(raw, None, 1, true);
+                tx.raw = Bytes::new();
+                tx.late_sign =
+                    Some(LateSignSpec { format: "test".to_string(), payload: json!(raw) });
+
+                tx
+            })
+            .collect();
+
+        let mut sender = sender(&rpc, None, 2).with_late_signer(signer.clone());
+        let submitter = RpcSubmitter::new(
+            vec![provider(&rpc.url, reqwest::Client::new())],
+            SenderConfig::default(),
+        )
+        .unwrap()
+        .with_late_signer(signer.clone());
+
+        let task = tokio::spawn(async move {
+            if use_rpc_submitter {
+                for tx in txs {
+                    submitter.submit(&tx).await.unwrap();
+                }
+            } else {
+                for tx in txs {
+                    sender.send(tx).await.unwrap();
+                }
+
+                sender.flush().await.unwrap();
+            }
+        });
+        wait_for_pending(&rpc, 1).await;
+
+        assert_eq!(signer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rpc.state.chain.lock().unwrap().pending, [keccak256([2])]);
+
+        rpc.state.head_delay_ms.store(0, Ordering::SeqCst);
+
+        rpc.state.mine();
+        wait_for_pending(&rpc, 1).await;
+
+        assert_eq!(signer.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(rpc.state.chain.lock().unwrap().pending, [keccak256([3])]);
+
+        rpc.state.mine();
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+
+        assert!(rpc.state.requests().iter().all(|r| r.method != "eth_getTransactionReceipt"));
+    }
 }

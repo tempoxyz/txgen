@@ -7,7 +7,7 @@
 use crate::{
     metrics::MetricsCollector,
     receipt_metrics::{ReceiptCollectorHandle, ReceiptMetricLabels},
-    RequestAuthProvider, RpcRequestContext,
+    ReceiptTracker, RequestAuthProvider, RpcRequestContext,
 };
 use alloy_network::{primitives::ReceiptResponse, AnyNetwork, AnyTransactionReceipt};
 use alloy_primitives::{keccak256, Address, Bytes, TxHash, U256};
@@ -210,6 +210,7 @@ pub struct RpcSubmitter {
     rate_limiter: Option<Arc<RateLimiter>>,
     ordering: Arc<RpcOrdering>,
     late_signer: Option<Arc<dyn LateSigner>>,
+    receipt_tracker: ReceiptTracker,
 }
 
 impl RpcSubmitter {
@@ -237,7 +238,9 @@ impl RpcSubmitter {
         let rate_limiter =
             (config.rate_limit > 0).then(|| Arc::new(RateLimiter::new(config.rate_limit)));
 
+        let receipt_tracker = ReceiptTracker::new(endpoints[0].provider().clone());
         Ok(Self {
+            receipt_tracker,
             endpoints: endpoints.into(),
             request_auth,
             semaphore: Arc::new(Semaphore::new(config.max_concurrent)),
@@ -250,6 +253,12 @@ impl RpcSubmitter {
     /// Register the signer used for deferred transactions.
     pub fn with_late_signer(mut self, signer: Arc<dyn LateSigner>) -> Self {
         self.late_signer = Some(signer);
+        self
+    }
+
+    /// Share an inclusion tracker backed by the chain's aggregate query endpoint.
+    pub fn with_receipt_tracker(mut self, tracker: ReceiptTracker) -> Self {
+        self.receipt_tracker = tracker;
         self
     }
 
@@ -316,6 +325,28 @@ impl RpcSubmitter {
             None => self.acquire_permit().await.map_err(RpcSubmitError::before_send)?,
         };
 
+        let inclusion = if tx.inclusion_keys.is_empty() {
+            None
+        } else {
+            let registration = self.receipt_tracker.prepare();
+
+            let waiter = match deadline {
+                Some(deadline) => {
+                    tokio::time::timeout_at(deadline, registration).await.map_err(|_| {
+                        RpcSubmitError::deadline(
+                            RpcSubmitFailureKind::BeforeSend,
+                            "submission deadline elapsed starting receipt observation",
+                            None,
+                        )
+                    })?
+                }
+                None => registration.await,
+            }
+            .map_err(RpcSubmitError::before_send)?;
+
+            Some(waiter)
+        };
+
         let raw = resolve_raw(&tx.raw, tx.late_sign.as_ref(), self.late_signer.as_deref())
             .map_err(RpcSubmitError::before_send)?;
         let expected_hash = keccak256(&raw);
@@ -323,6 +354,12 @@ impl RpcSubmitter {
         let headers = self
             .headers_for(&endpoint, "eth_sendRawTransaction", tx.sender, None)
             .map_err(RpcSubmitError::before_send)?;
+
+        let inclusion = inclusion
+            .map(|registration| registration.register(expected_hash))
+            .transpose()
+            .map_err(RpcSubmitError::before_send)?;
+
         let redact = self.request_auth.is_some();
         let submission = match deadline {
             Some(deadline) => {
@@ -341,15 +378,19 @@ impl RpcSubmitter {
                 .await
                 .map_err(|error| RpcSubmitError::from_transport(error, redact, expected_hash))?,
         };
+
         drop(permit);
 
         order.release_submission_keys();
+
         if let Some(inclusion_release) = order.take_inclusion_keys() {
-            let submitter = self.clone();
-            let sender = tx.sender;
-            let tx_hash = submission.tx_hash;
+            let inclusion = inclusion.expect("inclusion keys have a registered receipt waiter");
+
             tokio::spawn(async move {
-                let _ = submitter.wait_for_receipt(sender, tx_hash).await;
+                if let Err(error) = inclusion.wait().await {
+                    tracing::warn!(%error, "Failed waiting for transaction inclusion");
+                }
+
                 drop(inclusion_release);
             });
         }
@@ -471,20 +512,6 @@ impl RpcSubmitter {
             None => Ok(HeaderMap::new()),
         }?;
         Ok(mark_headers_sensitive(headers))
-    }
-
-    async fn wait_for_receipt(&self, sender: Option<Address>, tx_hash: TxHash) -> Result<bool> {
-        let deadline = tokio::time::Instant::now() + RECEIPT_TIMEOUT;
-
-        loop {
-            if let Some(receipt) = self.get_transaction_receipt(sender, tx_hash).await? {
-                return Ok(receipt.status());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                eyre::bail!("timed out waiting for transaction receipt");
-            }
-            tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
-        }
     }
 
     async fn acquire_permit(&self) -> Result<OwnedSemaphorePermit> {
@@ -667,8 +694,6 @@ type SchedulingKeys = Vec<SchedulingKey>;
 
 type KeySets = (SchedulingKeys, SchedulingKeys);
 
-const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
 const PENDING_BACKLOG_FACTOR: usize = 4;
 
 /// A submission RPC provider and the identity exposed to request authentication.
@@ -748,6 +773,7 @@ pub struct Sender {
     receipt_collector: Option<ReceiptCollectorHandle>,
     /// Optional signer for deferred transactions.
     late_signer: Option<Arc<dyn LateSigner>>,
+    receipt_tracker: ReceiptTracker,
 }
 
 impl Sender {
@@ -784,7 +810,9 @@ impl Sender {
         let max_buffered = max_buffered_transactions(&config, rate_limiter.as_deref());
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
 
+        let receipt_tracker = ReceiptTracker::new(endpoints[0].provider().clone());
         Self {
+            receipt_tracker,
             endpoints,
             request_auth,
             metrics,
@@ -806,6 +834,12 @@ impl Sender {
     /// Register the signer used for deferred transactions.
     pub fn with_late_signer(mut self, signer: Arc<dyn LateSigner>) -> Self {
         self.late_signer = Some(signer);
+        self
+    }
+
+    /// Share an inclusion tracker backed by the chain's aggregate query endpoint.
+    pub fn with_receipt_tracker(mut self, tracker: ReceiptTracker) -> Self {
+        self.receipt_tracker = tracker;
         self
     }
 
@@ -1069,6 +1103,7 @@ impl Sender {
         let request_auth = self.request_auth.clone();
         let receipt_collector = self.receipt_collector.clone();
         let late_signer = self.late_signer.clone();
+        let receipt_tracker = self.receipt_tracker.clone();
 
         self.worker_tasks.spawn(async move {
             submit_tx(
@@ -1077,6 +1112,7 @@ impl Sender {
                 submission_headers,
                 request_auth,
                 receipt_collector,
+                receipt_tracker,
                 metrics,
                 permit,
                 completion_tx,
@@ -1123,6 +1159,7 @@ async fn submit_tx(
     submission_headers: HeaderMap,
     request_auth: Option<Arc<dyn RequestAuthProvider>>,
     receipt_collector: Option<ReceiptCollectorHandle>,
+    receipt_tracker: ReceiptTracker,
     metrics: Arc<MetricsCollector>,
     permit: OwnedSemaphorePermit,
     completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
@@ -1136,6 +1173,23 @@ async fn submit_tx(
 
     metrics.record_sent();
 
+    let inclusion = if pending.inclusion_keys.is_empty() && pending.phase != TxPhase::Setup {
+        None
+    } else {
+        match receipt_tracker.prepare().await {
+            Ok(waiter) => Some(waiter),
+            Err(error) => {
+                tracing::error!(%error, "Failed to start block receipt observation");
+
+                metrics.record_failure();
+                drop(permit);
+                release_keys(&completion_tx, release_all_keys());
+
+                return;
+            }
+        }
+    };
+
     let raw = match resolve_raw(&pending.raw, pending.late_sign.as_ref(), late_signer.as_deref()) {
         Ok(raw) => raw,
         Err(error) => {
@@ -1145,13 +1199,32 @@ async fn submit_tx(
                 error = %error,
                 "failed to materialize deferred transaction",
             );
+
             metrics.record_failure();
             drop(permit);
             release_keys(&completion_tx, release_all_keys());
+
             return;
         }
     };
+
     let expected_hash = keccak256(&raw);
+    let inclusion = match inclusion
+        .map(|registration| registration.register(expected_hash))
+        .transpose()
+    {
+        Ok(inclusion) => inclusion,
+        Err(error) => {
+            tracing::error!(%error, "Failed to register transaction for block receipt observation");
+
+            metrics.record_failure();
+            drop(permit);
+            release_keys(&completion_tx, release_all_keys());
+
+            return;
+        }
+    };
+
     let start = Instant::now();
     let tx_hash = match send_raw_transaction(&endpoint, &raw, submission_headers).await {
         Ok(tx_hash) => {
@@ -1162,14 +1235,17 @@ async fn submit_tx(
             if submission_may_have_been_accepted(&e) {
                 track_workload_receipt(receipt_collector.as_ref(), &pending, expected_hash);
             }
+
             if request_auth.is_some() {
                 tracing::warn!("Failed to send authenticated transaction");
             } else {
                 tracing::warn!(error = %e, "Failed to send transaction");
             }
+
             metrics.record_failure();
             drop(permit);
             release_keys(&completion_tx, release_all_keys());
+
             return;
         }
     };
@@ -1180,22 +1256,24 @@ async fn submit_tx(
 
     release_keys(&completion_tx, pending.submission_keys);
 
-    if pending.inclusion_keys.is_empty() && pending.phase != TxPhase::Setup {
-        return;
-    }
+    let Some(inclusion) = inclusion else { return };
 
-    match wait_for_receipt(&endpoint, pending.sender, tx_hash, request_auth.as_deref()).await {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::error!(id = pending.id.as_deref(), phase = ?pending.phase, %tx_hash, "Transaction reverted");
+    match inclusion.wait().await {
+        Ok(receipt) if receipt.status() => {}
+        Ok(_) => {
+            tracing::error!(
+                id = pending.id.as_deref(),
+                phase = ?pending.phase,
+                %tx_hash,
+                "Transaction reverted",
+            );
+
             metrics.record_failure();
         }
-        Err(e) => {
-            if request_auth.is_some() {
-                tracing::error!(%tx_hash, "Failed waiting for authenticated transaction receipt");
-            } else {
-                tracing::error!(error = %e, %tx_hash, "Failed waiting for transaction receipt");
-            }
+        Err(error) => {
+            // The tracker only returns static diagnostics without RPC credentials.
+            tracing::error!(%error, %tx_hash, "Failed waiting for transaction inclusion");
+
             metrics.record_failure();
         }
     }
@@ -1298,44 +1376,6 @@ fn rpc_request_error(
 fn release_keys(completion_tx: &mpsc::UnboundedSender<SchedulingKeys>, keys: SchedulingKeys) {
     if !keys.is_empty() {
         let _ = completion_tx.send(keys);
-    }
-}
-
-async fn wait_for_receipt(
-    endpoint: &RpcEndpoint,
-    sender: Option<Address>,
-    tx_hash: TxHash,
-    request_auth: Option<&dyn RequestAuthProvider>,
-) -> Result<bool> {
-    let deadline = tokio::time::Instant::now() + RECEIPT_TIMEOUT;
-
-    loop {
-        let headers = match request_auth {
-            Some(auth) => auth
-                .headers_for(&RpcRequestContext {
-                    endpoint: endpoint.identity(),
-                    method: "eth_getTransactionReceipt",
-                    sender,
-                    tx_hash: Some(tx_hash),
-                })
-                .map(mark_headers_sensitive)?,
-            None => HeaderMap::new(),
-        };
-        let receipt = endpoint
-            .provider()
-            .get_transaction_receipt(tx_hash)
-            .with_headers(headers)
-            .map_err(|_| eyre::eyre!("cannot attach request headers to eth_getTransactionReceipt"))?
-            .await?;
-        if let Some(receipt) = receipt {
-            return Ok(receipt.status());
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            eyre::bail!("timed out waiting for transaction receipt");
-        }
-
-        tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
     }
 }
 
