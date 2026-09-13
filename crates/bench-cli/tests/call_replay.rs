@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -96,7 +96,7 @@ struct Node {
 }
 
 impl Node {
-    fn start(anvil: &PathBuf) -> Self {
+    fn start(anvil: &Path) -> Self {
         let port = free_port();
         let child = Command::new(anvil)
             .args(["--port", &port.to_string(), "--silent"])
@@ -147,7 +147,7 @@ impl Node {
         serde_json::from_str(response.split("\r\n\r\n").nth(1)?).ok()
     }
 
-    fn replay(&self, corpus: &PathBuf, name: &str) -> RunOutputs {
+    fn replay(&self, corpus: &Path, name: &str) -> RunOutputs {
         let directory = self.directory.path().join(name);
         std::fs::create_dir_all(&directory).unwrap();
         let path = |file: &str| directory.join(file);
@@ -193,13 +193,12 @@ fn build_corpus(node: &Node) -> PathBuf {
     // A single INVALID opcode, so calls to this address fail.
     node.rpc("anvil_setCode", json!([ALWAYS_FAILS, "0xfe"]));
 
-    let hash = node.rpc(
-        "eth_sendTransaction",
-        json!([{"from": SENDER, "to": RECIPIENT, "value": "0x1"}]),
-    );
+    let hash =
+        node.rpc("eth_sendTransaction", json!([{"from": SENDER, "to": RECIPIENT, "value": "0x1"}]));
     let hash = hash.as_str().expect("no transaction hash");
 
-    let transfer = json!({"from": SENDER, "to": RECIPIENT, "gas": "0x5208", "value": "0x1", "input": "0x"});
+    let transfer =
+        json!({"from": SENDER, "to": RECIPIENT, "gas": "0x5208", "value": "0x1", "input": "0x"});
     let records = [
         json!({
             "method": "eth_call",
