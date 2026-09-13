@@ -265,11 +265,13 @@ pub enum CallMethod {
     DebugTraceBlockByNumber,
     /// `trace_block`
     TraceBlock,
+    /// `trace_replayBlockTransactions`
+    TraceReplayBlockTransactions,
 }
 
 impl CallMethod {
     /// Every allowlisted method.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::EthCall,
         Self::EthEstimateGas,
         Self::EthCreateAccessList,
@@ -280,6 +282,7 @@ impl CallMethod {
         Self::TraceReplayTransaction,
         Self::DebugTraceBlockByNumber,
         Self::TraceBlock,
+        Self::TraceReplayBlockTransactions,
     ];
 
     /// Resolve a JSON-RPC method name against the allowlist.
@@ -300,6 +303,7 @@ impl CallMethod {
             Self::TraceReplayTransaction => "trace_replayTransaction",
             Self::DebugTraceBlockByNumber => "debug_traceBlockByNumber",
             Self::TraceBlock => "trace_block",
+            Self::TraceReplayBlockTransactions => "trace_replayBlockTransactions",
         }
     }
 
@@ -323,7 +327,9 @@ impl CallMethod {
             Self::EthCreateAccessList |
             Self::DebugTraceCall => Some(1),
             Self::TraceCall => Some(2),
-            Self::DebugTraceBlockByNumber | Self::TraceBlock => Some(0),
+            Self::DebugTraceBlockByNumber |
+            Self::TraceBlock |
+            Self::TraceReplayBlockTransactions => Some(0),
             _ => None,
         }
     }
@@ -333,7 +339,10 @@ impl CallMethod {
     /// Block-addressed tracing methods take a concrete block number that
     /// identifies the record, so their parameter is never rewritten.
     pub const fn block_param_rewritable(&self) -> bool {
-        !matches!(self, Self::DebugTraceBlockByNumber | Self::TraceBlock)
+        !matches!(
+            self,
+            Self::DebugTraceBlockByNumber | Self::TraceBlock | Self::TraceReplayBlockTransactions
+        )
     }
 }
 

@@ -280,6 +280,7 @@ txgen-ethereum extract --rpc http://localhost:8545 --from 25489981 --to 25490000
 | `trace_replayTransaction` | `[hash, ["trace","stateDiff"]]` |
 | `debug_traceBlockByNumber` | `[number, options]`, one record per `--tracer` |
 | `trace_block` | `[number]` |
+| `trace_replayBlockTransactions` | `[number, ["trace","stateDiff"]]`, label `trace+stateDiff` |
 
 ##### Tracers
 
@@ -548,7 +549,7 @@ allowlist:
 | `debug_traceCall` | `params[0]` | `params[1]` |
 | `trace_call` | `params[0]` | `params[2]` |
 | `debug_traceTransaction`, `trace_transaction`, `trace_replayTransaction` | none | none |
-| `debug_traceBlockByNumber`, `trace_block` | none | `params[0]`, never rewritten |
+| `debug_traceBlockByNumber`, `trace_block`, `trace_replayBlockTransactions` | none | `params[0]`, never rewritten |
 
 `--block-tag` replaces the block parameter of every record that has a rewritable one, which is what
 makes captured traffic replayable against a node that does not have the original blocks.
@@ -2042,7 +2043,7 @@ Summary of which RPC methods are required by each feature:
 | `eth_call` | `bench call` (when the corpus uses it), `txgen-tempo scenario run` (`prepare_encrypted_deposit` and other adapter `invoke` actions) |
 | `eth_estimateGas`, `eth_createAccessList` | `bench call` (when the corpus uses them) |
 | `debug_traceCall`, `debug_traceTransaction`, `debug_traceBlockByNumber` | `bench call` (when the corpus uses them) |
-| `trace_call`, `trace_transaction`, `trace_replayTransaction`, `trace_block` | `bench call` (when the corpus uses them) |
+| `trace_call`, `trace_transaction`, `trace_replayTransaction`, `trace_block`, `trace_replayBlockTransactions` | `bench call` (when the corpus uses them) |
 | `debug_getRawBlock` | `txgen extract`, `txgen-ethereum extract-big-blocks` |
 | `eth_getBlockAccessListByBlockNumber` | `txgen extract --bal`, `txgen-ethereum extract-big-blocks --bal` |
 | `reth_newPayload` | `bench send-blocks` |

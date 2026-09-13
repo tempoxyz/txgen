@@ -149,6 +149,7 @@ impl ExtractFormat {
                 CallMethod::TraceReplayTransaction,
                 CallMethod::DebugTraceBlockByNumber,
                 CallMethod::TraceBlock,
+                CallMethod::TraceReplayBlockTransactions,
             ],
         }
     }
@@ -821,6 +822,10 @@ fn block_params(method: CallMethod, number: u64, corpus: &CorpusConfig) -> Vec<R
             })
             .collect(),
         CallMethod::TraceBlock => vec![RecordVariant { params: vec![number], label: None }],
+        CallMethod::TraceReplayBlockTransactions => vec![RecordVariant {
+            params: vec![number, serde_json::json!(["trace", "stateDiff"])],
+            label: Some(parity_label(&["trace", "stateDiff"])),
+        }],
         _ => Vec::new(),
     }
 }
