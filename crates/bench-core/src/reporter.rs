@@ -6,6 +6,7 @@
 //! - ClickHouse (for time-series storage)
 
 use crate::{
+    call::CallReport,
     clickhouse::ClickHouseClient,
     metrics::{BenchMetrics, BlockStats, RunStats, ThroughputSample, TimeSeriesMetrics},
     receipt_clickhouse::{insert_receipt_gas_records, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE},
@@ -47,6 +48,8 @@ pub struct FinalReport {
     pub total_fees_paid: Option<U256>,
     /// Receipt-derived gas details for ClickHouse publication.
     pub receipt_records: Vec<ReceiptGasRecord>,
+    /// RPC corpus replay results (call mode only).
+    pub call: Option<CallReport>,
 }
 
 impl FinalReport {
@@ -351,10 +354,13 @@ pub struct JsonReport {
     /// Unified time-series samples (internal + node metrics).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub samples: Vec<Sample>,
+    /// RPC corpus replay results (call mode only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call: Option<CallReport>,
 }
 
 /// Latency statistics in JSON format.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct JsonLatency {
     /// Minimum latency in milliseconds.
     pub min_ms: f64,
@@ -364,6 +370,9 @@ pub struct JsonLatency {
     pub mean_ms: f64,
     /// P50 latency in milliseconds.
     pub p50_ms: f64,
+    /// P90 latency in milliseconds, reported where the open-loop cell needs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p90_ms: Option<f64>,
     /// P95 latency in milliseconds.
     pub p95_ms: f64,
     /// P99 latency in milliseconds.
@@ -455,6 +464,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         let has_data = report.bench_metrics.is_some() ||
             !report.blocks.is_empty() ||
             !report.receipt_metrics.is_empty() ||
+            report.call.is_some() ||
             report.has_samples();
         if !has_data {
             return Ok(());
@@ -486,6 +496,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
                         max_ms: latency.max.as_secs_f64() * 1000.0,
                         mean_ms: latency.mean.as_secs_f64() * 1000.0,
                         p50_ms: latency.p50.as_secs_f64() * 1000.0,
+                        p90_ms: None,
                         p95_ms: latency.p95.as_secs_f64() * 1000.0,
                         p99_ms: latency.p99.as_secs_f64() * 1000.0,
                     }),
@@ -516,6 +527,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             receipt_metrics: report.receipt_metrics.clone(),
             total_fees_paid: report.total_fees_paid.map(|fees| fees.to_string()),
             samples: Vec::new(),
+            call: report.call.clone(),
         };
 
         serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
