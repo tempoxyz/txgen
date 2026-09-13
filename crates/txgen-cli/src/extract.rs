@@ -10,6 +10,7 @@ use alloy_rlp::Decodable;
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload};
 use alloy_transport::layers::RetryBackoffLayer;
+use bench_core::CallMethod;
 use clap::{Args, ValueEnum};
 use eyre::{bail, Result, WrapErr};
 use futures::{stream, StreamExt};
@@ -45,13 +46,23 @@ pub struct ExtractArgs {
     #[arg(long, default_value_t = false)]
     pub bal: bool,
 
-    /// Output raw blocks or the signed transactions contained in them.
+    /// Output raw blocks, the signed transactions contained in them, or an
+    /// RPC replay corpus built from them.
     ///
     /// Transaction output is compatible with `bench send` and therefore
     /// replays the source transactions through `eth_sendRawTransaction` and
-    /// the node's transaction pool.
+    /// the node's transaction pool. Corpus output is compatible with
+    /// `bench call`.
     #[arg(long, value_enum, default_value_t = ExtractFormat::Blocks)]
     pub format: ExtractFormat,
+
+    /// Methods to emit for `--format calls` and `--format traces`.
+    ///
+    /// Defaults to `eth_call` for calls and
+    /// `debug_traceTransaction,trace_transaction` for traces. Records are
+    /// emitted in a fixed method order regardless of the order given here.
+    #[arg(long, value_delimiter = ',', value_name = "METHOD")]
+    pub methods: Vec<String>,
 }
 
 /// Output produced by `extract`.
@@ -61,6 +72,48 @@ pub enum ExtractFormat {
     Blocks,
     /// One signed transaction per line, for `bench send`.
     Transactions,
+    /// A replay corpus of calls built from each transaction, for `bench call`.
+    Calls,
+    /// A replay corpus addressing the transactions and blocks themselves,
+    /// for `bench call`.
+    Traces,
+}
+
+impl ExtractFormat {
+    /// Methods this format can emit, in the order records are written.
+    const fn available_methods(&self) -> &'static [CallMethod] {
+        match self {
+            Self::Blocks | Self::Transactions => &[],
+            Self::Calls => &[
+                CallMethod::EthCall,
+                CallMethod::EthEstimateGas,
+                CallMethod::EthCreateAccessList,
+                CallMethod::DebugTraceCall,
+                CallMethod::TraceCall,
+            ],
+            Self::Traces => &[
+                CallMethod::DebugTraceTransaction,
+                CallMethod::TraceTransaction,
+                CallMethod::TraceReplayTransaction,
+                CallMethod::DebugTraceBlockByNumber,
+                CallMethod::TraceBlock,
+            ],
+        }
+    }
+
+    /// Methods emitted when `--methods` is omitted.
+    const fn default_methods(&self) -> &'static [CallMethod] {
+        match self {
+            Self::Blocks | Self::Transactions => &[],
+            Self::Calls => &[CallMethod::EthCall],
+            Self::Traces => &[CallMethod::DebugTraceTransaction, CallMethod::TraceTransaction],
+        }
+    }
+
+    /// Whether the format emits a replay corpus.
+    const fn is_corpus(&self) -> bool {
+        matches!(self, Self::Calls | Self::Traces)
+    }
 }
 
 #[derive(Args)]
@@ -130,13 +183,14 @@ struct BigBlockData<T> {
 pub(crate) async fn run_extract<N>(args: ExtractArgs) -> Result<()>
 where
     N: Network,
-    N::TxEnvelope: Decodable + Encodable2718 + SignerRecoverable + 'static,
+    N::TxEnvelope: Decodable + Encodable2718 + SignerRecoverable + Transaction + 'static,
     N::Header: Decodable + 'static,
 {
     if args.from > args.to {
         bail!("--from must be <= --to");
     }
 
+    let methods = resolve_methods(args.format, &args.methods)?;
     let provider = retrying_http_provider::<N>(&args.rpc)?;
 
     let (tx, mut rx) = mpsc::channel::<Result<FetchedBlock>>(args.buffer_size);
@@ -156,7 +210,8 @@ where
             let file = std::fs::File::create(path)
                 .wrap_err_with(|| format!("failed to create output file: {}", path.display()))?;
             let mut writer = std::io::BufWriter::new(file);
-            let result = write_extracted_blocks(&mut rx, &mut writer, total, format).await;
+            let result =
+                write_extracted_blocks(&mut rx, &mut writer, total, format, &methods).await;
             if let Ok(item_count) = &result {
                 match format {
                     ExtractFormat::Blocks => {
@@ -166,18 +221,55 @@ where
                         "wrote {item_count} transactions from {total} blocks to {}",
                         path.display()
                     ),
+                    ExtractFormat::Calls | ExtractFormat::Traces => eprintln!(
+                        "wrote {item_count} records from {total} blocks to {}",
+                        path.display()
+                    ),
                 }
             }
             result.map(|_| ())
         }
         None => {
             let mut writer = std::io::stdout();
-            write_extracted_blocks(&mut rx, &mut writer, total, format).await.map(|_| ())
+            write_extracted_blocks(&mut rx, &mut writer, total, format, &methods).await.map(|_| ())
         }
     };
 
     fetch_handle.await?;
     write_result
+}
+
+/// Resolve `--methods` against the methods the format can emit.
+fn resolve_methods(format: ExtractFormat, requested: &[String]) -> Result<Vec<CallMethod>> {
+    if !format.is_corpus() {
+        if !requested.is_empty() {
+            bail!("--methods only applies to --format calls and --format traces");
+        }
+        return Ok(Vec::new());
+    }
+
+    if requested.is_empty() {
+        return Ok(format.default_methods().to_vec());
+    }
+
+    let available = format.available_methods();
+    let mut selected = Vec::new();
+    for name in requested {
+        let method = available.iter().find(|method| method.as_str() == name).ok_or_else(|| {
+            eyre::eyre!(
+                "--format {:?} cannot emit `{name}`; available: {}",
+                format,
+                available.iter().map(CallMethod::as_str).collect::<Vec<_>>().join(", ")
+            )
+        })?;
+        if !selected.contains(method) {
+            selected.push(*method);
+        }
+    }
+
+    // Emit in the format's own order so the corpus is deterministic regardless
+    // of how the methods were listed on the command line.
+    Ok(available.iter().copied().filter(|method| selected.contains(method)).collect())
 }
 
 pub(crate) async fn run_extract_big_blocks<N>(args: ExtractBigBlocksArgs) -> Result<()>
@@ -235,11 +327,33 @@ struct TransactionOutputLine<'a> {
     inclusion_keys: [Address; 0],
 }
 
+/// One line of a replay corpus, as read by `bench call`.
+#[derive(serde::Serialize)]
+struct CorpusOutputLine<'a> {
+    method: &'a str,
+    params: Vec<serde_json::Value>,
+    meta: RecordMeta,
+}
+
+/// The opaque per-record metadata carried through to the replay outputs.
+#[derive(serde::Serialize)]
+struct RecordMeta {
+    block: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hash: Option<B256>,
+}
+
+/// A call object built from a source transaction.
+type CallObject = serde_json::Map<String, serde_json::Value>;
+
 async fn write_extracted_blocks<W: Write>(
     rx: &mut mpsc::Receiver<Result<FetchedBlock>>,
     writer: &mut W,
     total: u64,
     format: ExtractFormat,
+    methods: &[CallMethod],
 ) -> Result<u64> {
     let start = std::time::Instant::now();
     let mut last_log = start;
@@ -283,6 +397,9 @@ async fn write_extracted_blocks<W: Write>(
                     item_count += 1;
                 }
             }
+            ExtractFormat::Calls | ExtractFormat::Traces => {
+                item_count += write_corpus_records(&mut *writer, &block, methods)?;
+            }
         }
         count += 1;
 
@@ -305,9 +422,160 @@ async fn write_extracted_blocks<W: Write>(
     Ok(item_count)
 }
 
+/// A transaction decoded out of a fetched block.
+///
+/// Only the fields the selected format writes are populated: signer recovery
+/// and transaction hashing are skipped where the output does not use them, and
+/// the unused fields keep their zero value.
 struct FetchedTransaction {
     raw: Bytes,
     signer: Address,
+    hash: B256,
+    call: Option<CallObject>,
+}
+
+/// Write the corpus records one block contributes.
+fn write_corpus_records<W: Write>(
+    writer: &mut W,
+    block: &FetchedBlock,
+    methods: &[CallMethod],
+) -> Result<u64> {
+    let mut written = 0u64;
+
+    for (index, transaction) in block.transactions.iter().enumerate() {
+        let meta =
+            || RecordMeta { block: block.number, index: Some(index), hash: Some(transaction.hash) };
+
+        for method in methods {
+            for params in transaction_params(*method, transaction) {
+                serde_json::to_writer(
+                    &mut *writer,
+                    &CorpusOutputLine { method: method.as_str(), params, meta: meta() },
+                )?;
+                writer.write_all(b"\n")?;
+                written += 1;
+            }
+        }
+    }
+
+    for method in methods {
+        let Some(params) = block_params(*method, block.number) else {
+            continue;
+        };
+        serde_json::to_writer(
+            &mut *writer,
+            &CorpusOutputLine {
+                method: method.as_str(),
+                params,
+                meta: RecordMeta { block: block.number, index: None, hash: None },
+            },
+        )?;
+        writer.write_all(b"\n")?;
+        written += 1;
+    }
+
+    Ok(written)
+}
+
+/// The parameter sets one transaction contributes for one method.
+///
+/// A method may contribute several records: the tracers that are worth
+/// replaying separately each get their own.
+fn transaction_params(
+    method: CallMethod,
+    transaction: &FetchedTransaction,
+) -> Vec<Vec<serde_json::Value>> {
+    let hash = serde_json::json!(transaction.hash);
+    let Some(call) = transaction.call.as_ref() else {
+        return match method {
+            CallMethod::DebugTraceTransaction => vec![
+                vec![hash.clone(), serde_json::json!({"tracer": "callTracer"})],
+                vec![
+                    hash,
+                    serde_json::json!({
+                        "tracer": "prestateTracer",
+                        "tracerConfig": {"diffMode": true},
+                    }),
+                ],
+            ],
+            CallMethod::TraceTransaction => vec![vec![hash]],
+            CallMethod::TraceReplayTransaction => {
+                vec![vec![hash, serde_json::json!(["trace", "stateDiff"])]]
+            }
+            _ => Vec::new(),
+        };
+    };
+
+    let call = serde_json::Value::Object(call.clone());
+    match method {
+        CallMethod::EthCall | CallMethod::EthCreateAccessList => {
+            vec![vec![call, serde_json::json!("latest")]]
+        }
+        CallMethod::EthEstimateGas => {
+            // Estimation with a pinned gas limit answers a different question,
+            // so the source transaction's limit is dropped.
+            let mut call = call;
+            if let Some(call) = call.as_object_mut() {
+                call.remove("gas");
+            }
+            vec![vec![call, serde_json::json!("latest")]]
+        }
+        CallMethod::DebugTraceCall => vec![
+            vec![
+                call.clone(),
+                serde_json::json!("latest"),
+                serde_json::json!({"tracer": "callTracer"}),
+            ],
+            vec![
+                call,
+                serde_json::json!("latest"),
+                serde_json::json!({"tracer": "prestateTracer"}),
+            ],
+        ],
+        CallMethod::TraceCall => vec![
+            vec![call.clone(), serde_json::json!(["trace"]), serde_json::json!("latest")],
+            vec![call, serde_json::json!(["trace", "stateDiff"]), serde_json::json!("latest")],
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// The parameters a block-addressed method takes, if this is one.
+fn block_params(method: CallMethod, number: u64) -> Option<Vec<serde_json::Value>> {
+    let number = serde_json::json!(format!("0x{number:x}"));
+    match method {
+        CallMethod::DebugTraceBlockByNumber => {
+            Some(vec![number, serde_json::json!({"tracer": "callTracer"})])
+        }
+        CallMethod::TraceBlock => Some(vec![number]),
+        _ => None,
+    }
+}
+
+/// Build the call object a replayed transaction runs as.
+///
+/// Fee fields are omitted so the call runs at a zero gas price on any node,
+/// and blob transactions keep only their call fields. The gas limit is pinned
+/// to the source transaction's so the result does not depend on the node's
+/// configured gas cap.
+fn call_object<T: Transaction>(transaction: &T, signer: Address) -> CallObject {
+    let mut call = CallObject::new();
+    call.insert("from".into(), serde_json::json!(signer));
+    if let Some(to) = transaction.to() {
+        call.insert("to".into(), serde_json::json!(to));
+    }
+    call.insert("gas".into(), serde_json::json!(format!("0x{:x}", transaction.gas_limit())));
+    call.insert("value".into(), serde_json::json!(transaction.value()));
+    call.insert("input".into(), serde_json::json!(transaction.input()));
+
+    if let Some(access_list) = transaction.access_list().filter(|list| !list.is_empty()) {
+        call.insert("accessList".into(), serde_json::json!(access_list));
+    }
+    if let Some(authorizations) = transaction.authorization_list().filter(|list| !list.is_empty()) {
+        call.insert("authorizationList".into(), serde_json::json!(authorizations));
+    }
+
+    call
 }
 
 struct FetchedBlock {
@@ -332,7 +600,7 @@ async fn fetch_blocks<N, P>(
     tx: mpsc::Sender<Result<FetchedBlock>>,
 ) where
     N: Network,
-    N::TxEnvelope: Decodable + Encodable2718 + SignerRecoverable + 'static,
+    N::TxEnvelope: Decodable + Encodable2718 + SignerRecoverable + Transaction + 'static,
     N::Header: Decodable + 'static,
     P: Provider<N> + DebugApi<N> + Clone + 'static,
 {
@@ -360,21 +628,39 @@ async fn fetch_blocks<N, P>(
                 let block = sealed.inner();
                 let transactions = match format {
                     ExtractFormat::Blocks => Vec::new(),
-                    ExtractFormat::Transactions => block
+                    _ => block
                         .body
                         .transactions
                         .iter()
                         .enumerate()
                         .map(|(index, transaction)| {
-                            let signer =
+                            let signer = if matches!(
+                                format,
+                                ExtractFormat::Transactions | ExtractFormat::Calls
+                            ) {
                                 transaction.recover_signer_unchecked().map_err(|error| {
                                     eyre::eyre!(
                                         "failed to recover signer for transaction {index} in block {block_num}: {error}"
                                     )
-                                })?;
+                                })?
+                            } else {
+                                Address::ZERO
+                            };
+
                             Ok(FetchedTransaction {
-                                raw: transaction.encoded_2718().into(),
+                                raw: match format {
+                                    ExtractFormat::Transactions => transaction.encoded_2718().into(),
+                                    _ => Bytes::new(),
+                                },
                                 signer,
+                                hash: match format {
+                                    ExtractFormat::Calls | ExtractFormat::Traces => {
+                                        transaction.trie_hash()
+                                    }
+                                    _ => B256::ZERO,
+                                },
+                                call: matches!(format, ExtractFormat::Calls)
+                                    .then(|| call_object(transaction, signer)),
                             })
                         })
                         .collect::<Result<Vec<_>>>()?,
@@ -558,6 +844,94 @@ fn build_big_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::{SignableTransaction, TxEip1559, TxEip4844, TxEip7702, TxLegacy};
+    use alloy_eips::{
+        eip2930::{AccessList, AccessListItem},
+        eip7702::{Authorization, SignedAuthorization},
+    };
+    use alloy_primitives::{Signature, TxKind, U256};
+    use serde_json::Value;
+
+    fn signature() -> Signature {
+        Signature::new(U256::from(1), U256::from(2), false)
+    }
+
+    fn legacy_create() -> alloy_consensus::TxEnvelope {
+        TxLegacy {
+            chain_id: Some(1),
+            nonce: 7,
+            gas_price: 1_000,
+            gas_limit: 100_000,
+            to: TxKind::Create,
+            value: U256::from(5),
+            input: Bytes::from_static(&[0x60, 0x01]),
+        }
+        .into_signed(signature())
+        .into()
+    }
+
+    fn eip1559_with_access_list() -> alloy_consensus::TxEnvelope {
+        TxEip1559 {
+            chain_id: 1,
+            nonce: 1,
+            gas_limit: 21_000,
+            max_fee_per_gas: 2_000,
+            max_priority_fee_per_gas: 1_000,
+            to: TxKind::Call(Address::repeat_byte(0xaa)),
+            value: U256::from(1),
+            access_list: AccessList(vec![AccessListItem {
+                address: Address::repeat_byte(0xbb),
+                storage_keys: vec![B256::repeat_byte(0x01)],
+            }]),
+            input: Bytes::new(),
+        }
+        .into_signed(signature())
+        .into()
+    }
+
+    fn blob_transaction() -> alloy_consensus::TxEnvelope {
+        let variant: alloy_consensus::TxEip4844Variant =
+            alloy_consensus::TxEip4844Variant::TxEip4844(TxEip4844 {
+                chain_id: 1,
+                nonce: 2,
+                gas_limit: 50_000,
+                max_fee_per_gas: 2_000,
+                max_priority_fee_per_gas: 1_000,
+                to: Address::repeat_byte(0xcc),
+                value: U256::from(3),
+                access_list: AccessList::default(),
+                blob_versioned_hashes: vec![B256::repeat_byte(0x02)],
+                max_fee_per_blob_gas: 9_999,
+                input: Bytes::from_static(&[0xde, 0xad]),
+            });
+        variant.into_signed(signature()).into()
+    }
+
+    fn eip7702_transaction() -> alloy_consensus::TxEnvelope {
+        TxEip7702 {
+            chain_id: 1,
+            nonce: 3,
+            gas_limit: 30_000,
+            max_fee_per_gas: 2_000,
+            max_priority_fee_per_gas: 1_000,
+            to: Address::repeat_byte(0xdd),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            authorization_list: vec![SignedAuthorization::new_unchecked(
+                Authorization {
+                    chain_id: U256::from(1),
+                    address: Address::repeat_byte(0xee),
+                    nonce: 0,
+                },
+                0,
+                U256::from(1),
+                U256::from(2),
+            )],
+            input: Bytes::new(),
+        }
+        .into_signed(signature())
+        .into()
+    }
 
     fn fetched_block() -> FetchedBlock {
         FetchedBlock {
@@ -572,24 +946,49 @@ mod tests {
             transactions: vec![FetchedTransaction {
                 raw: Bytes::from_static(&[0x02, 0xca, 0xfe]),
                 signer: Address::repeat_byte(0x22),
+                hash: B256::ZERO,
+                call: None,
             }],
         }
     }
 
-    #[tokio::test]
-    async fn writes_transaction_output_for_bench_send() {
+    fn corpus_block(format: ExtractFormat) -> FetchedBlock {
+        let transaction = eip1559_with_access_list();
+        let signer = Address::repeat_byte(0x22);
+        let mut block = fetched_block();
+        block.transactions = vec![FetchedTransaction {
+            raw: Bytes::new(),
+            signer,
+            hash: B256::repeat_byte(0x33),
+            call: matches!(format, ExtractFormat::Calls).then(|| call_object(&transaction, signer)),
+        }];
+        block
+    }
+
+    async fn write_block(
+        block: FetchedBlock,
+        format: ExtractFormat,
+        methods: &[CallMethod],
+    ) -> Vec<Value> {
         let (sender, mut receiver) = mpsc::channel(1);
-        sender.send(Ok(fetched_block())).await.unwrap();
+        sender.send(Ok(block)).await.unwrap();
         drop(sender);
 
         let mut output = Vec::new();
-        let count =
-            write_extracted_blocks(&mut receiver, &mut output, 1, ExtractFormat::Transactions)
-                .await
-                .unwrap();
+        write_extracted_blocks(&mut receiver, &mut output, 1, format, methods).await.unwrap();
+        String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
 
-        assert_eq!(count, 1);
-        let line: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    #[tokio::test]
+    async fn writes_transaction_output_for_bench_send() {
+        let lines = write_block(fetched_block(), ExtractFormat::Transactions, &[]).await;
+
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
         assert_eq!(line["phase"], "workload");
         assert_eq!(line["id"], "block:42:tx:0");
         assert_eq!(line["raw"], "0x02cafe");
@@ -600,15 +999,167 @@ mod tests {
 
     #[tokio::test]
     async fn block_output_keeps_original_transaction_count() {
-        let (sender, mut receiver) = mpsc::channel(1);
-        sender.send(Ok(fetched_block())).await.unwrap();
-        drop(sender);
+        let lines = write_block(fetched_block(), ExtractFormat::Blocks, &[]).await;
 
-        let mut output = Vec::new();
-        write_extracted_blocks(&mut receiver, &mut output, 1, ExtractFormat::Blocks).await.unwrap();
+        assert_eq!(lines[0]["tx_count"], 1);
+        assert_eq!(lines[0]["raw"], "0xaabb");
+    }
 
-        let line: serde_json::Value = serde_json::from_slice(&output).unwrap();
-        assert_eq!(line["tx_count"], 1);
-        assert_eq!(line["raw"], "0xaabb");
+    #[test]
+    fn call_object_carries_no_fee_fields() {
+        let call = call_object(&eip1559_with_access_list(), Address::repeat_byte(0x22));
+
+        assert_eq!(call["from"], "0x2222222222222222222222222222222222222222");
+        assert_eq!(call["to"], "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(call["gas"], "0x5208");
+        assert_eq!(call["value"], "0x1");
+        assert_eq!(call["input"], "0x");
+        for field in ["gasPrice", "maxFeePerGas", "maxPriorityFeePerGas", "maxFeePerBlobGas"] {
+            assert!(!call.contains_key(field), "{field} should be omitted");
+        }
+    }
+
+    #[test]
+    fn call_object_keeps_a_non_empty_access_list() {
+        let call = call_object(&eip1559_with_access_list(), Address::ZERO);
+        assert_eq!(call["accessList"][0]["address"], "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert!(!call.contains_key("authorizationList"));
+
+        let empty = call_object(&blob_transaction(), Address::ZERO);
+        assert!(!empty.contains_key("accessList"));
+    }
+
+    #[test]
+    fn call_object_keeps_an_authorization_list() {
+        let call = call_object(&eip7702_transaction(), Address::ZERO);
+        assert_eq!(
+            call["authorizationList"][0]["address"],
+            "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        );
+    }
+
+    #[test]
+    fn call_object_drops_blob_fields() {
+        let call = call_object(&blob_transaction(), Address::ZERO);
+
+        assert_eq!(call["to"], "0xcccccccccccccccccccccccccccccccccccccccc");
+        assert_eq!(call["input"], "0xdead");
+        assert!(!call.contains_key("blobVersionedHashes"));
+        assert!(!call.contains_key("maxFeePerBlobGas"));
+    }
+
+    #[test]
+    fn call_object_omits_to_for_contract_creation() {
+        let call = call_object(&legacy_create(), Address::ZERO);
+        assert!(!call.contains_key("to"));
+        assert_eq!(call["gas"], "0x186a0");
+    }
+
+    #[tokio::test]
+    async fn calls_format_emits_the_documented_parameter_layouts() {
+        let methods = ExtractFormat::Calls.available_methods();
+        let lines =
+            write_block(corpus_block(ExtractFormat::Calls), ExtractFormat::Calls, methods).await;
+
+        let emitted = lines.iter().map(|line| line["method"].as_str().unwrap()).collect::<Vec<_>>();
+        assert_eq!(
+            emitted,
+            vec![
+                "eth_call",
+                "eth_estimateGas",
+                "eth_createAccessList",
+                "debug_traceCall",
+                "debug_traceCall",
+                "trace_call",
+                "trace_call",
+            ]
+        );
+
+        assert_eq!(lines[0]["params"][1], "latest");
+        assert_eq!(lines[0]["params"][0]["gas"], "0x5208");
+        assert!(lines[1]["params"][0].get("gas").is_none(), "eth_estimateGas keeps no gas limit");
+        assert_eq!(lines[2]["params"][1], "latest");
+        assert_eq!(lines[3]["params"][2], serde_json::json!({"tracer": "callTracer"}));
+        assert_eq!(lines[4]["params"][2], serde_json::json!({"tracer": "prestateTracer"}));
+        assert_eq!(lines[5]["params"][1], serde_json::json!(["trace"]));
+        assert_eq!(lines[5]["params"][2], "latest");
+        assert_eq!(lines[6]["params"][1], serde_json::json!(["trace", "stateDiff"]));
+
+        for line in &lines {
+            assert_eq!(line["meta"]["block"], 42);
+            assert_eq!(line["meta"]["index"], 0);
+            assert_eq!(
+                line["meta"]["hash"],
+                "0x3333333333333333333333333333333333333333333333333333333333333333"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn traces_format_emits_the_documented_parameter_layouts() {
+        let methods = ExtractFormat::Traces.available_methods();
+        let lines =
+            write_block(corpus_block(ExtractFormat::Traces), ExtractFormat::Traces, methods).await;
+
+        let emitted = lines.iter().map(|line| line["method"].as_str().unwrap()).collect::<Vec<_>>();
+        assert_eq!(
+            emitted,
+            vec![
+                "debug_traceTransaction",
+                "debug_traceTransaction",
+                "trace_transaction",
+                "trace_replayTransaction",
+                "debug_traceBlockByNumber",
+                "trace_block",
+            ]
+        );
+
+        let hash = "0x3333333333333333333333333333333333333333333333333333333333333333";
+        assert_eq!(lines[0]["params"], serde_json::json!([hash, {"tracer": "callTracer"}]));
+        assert_eq!(
+            lines[1]["params"],
+            serde_json::json!([
+                hash,
+                {"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}}
+            ])
+        );
+        assert_eq!(lines[2]["params"], serde_json::json!([hash]));
+        assert_eq!(lines[3]["params"], serde_json::json!([hash, ["trace", "stateDiff"]]));
+        assert_eq!(lines[4]["params"], serde_json::json!(["0x2a", {"tracer": "callTracer"}]));
+        assert_eq!(lines[5]["params"], serde_json::json!(["0x2a"]));
+
+        // Block records address a block, not a transaction.
+        assert_eq!(lines[5]["meta"], serde_json::json!({"block": 42}));
+    }
+
+    #[test]
+    fn resolve_methods_defaults_per_format() {
+        assert_eq!(resolve_methods(ExtractFormat::Calls, &[]).unwrap(), vec![CallMethod::EthCall]);
+        assert_eq!(
+            resolve_methods(ExtractFormat::Traces, &[]).unwrap(),
+            vec![CallMethod::DebugTraceTransaction, CallMethod::TraceTransaction]
+        );
+        assert!(resolve_methods(ExtractFormat::Blocks, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_methods_normalizes_order_and_duplicates() {
+        let requested =
+            ["trace_call".to_string(), "eth_call".to_string(), "trace_call".to_string()];
+        assert_eq!(
+            resolve_methods(ExtractFormat::Calls, &requested).unwrap(),
+            vec![CallMethod::EthCall, CallMethod::TraceCall]
+        );
+    }
+
+    #[test]
+    fn resolve_methods_rejects_methods_a_format_cannot_emit() {
+        let error = resolve_methods(ExtractFormat::Calls, &["trace_block".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("trace_block"), "{error}");
+        assert!(error.contains("eth_call"), "{error}");
+
+        assert!(resolve_methods(ExtractFormat::Blocks, &["eth_call".to_string()]).is_err());
     }
 }
