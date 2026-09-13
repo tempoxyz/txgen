@@ -256,9 +256,9 @@ fn resolve_top_gas(format: ExtractFormat, top_gas: Option<usize>) -> Result<Opti
     match top_gas {
         None => Ok(None),
         Some(_) if !format.is_corpus() => {
-            bail!("--top-gas applies to --format calls and --format traces only")
+            Err(eyre::eyre!("--top-gas applies to --format calls and --format traces only"))
         }
-        Some(0) => bail!("--top-gas must be greater than zero"),
+        Some(0) => Err(eyre::eyre!("--top-gas must be greater than zero")),
         Some(limit) => Ok(Some(limit)),
     }
 }
