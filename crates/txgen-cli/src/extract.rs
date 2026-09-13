@@ -1493,8 +1493,13 @@ mod tests {
                 "trace_replayTransaction",
                 "debug_traceBlockByNumber",
                 "trace_block",
+                "trace_replayBlockTransactions",
             ]
         );
+        let replay_block =
+            lines.iter().find(|line| line["method"] == "trace_replayBlockTransactions").unwrap();
+        assert_eq!(replay_block["params"], serde_json::json!(["0x2a", ["trace", "stateDiff"]]));
+        assert_eq!(replay_block["meta"]["label"], "trace+stateDiff");
 
         let hash = "0x3333333333333333333333333333333333333333333333333333333333333333";
         assert_eq!(lines[0]["params"], serde_json::json!([hash, {"tracer": "callTracer"}]));
