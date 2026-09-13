@@ -672,9 +672,9 @@ impl ReplayRecorder {
         *state.dropped.entry(key.method).or_default() += 1;
     }
 
-    /// Consume the recorder and return the collected rows and counters.
-    pub fn finish(self) -> ReplayResults {
-        let mut state = self.state.into_inner().unwrap_or_else(|err| err.into_inner());
+    /// Take the collected rows and counters, leaving the recorder empty.
+    pub fn finish(&self) -> ReplayResults {
+        let mut state = std::mem::take(&mut *self.lock());
         state.open_loop.sort_by_key(|row| (row.offset_ms, row.record_index));
         state.closed_loop.sort_by_key(|row| (row.record_index, row.pass));
 

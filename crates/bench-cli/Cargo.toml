@@ -39,6 +39,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", 
 # misc
 eyre.workspace = true
 humantime = "2"
+rand.workspace = true
 reqwest = { version = "0.13", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

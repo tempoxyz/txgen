@@ -6,7 +6,7 @@
 //! - ClickHouse (for time-series storage)
 
 use crate::{
-    call::CallReport,
+    call::{CallReport, MethodStats},
     clickhouse::ClickHouseClient,
     metrics::{BenchMetrics, BlockStats, RunStats, ThroughputSample, TimeSeriesMetrics},
     receipt_clickhouse::{insert_receipt_gas_records, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE},
@@ -176,6 +176,79 @@ impl<W: Write + Send> ConsoleReporter<W> {
     pub fn new(writer: W, show_progress: bool) -> Self {
         Self { writer, show_progress }
     }
+
+    /// Render an RPC corpus replay.
+    fn write_call_report(&mut self, call: &CallReport) -> Result<()> {
+        writeln!(self.writer)?;
+        writeln!(self.writer, "═══════════════════════════════════════")?;
+        writeln!(self.writer, "             RPC Corpus Replay")?;
+        writeln!(self.writer, "═══════════════════════════════════════")?;
+        writeln!(self.writer)?;
+        writeln!(self.writer, "  Phase:           {:>10}", call.phase)?;
+        writeln!(self.writer, "  Records:         {:>10}", call.corpus.records)?;
+        writeln!(
+            self.writer,
+            "  Chain / head:    {:>10} / {}",
+            call.identity.chain_id, call.identity.head
+        )?;
+        writeln!(self.writer)?;
+
+        self.write_call_stats("Total", &call.totals)?;
+        if call.methods.len() > 1 {
+            for (method, stats) in &call.methods {
+                self.write_call_stats(method, stats)?;
+            }
+        }
+
+        if call.nondeterministic_total > 0 {
+            writeln!(self.writer, "  Nondeterministic records: {}", call.nondeterministic_total)?;
+        }
+
+        writeln!(self.writer, "═══════════════════════════════════════")?;
+        Ok(())
+    }
+
+    fn write_call_stats(&mut self, name: &str, stats: &MethodStats) -> Result<()> {
+        writeln!(self.writer, "  {name}")?;
+        writeln!(
+            self.writer,
+            "    Requests:      {:>10}  (ok {}, rpc_error {}, failed {}, dropped {})",
+            stats.requests,
+            stats.statuses.ok,
+            stats.statuses.rpc_error,
+            stats.statuses.failed(),
+            stats.dropped
+        )?;
+        if let Some(latency) = &stats.open_loop.latency {
+            writeln!(
+                self.writer,
+                "    Open loop:     {:>10.2} req/s  p50 {:.2}ms  p90 {:.2}ms  p99 {:.2}ms",
+                stats.open_loop.rps,
+                latency.p50_ms,
+                latency.p90_ms.unwrap_or_default(),
+                latency.p99_ms
+            )?;
+        }
+        if let Some(latency) = &stats.closed_loop.latency {
+            writeln!(
+                self.writer,
+                "    Closed loop:   {:>10.2} req/s  p50 {:.2}ms  p90 {:.2}ms  p99 {:.2}ms",
+                stats.closed_loop.rps,
+                latency.p50_ms,
+                latency.p90_ms.unwrap_or_default(),
+                latency.p99_ms
+            )?;
+        }
+        if stats.response_bytes.records > 0 {
+            writeln!(
+                self.writer,
+                "    Response size: {:>10} bytes median over {} records",
+                stats.response_bytes.median, stats.response_bytes.records
+            )?;
+        }
+        writeln!(self.writer)?;
+        Ok(())
+    }
 }
 
 impl<W: Write + Send> Reporter for ConsoleReporter<W> {
@@ -221,6 +294,10 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
     }
 
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
+        if let Some(call) = &report.call {
+            return self.write_call_report(call);
+        }
+
         let has_send_metrics = report.bench_metrics.is_some();
         let has_block_data = report.run_stats.is_some();
 
