@@ -211,7 +211,8 @@ txgen-ethereum extract --rpc http://localhost:8545 --from 1000 --to 2000 \
 | `-o, --output <PATH>` | Output file (default: stdout) |
 | `--buffer-size <N>` | Number of blocks to prefetch ahead (default: 20) |
 | `--bal` | Include RLP-encoded block access lists in the `bal` field |
-| `--format <FORMAT>` | Output `blocks` (default) or `transactions`; transaction output is accepted by `bench send` |
+| `--format <FORMAT>` | Output `blocks` (default), `transactions`, `calls`, or `traces`; transaction output is accepted by `bench send`, corpus output by `bench call` |
+| `--methods <a,b>` | Methods to emit for `calls` and `traces` (see below) |
 
 `--format transactions` preserves source block and transaction order. Transactions from different
 senders may be submitted concurrently by `bench send`; transactions from the same sender use a
@@ -219,6 +220,62 @@ shared scheduling key and are submitted in order. The target node must be at the
 before the replay range and configured to build blocks.
 
 **Required RPC methods:** `debug_getRawBlock`; with `--bal`: `eth_getBlockAccessListByBlockNumber`
+
+##### `--format calls`
+
+Turns each transaction of the block range into a read-only call against `latest`, as a replay
+corpus for [`bench call`](#bench-call). The call object carries the recovered sender as `from`, the
+transaction's `to` (omitted for contract creations), its gas limit, value and input, and its access
+list and EIP-7702 authorization list when those are non-empty. It carries no fee fields at all and
+no blob fields, so the call runs at a zero gas price on any node and a blob transaction replays as
+its plain call. Pinning the gas limit to the source transaction's keeps the result independent of
+the node's configured gas cap, which a contract that reads `gasleft()` would otherwise observe.
+
+Point the range at the blocks after the node's head: those transactions are exactly the calls a
+mempool-simulating client would have made against the head state. Some of them revert because they
+depend on an earlier block in the range; a revert is deterministic and counts as a response.
+
+```bash
+# A corpus of eth_call records from the 20 blocks after the node's head
+txgen-ethereum extract --rpc http://archive:8545 --from 25490001 --to 25490020 \
+  --format calls -o corpus.jsonl
+
+# Both debug_traceCall tracers from the same transactions
+txgen-ethereum extract --rpc http://archive:8545 --from 25490001 --to 25490020 \
+  --format calls --methods debug_traceCall -o traces.jsonl
+```
+
+| Method | Emitted parameters |
+|--------|--------------------|
+| `eth_call` (default) | `[call, "latest"]` |
+| `eth_estimateGas` | `[call without gas, "latest"]` |
+| `eth_createAccessList` | `[call, "latest"]` |
+| `debug_traceCall` | `[call, "latest", {"tracer":"callTracer"}]` and `[call, "latest", {"tracer":"prestateTracer"}]` |
+| `trace_call` | `[call, ["trace"], "latest"]` and `[call, ["trace","stateDiff"], "latest"]` |
+
+##### `--format traces`
+
+Emits a corpus addressing the transactions and blocks themselves, so the records replay real chain
+history. Point the range at blocks the node still has state for.
+
+```bash
+txgen-ethereum extract --rpc http://localhost:8545 --from 25489981 --to 25490000 \
+  --format traces --methods debug_traceTransaction,trace_transaction -o corpus.jsonl
+```
+
+| Method | Emitted parameters |
+|--------|--------------------|
+| `debug_traceTransaction` (default) | `[hash, {"tracer":"callTracer"}]` and `[hash, {"tracer":"prestateTracer","tracerConfig":{"diffMode":true}}]` |
+| `trace_transaction` (default) | `[hash]` |
+| `trace_replayTransaction` | `[hash, ["trace","stateDiff"]]` |
+| `debug_traceBlockByNumber` | `[number, {"tracer":"callTracer"}]` |
+| `trace_block` | `[number]` |
+
+Both corpus formats write one JSON object per line with `method`, `params` and an opaque `meta`
+holding `{block, index, hash}` for transaction records and `{block}` for block records. One
+transaction contributes one record per method and tracer, all sharing the same `meta`. Records are
+written in block order and in the fixed method order of the tables above, so the same range and the
+same source produce the same corpus regardless of how `--methods` was ordered.
 
 #### `extract-big-blocks`
 
@@ -368,6 +425,119 @@ bench send-blocks \
 For `send-blocks`, aggregate run rates use benchmark wall-clock duration. Per-block timestamps remain the original chain timestamps from the input. With `--reorg`, canonical block stats remain canonical-only, but the wall-clock duration includes synthetic fork block build/submission work.
 
 **Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API). Big-block inputs require a `reth-bb` compatible node. `--reorg` additionally requires `testing_buildBlockV1` on the regular HTTP RPC endpoint. Because synthetic forks intentionally omit transactions, start Reth with `--http --http.api eth,testing --testing.skip-invalid-transactions`. `--rpc-url` and `--local-rpc-url` are accepted as backwards-compatible aliases for `--rpc`.
+
+#### `bench call`
+
+Replay a corpus of read-only RPC requests against a node and report latency, throughput and a
+response digest per record. Built for comparing two builds of the same node: run it against each
+one and the digests say whether any response changed byte for byte, while the latency distributions
+say whether it got slower.
+
+Two phases run against the same corpus and report separately. The open-loop cell paces requests at
+`--rps` regardless of how fast the node answers and counts anything that would exceed
+`--max-concurrent` as dropped rather than delaying it, so the offered rate stays the configured one
+and queueing shows up as latency. The closed-loop passes walk the corpus in order with `--concurrency`
+workers, which measures per-call service time. Set `--rps 0` or `--passes 0` to run only the other.
+
+```bash
+# Warm the node, then measure
+bench call --input corpus.jsonl --rpc-url http://localhost:8545 \
+  --phase warmup --rps 200 --duration 60s
+
+bench call --input corpus.jsonl --rpc-url http://localhost:8545 \
+  --responses responses.ndjson \
+  --record-csv record_timings.csv \
+  --requests-csv requests.csv \
+  --report json:report.json
+
+# Replay captured traffic that names blocks this node does not have
+bench call --input captured.jsonl.gz --block-tag latest --strip-fees \
+  --methods eth_call,eth_estimateGas --timeout 120s
+```
+
+| Flag | Description |
+|------|-------------|
+| `-i, --input <PATH>` | Corpus file, NDJSON or gzip-compressed NDJSON |
+| `--rpc-url <URL>` | RPC endpoint (default: `http://localhost:8545`) |
+| `--phase <PHASE>` | `measure` (default) or `warmup` |
+| `--rps <N>` | Open-loop target rate (default: 100; 0 skips the phase) |
+| `--duration <DUR>` | Open-loop wall clock (default: 120s) |
+| `--requests <N>` | Fixed open-loop request count instead of `--duration` |
+| `--max-concurrent <N>` | Open-loop in-flight cap (default: 256) |
+| `--passes <N>` | Closed-loop passes over the corpus (default: 20; 0 skips the phase) |
+| `--concurrency <N>` | Closed-loop workers (default: 16) |
+| `--seed <N>` | Seed of the open-loop record sequence (default: 1) |
+| `--block-tag <TAG>` | Replace the block parameter of every record that has a rewritable one |
+| `--strip-fees` | Drop fee fields from the call object of call-shaped records |
+| `--methods <a,b>` | Replay only these methods; other records are skipped and counted |
+| `--timeout <DUR>` | Per-request timeout (default: 30s; raise it for tracing corpora) |
+| `--responses <PATH>` | Write per-record response digests as NDJSON |
+| `--record-csv <PATH>` | Write closed-loop per-record timings as CSV |
+| `--requests-csv <PATH>` | Write open-loop per-request timings as CSV |
+| `--max-fail-rate-pct <F>` | Exit non-zero above this HTTP and transport failure rate (default: 1.0) |
+| `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
+| `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
+| `--metrics-url <URL or NODE:URL,...>` | Prometheus endpoint(s) to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
+| `--scrape-interval-ms <N>` | Scrape interval in milliseconds (default: 500) |
+| `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp |
+| `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url` |
+
+**Required RPC methods:** `eth_chainId` and `eth_getBlockByNumber` for the identity check, plus
+whichever of the corpus methods below the corpus uses.
+
+##### Corpus format
+
+One JSON object per line, `.jsonl` or `.jsonl.gz`. `params` is sent as is; `meta` is optional and
+opaque, and its `block` and `index` are passed through to the outputs.
+
+```json
+{"method":"eth_call","params":[{"from":"0x..","to":"0x..","gas":"0x5208","input":"0x.."},"latest"],"meta":{"block":25490001,"index":3}}
+```
+
+A record's identity is its 1-based line number, which every output row keys on. A corpus may mix
+methods; the open-loop rate then applies to the stream as a whole, so replaying one class of method
+per run keeps the rate meaningful. `txgen extract --format calls` and `--format traces` produce this
+format, and captured traffic is accepted verbatim as long as it parses and every method is on the
+allowlist:
+
+| Method | Call object | Block parameter |
+|--------|-------------|-----------------|
+| `eth_call`, `eth_estimateGas`, `eth_createAccessList` | `params[0]` | `params[1]` |
+| `debug_traceCall` | `params[0]` | `params[1]` |
+| `trace_call` | `params[0]` | `params[2]` |
+| `debug_traceTransaction`, `trace_transaction`, `trace_replayTransaction` | none | none |
+| `debug_traceBlockByNumber`, `trace_block` | none | `params[0]`, never rewritten |
+
+`--block-tag` replaces the block parameter of every record that has a rewritable one, which is what
+makes captured traffic replayable against a node that does not have the original blocks.
+`--strip-fees` removes `gasPrice`, `maxFeePerGas`, `maxPriorityFeePerGas` and `maxFeePerBlobGas`
+from the top-level call object only. Both rewrites are off by default and both are recorded in the
+report.
+
+##### Outputs
+
+`responses.ndjson` carries one row per record: `{"record_index":1,"method":"eth_call","kind":"ok",
+"digest":"0x..","len":1152}`. The digest is `keccak256` of the raw `result` bytes exactly as
+received, with no re-serialisation or normalisation, so whitespace and key order are part of the
+comparison; a JSON-RPC error digests its code and message instead and is tagged `rpc_error`.
+Responses are hashed as they stream in, so a trace response of tens of megabytes costs a fixed
+amount of memory. `len` is the number of bytes digested, which is how a response-size change shows
+up even when a parity break is intentional.
+
+The reference digest for a record is the one from the first closed-loop pass. If a later pass or
+the open-loop cell disagrees, the record is counted under `nondeterministic` with its index: that is
+the node or the corpus being nondeterministic inside a single run, and it makes any cross-run
+comparison of that record inconclusive.
+
+`record_timings.csv` is `record_index,method,pass,latency_us,status` and `requests.csv` is
+`offset_ms,record_index,method,latency_us,status`, where `status` is one of `ok`, `rpc_error`,
+`http_error`, `transport_error` or `timeout`. The JSON report adds a `call` section with the corpus
+counts, the node identity, the replay configuration, the open-loop latency block, `closed_loop_rps`,
+per-status counts and the nondeterministic list, all repeated per method under `call.methods`.
+
+Request and response bodies are never logged or written to any output at any log level. Failures are
+reported as counts and record indexes, which is what makes a corpus of third-party traffic usable in
+a public CI log.
 
 #### `bench view`
 
@@ -1813,7 +1983,7 @@ Summary of which RPC methods are required by each feature:
 
 | RPC Method | Required By |
 |------------|-------------|
-| `eth_chainId` | `scenario run` (`chain_id: auto` and explicit-ID validation) |
+| `eth_chainId` | `bench call` (identity check), `scenario run` (`chain_id: auto` and explicit-ID validation) |
 | `eth_getTransactionCount` | `txgen-ethereum generate --rpc`, `txgen-tempo generate --rpc`, `scenario run` (query RPC; pending nonce initialization) |
 | `eth_getStorageAt` | `txgen-tempo scenario run` (Tempo parallel nonce lanes) |
 | `eth_sendRawTransaction` | `bench send`, `scenario run` (workload setup and `submit`), optionally sender-authenticated |
@@ -1821,9 +1991,12 @@ Summary of which RPC methods are required by each feature:
 | `eth_getTransactionReceipt` | `scenario run` (workload setup, `submit await: receipt`, `wait_receipt`, and transaction-hash `wait_log`), optionally sender-authenticated |
 | `eth_getBlockReceipts` | Shared setup/sequence inclusion tracking in `bench send`, inclusion-key tracking in `scenario run`, and `bench send --collect-receipt-metrics` (post-run non-system receipt gas and fee metrics) |
 | `eth_blockNumber` | `bench send` (query RPC when configured; benchmark block range and shared inclusion tracking), `scenario run` (`checkpoint`, confirmations, and block-range log polling) |
-| `eth_getBlockByNumber` | `bench send` (query RPC when configured; per-block stats collection), `scenario run` (`checkpoint`) |
+| `eth_getBlockByNumber` | `bench send` (query RPC when configured; per-block stats collection), `bench call` (identity check), `scenario run` (`checkpoint`) |
 | `eth_getLogs` | `scenario run` (block-range `wait_log`) |
-| `eth_call` | `txgen-tempo scenario run` (`prepare_encrypted_deposit` and other adapter `invoke` actions) |
+| `eth_call` | `bench call` (when the corpus uses it), `txgen-tempo scenario run` (`prepare_encrypted_deposit` and other adapter `invoke` actions) |
+| `eth_estimateGas`, `eth_createAccessList` | `bench call` (when the corpus uses them) |
+| `debug_traceCall`, `debug_traceTransaction`, `debug_traceBlockByNumber` | `bench call` (when the corpus uses them) |
+| `trace_call`, `trace_transaction`, `trace_replayTransaction`, `trace_block` | `bench call` (when the corpus uses them) |
 | `debug_getRawBlock` | `txgen extract`, `txgen-ethereum extract-big-blocks` |
 | `eth_getBlockAccessListByBlockNumber` | `txgen extract --bal`, `txgen-ethereum extract-big-blocks --bal` |
 | `reth_newPayload` | `bench send-blocks` |
@@ -1831,7 +2004,7 @@ Summary of which RPC methods are required by each feature:
 | `testing_buildBlockV1` | `bench send-blocks --reorg` |
 | `txpool_status` | `bench send` (query RPC when configured; pool drain wait) |
 
-> **Note:** `debug_*` methods require a node with the debug namespace enabled (typically archive nodes). `reth_*` methods are custom reth Engine API extensions.
+> **Note:** `debug_*` methods require a node with the debug namespace enabled (typically archive nodes), and `trace_*` methods the trace namespace. `reth_*` methods are custom reth Engine API extensions.
 
 ## Examples
 
@@ -1860,7 +2033,7 @@ txgen/
 │   ├── txgen-cli/        # Shared CLI framework and NetworkAdapter trait
 │   ├── txgen-ethereum/   # Ethereum binary: legacy, eip2930, eip1559
 │   ├── txgen-tempo/      # Tempo binary: 0x76 + delegates to ethereum
-│   ├── bench-core/       # Benchmarking: metrics, sender, reporters
+│   ├── bench-core/       # Benchmarking: metrics, sender, reporters, replay corpus
 │   └── bench-cli/        # Bench CLI binary (bench)
 └── examples/             # Example workload specs
 ```
