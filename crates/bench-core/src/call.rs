@@ -11,7 +11,7 @@
 //! This module owns the pieces that are independent of how requests are
 //! scheduled: the method allowlist and its parameter-position table, the
 //! optional request rewrites, the streaming response digest, and the
-//! per-method accounting that both replay phases feed.
+//! per-key accounting that both replay phases feed.
 //!
 //! Request and response bodies are never logged or written to any output.
 //! Diagnostics identify records by their 1-based line number so a corpus of
@@ -25,12 +25,18 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::{BufRead, BufReader, Read},
     path::Path,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 /// Maximum bytes of a JSON-RPC `error` member retained for digesting.
 const MAX_ERROR_CAPTURE: usize = 64 * 1024;
+
+/// The shape a `meta.label` must have, as documented in errors.
+const LABEL_PATTERN: &str = "^[A-Za-z0-9._+:-]{1,48}$";
+
+/// Maximum length of a `meta.label`.
+const MAX_LABEL_LEN: usize = 48;
 
 /// Maximum length of a member key tracked while scanning a response.
 const MAX_KEY_LEN: usize = 32;
@@ -47,8 +53,8 @@ const FEE_FIELDS: [&str; 4] =
 #[derive(Debug, Default)]
 pub struct Corpus {
     records: Vec<CorpusRecord>,
-    counts: BTreeMap<CallMethod, usize>,
-    skipped: BTreeMap<CallMethod, usize>,
+    counts: BTreeMap<Arc<str>, usize>,
+    skipped: BTreeMap<Arc<str>, usize>,
 }
 
 impl Corpus {
@@ -94,8 +100,11 @@ impl Corpus {
                 bail!("corpus line {line_number}: unsupported method `{}`", raw.method);
             };
 
+            let meta = raw.meta.unwrap_or_default();
+            let key = reporting_key(line_number, method, meta.label.as_deref())?;
+
             if !options.replays(method) {
-                *corpus.skipped.entry(method).or_default() += 1;
+                *corpus.skipped.entry(key).or_default() += 1;
                 continue;
             }
 
@@ -104,15 +113,15 @@ impl Corpus {
             };
             options.rewrite(method, &mut params);
 
-            let meta = raw.meta.unwrap_or_default();
+            *corpus.counts.entry(key.clone()).or_default() += 1;
             corpus.records.push(CorpusRecord {
                 record_index: line_number,
                 method,
+                key,
                 body: request_body(line_number, method, &params)?,
                 meta_block: meta.block,
                 meta_index: meta.index,
             });
-            *corpus.counts.entry(method).or_default() += 1;
         }
 
         Ok(corpus)
@@ -133,13 +142,13 @@ impl Corpus {
         self.records.is_empty()
     }
 
-    /// Retained record count per method.
-    pub fn counts_per_method(&self) -> &BTreeMap<CallMethod, usize> {
+    /// Retained record count per reporting key.
+    pub fn counts_per_method(&self) -> &BTreeMap<Arc<str>, usize> {
         &self.counts
     }
 
-    /// Record count per method dropped by the `--methods` filter.
-    pub fn skipped_per_method(&self) -> &BTreeMap<CallMethod, usize> {
+    /// Record count per reporting key dropped by the `--methods` filter.
+    pub fn skipped_per_method(&self) -> &BTreeMap<Arc<str>, usize> {
         &self.skipped
     }
 
@@ -166,6 +175,9 @@ pub struct CorpusRecord {
     pub record_index: usize,
     /// The allowlisted method this record replays.
     pub method: CallMethod,
+    /// The key this record is reported under: the method name, or
+    /// `method:label` when the record carries a `meta.label`.
+    pub key: Arc<str>,
     /// `meta.block` passed through from the corpus, when present.
     pub meta_block: Option<u64>,
     /// `meta.index` passed through from the corpus, when present.
@@ -609,8 +621,10 @@ pub struct RequestOutcome {
 
 /// Shared accounting for both replay phases.
 ///
-/// Every counter, latency sample and output row is keyed by method, so a
-/// mixed corpus reports per method as well as in total. Digests are compared
+/// Every counter, latency sample and output row is keyed by the record's
+/// reporting key, so a mixed corpus reports per key as well as in total. Two
+/// records of the same method that carry different labels are separate keys
+/// and are never pooled. Digests are compared
 /// as they arrive: the first closed-loop pass sets each record's reference
 /// digest, and any later disagreement within the same run is reported as
 /// nondeterminism rather than silently averaged away.
@@ -628,7 +642,7 @@ impl ReplayRecorder {
         let records = corpus
             .records()
             .iter()
-            .map(|record| RecordKey { record_index: record.record_index, method: record.method })
+            .map(|record| RecordKey { record_index: record.record_index, key: record.key.clone() })
             .collect::<Vec<_>>();
         let state = RecorderState { references: vec![None; records.len()], ..Default::default() };
         Self { records, max_nondeterministic, state: Mutex::new(state) }
@@ -638,12 +652,12 @@ impl ReplayRecorder {
     ///
     /// `slot` is the record's position in the loaded corpus.
     pub fn record_open_loop(&self, slot: usize, offset_ms: u64, outcome: RequestOutcome) {
-        let key = self.records[slot];
+        let key = &self.records[slot];
         let mut state = self.lock();
         state.open_loop.push(OpenLoopRow {
             offset_ms,
             record_index: key.record_index,
-            method: key.method,
+            method: key.key.clone(),
             latency_us: outcome.latency.as_micros() as u64,
             status: outcome.status,
         });
@@ -652,11 +666,11 @@ impl ReplayRecorder {
 
     /// Record one closed-loop request from `pass` (0-based).
     pub fn record_closed_loop(&self, slot: usize, pass: u32, outcome: RequestOutcome) {
-        let key = self.records[slot];
+        let key = &self.records[slot];
         let mut state = self.lock();
         state.closed_loop.push(ClosedLoopRow {
             record_index: key.record_index,
-            method: key.method,
+            method: key.key.clone(),
             pass,
             latency_us: outcome.latency.as_micros() as u64,
             status: outcome.status,
@@ -667,9 +681,9 @@ impl ReplayRecorder {
     /// Record an open-loop request that was never issued because it would
     /// have exceeded `--max-concurrent`.
     pub fn record_dropped(&self, slot: usize) {
-        let key = self.records[slot];
+        let key = self.records[slot].key.clone();
         let mut state = self.lock();
-        *state.dropped.entry(key.method).or_default() += 1;
+        *state.dropped.entry(key).or_default() += 1;
     }
 
     /// Take the collected rows and counters, leaving the recorder empty.
@@ -685,7 +699,7 @@ impl ReplayRecorder {
             .filter_map(|(key, reference)| {
                 reference.as_ref().map(|reference| ResponseRow {
                     record_index: key.record_index,
-                    method: key.method,
+                    method: key.key.clone(),
                     kind: reference.kind,
                     digest: reference.digest,
                     len: reference.len,
@@ -721,7 +735,7 @@ impl ReplayRecorder {
         let Some(response) = outcome.response else {
             return;
         };
-        let key = self.records[slot];
+        let key = &self.records[slot];
         let reference =
             Reference { kind: response.kind, digest: response.digest, len: response.len as u64 };
 
@@ -732,7 +746,7 @@ impl ReplayRecorder {
                 if state.nondeterministic.len() < self.max_nondeterministic {
                     state.nondeterministic.push(Nondeterministic {
                         record_index: key.record_index,
-                        method: key.method.as_str().to_string(),
+                        method: key.key.to_string(),
                     });
                 }
                 if !authoritative {
@@ -755,8 +769,8 @@ pub struct ReplayResults {
     pub closed_loop: Vec<ClosedLoopRow>,
     /// Reference digest per record that was answered at least once.
     pub responses: Vec<ResponseRow>,
-    /// Open-loop requests dropped at the concurrency cap, per method.
-    pub dropped: BTreeMap<CallMethod, u64>,
+    /// Open-loop requests dropped at the concurrency cap, per reporting key.
+    pub dropped: BTreeMap<Arc<str>, u64>,
     /// Records whose digest changed within the run, capped for reporting.
     pub nondeterministic: Vec<Nondeterministic>,
     /// Total disagreements observed, including those beyond the cap.
@@ -764,7 +778,7 @@ pub struct ReplayResults {
 }
 
 impl ReplayResults {
-    /// Build per-method and total statistics.
+    /// Build per-key and total statistics.
     ///
     /// `open_loop_secs` and `closed_loop_secs` are the wall-clock durations of
     /// the two phases, used for the achieved request rates.
@@ -773,33 +787,33 @@ impl ReplayResults {
         open_loop_secs: f64,
         closed_loop_secs: f64,
     ) -> (MethodStats, BTreeMap<String, MethodStats>) {
-        let mut builders: BTreeMap<CallMethod, StatsBuilder> = BTreeMap::new();
+        let mut builders: BTreeMap<Arc<str>, StatsBuilder> = BTreeMap::new();
         let mut total = StatsBuilder::default();
 
         for row in &self.open_loop {
-            let builder = builders.entry(row.method).or_default();
+            let builder = builders.entry(row.method.clone()).or_default();
             builder.open.push(row.status, row.latency_us);
             total.open.push(row.status, row.latency_us);
         }
         for row in &self.closed_loop {
-            let builder = builders.entry(row.method).or_default();
+            let builder = builders.entry(row.method.clone()).or_default();
             builder.closed.push(row.status, row.latency_us);
             total.closed.push(row.status, row.latency_us);
         }
         for row in &self.responses {
-            let builder = builders.entry(row.method).or_default();
+            let builder = builders.entry(row.method.clone()).or_default();
             builder.response_bytes.push(row.len);
             total.response_bytes.push(row.len);
         }
         for (method, dropped) in &self.dropped {
-            builders.entry(*method).or_default().dropped += dropped;
+            builders.entry(method.clone()).or_default().dropped += dropped;
             total.dropped += dropped;
         }
 
         let methods = builders
             .into_iter()
             .map(|(method, builder)| {
-                (method.as_str().to_string(), builder.build(open_loop_secs, closed_loop_secs))
+                (method.to_string(), builder.build(open_loop_secs, closed_loop_secs))
             })
             .collect();
         (total.build(open_loop_secs, closed_loop_secs), methods)
@@ -807,14 +821,14 @@ impl ReplayResults {
 }
 
 /// One row of `requests.csv`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct OpenLoopRow {
     /// Milliseconds from the run start to the request being issued.
     pub offset_ms: u64,
     /// The replayed record.
     pub record_index: usize,
-    /// The replayed method.
-    pub method: CallMethod,
+    /// The record's reporting key.
+    pub method: Arc<str>,
     /// Request latency in microseconds.
     pub latency_us: u64,
     /// How the request finished.
@@ -822,12 +836,12 @@ pub struct OpenLoopRow {
 }
 
 /// One row of `record_timings.csv`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ClosedLoopRow {
     /// The replayed record.
     pub record_index: usize,
-    /// The replayed method.
-    pub method: CallMethod,
+    /// The record's reporting key.
+    pub method: Arc<str>,
     /// 0-based closed-loop pass.
     pub pass: u32,
     /// Request latency in microseconds.
@@ -837,12 +851,12 @@ pub struct ClosedLoopRow {
 }
 
 /// One row of `responses.ndjson`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ResponseRow {
     /// The replayed record.
     pub record_index: usize,
-    /// The replayed method.
-    pub method: CallMethod,
+    /// The record's reporting key.
+    pub method: Arc<str>,
     /// Whether the reference response was a result or a JSON-RPC error.
     pub kind: ResponseKind,
     /// `keccak256` of the digested response bytes.
@@ -853,7 +867,7 @@ pub struct ResponseRow {
 
 impl ResponseRow {
     /// Serialize the row as one NDJSON line.
-    pub fn to_json(self) -> String {
+    pub fn to_json(&self) -> String {
         format!(
             r#"{{"record_index":{},"method":"{}","kind":"{}","digest":"0x{}","len":{}}}"#,
             self.record_index,
@@ -870,7 +884,7 @@ impl ResponseRow {
 pub struct Nondeterministic {
     /// The corpus record.
     pub record_index: usize,
-    /// The replayed method.
+    /// The record's reporting key.
     pub method: String,
 }
 
@@ -879,11 +893,11 @@ pub struct Nondeterministic {
 pub struct CorpusSummary {
     /// Records retained after method filtering.
     pub records: u64,
-    /// Retained records per method.
+    /// Retained records per reporting key.
     pub records_per_method: BTreeMap<String, u64>,
     /// Records dropped by the method filter.
     pub skipped: u64,
-    /// Dropped records per method.
+    /// Dropped records per reporting key.
     pub skipped_per_method: BTreeMap<String, u64>,
 }
 
@@ -949,7 +963,7 @@ pub struct CallReport {
     pub closed_loop_rps: f64,
     /// Counters and latencies across the whole corpus.
     pub totals: MethodStats,
-    /// Counters and latencies per method.
+    /// Counters and latencies per reporting key.
     pub methods: BTreeMap<String, MethodStats>,
     /// Records whose digest changed within the run.
     pub nondeterministic: Vec<Nondeterministic>,
@@ -957,7 +971,8 @@ pub struct CallReport {
     pub nondeterministic_total: u64,
 }
 
-/// Counters and latency distributions for one method, or for a whole corpus.
+/// Counters and latency distributions for one reporting key, or for a whole
+/// corpus.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MethodStats {
     /// Requests issued across both phases.
@@ -1208,15 +1223,15 @@ struct RecorderState {
     open_loop: Vec<OpenLoopRow>,
     closed_loop: Vec<ClosedLoopRow>,
     references: Vec<Option<Reference>>,
-    dropped: BTreeMap<CallMethod, u64>,
+    dropped: BTreeMap<Arc<str>, u64>,
     nondeterministic: Vec<Nondeterministic>,
     nondeterministic_total: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RecordKey {
     record_index: usize,
-    method: CallMethod,
+    key: Arc<str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1292,13 +1307,35 @@ struct RawRecord {
     meta: Option<RecordMeta>,
 }
 
-/// The opaque `meta` object; only `block` and `index` are passed through.
+/// The opaque `meta` object; only `block`, `index` and `label` are read.
 #[derive(Default, Deserialize)]
 struct RecordMeta {
     #[serde(default)]
     block: Option<u64>,
     #[serde(default)]
     index: Option<u64>,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// The key a record is reported under.
+///
+/// A label separates variants of the same method - one tracer from another,
+/// say - so their latencies and digests are never pooled. The label is kept
+/// out of the error text: a corpus of captured traffic must stay usable in a
+/// public log.
+fn reporting_key(line: usize, method: CallMethod, label: Option<&str>) -> Result<Arc<str>> {
+    let Some(label) = label else {
+        return Ok(Arc::from(method.as_str()));
+    };
+
+    let valid = (1..=MAX_LABEL_LEN).contains(&label.len()) &&
+        label.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._+:-".contains(&byte));
+    if !valid {
+        bail!("corpus line {line}: `meta.label` must match {LABEL_PATTERN}");
+    }
+
+    Ok(Arc::from(format!("{}:{label}", method.as_str())))
 }
 
 fn request_body(id: usize, method: CallMethod, params: &[serde_json::Value]) -> Result<String> {
@@ -1333,8 +1370,8 @@ fn digest_rpc_error(error: &[u8]) -> ResponseSummary {
     }
 }
 
-fn named_counts(counts: &BTreeMap<CallMethod, usize>) -> BTreeMap<String, u64> {
-    counts.iter().map(|(method, count)| (method.as_str().to_string(), *count as u64)).collect()
+fn named_counts(counts: &BTreeMap<Arc<str>, usize>) -> BTreeMap<String, u64> {
+    counts.iter().map(|(key, count)| (key.to_string(), *count as u64)).collect()
 }
 
 fn percentile(sorted: &[u64], p: usize) -> u64 {
@@ -1527,9 +1564,97 @@ mod tests {
 
         assert_eq!(corpus.len(), 2);
         assert_eq!(corpus.skipped(), 1);
-        assert_eq!(corpus.skipped_per_method()[&CallMethod::EthEstimateGas], 1);
+        assert_eq!(corpus.skipped_per_method()["eth_estimateGas"], 1);
         // Record identity stays the corpus line number.
         assert_eq!(corpus.records()[1].record_index, 3);
+    }
+
+    #[test]
+    fn labels_split_one_method_into_several_reporting_keys() {
+        let lines = concat!(
+            r#"{"method":"debug_traceTransaction","params":["0xaa"],"meta":{"label":"callTracer"}}"#,
+            "\n",
+            r#"{"method":"debug_traceTransaction","params":["0xaa"],"meta":{"label":"structlog"}}"#,
+            "\n",
+            r#"{"method":"debug_traceTransaction","params":["0xaa"]}"#,
+        );
+        let corpus = load(lines, &CorpusOptions::default()).unwrap();
+
+        let keys = corpus.records().iter().map(|record| &*record.key).collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                "debug_traceTransaction:callTracer",
+                "debug_traceTransaction:structlog",
+                "debug_traceTransaction",
+            ]
+        );
+        // Every record still replays the same allowlisted method.
+        assert!(corpus
+            .records()
+            .iter()
+            .all(|record| record.method == CallMethod::DebugTraceTransaction));
+        assert_eq!(corpus.summary().records_per_method.len(), 3);
+    }
+
+    #[test]
+    fn unlabelled_records_report_under_the_bare_method_name() {
+        let lines = concat!(
+            r#"{"method":"eth_call","params":[{},"latest"],"meta":{"block":1}}"#,
+            "\n",
+            r#"{"method":"eth_call","params":[{},"latest"]}"#,
+            "\n",
+            r#"{"method":"trace_block","params":["0x1"]}"#,
+        );
+        let corpus = load(lines, &CorpusOptions::default()).unwrap();
+
+        assert_eq!(
+            corpus.summary().records_per_method,
+            BTreeMap::from([("eth_call".to_string(), 2), ("trace_block".to_string(), 1)])
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_label_by_line_without_echoing_it() {
+        for label in ["", "has space", "semi;colon", &"x".repeat(49)] {
+            let lines = format!(
+                "{{\"method\":\"eth_call\",\"params\":[]}}\n{{\"method\":\"eth_call\",\"params\":[],\"meta\":{{\"label\":\"{label}\"}}}}"
+            );
+            let error = load(&lines, &CorpusOptions::default()).unwrap_err().to_string();
+
+            assert!(error.contains("corpus line 2"), "{label:?}: {error}");
+            assert!(error.contains(LABEL_PATTERN), "{label:?}: {error}");
+            assert!(!error.contains(label) || label.is_empty(), "{label:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn accepts_every_character_the_label_pattern_allows() {
+        let label = "prestateTracer.diff+2:v1-x";
+        let lines = format!(r#"{{"method":"eth_call","params":[],"meta":{{"label":"{label}"}}}}"#);
+        let corpus = load(&lines, &CorpusOptions::default()).unwrap();
+        assert_eq!(&*corpus.records()[0].key, format!("eth_call:{label}"));
+    }
+
+    #[test]
+    fn methods_filter_selects_by_the_base_method_of_a_labelled_record() {
+        let lines = concat!(
+            r#"{"method":"debug_traceCall","params":[{},"latest",{}],"meta":{"label":"structlog"}}"#,
+            "\n",
+            r#"{"method":"debug_traceCall","params":[{},"latest",{}],"meta":{"label":"callTracer"}}"#,
+            "\n",
+            r#"{"method":"eth_call","params":[{},"latest"],"meta":{"label":"plain"}}"#,
+        );
+        let options = CorpusOptions {
+            methods: Some(BTreeSet::from([CallMethod::DebugTraceCall])),
+            ..Default::default()
+        };
+        let corpus = load(lines, &options).unwrap();
+
+        assert_eq!(corpus.len(), 2);
+        assert_eq!(corpus.summary().records_per_method.len(), 2);
+        // Skipped records are counted under their own reporting key too.
+        assert_eq!(corpus.skipped_per_method()["eth_call:plain"], 1);
     }
 
     #[test]
@@ -1686,6 +1811,54 @@ mod tests {
         let results = recorder.finish();
         assert_eq!(results.responses[0].digest, B256::repeat_byte(0xbb));
         assert_eq!(results.nondeterministic_total, 1);
+    }
+
+    #[test]
+    fn stats_and_rows_carry_the_reporting_key() {
+        let corpus = load(
+            concat!(
+                r#"{"method":"debug_traceTransaction","params":["0xaa"],"meta":{"label":"callTracer"}}"#,
+                "\n",
+                r#"{"method":"debug_traceTransaction","params":["0xaa"],"meta":{"label":"structlog"}}"#,
+            ),
+            &CorpusOptions::default(),
+        )
+        .unwrap();
+        let recorder = ReplayRecorder::new(&corpus, 200);
+
+        let outcome = |digest: u8| RequestOutcome {
+            latency: Duration::from_millis(1),
+            status: RequestStatus::Ok,
+            response: Some(ResponseSummary {
+                kind: ResponseKind::Ok,
+                digest: B256::repeat_byte(digest),
+                len: 32,
+            }),
+        };
+
+        recorder.record_open_loop(0, 0, outcome(0xaa));
+        recorder.record_closed_loop(0, 0, outcome(0xaa));
+        recorder.record_closed_loop(1, 0, outcome(0xbb));
+        recorder.record_closed_loop(1, 1, outcome(0xcc));
+        recorder.record_dropped(1);
+
+        let results = recorder.finish();
+        assert_eq!(&*results.open_loop[0].method, "debug_traceTransaction:callTracer");
+        assert_eq!(&*results.closed_loop[0].method, "debug_traceTransaction:callTracer");
+        assert_eq!(&*results.responses[1].method, "debug_traceTransaction:structlog");
+        assert!(results.responses[1]
+            .to_json()
+            .contains(r#""method":"debug_traceTransaction:structlog""#));
+        assert_eq!(results.nondeterministic[0].method, "debug_traceTransaction:structlog");
+
+        let (totals, methods) = results.stats(1.0, 1.0);
+        assert_eq!(totals.requests, 4);
+        assert_eq!(
+            methods.keys().collect::<Vec<_>>(),
+            vec!["debug_traceTransaction:callTracer", "debug_traceTransaction:structlog",]
+        );
+        assert_eq!(methods["debug_traceTransaction:callTracer"].requests, 2);
+        assert_eq!(methods["debug_traceTransaction:structlog"].dropped, 1);
     }
 
     #[test]

@@ -697,6 +697,21 @@ mod tests {
         file
     }
 
+    /// A corpus of one method whose records carry different labels.
+    fn labelled_corpus_file() -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for label in ["callTracer", "structlog"] {
+            writeln!(
+                file,
+                r#"{{"method":"debug_traceTransaction","params":["0x{:064x}"],"meta":{{"label":"{label}"}}}}"#,
+                1
+            )
+            .unwrap();
+        }
+        file.flush().unwrap();
+        file
+    }
+
     fn args(url: &str, input: &Path) -> CallArgs {
         CallArgs {
             input: input.to_path_buf(),
@@ -836,5 +851,58 @@ mod tests {
         assert_eq!(first["kind"], "ok");
         assert_eq!(first["len"], 6);
         assert!(first["digest"].as_str().unwrap().starts_with("0x"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn labels_key_every_output() {
+        let server = StubServer::start(StubBehavior::Fast);
+        let file = labelled_corpus_file();
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = args(&server.url, file.path());
+        args.rps = 200;
+        args.requests = Some(4);
+        args.passes = 1;
+        args.responses = Some(dir.path().join("responses.ndjson"));
+        args.record_csv = Some(dir.path().join("record_timings.csv"));
+        args.requests_csv = Some(dir.path().join("requests.csv"));
+
+        let replay = Replay::new(&args, Arc::new(load_corpus(&args).unwrap())).unwrap();
+        let open_loop_secs = replay.run_open_loop(&args, &RunClock::new()).await.unwrap();
+        let closed_loop_secs = replay.run_closed_loop(&args).await.unwrap();
+        let results = replay.recorder.finish();
+        write_outputs(&args, &results).unwrap();
+
+        let key = |line: &str| line.split(',').nth(2).unwrap().to_string();
+        let requests = std::fs::read_to_string(args.requests_csv.unwrap()).unwrap();
+        assert!(
+            requests
+                .lines()
+                .skip(1)
+                .map(key)
+                .all(|method| method.starts_with("debug_traceTransaction:")),
+            "{requests}"
+        );
+
+        let timings = std::fs::read_to_string(args.record_csv.unwrap()).unwrap();
+        let mut replayed = timings.lines().skip(1).map(|line| line.split(',').nth(1).unwrap());
+        assert_eq!(replayed.next(), Some("debug_traceTransaction:callTracer"));
+        assert_eq!(replayed.next(), Some("debug_traceTransaction:structlog"));
+
+        let responses = std::fs::read_to_string(args.responses.unwrap()).unwrap();
+        let methods = responses
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .map(|row| row["method"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec!["debug_traceTransaction:callTracer", "debug_traceTransaction:structlog"]
+        );
+
+        let (_, per_key) = results.stats(open_loop_secs, closed_loop_secs);
+        assert_eq!(
+            per_key.keys().collect::<Vec<_>>(),
+            vec!["debug_traceTransaction:callTracer", "debug_traceTransaction:structlog"]
+        );
     }
 }
