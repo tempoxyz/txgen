@@ -63,6 +63,14 @@ pub struct ExtractArgs {
     /// emitted in a fixed method order regardless of the order given here.
     #[arg(long, value_delimiter = ',', value_name = "METHOD")]
     pub methods: Vec<String>,
+
+    /// For `--format calls` and `--format traces`, keep only the N transactions
+    /// with the highest gas limit in each block.
+    ///
+    /// Ties keep the earlier transaction, block order is preserved, and
+    /// block-level records are unaffected.
+    #[arg(long, value_name = "N")]
+    pub top_gas: Option<usize>,
 }
 
 /// Output produced by `extract`.
@@ -191,6 +199,7 @@ where
     }
 
     let methods = resolve_methods(args.format, &args.methods)?;
+    let top_gas = resolve_top_gas(args.format, args.top_gas)?;
     let provider = retrying_http_provider::<N>(&args.rpc)?;
 
     let (tx, mut rx) = mpsc::channel::<Result<FetchedBlock>>(args.buffer_size);
@@ -211,7 +220,8 @@ where
                 .wrap_err_with(|| format!("failed to create output file: {}", path.display()))?;
             let mut writer = std::io::BufWriter::new(file);
             let result =
-                write_extracted_blocks(&mut rx, &mut writer, total, format, &methods).await;
+                write_extracted_blocks(&mut rx, &mut writer, total, format, &methods, top_gas)
+                    .await;
             if let Ok(item_count) = &result {
                 match format {
                     ExtractFormat::Blocks => {
@@ -231,12 +241,26 @@ where
         }
         None => {
             let mut writer = std::io::stdout();
-            write_extracted_blocks(&mut rx, &mut writer, total, format, &methods).await.map(|_| ())
+            write_extracted_blocks(&mut rx, &mut writer, total, format, &methods, top_gas)
+                .await
+                .map(|_| ())
         }
     };
 
     fetch_handle.await?;
     write_result
+}
+
+/// Validate `--top-gas` against the format.
+fn resolve_top_gas(format: ExtractFormat, top_gas: Option<usize>) -> Result<Option<usize>> {
+    match top_gas {
+        None => Ok(None),
+        Some(_) if !format.is_corpus() => {
+            bail!("--top-gas applies to --format calls and --format traces only")
+        }
+        Some(0) => bail!("--top-gas must be greater than zero"),
+        Some(limit) => Ok(Some(limit)),
+    }
 }
 
 /// Resolve `--methods` against the methods the format can emit.
@@ -354,6 +378,7 @@ async fn write_extracted_blocks<W: Write>(
     total: u64,
     format: ExtractFormat,
     methods: &[CallMethod],
+    top_gas: Option<usize>,
 ) -> Result<u64> {
     let start = std::time::Instant::now();
     let mut last_log = start;
@@ -398,7 +423,7 @@ async fn write_extracted_blocks<W: Write>(
                 }
             }
             ExtractFormat::Calls | ExtractFormat::Traces => {
-                item_count += write_corpus_records(&mut *writer, &block, methods)?;
+                item_count += write_corpus_records(&mut *writer, &block, methods, top_gas)?;
             }
         }
         count += 1;
@@ -431,6 +456,7 @@ struct FetchedTransaction {
     raw: Bytes,
     signer: Address,
     hash: B256,
+    gas_limit: u64,
     call: Option<CallObject>,
 }
 
@@ -439,10 +465,11 @@ fn write_corpus_records<W: Write>(
     writer: &mut W,
     block: &FetchedBlock,
     methods: &[CallMethod],
+    top_gas: Option<usize>,
 ) -> Result<u64> {
     let mut written = 0u64;
 
-    for (index, transaction) in block.transactions.iter().enumerate() {
+    for (index, transaction) in selected_transactions(block, top_gas) {
         let meta =
             || RecordMeta { block: block.number, index: Some(index), hash: Some(transaction.hash) };
 
@@ -475,6 +502,26 @@ fn write_corpus_records<W: Write>(
     }
 
     Ok(written)
+}
+
+/// The transactions a block contributes, in block order, optionally limited to
+/// the `top_gas` with the highest gas limit; ties keep the earlier transaction.
+fn selected_transactions(
+    block: &FetchedBlock,
+    top_gas: Option<usize>,
+) -> Vec<(usize, &FetchedTransaction)> {
+    let mut selected: Vec<(usize, &FetchedTransaction)> =
+        block.transactions.iter().enumerate().collect();
+    if let Some(limit) = top_gas &&
+        limit < selected.len()
+    {
+        selected.sort_by(|(index_a, a), (index_b, b)| {
+            b.gas_limit.cmp(&a.gas_limit).then(index_a.cmp(index_b))
+        });
+        selected.truncate(limit);
+        selected.sort_by_key(|(index, _)| *index);
+    }
+    selected
 }
 
 /// The parameter sets one transaction contributes for one method.
@@ -659,6 +706,7 @@ async fn fetch_blocks<N, P>(
                                     }
                                     _ => B256::ZERO,
                                 },
+                                gas_limit: transaction.gas_limit(),
                                 call: matches!(format, ExtractFormat::Calls)
                                     .then(|| call_object(transaction, signer)),
                             })
@@ -947,6 +995,7 @@ mod tests {
                 raw: Bytes::from_static(&[0x02, 0xca, 0xfe]),
                 signer: Address::repeat_byte(0x22),
                 hash: B256::ZERO,
+                gas_limit: 21_000,
                 call: None,
             }],
         }
@@ -960,8 +1009,26 @@ mod tests {
             raw: Bytes::new(),
             signer,
             hash: B256::repeat_byte(0x33),
+            gas_limit: 21_000,
             call: matches!(format, ExtractFormat::Calls).then(|| call_object(&transaction, signer)),
         }];
+        block
+    }
+
+    fn traces_block_with_gas_limits(gas_limits: &[u64]) -> FetchedBlock {
+        let mut block = fetched_block();
+        block.transactions = gas_limits
+            .iter()
+            .enumerate()
+            .map(|(index, gas_limit)| FetchedTransaction {
+                raw: Bytes::new(),
+                signer: Address::ZERO,
+                hash: B256::repeat_byte(0x40 + index as u8),
+                gas_limit: *gas_limit,
+                call: None,
+            })
+            .collect();
+        block.tx_count = gas_limits.len();
         block
     }
 
@@ -970,17 +1037,75 @@ mod tests {
         format: ExtractFormat,
         methods: &[CallMethod],
     ) -> Vec<Value> {
+        write_block_top_gas(block, format, methods, None).await
+    }
+
+    async fn write_block_top_gas(
+        block: FetchedBlock,
+        format: ExtractFormat,
+        methods: &[CallMethod],
+        top_gas: Option<usize>,
+    ) -> Vec<Value> {
         let (sender, mut receiver) = mpsc::channel(1);
         sender.send(Ok(block)).await.unwrap();
         drop(sender);
 
         let mut output = Vec::new();
-        write_extracted_blocks(&mut receiver, &mut output, 1, format, methods).await.unwrap();
+        write_extracted_blocks(&mut receiver, &mut output, 1, format, methods, top_gas)
+            .await
+            .unwrap();
         String::from_utf8(output)
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn top_gas_keeps_the_heaviest_transactions_in_block_order() {
+        let block = traces_block_with_gas_limits(&[21_000, 500_000, 100_000, 500_000]);
+        let lines = write_block_top_gas(
+            block,
+            ExtractFormat::Traces,
+            &[CallMethod::TraceTransaction, CallMethod::TraceBlock],
+            Some(2),
+        )
+        .await;
+
+        // The two 500k transactions win; the tie between them keeps the earlier one first,
+        // and the block-level record is still emitted.
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["meta"]["index"], 1);
+        assert_eq!(lines[0]["params"][0], format!("{}", B256::repeat_byte(0x41)));
+        assert_eq!(lines[1]["meta"]["index"], 3);
+        assert_eq!(lines[1]["params"][0], format!("{}", B256::repeat_byte(0x43)));
+        assert_eq!(lines[2]["method"], "trace_block");
+    }
+
+    #[tokio::test]
+    async fn top_gas_larger_than_the_block_keeps_every_transaction() {
+        let block = traces_block_with_gas_limits(&[21_000, 100_000]);
+        let lines = write_block_top_gas(
+            block,
+            ExtractFormat::Traces,
+            &[CallMethod::TraceTransaction],
+            Some(5),
+        )
+        .await;
+
+        assert_eq!(
+            lines.iter().map(|line| line["meta"]["index"].as_u64().unwrap()).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn top_gas_is_validated_against_the_format() {
+        assert_eq!(resolve_top_gas(ExtractFormat::Traces, Some(3)).unwrap(), Some(3));
+        assert_eq!(resolve_top_gas(ExtractFormat::Blocks, None).unwrap(), None);
+        assert!(resolve_top_gas(ExtractFormat::Blocks, Some(3)).is_err());
+        assert!(resolve_top_gas(ExtractFormat::Transactions, Some(3)).is_err());
+        assert!(resolve_top_gas(ExtractFormat::Calls, Some(0)).is_err());
     }
 
     #[tokio::test]

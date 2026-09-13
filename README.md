@@ -213,6 +213,7 @@ txgen-ethereum extract --rpc http://localhost:8545 --from 1000 --to 2000 \
 | `--bal` | Include RLP-encoded block access lists in the `bal` field |
 | `--format <FORMAT>` | Output `blocks` (default), `transactions`, `calls`, or `traces`; transaction output is accepted by `bench send`, corpus output by `bench call` |
 | `--methods <a,b>` | Methods to emit for `calls` and `traces` (see below) |
+| `--top-gas <N>` | For `calls` and `traces`: keep only the N transactions with the highest gas limit per block (ties keep the earlier one); block-level records are unaffected |
 
 `--format transactions` preserves source block and transaction order. Transactions from different
 senders may be submitted concurrently by `bench send`; transactions from the same sender use a
