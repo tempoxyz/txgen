@@ -214,6 +214,9 @@ txgen-ethereum extract --rpc http://localhost:8545 --from 1000 --to 2000 \
 | `--format <FORMAT>` | Output `blocks` (default), `transactions`, `calls`, or `traces`; transaction output is accepted by `bench send`, corpus output by `bench call` |
 | `--methods <a,b>` | Methods to emit for `calls` and `traces` (see below) |
 | `--top-gas <N>` | For `calls` and `traces`: keep only the N transactions with the highest gas limit per block (ties keep the earlier one); block-level records are unaffected |
+| `--tracer <SPEC>` | Tracer for the `debug_trace*` methods, repeatable (default: `callTracer`); see [Tracers](#tracers) |
+| `--tracer-config <JSON>` | JSON object merged as `tracerConfig` into every named-tracer record |
+| `--trace-options <JSON>` | JSON object merged into the top level of every `debug_trace*` record's tracing options |
 
 `--format transactions` preserves source block and transaction order. Transactions from different
 senders may be submitted concurrently by `bench send`; transactions from the same sender use a
@@ -241,9 +244,10 @@ depend on an earlier block in the range; a revert is deterministic and counts as
 txgen-ethereum extract --rpc http://archive:8545 --from 25490001 --to 25490020 \
   --format calls -o corpus.jsonl
 
-# Both debug_traceCall tracers from the same transactions
+# The same transactions traced with the prestate tracer in diff mode
 txgen-ethereum extract --rpc http://archive:8545 --from 25490001 --to 25490020 \
-  --format calls --methods debug_traceCall -o traces.jsonl
+  --format calls --methods debug_traceCall \
+  --tracer prestateTracer --tracer-config '{"diffMode":true}' -o traces.jsonl
 ```
 
 | Method | Emitted parameters |
@@ -251,7 +255,7 @@ txgen-ethereum extract --rpc http://archive:8545 --from 25490001 --to 25490020 \
 | `eth_call` (default) | `[call, "latest"]` |
 | `eth_estimateGas` | `[call without gas, "latest"]` |
 | `eth_createAccessList` | `[call, "latest"]` |
-| `debug_traceCall` | `[call, "latest", {"tracer":"callTracer"}]` and `[call, "latest", {"tracer":"prestateTracer"}]` |
+| `debug_traceCall` | `[call, "latest", options]`, one record per `--tracer` |
 | `trace_call` | `[call, ["trace"], "latest"]` and `[call, ["trace","stateDiff"], "latest"]` |
 
 ##### `--format traces`
@@ -262,19 +266,50 @@ history. Point the range at blocks the node still has state for.
 ```bash
 txgen-ethereum extract --rpc http://localhost:8545 --from 25489981 --to 25490000 \
   --format traces --methods debug_traceTransaction,trace_transaction -o corpus.jsonl
+
+# The call tracer and the struct logger, from the same transactions
+txgen-ethereum extract --rpc http://localhost:8545 --from 25489981 --to 25490000 \
+  --format traces --tracer callTracer --tracer structlog \
+  --trace-options '{"disableStorage":true,"disableStack":true}' -o corpus.jsonl
 ```
 
 | Method | Emitted parameters |
 |--------|--------------------|
-| `debug_traceTransaction` (default) | `[hash, {"tracer":"callTracer"}]` and `[hash, {"tracer":"prestateTracer","tracerConfig":{"diffMode":true}}]` |
+| `debug_traceTransaction` (default) | `[hash, options]`, one record per `--tracer` |
 | `trace_transaction` (default) | `[hash]` |
 | `trace_replayTransaction` | `[hash, ["trace","stateDiff"]]` |
-| `debug_traceBlockByNumber` | `[number, {"tracer":"callTracer"}]` |
+| `debug_traceBlockByNumber` | `[number, options]`, one record per `--tracer` |
 | `trace_block` | `[number]` |
 
+##### Tracers
+
+`--tracer` decides what the `debug_trace*` methods above ask the node to run, and each spec emits its
+own record. A spec is one of:
+
+| Spec | Effect | Label |
+|------|--------|-------|
+| a tracer name | sent as the `tracer` field verbatim | the name |
+| `structlog` | no `tracer` field, so the node runs its struct logger | `structlog` |
+| `js:<path>` | the file's contents are sent as the `tracer` field | `js:<file stem>` |
+
+Names are not checked against a list: to a node, an unknown tracer string is JavaScript source, so
+`callTracer`, `prestateTracer`, `flatCallTracer`, `4byteTracer`, `noopTracer` and `muxTracer` are
+all just names passed straight through. A `js:` file must exist and be non-empty.
+
+`--tracer-config` is merged as `tracerConfig` into every named-tracer record and cannot be combined
+with `structlog`, which takes its settings from `--trace-options` instead. `--trace-options` is
+merged into the top level of the tracing options object of every `debug_trace*` record, which is
+where `timeout`, `disableStorage`, `disableStack`, `enableMemory`, `enableReturnData` and `limit`
+belong; it may not carry `tracer` or `tracerConfig`, which have their own flags. So the options
+object of a record is `{tracer?, tracerConfig?, ...trace-options}`, and with no flags at all it is
+exactly `{"tracer":"callTracer"}`.
+
 Both corpus formats write one JSON object per line with `method`, `params` and an opaque `meta`
-holding `{block, index, hash}` for transaction records and `{block}` for block records. One
-transaction contributes one record per method and tracer, all sharing the same `meta`. Records are
+holding `{block, index, hash}` for transaction records and `{block}` for block records. Records that
+are one variant of a method also carry a `meta.label` naming the variant - the tracer spec for the
+`debug_trace*` methods, and the requested trace types (`trace`, `trace+stateDiff`) for `trace_call`
+and `trace_replayTransaction` - which is what keeps them apart in a replay's per-method outputs. One
+transaction contributes one record per method and variant, all sharing the same `meta`. Records are
 written in block order and in the fixed method order of the tables above, so the same range and the
 same source produce the same corpus regardless of how `--methods` was ordered.
 
@@ -495,6 +530,12 @@ opaque, and its `block` and `index` are passed through to the outputs.
 {"method":"eth_call","params":[{"from":"0x..","to":"0x..","gas":"0x5208","input":"0x.."},"latest"],"meta":{"block":25490001,"index":3}}
 ```
 
+`meta.label` is optional and names the variant a record replays, one tracer against another say. A
+record is reported under `method:label` when it has one and under `method` when it does not, and
+that key is what every per-method output is grouped by, so two tracers of the same method never pool
+their latencies or their digests. A label must match `^[A-Za-z0-9._+:-]{1,48}$`; anything else is a
+load error naming the line. `--methods` still selects by the bare method name.
+
 A record's identity is its 1-based line number, which every output row keys on. A corpus may mix
 methods; the open-loop rate then applies to the stream as a whole, so replaying one class of method
 per run keeps the rate meaningful. `txgen extract --format calls` and `--format traces` produce this
@@ -534,7 +575,11 @@ comparison of that record inconclusive.
 `offset_ms,record_index,method,latency_us,status`, where `status` is one of `ok`, `rpc_error`,
 `http_error`, `transport_error` or `timeout`. The JSON report adds a `call` section with the corpus
 counts, the node identity, the replay configuration, the open-loop latency block, `closed_loop_rps`,
-per-status counts and the nondeterministic list, all repeated per method under `call.methods`.
+per-status counts and the nondeterministic list, all repeated per method under `call.methods`. The
+`method` of every one of those - the CSV column, the `responses.ndjson` field, and the keys of
+`call.methods`, `call.corpus.records_per_method` and `call.corpus.skipped_per_method` - is the
+record's reporting key, so a labelled corpus reports `debug_traceTransaction:callTracer` and
+`debug_traceTransaction:structlog` as two separate entries.
 
 Request and response bodies are never logged or written to any output at any log level. Failures are
 reported as counts and record indexes, which is what makes a corpus of third-party traffic usable in
