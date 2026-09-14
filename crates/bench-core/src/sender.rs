@@ -726,8 +726,40 @@ impl fmt::Debug for RpcEndpoint {
     }
 }
 
+/// Worker notifications for scheduling keys and setup prerequisites.
+enum Completion {
+    Release(SchedulingKeys),
+    SetupFinished { queue_id: u64, id: Option<String>, success: bool },
+}
+
+// Report every setup exit path, including task cancellation and pre-submission errors.
+struct SetupCompletion {
+    queue_id: u64,
+    tx: mpsc::UnboundedSender<Completion>,
+    id: Option<String>,
+    success: bool,
+}
+
+impl Drop for SetupCompletion {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Completion::SetupFinished {
+            queue_id: self.queue_id,
+            id: self.id.take(),
+            success: self.success,
+        });
+    }
+}
+
+/// The immediately preceding setup transaction, used to infer receipt barriers.
+struct SetupPredecessor {
+    queue_id: u64,
+    sender: Option<Address>,
+    submission_keys: SchedulingKeys,
+}
+
 /// A transaction to be sent.
 struct PendingTx {
+    wait_for_setup: Option<u64>,
     queue_id: u64,
     phase: TxPhase,
     id: Option<String>,
@@ -754,8 +786,12 @@ pub struct Sender {
     pending: VecDeque<PendingTx>,
     /// Scheduling keys currently held by dispatched transactions.
     active_keys: HashSet<SchedulingKey>,
-    completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
-    completion_rx: mpsc::UnboundedReceiver<SchedulingKeys>,
+    completion_tx: mpsc::UnboundedSender<Completion>,
+    completion_rx: mpsc::UnboundedReceiver<Completion>,
+    previous_setup: Option<SetupPredecessor>,
+    completed_setup: HashSet<u64>,
+    in_flight_setup: usize,
+    setup_failure: Option<String>,
     /// Worker tasks for awaiting completion and reaping completed task state.
     worker_tasks: JoinSet<()>,
     /// Rate limiter tokens.
@@ -821,6 +857,10 @@ impl Sender {
             active_keys: HashSet::new(),
             completion_tx,
             completion_rx,
+            previous_setup: None,
+            completed_setup: HashSet::new(),
+            in_flight_setup: 0,
+            setup_failure: None,
             worker_tasks: JoinSet::new(),
             rate_limiter,
             max_buffered,
@@ -883,7 +923,31 @@ impl Sender {
         }
         let (submission_keys, inclusion_keys) =
             normalize_key_sets(submission_keys, inclusion_keys)?;
+        let wait_for_setup = if phase == TxPhase::Setup {
+            let predecessor = self
+                .previous_setup
+                .as_ref()
+                .filter(|previous| {
+                    // Only the same sender on the same ordered nonce lane can
+                    // pipeline safely. Expiring nonces have distinct keys; missing
+                    // sender/lane metadata is conservatively treated as a barrier.
+                    !(sender.is_some() &&
+                        sender == previous.sender &&
+                        submission_keys.len() == 1 &&
+                        submission_keys == previous.submission_keys)
+                })
+                .map(|previous| previous.queue_id);
+            self.previous_setup = Some(SetupPredecessor {
+                queue_id,
+                sender,
+                submission_keys: submission_keys.clone(),
+            });
+            predecessor
+        } else {
+            None
+        };
         self.pending.push_back(PendingTx {
+            wait_for_setup,
             queue_id,
             phase,
             id,
@@ -930,10 +994,10 @@ impl Sender {
             first_error = Some(failure.error);
         }
 
-        while !self.pending.is_empty() || !self.active_keys.is_empty() {
+        while !self.pending.is_empty() || !self.active_keys.is_empty() || self.in_flight_setup > 0 {
             match self.completion_rx.recv().await {
-                Some(keys) => {
-                    self.release_keys(&keys);
+                Some(completion) => {
+                    self.handle_completion(completion);
                     if first_error.is_none() &&
                         let Err(failure) = self.pump().await
                     {
@@ -958,8 +1022,8 @@ impl Sender {
     }
 
     fn drain_completions(&mut self) {
-        while let Ok(keys) = self.completion_rx.try_recv() {
-            self.release_keys(&keys);
+        while let Ok(completion) = self.completion_rx.try_recv() {
+            self.handle_completion(completion);
         }
         self.reap_worker_tasks();
     }
@@ -968,6 +1032,25 @@ impl Sender {
         while let Some(result) = self.worker_tasks.try_join_next() {
             if let Err(err) = result {
                 tracing::warn!(%err, "sender worker task failed");
+            }
+        }
+    }
+
+    fn handle_completion(&mut self, completion: Completion) {
+        match completion {
+            Completion::Release(keys) => self.release_keys(&keys),
+            Completion::SetupFinished { queue_id, id, success } => {
+                self.in_flight_setup -= 1;
+                if success {
+                    self.completed_setup.insert(queue_id);
+                } else {
+                    self.setup_failure.get_or_insert_with(|| {
+                        format!(
+                            "setup transaction '{}' failed; cancelling queued setup",
+                            id.as_deref().unwrap_or("<unnamed>")
+                        )
+                    });
+                }
             }
         }
     }
@@ -989,7 +1072,7 @@ impl Sender {
             }
 
             match self.completion_rx.recv().await {
-                Some(keys) => self.release_keys(&keys),
+                Some(completion) => self.handle_completion(completion),
                 None => break,
             }
         }
@@ -999,6 +1082,12 @@ impl Sender {
     async fn pump(&mut self) -> std::result::Result<(), DispatchPreparationError> {
         loop {
             self.drain_completions();
+            if let Some(error) = &self.setup_failure {
+                return Err(DispatchPreparationError {
+                    queue_id: u64::MAX,
+                    error: eyre::eyre!("{error}"),
+                });
+            }
 
             let Some(index) = self.next_ready_index() else {
                 break;
@@ -1036,6 +1125,11 @@ impl Sender {
                     // A failed `send`/`flush` must not leave this transaction
                     // queued for an implicit later submission.
                     let pending = self.pending.remove(index).expect("pending index exists");
+                    if pending.phase == TxPhase::Setup {
+                        self.setup_failure = Some(format!(
+                            "setup transaction '{id}' failed authentication; cancelling queued setup"
+                        ));
+                    }
                     return Err(DispatchPreparationError { queue_id: pending.queue_id, error });
                 }
             };
@@ -1052,7 +1146,8 @@ impl Sender {
         let mut blocked_keys = self.active_keys.clone();
 
         for (index, pending) in self.pending.iter().enumerate() {
-            let is_blocked = pending.scheduling_keys().any(|key| blocked_keys.contains(key));
+            let is_blocked = pending.scheduling_keys().any(|key| blocked_keys.contains(key)) ||
+                pending.wait_for_setup.is_some_and(|id| !self.completed_setup.contains(&id));
 
             if is_blocked {
                 for key in pending.scheduling_keys() {
@@ -1105,9 +1200,21 @@ impl Sender {
         let late_signer = self.late_signer.clone();
         let receipt_tracker = self.receipt_tracker.clone();
 
+        let setup_completion = if pending.phase == TxPhase::Setup {
+            self.in_flight_setup += 1;
+            Some(SetupCompletion {
+                queue_id: pending.queue_id,
+                tx: completion_tx.clone(),
+                id: pending.id.clone(),
+                success: false,
+            })
+        } else {
+            None
+        };
         self.worker_tasks.spawn(async move {
             submit_tx(
                 pending,
+                setup_completion,
                 endpoint,
                 submission_headers,
                 request_auth,
@@ -1155,6 +1262,7 @@ fn normalize_key_sets(
 #[allow(clippy::too_many_arguments)]
 async fn submit_tx(
     pending: PendingTx,
+    mut setup_completion: Option<SetupCompletion>,
     endpoint: RpcEndpoint,
     submission_headers: HeaderMap,
     request_auth: Option<Arc<dyn RequestAuthProvider>>,
@@ -1162,7 +1270,7 @@ async fn submit_tx(
     receipt_tracker: ReceiptTracker,
     metrics: Arc<MetricsCollector>,
     permit: OwnedSemaphorePermit,
-    completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
+    completion_tx: mpsc::UnboundedSender<Completion>,
     late_signer: Option<Arc<dyn LateSigner>>,
 ) {
     let release_all_keys = || {
@@ -1259,7 +1367,11 @@ async fn submit_tx(
     let Some(inclusion) = inclusion else { return };
 
     match inclusion.wait().await {
-        Ok(receipt) if receipt.status() => {}
+        Ok(receipt) if receipt.status() => {
+            if let Some(completion) = &mut setup_completion {
+                completion.success = true;
+            }
+        }
         Ok(_) => {
             tracing::error!(
                 id = pending.id.as_deref(),
@@ -1373,9 +1485,9 @@ fn rpc_request_error(
     }
 }
 
-fn release_keys(completion_tx: &mpsc::UnboundedSender<SchedulingKeys>, keys: SchedulingKeys) {
+fn release_keys(completion_tx: &mpsc::UnboundedSender<Completion>, keys: SchedulingKeys) {
     if !keys.is_empty() {
-        let _ = completion_tx.send(keys);
+        let _ = completion_tx.send(Completion::Release(keys));
     }
 }
 

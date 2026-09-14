@@ -508,11 +508,10 @@ where
         return Ok(MaterializedSetup { transactions, bindings });
     };
 
-    let setup_key = compute_setup_key();
     let mut output =
         OnlineSetupOutput { prepare_timeout, transactions: &mut transactions, submit: &mut submit };
     for step in &setup.steps {
-        materialize_setup_step_online(adapter, step, &mut bindings, setup_key, ctx, &mut output)
+        materialize_setup_step_online(adapter, step, &mut bindings, ctx, &mut output)
             .await
             .wrap_err_with(|| format!("failed to materialize setup step '{}'", step.id))?;
     }
@@ -530,7 +529,6 @@ async fn materialize_setup_step_online<A, F, Fut>(
     adapter: &mut A,
     step: &SetupStep,
     setup_bindings: &mut std::collections::HashMap<String, ResolvedBinding>,
-    setup_key: SchedulingKey,
     ctx: &mut BuildContext<'_>,
     output: &mut OnlineSetupOutput<'_, F>,
 ) -> Result<()>
@@ -563,12 +561,11 @@ where
             bail!("setup step `keychain_authorize_pool` produced no transactions");
         }
         for (idx, value) in templates.into_iter().enumerate() {
-            let inclusion_key = compute_setup_extension_key(&step.id, idx);
             let (generated, _) = materialize_setup_value_online(
                 adapter,
                 &format!("setup.{}[{idx}]", step.id),
                 value,
-                &[inclusion_key],
+                &[],
                 ctx,
                 output.prepare_timeout,
             )
@@ -585,7 +582,7 @@ where
             adapter,
             &format!("setup.{}", step.id),
             value,
-            &[setup_key],
+            &[],
             ctx,
             output.prepare_timeout,
         )
@@ -601,7 +598,7 @@ where
             adapter,
             &format!("setup.{}", step.id),
             materialized,
-            &[setup_key],
+            &[],
             ctx,
             output.prepare_timeout,
         )
@@ -1075,9 +1072,8 @@ where
     let mut last_progress = started;
     let total_steps = setup.steps.len();
     eprintln!("starting setup generation: steps={total_steps}");
-    let setup_key = compute_setup_key();
     for (idx, step) in setup.steps.iter().enumerate() {
-        emit_setup_step(adapter, step, &mut bindings, setup_key, ctx, writer)
+        emit_setup_step(adapter, step, &mut bindings, ctx, writer)
             .wrap_err_with(|| format!("failed to emit setup step '{}'", step.id))?;
 
         if last_progress.elapsed() >= PROGRESS_LOG_INTERVAL {
@@ -1098,7 +1094,6 @@ fn emit_setup_step<A: NetworkAdapter, W: Write>(
     adapter: &mut A,
     step: &SetupStep,
     setup_bindings: &mut std::collections::HashMap<String, ResolvedBinding>,
-    setup_key: SchedulingKey,
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
 ) -> Result<()>
@@ -1129,13 +1124,12 @@ where
             bail!("setup step `keychain_authorize_pool` produced no transactions");
         }
         for (idx, value) in templates.into_iter().enumerate() {
-            let inclusion_key = compute_setup_extension_key(&step.id, idx);
             emit_template_value(
                 adapter,
                 &format!("setup.{}[{idx}]", step.id),
                 value,
                 TxPhase::Setup,
-                &[inclusion_key],
+                &[],
                 ctx,
                 writer,
             )?;
@@ -1151,7 +1145,7 @@ where
             &format!("setup.{}", step.id),
             value,
             TxPhase::Setup,
-            &[setup_key],
+            &[],
             ctx,
             writer,
         )?
@@ -1168,7 +1162,7 @@ where
             &format!("setup.{}", step.id),
             materialized,
             TxPhase::Setup,
-            &[setup_key],
+            &[],
             ctx,
             writer,
         )?
@@ -1813,15 +1807,6 @@ fn referenced_local_binding(
     } else {
         None
     }
-}
-
-fn compute_setup_key() -> SchedulingKey {
-    scheduling_key_from_hash(keccak256(b"txgen:setup"))
-}
-
-fn compute_setup_extension_key(step_id: &str, idx: usize) -> SchedulingKey {
-    let material = format!("txgen:setup:{step_id}:{idx}");
-    scheduling_key_from_hash(keccak256(material.as_bytes()))
 }
 
 fn scheduling_key_from_hash(hash: B256) -> SchedulingKey {

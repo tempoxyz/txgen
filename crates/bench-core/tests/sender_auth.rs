@@ -728,3 +728,140 @@ async fn deferred_sequences_wait_for_tracker_before_signing_and_track_signed_has
         assert!(rpc.state.requests().iter().all(|r| r.method != "eth_getTransactionReceipt"));
     }
 }
+
+fn setup_tx(raw: u8, sender: Option<Address>, lane: u8) -> GeneratedTx {
+    let mut tx = transaction(raw, sender, lane, false);
+    tx.phase = TxPhase::Setup;
+    tx
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn setup_pipelines_same_sender_and_waits_at_sender_changes() {
+    let rpc = MockRpc::start();
+    rpc.state.automine.store(false, Ordering::SeqCst);
+    let mut sender = sender(&rpc, None, 16);
+    let alice = Some(Address::repeat_byte(1));
+    let bob = Some(Address::repeat_byte(2));
+    sender.send(setup_tx(2, alice, 1)).await.unwrap();
+    sender.send(setup_tx(3, alice, 1)).await.unwrap();
+    sender.send(setup_tx(4, bob, 2)).await.unwrap();
+    sender.send(setup_tx(5, bob, 2)).await.unwrap();
+    sender.send(setup_tx(6, alice, 1)).await.unwrap();
+    let flush = tokio::spawn(async move { sender.flush().await });
+    wait_for_pending(&rpc, 2).await;
+    // Including Alice's first tx must not release Bob: he waits for the
+    // immediately preceding tx, even though both Alice txs were pipelined.
+    let second = rpc.state.chain.lock().unwrap().pending.pop().unwrap();
+    rpc.state.mine();
+    rpc.state.chain.lock().unwrap().pending.push(second);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(rpc.state.chain.lock().unwrap().pending, [keccak256([3])]);
+    rpc.state.mine();
+    wait_for_pending(&rpc, 2).await;
+    assert_eq!(rpc.state.chain.lock().unwrap().pending, [keccak256([4]), keccak256([5])]);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(rpc.state.chain.lock().unwrap().pending.len(), 2);
+    rpc.state.mine();
+    wait_for_pending(&rpc, 1).await;
+    assert_eq!(rpc.state.chain.lock().unwrap().pending, [keccak256([6])]);
+    assert!(!flush.is_finished(), "the final setup receipt must also succeed");
+    rpc.state.mine();
+    tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn setup_waits_when_nonce_lanes_differ_or_sender_is_unknown() {
+    for (first_sender, second_sender, first_lane, second_lane) in [
+        (Some(Address::repeat_byte(1)), Some(Address::repeat_byte(1)), 1, 2),
+        (Some(Address::repeat_byte(1)), Some(Address::repeat_byte(2)), 1, 1),
+        (None, None, 1, 1),
+    ] {
+        let rpc = MockRpc::start();
+        rpc.state.automine.store(false, Ordering::SeqCst);
+        let mut sender = sender(&rpc, None, 16);
+        sender.send(setup_tx(2, first_sender, first_lane)).await.unwrap();
+        sender.send(setup_tx(3, second_sender, second_lane)).await.unwrap();
+        let flush = tokio::spawn(async move { sender.flush().await });
+        wait_for_pending(&rpc, 1).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(rpc.state.chain.lock().unwrap().pending, [keccak256([2])]);
+        rpc.state.mine();
+        wait_for_pending(&rpc, 1).await;
+        assert_eq!(rpc.state.chain.lock().unwrap().pending, [keccak256([3])]);
+        assert!(!flush.is_finished());
+        rpc.state.mine();
+        tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap().unwrap().unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reverted_setup_predecessor_never_releases_next_sender() {
+    let rpc = MockRpc::start();
+    rpc.state.automine.store(false, Ordering::SeqCst);
+    let mut sender = sender(&rpc, None, 16);
+    sender.send(setup_tx(2, Some(Address::repeat_byte(1)), 1)).await.unwrap();
+    sender.send(setup_tx(3, Some(Address::repeat_byte(2)), 2)).await.unwrap();
+    let flush = tokio::spawn(async move { sender.flush().await });
+    wait_for_pending(&rpc, 1).await;
+    {
+        let mut chain = rpc.state.chain.lock().unwrap();
+        let hash = chain.pending.pop().unwrap();
+        let mut value = receipt(hash);
+        value["blockNumber"] = json!("0x1");
+        value["status"] = json!("0x0");
+        chain.blocks.push(vec![value]);
+    }
+    let error =
+        tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap().unwrap().unwrap_err();
+    assert!(error.to_string().contains("setup transaction 'tx-2' failed"));
+    assert_eq!(
+        rpc.state.requests().iter().filter(|r| r.method == "eth_sendRawTransaction").count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pipelined_setup_still_requires_every_receipt_to_succeed() {
+    let rpc = MockRpc::start();
+    rpc.state.automine.store(false, Ordering::SeqCst);
+    let mut sender = sender(&rpc, None, 16);
+    let alice = Some(Address::repeat_byte(1));
+    sender.send(setup_tx(2, alice, 1)).await.unwrap();
+    sender.send(setup_tx(3, alice, 1)).await.unwrap();
+    let flush = tokio::spawn(async move { sender.flush().await });
+    wait_for_pending(&rpc, 2).await;
+    {
+        let mut chain = rpc.state.chain.lock().unwrap();
+        let hashes = std::mem::take(&mut chain.pending);
+        let receipts = hashes
+            .into_iter()
+            .enumerate()
+            .map(|(index, hash)| {
+                let mut value = receipt(hash);
+                value["blockNumber"] = json!("0x1");
+                if index == 0 {
+                    value["status"] = json!("0x0");
+                }
+                value
+            })
+            .collect();
+        chain.blocks.push(receipts);
+    }
+    let error =
+        tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap().unwrap().unwrap_err();
+    assert!(error.to_string().contains("setup transaction 'tx-2' failed"));
+}
+
+#[tokio::test]
+async fn setup_authentication_failure_cannot_leave_a_dangling_predecessor() {
+    let rpc = MockRpc::start();
+    let temp = TempDir::new().unwrap();
+    let request_auth: Arc<dyn RequestAuthProvider> = Arc::new(
+        SenderHeaderAuthProvider::from_file(AUTH_HEADER, auth_file(&temp), Duration::ZERO).unwrap(),
+    );
+    let mut sender = sender(&rpc, Some(request_auth), 16);
+    assert!(sender.send(setup_tx(2, Some(Address::repeat_byte(9)), 9)).await.is_err());
+    assert!(sender.send(setup_tx(3, Some(Address::repeat_byte(1)), 1)).await.is_err());
+    assert!(tokio::time::timeout(Duration::from_secs(5), sender.flush()).await.unwrap().is_err());
+    assert!(rpc.state.requests().is_empty());
+}
