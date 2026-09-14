@@ -1747,7 +1747,21 @@ args:
 
 Use `setup.steps` for deterministic transactions that prepare the chain before the measured workload, such as contract deployments and mint/configuration calls. `txgen` emits all setup transactions first with `phase: "setup"`; workload transactions are emitted afterwards with `phase: "workload"`.
 
-`bench send` treats the first workload transaction as a setup barrier: it waits for all setup transactions to be included, resets benchmark timing/metrics, and only then sends workload transactions. Use `bench send --skip-setup` to ignore setup transactions when the target chain is already prepared.
+`bench send` treats the first workload transaction as a setup barrier: it requires all setup transactions to succeed, resets benchmark timing/metrics, and only then sends workload transactions. Use `bench send --skip-setup` to ignore setup transactions when the target chain is already prepared.
+
+Setup ordering is inferred automatically from consecutive emitted transactions.
+Transactions from the same sender on the same ordered nonce lane are submitted
+back-to-back without waiting for receipts. When the sender changes, the next
+transaction waits for the previous transaction's successful receipt. The same
+receipt barrier applies when a sender switches nonce lanes, uses expiring nonces,
+or has no ordering metadata. Expanded setup steps follow the same rule for each
+emitted transaction. No additional YAML fields are needed.
+
+A failed setup transaction cancels queued setup and prevents workload startup;
+already submitted transactions may still execute. Nonce ordering guarantees
+execution order, but senders must already have enough funds for transaction
+admission. This optimization applies to `generate | bench send`; `scenario run`
+continues to initialize setup serially.
 
 ```yaml
 artifacts:
