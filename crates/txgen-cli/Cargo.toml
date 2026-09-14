@@ -45,4 +45,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "rt", "sync
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+# `--tracer js:<path>` reads a file, so its test needs one on disk.
+tempfile = "3"
 tokio = { workspace = true, features = ["net"] }

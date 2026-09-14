@@ -34,6 +34,7 @@ pub fn execute(args: ViewArgs) -> Result<()> {
 
     let final_report = FinalReport {
         bench_metrics,
+        call: report.call,
         run_stats: report.run_stats,
         blocks: report.blocks.unwrap_or_default(),
         total_fees_paid: report

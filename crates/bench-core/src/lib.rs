@@ -1,12 +1,14 @@
 //! Core library for the bench tool.
 //!
 //! Provides shared foundation components:
+//! - [`call`] - RPC corpus replay: method allowlist, response digests, accounting
 //! - [`source`] - Transaction sources (file, stdin)
 //! - [`sender`] - Sending with scheduling key ordering + rate limiting
 //! - [`metrics`] - Collection (sent/success/failed counts, timing)
 //! - [`reporter`] - Output (console, JSON + NDJSON samples, ClickHouse, Prometheus remote write)
 
 pub mod auth;
+pub mod call;
 pub mod clickhouse;
 pub mod clock;
 pub mod metrics;
@@ -22,6 +24,12 @@ pub mod sender;
 pub mod source;
 
 pub use auth::{RequestAuthProvider, RpcRequestContext, SenderHeaderAuthProvider};
+pub use call::{
+    digest_response, CallMethod, CallReport, CallRunConfig, ClosedLoopRow, Corpus, CorpusOptions,
+    CorpusRecord, CorpusSummary, MethodStats, NodeIdentity, Nondeterministic, OpenLoopRow,
+    PhaseStats, ReplayRecorder, ReplayResults, RequestOutcome, RequestStatus, ResponseBytes,
+    ResponseKind, ResponseRow, ResponseScanner, ResponseSummary, StatusCounts,
+};
 pub use clickhouse::ClickHouseClient;
 pub use clock::RunClock;
 pub use metrics::{

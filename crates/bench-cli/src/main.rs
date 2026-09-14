@@ -3,9 +3,10 @@
 //! Provides subcommands:
 //! - `send` - Send from file/stdin
 //! - `send-blocks` - Submit blocks via reth Engine API
+//! - `call` - Replay an RPC corpus against a node
 //! - `view` - Print an existing JSON report to console
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use eyre::{bail, Context, Result};
 use std::{collections::HashSet, path::PathBuf, time::Duration};
 
@@ -14,6 +15,7 @@ use crate::{
     wait_for_persistence::WaitForPersistence,
 };
 
+mod call;
 mod metrics_forwarder;
 mod metrics_url;
 mod send;
@@ -257,6 +259,150 @@ pub struct SendBlocksArgs {
     pub rpc: String,
 }
 
+/// Arguments for the `call` subcommand.
+#[derive(Args)]
+pub struct CallArgs {
+    /// Corpus file: NDJSON, optionally gzip-compressed.
+    #[arg(short, long)]
+    pub input: PathBuf,
+
+    /// RPC endpoint URL.
+    #[arg(long, default_value = "http://localhost:8545")]
+    pub rpc_url: String,
+
+    /// Replay phase.
+    ///
+    /// `warmup` runs only the open-loop cell and writes no per-record output,
+    /// so the measured phase never replays requests the node just answered
+    /// cold. `measure` runs both phases and writes every output.
+    #[arg(long, value_enum, default_value_t = CallPhase::Measure)]
+    pub phase: CallPhase,
+
+    /// Open-loop target rate in requests per second (0 = skip the open loop).
+    #[arg(long, default_value_t = 100)]
+    pub rps: u64,
+
+    /// Open-loop wall clock.
+    #[arg(long, default_value = "120s", value_parser = humantime::parse_duration)]
+    pub duration: Duration,
+
+    /// Fixed open-loop request count, used instead of --duration.
+    #[arg(long, value_name = "N")]
+    pub requests: Option<u64>,
+
+    /// Maximum open-loop requests in flight.
+    ///
+    /// A request that would exceed this cap is counted as dropped rather than
+    /// delayed, so the offered rate stays the configured one.
+    #[arg(long, default_value_t = 256, value_parser = parse_positive_usize)]
+    pub max_concurrent: usize,
+
+    /// Closed-loop passes over the whole corpus (0 = skip the closed loop).
+    #[arg(long, default_value_t = 20)]
+    pub passes: u64,
+
+    /// Closed-loop worker count.
+    #[arg(long, default_value_t = 16, value_parser = parse_positive_usize)]
+    pub concurrency: usize,
+
+    /// Seed for the open-loop record sequence.
+    #[arg(long, default_value_t = 1)]
+    pub seed: u64,
+
+    /// Replace the block parameter of every record that has a rewritable one.
+    #[arg(long, value_name = "TAG")]
+    pub block_tag: Option<String>,
+
+    /// Drop fee fields from the call object of call-shaped records.
+    #[arg(long)]
+    pub strip_fees: bool,
+
+    /// Replay only these methods; other records are skipped and counted.
+    #[arg(long, value_delimiter = ',', value_name = "METHOD")]
+    pub methods: Vec<String>,
+
+    /// Per-request timeout.
+    #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
+    pub timeout: Duration,
+
+    /// Write per-record response digests as NDJSON.
+    #[arg(long, value_name = "PATH")]
+    pub responses: Option<PathBuf>,
+
+    /// Write closed-loop per-record timings as CSV.
+    #[arg(long, value_name = "PATH")]
+    pub record_csv: Option<PathBuf>,
+
+    /// Write open-loop per-request timings as CSV.
+    #[arg(long, value_name = "PATH")]
+    pub requests_csv: Option<PathBuf>,
+
+    /// Exit non-zero above this HTTP and transport failure rate.
+    #[arg(long, default_value_t = 1.0, value_name = "PERCENT")]
+    pub max_fail_rate_pct: f64,
+
+    /// Report output destinations
+    #[arg(long = "report", value_name = "FORMAT")]
+    pub reports: Vec<String>,
+
+    /// Metadata key=value pairs to include in the report.
+    #[arg(short = 'm', long = "metadata", value_name = "KEY=VALUE")]
+    pub metadata: Vec<String>,
+
+    /// Prometheus metrics endpoint(s) to scrape during the benchmark.
+    ///
+    /// Use a single URL, comma-separated `node:URL` entries, or rich
+    /// `key=value;key=value@URL` entries. Labels are added to scraped samples.
+    #[arg(
+        long,
+        value_name = "URL|NODE:URL|LABELS@URL",
+        value_delimiter = ',',
+        value_parser = parse_metrics_url
+    )]
+    pub metrics_url: Vec<MetricsURL>,
+
+    /// File containing metric names to publish to ClickHouse, one per line.
+    #[arg(long, value_name = "PATH")]
+    pub clickhouse_metrics_file: Option<PathBuf>,
+
+    /// Scrape interval in milliseconds for the metrics scraper.
+    #[arg(long, default_value = "500")]
+    pub scrape_interval_ms: u64,
+
+    /// Align exported metric timestamps to this benchmark-start Unix timestamp.
+    ///
+    /// Accepts Unix seconds or milliseconds. Exported samples keep their
+    /// original offset within the run.
+    #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
+    pub metrics_align: Option<u64>,
+
+    /// Forward scraped samples in real time via Prometheus remote write.
+    ///
+    /// Uses `/api/v1/write` and the same PROMETHEUS_* environment variables
+    /// as `--report prometheus:<url>`. Requires `--metrics-url`.
+    #[arg(long = "metrics-forward", value_name = "URL")]
+    pub metrics_forward: Option<String>,
+}
+
+/// Which phase of a corpus replay to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CallPhase {
+    /// Offer load without recording anything per record.
+    Warmup,
+    /// Record the open-loop cell and the closed-loop passes.
+    Measure,
+}
+
+impl CallPhase {
+    /// Lowercase name written to the report.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Warmup => "warmup",
+            Self::Measure => "measure",
+        }
+    }
+}
+
 /// Arguments for the `view` subcommand.
 #[derive(Args)]
 pub struct ViewArgs {
@@ -278,6 +424,8 @@ enum Command {
     Send(SendArgs),
     /// Submit blocks or reth-bb big blocks via reth Engine API
     SendBlocks(SendBlocksArgs),
+    /// Replay an RPC corpus (eth_call, debug_*, trace_*) against a node
+    Call(CallArgs),
     /// Print an existing JSON report to the console
     View(ViewArgs),
 }
@@ -304,6 +452,14 @@ fn parse_unix_timestamp_ms(s: &str) -> Result<u64, String> {
     } else {
         Ok(timestamp)
     }
+}
+
+fn parse_positive_usize(s: &str) -> Result<usize, String> {
+    let value = s.trim().parse::<usize>().map_err(|e| format!("invalid value {s:?}: {e}"))?;
+    if value == 0 {
+        return Err(format!("{s:?} must be greater than 0"));
+    }
+    Ok(value)
 }
 
 fn parse_reorg_depth(s: &str) -> Result<usize, String> {
@@ -394,6 +550,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Send(args) => send::execute(args).await,
         Command::SendBlocks(args) => send_blocks::execute(args).await,
+        Command::Call(args) => call::execute(args).await,
         Command::View(args) => view::execute(args),
     }
 }
@@ -651,6 +808,60 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_call_defaults() {
+        let cli = Cli::try_parse_from(["bench", "call", "-i", "corpus.jsonl"]).unwrap();
+
+        let Command::Call(args) = cli.command else {
+            panic!("expected call command");
+        };
+
+        assert_eq!(args.phase, CallPhase::Measure);
+        assert_eq!(args.rps, 100);
+        assert_eq!(args.duration, Duration::from_secs(120));
+        assert_eq!(args.requests, None);
+        assert_eq!(args.max_concurrent, 256);
+        assert_eq!(args.passes, 20);
+        assert_eq!(args.concurrency, 16);
+        assert_eq!(args.seed, 1);
+        assert_eq!(args.timeout, Duration::from_secs(30));
+        assert_eq!(args.max_fail_rate_pct, 1.0);
+        assert!(args.methods.is_empty());
+        assert_eq!(args.block_tag, None);
+        assert!(!args.strip_fees);
+    }
+
+    #[test]
+    fn test_call_accepts_a_comma_separated_method_filter() {
+        let cli = Cli::try_parse_from([
+            "bench",
+            "call",
+            "-i",
+            "corpus.jsonl.gz",
+            "--phase",
+            "warmup",
+            "--methods",
+            "eth_call,debug_traceCall",
+        ])
+        .unwrap();
+
+        let Command::Call(args) = cli.command else {
+            panic!("expected call command");
+        };
+
+        assert_eq!(args.phase, CallPhase::Warmup);
+        assert_eq!(args.methods, vec!["eth_call", "debug_traceCall"]);
+    }
+
+    #[test]
+    fn test_call_rejects_a_zero_concurrency() {
+        assert!(
+            Cli::try_parse_from(["bench", "call", "-i", "c.jsonl", "--concurrency", "0"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["bench", "call", "-i", "c.jsonl", "--max-concurrent", "0"])
+            .is_err());
     }
 
     #[test]

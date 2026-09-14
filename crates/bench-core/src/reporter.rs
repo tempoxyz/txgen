@@ -6,6 +6,7 @@
 //! - ClickHouse (for time-series storage)
 
 use crate::{
+    call::{CallReport, MethodStats},
     clickhouse::ClickHouseClient,
     metrics::{BenchMetrics, BlockStats, RunStats, ThroughputSample, TimeSeriesMetrics},
     receipt_clickhouse::{insert_receipt_gas_records, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE},
@@ -47,6 +48,8 @@ pub struct FinalReport {
     pub total_fees_paid: Option<U256>,
     /// Receipt-derived gas details for ClickHouse publication.
     pub receipt_records: Vec<ReceiptGasRecord>,
+    /// RPC corpus replay results (call mode only).
+    pub call: Option<CallReport>,
 }
 
 impl FinalReport {
@@ -173,6 +176,79 @@ impl<W: Write + Send> ConsoleReporter<W> {
     pub fn new(writer: W, show_progress: bool) -> Self {
         Self { writer, show_progress }
     }
+
+    /// Render an RPC corpus replay.
+    fn write_call_report(&mut self, call: &CallReport) -> Result<()> {
+        writeln!(self.writer)?;
+        writeln!(self.writer, "═══════════════════════════════════════")?;
+        writeln!(self.writer, "             RPC Corpus Replay")?;
+        writeln!(self.writer, "═══════════════════════════════════════")?;
+        writeln!(self.writer)?;
+        writeln!(self.writer, "  Phase:           {:>10}", call.phase)?;
+        writeln!(self.writer, "  Records:         {:>10}", call.corpus.records)?;
+        writeln!(
+            self.writer,
+            "  Chain / head:    {:>10} / {}",
+            call.identity.chain_id, call.identity.head
+        )?;
+        writeln!(self.writer)?;
+
+        self.write_call_stats("Total", &call.totals)?;
+        if call.methods.len() > 1 {
+            for (method, stats) in &call.methods {
+                self.write_call_stats(method, stats)?;
+            }
+        }
+
+        if call.nondeterministic_total > 0 {
+            writeln!(self.writer, "  Nondeterministic records: {}", call.nondeterministic_total)?;
+        }
+
+        writeln!(self.writer, "═══════════════════════════════════════")?;
+        Ok(())
+    }
+
+    fn write_call_stats(&mut self, name: &str, stats: &MethodStats) -> Result<()> {
+        writeln!(self.writer, "  {name}")?;
+        writeln!(
+            self.writer,
+            "    Requests:      {:>10}  (ok {}, rpc_error {}, failed {}, dropped {})",
+            stats.requests,
+            stats.statuses.ok,
+            stats.statuses.rpc_error,
+            stats.statuses.failed(),
+            stats.dropped
+        )?;
+        if let Some(latency) = &stats.open_loop.latency {
+            writeln!(
+                self.writer,
+                "    Open loop:     {:>10.2} req/s  p50 {:.2}ms  p90 {:.2}ms  p99 {:.2}ms",
+                stats.open_loop.rps,
+                latency.p50_ms,
+                latency.p90_ms.unwrap_or_default(),
+                latency.p99_ms
+            )?;
+        }
+        if let Some(latency) = &stats.closed_loop.latency {
+            writeln!(
+                self.writer,
+                "    Closed loop:   {:>10.2} req/s  p50 {:.2}ms  p90 {:.2}ms  p99 {:.2}ms",
+                stats.closed_loop.rps,
+                latency.p50_ms,
+                latency.p90_ms.unwrap_or_default(),
+                latency.p99_ms
+            )?;
+        }
+        if stats.response_bytes.records > 0 {
+            writeln!(
+                self.writer,
+                "    Response size: {:>10} bytes median over {} records",
+                stats.response_bytes.median, stats.response_bytes.records
+            )?;
+        }
+        writeln!(self.writer)?;
+        Ok(())
+    }
 }
 
 impl<W: Write + Send> Reporter for ConsoleReporter<W> {
@@ -218,6 +294,10 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
     }
 
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
+        if let Some(call) = &report.call {
+            return self.write_call_report(call);
+        }
+
         let has_send_metrics = report.bench_metrics.is_some();
         let has_block_data = report.run_stats.is_some();
 
@@ -351,10 +431,13 @@ pub struct JsonReport {
     /// Unified time-series samples (internal + node metrics).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub samples: Vec<Sample>,
+    /// RPC corpus replay results (call mode only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call: Option<CallReport>,
 }
 
 /// Latency statistics in JSON format.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct JsonLatency {
     /// Minimum latency in milliseconds.
     pub min_ms: f64,
@@ -364,6 +447,9 @@ pub struct JsonLatency {
     pub mean_ms: f64,
     /// P50 latency in milliseconds.
     pub p50_ms: f64,
+    /// P90 latency in milliseconds, reported where the open-loop cell needs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p90_ms: Option<f64>,
     /// P95 latency in milliseconds.
     pub p95_ms: f64,
     /// P99 latency in milliseconds.
@@ -455,6 +541,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
         let has_data = report.bench_metrics.is_some() ||
             !report.blocks.is_empty() ||
             !report.receipt_metrics.is_empty() ||
+            report.call.is_some() ||
             report.has_samples();
         if !has_data {
             return Ok(());
@@ -486,6 +573,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
                         max_ms: latency.max.as_secs_f64() * 1000.0,
                         mean_ms: latency.mean.as_secs_f64() * 1000.0,
                         p50_ms: latency.p50.as_secs_f64() * 1000.0,
+                        p90_ms: None,
                         p95_ms: latency.p95.as_secs_f64() * 1000.0,
                         p99_ms: latency.p99.as_secs_f64() * 1000.0,
                     }),
@@ -516,6 +604,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             receipt_metrics: report.receipt_metrics.clone(),
             total_fees_paid: report.total_fees_paid.map(|fees| fees.to_string()),
             samples: Vec::new(),
+            call: report.call.clone(),
         };
 
         serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
