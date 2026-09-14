@@ -96,6 +96,12 @@ pub struct ExtractArgs {
     /// block-level records are unaffected.
     #[arg(long, value_name = "N")]
     pub top_gas: Option<usize>,
+    block_param: BlockParam::Latest,
+
+    /// Block parameter of every `--format calls` record: `latest`, or
+    /// `parent` to pin each call to the state before its source block.
+    #[arg(long, value_name = "latest|parent", default_value = "latest")]
+    pub block_param: BlockParam,
 
     /// Tracer to emit for the `debug_trace*` methods of `--format calls` and
     /// `--format traces`; repeatable, defaults to `callTracer`.
@@ -129,6 +135,18 @@ pub enum ExtractFormat {
     /// A replay corpus addressing the transactions and blocks themselves,
     /// for `bench call`.
     Traces,
+}
+
+/// Block parameter of every `--format calls` record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum BlockParam {
+    /// The node's latest block.
+    #[default]
+    Latest,
+    /// The parent of the record's source block, so a transaction that already
+    /// executed replays against the state its preconditions held in.
+    Parent,
 }
 
 impl ExtractFormat {
@@ -299,6 +317,7 @@ fn resolve_corpus_config(args: &ExtractArgs) -> Result<CorpusConfig> {
             ("--tracer", !args.tracer.is_empty()),
             ("--tracer-config", args.tracer_config.is_some()),
             ("--trace-options", args.trace_options.is_some()),
+            ("--block-param", args.block_param != BlockParam::Latest),
         ] {
             if given {
                 bail!("{flag} only applies to --format calls and --format traces");
@@ -331,7 +350,16 @@ fn resolve_corpus_config(args: &ExtractArgs) -> Result<CorpusConfig> {
         tracers,
         tracer_config: tracer_config.map(serde_json::Value::Object),
         options,
+        block_param: resolve_block_param(format, args.block_param)?,
     })
+}
+
+/// `--block-param parent` only makes sense for records that carry a block parameter.
+fn resolve_block_param(format: ExtractFormat, block_param: BlockParam) -> Result<BlockParam> {
+    if block_param != BlockParam::Latest && format != ExtractFormat::Calls {
+        bail!("--block-param {block_param:?} only applies to --format calls");
+    }
+    Ok(block_param)
 }
 
 /// Resolve the `--tracer` specs, defaulting to `callTracer`.
@@ -500,9 +528,19 @@ struct CorpusConfig {
     tracer_config: Option<serde_json::Value>,
     /// `--trace-options`, merged into every tracing options object.
     options: TraceOptions,
+    /// `--block-param`, the block every call-format record executes against.
+    block_param: BlockParam,
 }
 
 impl CorpusConfig {
+    /// The block parameter of a record sourced from `block`.
+    fn block_param(&self, block: u64) -> serde_json::Value {
+        match self.block_param {
+            BlockParam::Latest => serde_json::json!("latest"),
+            BlockParam::Parent => serde_json::json!(format!("0x{:x}", block.saturating_sub(1))),
+        }
+    }
+
     /// The tracing options object one spec contributes.
     fn trace_options(&self, spec: &TracerSpec) -> serde_json::Value {
         let mut options = self.options.clone();
@@ -681,7 +719,7 @@ fn write_corpus_records<W: Write>(
 
     for (index, transaction) in selected_transactions(block, corpus.top_gas) {
         for method in &corpus.methods {
-            for variant in transaction_params(*method, transaction, corpus) {
+            for variant in transaction_params(*method, transaction, block.number, corpus) {
                 serde_json::to_writer(
                     &mut *writer,
                     &CorpusOutputLine {
@@ -752,6 +790,7 @@ fn selected_transactions(
 fn transaction_params(
     method: CallMethod,
     transaction: &FetchedTransaction,
+    block: u64,
     corpus: &CorpusConfig,
 ) -> Vec<RecordVariant> {
     let hash = serde_json::json!(transaction.hash);
@@ -779,7 +818,7 @@ fn transaction_params(
     let call = serde_json::Value::Object(call.clone());
     match method {
         CallMethod::EthCall | CallMethod::EthCreateAccessList => {
-            vec![RecordVariant { params: vec![call, serde_json::json!("latest")], label: None }]
+            vec![RecordVariant { params: vec![call, corpus.block_param(block)], label: None }]
         }
         CallMethod::EthEstimateGas => {
             // Estimation with a pinned gas limit answers a different question,
@@ -788,20 +827,20 @@ fn transaction_params(
             if let Some(call) = call.as_object_mut() {
                 call.remove("gas");
             }
-            vec![RecordVariant { params: vec![call, serde_json::json!("latest")], label: None }]
+            vec![RecordVariant { params: vec![call, corpus.block_param(block)], label: None }]
         }
         CallMethod::DebugTraceCall => corpus
             .tracers
             .iter()
             .map(|spec| RecordVariant {
-                params: vec![call.clone(), serde_json::json!("latest"), corpus.trace_options(spec)],
+                params: vec![call.clone(), corpus.block_param(block), corpus.trace_options(spec)],
                 label: Some(spec.label.clone()),
             })
             .collect(),
         CallMethod::TraceCall => [PARITY_TRACE.as_slice(), PARITY_TRACE_STATE_DIFF.as_slice()]
             .into_iter()
             .map(|types| RecordVariant {
-                params: vec![call.clone(), serde_json::json!(types), serde_json::json!("latest")],
+                params: vec![call.clone(), serde_json::json!(types), corpus.block_param(block)],
                 label: Some(parity_label(types)),
             })
             .collect(),
@@ -1316,6 +1355,7 @@ mod tests {
             format,
             methods: Vec::new(),
             top_gas: None,
+            block_param: BlockParam::Latest,
             tracer: Vec::new(),
             tracer_config: None,
             trace_options: None,
@@ -1433,6 +1473,44 @@ mod tests {
         let call = call_object(&legacy_create(), Address::ZERO);
         assert!(!call.contains_key("to"));
         assert_eq!(call["gas"], "0x186a0");
+    }
+
+    #[tokio::test]
+    async fn parent_block_param_replaces_latest_in_every_call_record() {
+        let methods = ExtractFormat::Calls.available_methods();
+        let parent = format!("0x{:x}", corpus_block(ExtractFormat::Calls).number - 1);
+        let latest =
+            write_block(corpus_block(ExtractFormat::Calls), ExtractFormat::Calls, methods).await;
+        let corpus = CorpusConfig { block_param: BlockParam::Parent, ..corpus_config(methods) };
+        let pinned =
+            write_block_with(corpus_block(ExtractFormat::Calls), ExtractFormat::Calls, corpus)
+                .await;
+
+        assert_eq!(latest.len(), pinned.len());
+        let mut replaced = 0;
+        for (latest, pinned) in latest.iter().zip(&pinned) {
+            let (a, b) =
+                (latest["params"].as_array().unwrap(), pinned["params"].as_array().unwrap());
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b) {
+                if x == "latest" {
+                    assert_eq!(y, &Value::String(parent.clone()));
+                    replaced += 1;
+                } else {
+                    assert_eq!(x, y);
+                }
+            }
+        }
+        assert!(replaced > 0);
+    }
+
+    #[test]
+    fn block_param_parent_is_rejected_outside_the_calls_format() {
+        assert!(resolve_block_param(ExtractFormat::Traces, BlockParam::Parent).is_err());
+        assert_eq!(
+            resolve_block_param(ExtractFormat::Calls, BlockParam::Parent).unwrap(),
+            BlockParam::Parent
+        );
     }
 
     #[tokio::test]

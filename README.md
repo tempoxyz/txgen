@@ -217,6 +217,7 @@ txgen-ethereum extract --rpc http://localhost:8545 --from 1000 --to 2000 \
 | `--tracer <SPEC>` | Tracer for the `debug_trace*` methods, repeatable (default: `callTracer`); see [Tracers](#tracers) |
 | `--tracer-config <JSON>` | JSON object merged as `tracerConfig` into every named-tracer record |
 | `--trace-options <JSON>` | JSON object merged into the top level of every `debug_trace*` record's tracing options |
+| `--block-param <latest\|parent>` | For `calls`: the block parameter of every record, the node's `latest` (default) or the parent of the source block, so already-executed transactions replay against the state their preconditions held in |
 
 `--format transactions` preserves source block and transaction order. Transactions from different
 senders may be submitted concurrently by `bench send`; transactions from the same sender use a
