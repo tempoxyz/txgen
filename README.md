@@ -505,7 +505,7 @@ bench call --input captured.jsonl.gz --block-tag latest --strip-fees \
 | `--passes <N>` | Closed-loop passes over the corpus (default: 20; 0 skips the phase) |
 | `--concurrency <N>` | Closed-loop workers (default: 16) |
 | `--seed <N>` | Seed of the open-loop record sequence (default: 1) |
-| `--block-tag <TAG>` | Replace the block parameter of every record that has a rewritable one |
+| `--block-tag <TAG>` | Replace the block parameter of every record that has a rewritable one, appending it when the optional block parameter is omitted |
 | `--strip-fees` | Drop fee fields from the call object of call-shaped records |
 | `--methods <a,b>` | Replay only these methods; other records are skipped and counted |
 | `--timeout <DUR>` | Per-request timeout (default: 30s; raise it for tracing corpora) |

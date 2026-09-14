@@ -220,12 +220,20 @@ impl CorpusOptions {
     }
 
     /// Apply the configured rewrites to one record's parameters in place.
-    fn rewrite(&self, method: CallMethod, params: &mut [serde_json::Value]) {
+    ///
+    /// A record may omit its optional block parameter, so the tag is appended
+    /// when its position is the next one; shorter arrays are left alone rather
+    /// than inventing the required parameters in between.
+    fn rewrite(&self, method: CallMethod, params: &mut Vec<serde_json::Value>) {
         if let Some(tag) = &self.block_tag &&
             method.block_param_rewritable() &&
-            let Some(block) = method.block_param_index().and_then(|index| params.get_mut(index))
+            let Some(index) = method.block_param_index()
         {
-            *block = serde_json::Value::String(tag.clone());
+            if let Some(block) = params.get_mut(index) {
+                *block = serde_json::Value::String(tag.clone());
+            } else if index == params.len() {
+                params.push(serde_json::Value::String(tag.clone()));
+            }
         }
 
         if self.strip_fees &&
@@ -1534,6 +1542,44 @@ mod tests {
         assert_eq!(params[2][2], "latest");
         assert_eq!(params[3][0], "0xaa");
         assert_eq!(params[4][0], "0x10");
+    }
+
+    #[test]
+    fn block_tag_is_appended_when_the_optional_block_is_omitted() {
+        let lines = concat!(
+            r#"{"method":"eth_estimateGas","params":[{}]}"#,
+            "\n",
+            r#"{"method":"trace_call","params":[{},["trace"]]}"#,
+            "\n",
+            r#"{"method":"eth_call","params":[{}]}"#,
+        );
+        let options = CorpusOptions { block_tag: Some("0x123".into()), ..Default::default() };
+        let corpus = load(lines, &options).unwrap();
+        let params =
+            corpus.records().iter().map(|record| record.params().unwrap()).collect::<Vec<_>>();
+
+        assert_eq!(params[0].as_array().unwrap().len(), 2);
+        assert_eq!(params[0][1], "0x123");
+        assert_eq!(params[1].as_array().unwrap().len(), 3);
+        assert_eq!(params[1][2], "0x123");
+        assert_eq!(params[2].as_array().unwrap().len(), 2);
+        assert_eq!(params[2][1], "0x123");
+    }
+
+    #[test]
+    fn block_tag_leaves_shorter_malformed_params_alone() {
+        let lines = concat!(
+            r#"{"method":"trace_call","params":[{}]}"#,
+            "\n",
+            r#"{"method":"eth_call","params":[]}"#,
+        );
+        let options = CorpusOptions { block_tag: Some("0x123".into()), ..Default::default() };
+        let corpus = load(lines, &options).unwrap();
+        let params =
+            corpus.records().iter().map(|record| record.params().unwrap()).collect::<Vec<_>>();
+
+        assert_eq!(params[0].as_array().unwrap().len(), 1);
+        assert_eq!(params[1].as_array().unwrap().len(), 0);
     }
 
     #[test]
