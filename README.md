@@ -1531,6 +1531,25 @@ Use `setup.steps` for deterministic transactions that prepare the chain before t
 
 `bench send` treats the first workload transaction as a setup barrier: it waits for all setup transactions to be included, resets benchmark timing/metrics, and only then sends workload transactions. Use `bench send --skip-setup` to ignore setup transactions when the target chain is already prepared.
 
+For a timed workload with a long setup, run setup separately so pipe backpressure
+does not consume `generate --duration` or age short-lived workload signatures:
+
+```bash
+set -o pipefail
+txgen-tempo generate -s workload.yml --rpc "$RPC_URL" -n 0 \
+  --setup-state-out setup.json | bench send --rpc-url "$RPC_URL" &&
+txgen-tempo generate -s workload.yml --rpc "$RPC_URL" --duration 30s \
+  --setup-state-in setup.json | bench send --rpc-url "$RPC_URL" --drain-timeout 300
+```
+
+`--setup-state-out` requires `--count 0` and saves public setup outputs such as
+contract addresses and transaction hashes. Reuse that file only after every setup
+transaction succeeds, with the same spec and chain. `--setup-state-in` emits only
+workload transactions, retains the original `setup.<id>.*` bindings, and requires
+`--rpc` to fetch current nonces without reserving setup nonces again. Chain IDs,
+state versions, and setup step IDs are checked. Keychain setup extensions are not
+supported by this state file because they also initialize adapter state.
+
 ```yaml
 artifacts:
   token:
