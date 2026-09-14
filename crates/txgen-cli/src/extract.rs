@@ -96,7 +96,6 @@ pub struct ExtractArgs {
     /// block-level records are unaffected.
     #[arg(long, value_name = "N")]
     pub top_gas: Option<usize>,
-    block_param: BlockParam::Latest,
 
     /// Block parameter of every `--format calls` record: `latest`, or
     /// `parent` to pin each call to the state before its source block.
