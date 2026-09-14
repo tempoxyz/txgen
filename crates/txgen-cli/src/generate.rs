@@ -1113,39 +1113,66 @@ enum ResolvedBinding {
     SetupTx { address: Option<Address>, tx_hash: B256, sender: Address, nonce: u64 },
 }
 
-fn pick_workload_item(
-    spec: &WorkloadSpec,
-    rng: &mut StdRng,
-    remaining_txs: u64,
-) -> Result<Option<MixItem>> {
-    let mut total_weight = 0u64;
-    let mut candidates = Vec::new();
+struct WeightedWorkloadItem {
+    item: MixItem,
+    tx_count: u64,
+    weight: u64,
+    cumulative_weight: u64,
+}
 
-    for entry in &spec.mix {
-        let item = entry.item.clone();
-        let tx_count = workload_item_tx_count(spec, &item)?;
-        if tx_count > 0 && tx_count <= remaining_txs && entry.weight > 0 {
-            total_weight = total_weight
-                .checked_add(entry.weight)
-                .ok_or_else(|| eyre::eyre!("mix weights overflowed u64"))?;
-            candidates.push((item, entry.weight));
+/// Precompute weights and validate references once. The remaining transaction
+/// budget only decreases, so entries that stop fitting can be removed permanently.
+struct WorkloadSelector {
+    entries: Vec<WeightedWorkloadItem>,
+    total_weight: u64,
+    max_tx_count: u64,
+}
+
+impl WorkloadSelector {
+    fn new(spec: &WorkloadSpec, remaining_txs: u64) -> Result<Self> {
+        let mut selector = Self { entries: Vec::new(), total_weight: 0, max_tx_count: 0 };
+        if remaining_txs == 0 {
+            return Ok(selector);
         }
-    }
-
-    if total_weight == 0 {
-        return Ok(None);
-    }
-
-    let roll = rng.random_range(0..total_weight);
-    let mut cumulative = 0;
-    for (item, weight) in candidates {
-        cumulative += weight;
-        if roll < cumulative {
-            return Ok(Some(item));
+        for entry in &spec.mix {
+            let tx_count = workload_item_tx_count(spec, &entry.item)?;
+            if tx_count > 0 && tx_count <= remaining_txs && entry.weight > 0 {
+                selector.total_weight = selector
+                    .total_weight
+                    .checked_add(entry.weight)
+                    .ok_or_else(|| eyre::eyre!("mix weights overflowed u64"))?;
+                selector.max_tx_count = selector.max_tx_count.max(tx_count);
+                selector.entries.push(WeightedWorkloadItem {
+                    item: entry.item.clone(),
+                    tx_count,
+                    weight: entry.weight,
+                    cumulative_weight: selector.total_weight,
+                });
+            }
         }
+        Ok(selector)
     }
 
-    unreachable!("workload selection failed with roll={roll} total_weight={total_weight}")
+    fn pick(&mut self, rng: &mut StdRng, remaining_txs: u64) -> Option<&MixItem> {
+        if remaining_txs < self.max_tx_count {
+            // Rebuild only when a sequence no longer fits the remaining budget.
+            // Retaining list order preserves seeded choices from the old sampler.
+            self.entries.retain(|entry| entry.tx_count <= remaining_txs);
+            self.total_weight = 0;
+            self.max_tx_count = 0;
+            for entry in &mut self.entries {
+                self.total_weight += entry.weight;
+                entry.cumulative_weight = self.total_weight;
+                self.max_tx_count = self.max_tx_count.max(entry.tx_count);
+            }
+        }
+        if self.total_weight == 0 {
+            return None;
+        }
+        let roll = rng.random_range(0..self.total_weight);
+        let index = self.entries.partition_point(|entry| entry.cumulative_weight <= roll);
+        Some(&self.entries[index].item)
+    }
 }
 
 fn workload_item_tx_count(spec: &WorkloadSpec, item: &MixItem) -> Result<u64> {
@@ -1602,6 +1629,7 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
+    let mut selector = WorkloadSelector::new(spec, limit.count.unwrap_or(u64::MAX))?;
     let mut signing_pool = SigningPool::new(signing_workers)?;
     let mut written = 0u64;
     let mut sequence_instances = 0u64;
@@ -1619,7 +1647,7 @@ where
         }
 
         let remaining = limit.count.map(|count| count - written).unwrap_or(u64::MAX);
-        let Some(item) = pick_workload_item(spec, ctx.rng, remaining)? else {
+        let Some(item) = selector.pick(ctx.rng, remaining).cloned() else {
             break;
         };
 
@@ -2159,6 +2187,142 @@ mod tests {
         ) -> Result<TxRequest<TransactionRequest, Self::SignContext>> {
             unreachable!("test constructs its prepared request directly")
         }
+    }
+
+    fn reference_pick_workload_item(
+        spec: &WorkloadSpec,
+        rng: &mut StdRng,
+        remaining_txs: u64,
+    ) -> Result<Option<MixItem>> {
+        let mut total_weight = 0u64;
+        let mut candidates = Vec::new();
+
+        for entry in &spec.mix {
+            let item = entry.item.clone();
+            let tx_count = workload_item_tx_count(spec, &item)?;
+            if tx_count > 0 && tx_count <= remaining_txs && entry.weight > 0 {
+                total_weight = total_weight
+                    .checked_add(entry.weight)
+                    .ok_or_else(|| eyre::eyre!("mix weights overflowed u64"))?;
+                candidates.push((item, entry.weight));
+            }
+        }
+
+        if total_weight == 0 {
+            return Ok(None);
+        }
+
+        let roll = rng.random_range(0..total_weight);
+        let mut cumulative = 0;
+        for (item, weight) in candidates {
+            cumulative += weight;
+            if roll < cumulative {
+                return Ok(Some(item));
+            }
+        }
+
+        unreachable!("workload selection failed with roll={roll} total_weight={total_weight}")
+    }
+
+    fn selector_spec() -> WorkloadSpec {
+        WorkloadSpec::parse(r#"
+chain_id: 1
+templates:
+  a: {}
+  b: {}
+sequences:
+  short:
+    steps: [{template: a}, {template: b}, {template: a}]
+  long:
+    steps: [{template: a}, {template: b}, {template: a}, {template: b}, {template: a}, {template: b}, {template: a}]
+mix:
+  - {template: a, weight: 2}
+  - {sequence: long, weight: 23}
+  - {template: b, weight: 0}
+  - {sequence: short, weight: 11}
+  - {template: b, weight: 5}
+  - {template: a, weight: 1}
+"#).unwrap()
+    }
+
+    #[test]
+    fn weighted_selector_preserves_seeded_choices_and_sequence_boundaries() -> Result<()> {
+        for sequences_only in [false, true] {
+            let mut spec = selector_spec();
+            if sequences_only {
+                spec.mix.retain(|entry| matches!(entry.item, MixItem::Sequence(_)));
+            }
+            for seed in 0..32 {
+                for count in 0..100 {
+                    let mut selector = WorkloadSelector::new(&spec, count)?;
+                    let mut expected_rng = StdRng::seed_from_u64(seed);
+                    let mut actual_rng = expected_rng.clone();
+                    let mut remaining = count;
+                    while remaining > 0 {
+                        let expected =
+                            reference_pick_workload_item(&spec, &mut expected_rng, remaining)?;
+                        let actual = selector.pick(&mut actual_rng, remaining).cloned();
+                        assert_eq!(
+                            actual, expected,
+                            "seed={seed}, count={count}, remaining={remaining}"
+                        );
+                        let Some(item) = actual else { break };
+                        let size = workload_item_tx_count(&spec, &item)?;
+                        assert!(size <= remaining);
+                        remaining -= size;
+                    }
+                    assert_eq!(actual_rng.random::<u64>(), expected_rng.random::<u64>());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn weighted_selector_handles_zero_weights_and_count_filtered_overflow() -> Result<()> {
+        let mut spec = selector_spec();
+        for entry in &mut spec.mix {
+            entry.weight = 0;
+        }
+        let mut selector = WorkloadSelector::new(&spec, u64::MAX)?;
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut untouched_rng = rng.clone();
+        assert!(selector.pick(&mut rng, u64::MAX).is_none());
+        assert_eq!(rng.random::<u64>(), untouched_rng.random::<u64>());
+
+        // A sequence that cannot fit must not contribute to the weight sum.
+        spec.mix[0].weight = u64::MAX;
+        spec.mix[1].weight = 1;
+        let mut selector = WorkloadSelector::new(&spec, 1)?;
+        assert_eq!(selector.pick(&mut rng, 1), Some(&MixItem::Template("a".to_owned())));
+        assert!(WorkloadSelector::new(&spec, 7).err().unwrap().to_string().contains("overflowed"));
+        assert!(WorkloadSelector::new(&spec, 0)?.pick(&mut rng, 0).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn weighted_selector_validates_references_and_rejects_empty_sequences() {
+        let mut spec = selector_spec();
+        spec.templates.remove("a");
+        assert!(WorkloadSelector::new(&spec, 100)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("template 'a' not found"));
+        let mut spec = selector_spec();
+        spec.sequences.remove("long");
+        assert!(WorkloadSelector::new(&spec, 100)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("sequence 'long' not found"));
+        let mut spec = selector_spec();
+        spec.sequences.get_mut("long").unwrap().steps.clear();
+        assert!(WorkloadSelector::new(&spec, 100)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("has no steps"));
     }
 
     fn var(path: &str) -> serde_yaml::Value {
