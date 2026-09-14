@@ -76,6 +76,15 @@ pub struct GenerateArgs {
     /// network-specific signing key material.
     #[arg(long)]
     pub defer_signing: bool,
+
+    /// Save setup bindings for a separate workload run. Requires --count 0.
+    #[arg(long, conflicts_with = "setup_state_in")]
+    pub setup_state_out: Option<PathBuf>,
+
+    /// Reuse bindings from a successfully submitted setup run without emitting
+    /// setup again. Fetches current workload nonces using --rpc.
+    #[arg(long, requires = "rpc", conflicts_with = "setup_state_out")]
+    pub setup_state_in: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +101,8 @@ pub struct GenerateContext {
     limit: GenerationLimit,
     signing_workers: usize,
     defer_signing: bool,
+    setup_state_in: Option<SetupState>,
+    setup_state_out: Option<PathBuf>,
 }
 
 impl GenerateContext {
@@ -102,6 +113,26 @@ impl GenerateContext {
 
         let spec = WorkloadSpec::load(&args.spec)
             .wrap_err_with(|| format!("failed to load spec: {}", args.spec.display()))?;
+        if args.setup_state_out.is_some() && args.count != Some(0) {
+            bail!("--setup-state-out requires --count 0; submit setup successfully before generating workload");
+        }
+        if (args.setup_state_in.is_some() || args.setup_state_out.is_some()) &&
+            spec.setup.as_ref().is_some_and(|setup| {
+                setup.steps.iter().any(|step| step.keychain_authorize_pool.is_some())
+            })
+        {
+            bail!("setup state does not support keychain_authorize_pool adapter state");
+        }
+        let setup_state_in = args
+            .setup_state_in
+            .as_ref()
+            .map(|path| {
+                let state: SetupState = serde_json::from_reader(std::fs::File::open(path)?)?;
+                state.validate(&spec)?;
+                Ok::<_, eyre::Report>(state)
+            })
+            .transpose()
+            .wrap_err("failed to load setup state")?;
         let base_path = args.spec.parent().unwrap_or_else(|| std::path::Path::new("."));
         let accounts = AccountManager::from_spec(&spec.accounts)?;
         let address_pools = AddressPoolManager::from_spec(&spec.address_pools)?;
@@ -122,6 +153,8 @@ impl GenerateContext {
             limit,
             signing_workers: args.signing_workers,
             defer_signing: args.defer_signing,
+            setup_state_in,
+            setup_state_out: args.setup_state_out.clone(),
         })
     }
 
@@ -944,7 +977,16 @@ where
     match output {
         Some(path) => {
             let mut writer = txgen_core::output::file_writer(&path)?;
-            let setup_bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+            let setup_bindings = if let Some(state) = &ctx.setup_state_in {
+                state.bindings()
+            } else {
+                let bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+                if let Some(path) = &ctx.setup_state_out {
+                    writer.flush()?;
+                    SetupState::from_bindings(ctx.spec.chain_id, &bindings).save(path)?;
+                }
+                bindings
+            };
             let written = generate_txs(
                 adapter,
                 &ctx.spec,
@@ -958,7 +1000,16 @@ where
         }
         None => {
             let mut writer = txgen_core::output::stdout_writer();
-            let setup_bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+            let setup_bindings = if let Some(state) = &ctx.setup_state_in {
+                state.bindings()
+            } else {
+                let bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+                if let Some(path) = &ctx.setup_state_out {
+                    writer.flush()?;
+                    SetupState::from_bindings(ctx.spec.chain_id, &bindings).save(path)?;
+                }
+                bindings
+            };
             generate_txs(
                 adapter,
                 &ctx.spec,
@@ -972,6 +1023,82 @@ where
     }
 
     Ok(())
+}
+
+/// Public setup outputs only; this file is not evidence that setup succeeded.
+/// The caller must wait for successful submission/inclusion before reusing it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SetupState {
+    version: u32,
+    chain_id: u64,
+    transactions: BTreeMap<String, EmittedTxInfo>,
+}
+
+impl SetupState {
+    fn from_bindings(
+        chain_id: u64,
+        bindings: &std::collections::HashMap<String, ResolvedBinding>,
+    ) -> Self {
+        let transactions = bindings
+            .iter()
+            .filter_map(|(id, binding)| {
+                if let ResolvedBinding::SetupTx { address, tx_hash, sender, nonce } = binding {
+                    Some((
+                        id.clone(),
+                        EmittedTxInfo {
+                            created_address: *address,
+                            tx_hash: *tx_hash,
+                            sender: *sender,
+                            nonce: *nonce,
+                        },
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Self { version: 1, chain_id, transactions }
+    }
+
+    fn save(&self, path: &std::path::Path) -> Result<()> {
+        std::fs::write(path, serde_json::to_vec_pretty(self)?)
+            .wrap_err_with(|| format!("failed to save setup state to {}", path.display()))
+    }
+
+    fn validate(&self, spec: &WorkloadSpec) -> Result<()> {
+        if self.version != 1 || self.chain_id != spec.chain_id {
+            bail!("setup state version or chain ID does not match this workload");
+        }
+        let expected: BTreeSet<_> = spec
+            .setup
+            .iter()
+            .flat_map(|setup| &setup.steps)
+            .map(|step| format!("setup.{}", step.id))
+            .collect();
+        if self.transactions.keys().cloned().collect::<BTreeSet<_>>() != expected {
+            bail!("setup state step IDs do not match this workload");
+        }
+        Ok(())
+    }
+
+    fn bindings(&self) -> std::collections::HashMap<String, ResolvedBinding> {
+        let mut bindings = std::collections::HashMap::from([(
+            "chain_id".to_owned(),
+            ResolvedBinding::U64(self.chain_id),
+        )]);
+        bindings.extend(self.transactions.iter().map(|(id, info)| {
+            (
+                id.clone(),
+                ResolvedBinding::SetupTx {
+                    address: info.created_address,
+                    tx_hash: info.tx_hash,
+                    sender: info.sender,
+                    nonce: info.nonce,
+                },
+            )
+        }));
+        bindings
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1042,7 +1169,7 @@ fn workload_item_tx_count(spec: &WorkloadSpec, item: &MixItem) -> Result<u64> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct EmittedTxInfo {
     sender: Address,
     nonce: u64,
