@@ -60,5 +60,4 @@ eyre = "0.6"
 tokio = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = "1"
-abi-fuzz = { git = "https://github.com/tempoxyz/abi-fuzz", rev = "2d8dac35d70fa13072f183ea8c9a90d144e3144f" }
 reqwest = { version = "0.13", features = ["json"] }

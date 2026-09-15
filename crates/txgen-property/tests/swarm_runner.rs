@@ -75,8 +75,7 @@ impl WorkloadGenerator for Workload {
         context: &mut GenerateContext<'_>,
     ) -> Result<Self::Action> {
         let amount =
-            match context.abi_value(AbiStrategy::Random, &alloy_dyn_abi::DynSolType::Uint(8), None)
-            {
+            match context.abi_value(AbiStrategy::Random, &alloy_dyn_abi::DynSolType::Uint(8)) {
                 alloy_dyn_abi::DynSolValue::Uint(value, 8) => value.to::<u8>(),
                 value => panic!("unexpected generated value {value:?}"),
             };

@@ -6,8 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-abi-fuzz.workspace = true
 alloy-dyn-abi.workspace = true
+alloy-primitives.workspace = true
 eyre.workspace = true
 rand.workspace = true
 serde.workspace = true

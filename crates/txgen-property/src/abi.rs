@@ -1,8 +1,5 @@
-use abi_fuzz::{
-    generators::{EchidnaGenerator, RandomGenerator},
-    Constraints, Generator,
-};
 use alloy_dyn_abi::{DynSolType, DynSolValue};
+use alloy_primitives::U256;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
@@ -18,10 +15,7 @@ pub enum AbiStrategy {
 
 /// Reusable ABI-fuzz generators for one property run.
 #[derive(Debug, Default)]
-pub struct AbiValueGenerator {
-    random: RandomGenerator,
-    echidna: EchidnaGenerator,
-}
+pub struct AbiValueGenerator;
 
 impl AbiValueGenerator {
     /// Generate one value matching `ty`.
@@ -29,16 +23,27 @@ impl AbiValueGenerator {
         &mut self,
         strategy: AbiStrategy,
         ty: &DynSolType,
-        constraints: Option<&Constraints>,
         rng: &mut dyn RngCore,
     ) -> DynSolValue {
-        match strategy {
-            AbiStrategy::Random => self.random.generate_constrained(ty, constraints, rng),
-            // EchidnaGenerator intentionally has no constrained override. A
-            // model that needs bounds should select Random with constraints or
-            // provide a concrete model-derived value.
-            AbiStrategy::Echidna => self.echidna.generate(ty, rng),
-        }
+        let DynSolType::Uint(bits) = ty else {
+            panic!("built-in ABI generator currently supports unsigned integers, got {ty}")
+        };
+        let max = if *bits == 256 { U256::MAX } else { (U256::from(1) << bits) - U256::from(1) };
+        let value = match strategy {
+            AbiStrategy::Random => {
+                let mut bytes = [0_u8; 32];
+                rng.fill_bytes(&mut bytes);
+                U256::from_be_bytes(bytes) & max
+            }
+            AbiStrategy::Echidna => match rng.next_u32() % 5 {
+                0 => U256::ZERO,
+                1 => U256::from(1),
+                2 => max,
+                3 => max.saturating_sub(U256::from(1)),
+                _ => max >> 1,
+            },
+        };
+        DynSolValue::Uint(value, *bits)
     }
 }
 
@@ -56,12 +61,7 @@ pub struct GenerateContext<'a> {
 
 impl GenerateContext<'_> {
     /// Generate one ABI value through the selected strategy.
-    pub fn abi_value(
-        &mut self,
-        strategy: AbiStrategy,
-        ty: &DynSolType,
-        constraints: Option<&Constraints>,
-    ) -> DynSolValue {
-        self.abi.generate(strategy, ty, constraints, self.rng)
+    pub fn abi_value(&mut self, strategy: AbiStrategy, ty: &DynSolType) -> DynSolValue {
+        self.abi.generate(strategy, ty, self.rng)
     }
 }

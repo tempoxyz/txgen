@@ -369,7 +369,7 @@ impl WorkloadGenerator for ZoneWorkload {
         kind: &Self::ActionKind,
         context: &mut GenerateContext<'_>,
     ) -> Result<Self::Action> {
-        let raw_amount = match context.abi_value(swarm.abi_strategy, &DynSolType::Uint(128), None) {
+        let raw_amount = match context.abi_value(swarm.abi_strategy, &DynSolType::Uint(128)) {
             DynSolValue::Uint(value, 128) => value.to::<u128>(),
             value => bail!("ABI generator returned unexpected uint128 value {value:?}"),
         };
@@ -1039,6 +1039,25 @@ impl ZonePropertyBackend for LiveZoneBackend {
     async fn ensure_approvals(&mut self) -> Result<()> {
         self.ensure_allowance(&self.l1, self.l1_chain_id, self.config.portal, ZoneLayer::Tempo)
             .await?;
+
+        // A fresh Zone has no user fee-token balance by construction. Seed it through the
+        // real Portal path before submitting the Zone approval; pre-funding genesis would
+        // create unbacked Zone supply and hide failures in the deposit lifecycle.
+        let bootstrap =
+            ZoneAction::Deposit { raw_amount: 1_000_000, amount_mode: ZoneAmountMode::Spendable };
+        let trace = self.execute(&bootstrap).await?;
+        ensure!(trace.outcome == ZoneOutcome::Success, "bootstrap deposit reverted");
+        let terminal = self
+            .await_terminal(&bootstrap, &trace)
+            .await?
+            .ok_or_else(|| eyre::eyre!("bootstrap deposit did not reach a terminal Zone state"))?;
+        ensure!(
+            terminal.terminal_reason == "deposit_processed",
+            "bootstrap deposit ended as {}",
+            terminal.terminal_reason
+        );
+        ensure!(terminal.backing.is_solvent(), "bootstrap deposit left the Portal underbacked");
+
         self.ensure_allowance(
             &self.user_zone,
             self.config.zone_chain_id,
