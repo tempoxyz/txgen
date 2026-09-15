@@ -355,6 +355,9 @@ bench send --input transactions.ndjson --rpc-url http://localhost:8545 --tps 500
 # From stdin (pipe from txgen)
 txgen-ethereum generate -s workload.yaml -n 1000 | bench send --rpc-url http://localhost:8545
 
+# Keep at most 50,000 submitted transactions awaiting inclusion
+txgen-tempo generate -s workload.yaml --duration 90s | bench send --max-pending 50000
+
 # With JSON report and metadata
 bench send -i txs.ndjson --rpc-url http://localhost:8545 \
   --report json:report.json \
@@ -601,6 +604,23 @@ bench view report.json
 | `<INPUT>` | JSON report file (default: `report.json`) |
 
 **Required RPC methods:** None (offline)
+
+### Pending transaction limit
+
+`bench send --max-pending 50000` reserves a slot before each workload submission
+and refills it when the shared block scanner observes inclusion (including a revert)
+or the RPC definitively rejects the transaction. It counts this sender's outstanding
+transactions, including RPC requests in flight, not unrelated transactions in the node's
+pool. Omit the option for the existing rate-only mode. `--tps` remains an optional
+submission ceiling and `--max-concurrent` independently limits RPC requests.
+
+One head poller and one `eth_getBlockReceipts` request per observed block serve all
+pending transactions and inclusion dependencies; waiting workers receive notifications
+and never poll individual receipts. Registration happens before submission, so fast
+inclusion is not missed. A lost RPC response retains its slot until inclusion. Unsupported
+block receipt queries or a transaction missing for five minutes stop submissions with an
+error rather than forgetting outstanding transactions. Flush waits for the final inclusions;
+this measures inclusion, not finality, and does not refill slots for pool evictions.
 
 ### Live Progress
 

@@ -46,6 +46,9 @@ struct MockState {
     response_delay_ms: AtomicUsize,
     head_delay_ms: AtomicUsize,
     head_ready: AtomicBool,
+    reject_sends: AtomicBool,
+    unsupported_receipts: AtomicBool,
+    lose_send_response: AtomicBool,
     chain: Mutex<MockChain>,
 }
 
@@ -76,6 +79,9 @@ impl MockState {
 
         match request.method.as_str() {
             "eth_sendRawTransaction" => {
+                if self.reject_sends.load(Ordering::SeqCst) {
+                    return HttpResponse::ok(json!({"code": -32000, "message": "rejected"}));
+                }
                 let raw = request.params[0].as_str().unwrap().to_string();
                 let previous = self.sends_in_flight.fetch_add(1, Ordering::SeqCst);
                 if previous > 0 {
@@ -100,6 +106,9 @@ impl MockState {
                 if self.automine.load(Ordering::SeqCst) {
                     self.mine();
                 }
+                if self.lose_send_response.load(Ordering::SeqCst) {
+                    return HttpResponse::new(503, json!({"error": "response lost"}));
+                }
                 thread::sleep(Duration::from_millis(
                     self.response_delay_ms.load(Ordering::SeqCst) as u64
                 ));
@@ -113,6 +122,9 @@ impl MockState {
                 HttpResponse::ok(json!(format!("0x{:x}", self.chain.lock().unwrap().blocks.len())))
             }
             "eth_getBlockReceipts" => {
+                if self.unsupported_receipts.load(Ordering::SeqCst) {
+                    return HttpResponse::ok(json!({"code": -32601, "message": "method not found"}));
+                }
                 let number = usize::from_str_radix(
                     request.params[0].as_str().unwrap().trim_start_matches("0x"),
                     16,
@@ -203,7 +215,9 @@ fn serve_connection(mut stream: TcpStream, state: Arc<MockState>) {
     };
     let id = request_json["id"].clone();
     let response = state.respond(request);
-    let body = if response.status == 200 {
+    let body = if response.status == 200 && response.body.get("code").is_some() {
+        json!({ "jsonrpc": "2.0", "id": id, "error": response.body }).to_string()
+    } else if response.status == 200 {
         json!({ "jsonrpc": "2.0", "id": id, "result": response.body }).to_string()
     } else {
         response.body.to_string()
@@ -561,6 +575,114 @@ async fn wait_for_pending(rpc: &MockRpc, count: usize) {
     })
     .await
     .expect("transactions were not submitted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_limit_refills_only_included_slots_and_shares_block_queries() {
+    let rpc = MockRpc::start();
+    rpc.state.automine.store(false, Ordering::SeqCst);
+    let mut sender = sender(&rpc, None, 8).with_max_pending(3.try_into().unwrap());
+    // One submission lane can fill multiple pending slots after RPC acceptance.
+    for raw in 2..=7 {
+        sender.send(transaction(raw, None, 1, false)).await.unwrap();
+    }
+    let flush = tokio::spawn(async move { sender.flush().await });
+    wait_for_pending(&rpc, 3).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(rpc.state.chain.lock().unwrap().pending.len(), 3);
+
+    // Include just one tracked transaction plus one unrelated transaction.
+    {
+        let mut chain = rpc.state.chain.lock().unwrap();
+        let hash = chain.pending.remove(0);
+        chain.blocks.push(vec![receipt(hash), receipt(TxHash::repeat_byte(99))]);
+    }
+    wait_for_pending(&rpc, 3).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        rpc.state.requests().iter().filter(|r| r.method == "eth_sendRawTransaction").count(),
+        4
+    );
+    rpc.state.mine();
+    wait_for_pending(&rpc, 2).await;
+    assert!(!flush.is_finished(), "flush must await the final inclusions");
+    rpc.state.mine();
+    tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap().unwrap().unwrap();
+    let requests = rpc.state.requests();
+    assert_eq!(requests.iter().filter(|r| r.method == "eth_getBlockReceipts").count(), 3);
+    assert!(requests.iter().all(|r| r.method != "eth_getTransactionReceipt"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_limit_handles_inclusion_before_rpc_response() {
+    let rpc = MockRpc::start();
+    rpc.state.response_delay_ms.store(250, Ordering::SeqCst);
+    let mut sender = sender(&rpc, None, 8).with_max_pending(1.try_into().unwrap());
+    for raw in 2..=4 {
+        sender.send(transaction(raw, None, raw, false)).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), sender.flush()).await.unwrap().unwrap();
+    assert_eq!(rpc.state.chain.lock().unwrap().blocks.len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_limit_releases_definite_rejections() {
+    let rpc = MockRpc::start();
+    rpc.state.reject_sends.store(true, Ordering::SeqCst);
+    let mut sender = sender(&rpc, None, 8).with_max_pending(1.try_into().unwrap());
+    for raw in 2..=4 {
+        sender.send(transaction(raw, None, raw, false)).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), sender.flush()).await.unwrap().unwrap();
+    assert_eq!(
+        rpc.state.requests().iter().filter(|r| r.method == "eth_sendRawTransaction").count(),
+        3
+    );
+    assert!(rpc.state.chain.lock().unwrap().pending.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_limit_stops_when_block_observation_is_unsupported() {
+    let rpc = MockRpc::start();
+    rpc.state.unsupported_receipts.store(true, Ordering::SeqCst);
+    let mut sender = sender(&rpc, None, 8).with_max_pending(1.try_into().unwrap());
+    for raw in 2..=4 {
+        sender.send(transaction(raw, None, raw, false)).await.unwrap();
+    }
+    let error =
+        tokio::time::timeout(Duration::from_secs(5), sender.flush()).await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("eth_getBlockReceipts"));
+    assert_eq!(
+        rpc.state.requests().iter().filter(|r| r.method == "eth_sendRawTransaction").count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_limit_keeps_uncertain_submissions_until_inclusion() {
+    let rpc = MockRpc::start();
+    rpc.state.automine.store(false, Ordering::SeqCst);
+    rpc.state.lose_send_response.store(true, Ordering::SeqCst);
+    // No transport retry: the node accepts the transaction then loses its response.
+    let provider = ProviderBuilder::new_with_network::<AnyNetwork>()
+        .connect_http(rpc.url.parse().unwrap())
+        .erased();
+    let metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
+    let mut sender = Sender::new(vec![provider], SenderConfig::default(), metrics)
+        .with_max_pending(1.try_into().unwrap());
+    sender.send(transaction(2, None, 1, false)).await.unwrap();
+    sender.send(transaction(3, None, 2, false)).await.unwrap();
+    let flush = tokio::spawn(async move { sender.flush().await });
+    wait_for_pending(&rpc, 1).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        rpc.state.requests().iter().filter(|r| r.method == "eth_sendRawTransaction").count(),
+        1
+    );
+    rpc.state.mine();
+    wait_for_pending(&rpc, 1).await;
+    rpc.state.mine();
+    tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap().unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

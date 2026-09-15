@@ -323,7 +323,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn ten_thousand_interests_share_a_block_response_and_duplicate_waiters() {
+    async fn fifty_thousand_interests_share_a_block_response_and_duplicate_waiters() {
         let asserter = Asserter::new();
         asserter.push_success(&"0x0");
 
@@ -331,7 +331,7 @@ mod tests {
         let mut waiters = Vec::new();
         let mut receipts = Vec::new();
 
-        for i in 0u64..10_000 {
+        for i in 0u64..50_000 {
             let hash = alloy_primitives::keccak256(i.to_be_bytes());
             waiters.push(tracker.register(hash).await.unwrap());
             receipts.push(receipt(hash, 1));

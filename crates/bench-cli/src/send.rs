@@ -28,6 +28,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         input = args.input.as_ref().map(|p| p.display().to_string()).as_deref().unwrap_or("stdin"),
         rpc_urls = ?args.rpc_urls,
         tps = args.tps,
+        max_pending = args.max_pending.map(|limit| limit.get()),
         skip_setup = args.skip_setup,
         collect_latencies = args.collect_latencies,
         collect_receipt_metrics = args.collect_receipt_metrics,
@@ -35,7 +36,10 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         "Starting send"
     );
 
-    let metadata = parse_metadata(&args.metadata)?;
+    let mut metadata = parse_metadata(&args.metadata)?;
+    if let Some(limit) = args.max_pending {
+        metadata.insert("max_pending".to_string(), limit.to_string());
+    }
     let scraper_configs =
         metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
 
@@ -181,6 +185,9 @@ async fn execute_source<S: TxSource>(
     let mut sender =
         Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth)
             .with_receipt_tracker(receipt_tracker);
+    if let Some(limit) = args.max_pending {
+        sender = sender.with_max_pending(limit);
+    }
     if let Some(late_signer) = late_signer {
         sender = sender.with_late_signer(late_signer);
     }
