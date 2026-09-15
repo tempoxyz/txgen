@@ -1,6 +1,7 @@
 pub mod auth_token_map;
 pub mod late_sign;
 mod nonce;
+pub mod property;
 mod template;
 mod zone;
 pub mod zone_auth;

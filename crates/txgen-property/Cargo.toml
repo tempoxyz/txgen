@@ -1,0 +1,19 @@
+[package]
+name = "txgen-property"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+abi-fuzz.workspace = true
+alloy-dyn-abi.workspace = true
+eyre.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt"] }

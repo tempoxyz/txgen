@@ -9,11 +9,17 @@ license.workspace = true
 name = "txgen-tempo"
 path = "src/bin/main.rs"
 
+[[bin]]
+name = "txgen-tempo-property"
+path = "src/bin/property.rs"
+
 [dependencies]
 # workspace
 bench-core.workspace = true
 txgen-core.workspace = true
 txgen-cli.workspace = true
+txgen-property.workspace = true
+zone-portal-backing = { git = "https://github.com/tempoxyz/zones", rev = "b9e822438be6415dc667bef7391f359a7d07c7ac" }
 
 # serde
 serde.workspace = true
@@ -24,12 +30,15 @@ serde_yaml.workspace = true
 clap.workspace = true
 
 # alloy
+alloy-dyn-abi.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-signer.workspace = true
 alloy-network.workspace = true
 alloy-provider.workspace = true
 alloy-eips.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-sol-types.workspace = true
 
 # tempo
 tempo-alloy.workspace = true
@@ -43,6 +52,7 @@ sha2.workspace = true
 
 # misc
 rand.workspace = true
+reqwest.workspace = true
 rustix.workspace = true
 eyre.workspace = true
 hex.workspace = true
