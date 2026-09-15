@@ -8,7 +8,7 @@
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eyre::{bail, Context, Result};
-use std::{collections::HashSet, path::PathBuf, time::Duration};
+use std::{collections::HashSet, num::NonZeroUsize, path::PathBuf, time::Duration};
 
 use crate::{
     metrics_url::{parse_metrics_url, MetricsURL},
@@ -79,6 +79,16 @@ pub struct SendArgs {
     /// connections are open at once to avoid overwhelming the RPC endpoint.
     #[arg(long, default_value = "100")]
     pub max_concurrent: usize,
+
+    /// Maximum submitted transactions awaiting inclusion (disabled when omitted).
+    ///
+    /// Reserves capacity before dispatch and refills it from shared block hashes,
+    /// including reverted transactions or Tempo transactions past their signed expiry.
+    /// RPC concurrency and --tps still apply. The query endpoint must support
+    /// eth_blockNumber and eth_getBlockByNumber. Receipt dependencies also require
+    /// eth_getBlockReceipts. Unresolved transactions time out after five minutes.
+    #[arg(long)]
+    pub max_pending: Option<NonZeroUsize>,
 
     /// Number of times to retry failed transaction submissions.
     ///
