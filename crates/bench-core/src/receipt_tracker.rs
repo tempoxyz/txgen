@@ -1,13 +1,14 @@
-//! Shared block receipt observation for transaction inclusion dependencies.
+//! Shared block observation for pending limits and receipt dependencies.
 //!
 //! Register before dispatching a transaction. Registration waits for a shared
 //! starting head, so even inclusion before the submission response is covered.
-//! HTTP endpoints use one head poller; receipt RPC traffic scales with blocks,
+//! HTTP endpoints use one head poller; block RPC traffic scales with blocks,
 //! never with the number of pending transactions. This observes inclusion only,
 //! not finality or additional confirmations.
 
+use alloy_consensus::BlockHeader;
 use alloy_eips::BlockId;
-use alloy_network::{AnyNetwork, AnyTransactionReceipt};
+use alloy_network::{primitives::BlockResponse, AnyNetwork, AnyTransactionReceipt};
 use alloy_primitives::TxHash;
 use alloy_provider::{DynProvider, Provider};
 use eyre::{eyre, Result};
@@ -23,7 +24,19 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
 
 type Receipt = Arc<AnyTransactionReceipt>;
-type ReceiptResult = Result<Receipt, String>;
+type ReceiptResult = Result<Inclusion, String>;
+
+#[derive(Debug)]
+pub(crate) enum Inclusion {
+    Included(Option<Receipt>),
+    Expired,
+}
+
+struct Interest {
+    sender: oneshot::Sender<ReceiptResult>,
+    receipt: bool,
+    expires_at: Option<u64>,
+}
 
 /// Cloneable, lazy receipt service for one chain's aggregate query provider.
 #[derive(Clone)]
@@ -39,11 +52,12 @@ struct State {
     preparing: usize,
     next_id: u64,
     ready: watch::Sender<Option<Result<(), String>>>,
-    pending: HashMap<TxHash, HashMap<u64, oneshot::Sender<ReceiptResult>>>,
+    pending: HashMap<TxHash, HashMap<u64, Interest>>,
 }
 
 impl ReceiptTracker {
-    /// Use an endpoint authorized for `eth_blockNumber` and `eth_getBlockReceipts`.
+    /// Use an endpoint authorized for `eth_blockNumber`, `eth_getBlockByNumber`,
+    /// and (for receipt dependencies) `eth_getBlockReceipts`.
     /// Sender-specific submission credentials are not used for aggregate queries.
     pub fn new(provider: DynProvider<AnyNetwork>) -> Self {
         let state = State {
@@ -111,6 +125,15 @@ pub(crate) struct ReceiptRegistration {
 
 impl ReceiptRegistration {
     pub(crate) fn register(self, hash: TxHash) -> Result<ReceiptWaiter> {
+        self.register_pending(hash, true, None)
+    }
+
+    pub(crate) fn register_pending(
+        self,
+        hash: TxHash,
+        receipt: bool,
+        expires_at: Option<u64>,
+    ) -> Result<ReceiptWaiter> {
         let (sender, receiver) = oneshot::channel();
 
         let id = {
@@ -123,7 +146,11 @@ impl ReceiptRegistration {
             let id = state.next_id;
             state.next_id += 1;
 
-            state.pending.entry(hash).or_default().insert(id, sender);
+            state
+                .pending
+                .entry(hash)
+                .or_default()
+                .insert(id, Interest { sender, receipt, expires_at });
 
             id
         };
@@ -148,7 +175,14 @@ pub(crate) struct ReceiptWaiter {
 }
 
 impl ReceiptWaiter {
-    pub(crate) async fn wait(mut self) -> Result<Receipt> {
+    pub(crate) async fn wait(self) -> Result<Receipt> {
+        match self.observe().await? {
+            Inclusion::Included(Some(receipt)) => Ok(receipt),
+            _ => Err(eyre!("transaction expired before receipt observation")),
+        }
+    }
+
+    pub(crate) async fn observe(mut self) -> Result<Inclusion> {
         tokio::time::timeout(RECEIPT_TIMEOUT, &mut self.receiver)
             .await
             .map_err(|_| eyre!("timed out waiting for transaction inclusion"))?
@@ -192,11 +226,47 @@ impl Inner {
             if let Some(waiters) = state.pending.remove(&receipt.transaction_hash()) {
                 let receipt = Arc::new(receipt);
 
-                for sender in waiters.into_values() {
-                    let _ = sender.send(Ok(receipt.clone()));
+                for interest in waiters.into_values() {
+                    let _ = interest.sender.send(Ok(Inclusion::Included(Some(receipt.clone()))));
                 }
             }
         }
+    }
+
+    fn dispatch_hashes(&self, hashes: impl Iterator<Item = TxHash>) {
+        let mut state = self.state.lock().expect("receipt tracker state");
+        for hash in hashes {
+            if let Some(waiters) = state.pending.get_mut(&hash) {
+                let included: Vec<_> = waiters
+                    .iter()
+                    .filter_map(|(&id, interest)| (!interest.receipt).then_some(id))
+                    .collect();
+                for id in included {
+                    let interest = waiters.remove(&id).expect("included interest exists");
+                    let _ = interest.sender.send(Ok(Inclusion::Included(None)));
+                }
+                if waiters.is_empty() {
+                    state.pending.remove(&hash);
+                }
+            }
+        }
+    }
+
+    fn expire(&self, timestamp: u64) {
+        let mut state = self.state.lock().expect("receipt tracker state");
+        state.pending.retain(|_, waiters| {
+            let expired: Vec<_> = waiters
+                .iter()
+                .filter_map(|(&id, interest)| {
+                    interest.expires_at.filter(|&expiry| expiry <= timestamp).map(|_| id)
+                })
+                .collect();
+            for id in expired {
+                let interest = waiters.remove(&id).expect("expired interest exists");
+                let _ = interest.sender.send(Ok(Inclusion::Expired));
+            }
+            !waiters.is_empty()
+        });
     }
 
     async fn run(self: Arc<Self>) {
@@ -215,14 +285,14 @@ impl Inner {
                         Some(alloy_transport::RpcError::ErrorResp(payload)) if payload.code == -32601
                     ) =>
                 {
-                    let message = "receipt observation requires eth_blockNumber and eth_getBlockReceipts on the query endpoint";
+                    let message = "inclusion observation requires eth_blockNumber and eth_getBlockByNumber (eth_getBlockReceipts for receipt dependencies) on the query endpoint";
 
                     let mut state = self.state.lock().expect("receipt tracker state");
                     state.ready.send_replace(Some(Err(message.to_string())));
 
                     for (_, waiters) in state.pending.drain() {
-                        for sender in waiters.into_values() {
-                            let _ = sender.send(Err(message.to_string()));
+                        for interest in waiters.into_values() {
+                            let _ = interest.sender.send(Err(message.to_string()));
                         }
                     }
 
@@ -266,18 +336,53 @@ impl Inner {
                 break;
             }
 
-            let receipts = self
-                .provider
-                .get_block_receipts(BlockId::number(number))
-                .await?
-                .ok_or_else(|| eyre!("block receipts are not available yet"))?;
-
-            if receipts.iter().any(|r| r.block_number() != Some(number) || r.block_hash().is_none())
-            {
-                return Err(eyre!("block receipt response has inconsistent inclusion fields"));
+            let (needs_receipts, needs_block) = {
+                let state = self.state.lock().expect("receipt tracker state");
+                let needs_receipts =
+                    state.pending.values().flat_map(|w| w.values()).any(|i| i.receipt);
+                let needs_block = state
+                    .pending
+                    .values()
+                    .flat_map(|w| w.values())
+                    .any(|i| !i.receipt || i.expires_at.is_some());
+                (needs_receipts, needs_block)
+            };
+            let mut timestamp = None;
+            if needs_block {
+                let block = self
+                    .provider
+                    .get_block_by_number(number.into())
+                    .await?
+                    .ok_or_else(|| eyre!("block is not available yet"))?;
+                if block.header().number() != number {
+                    return Err(eyre!("block response has an inconsistent number"));
+                }
+                self.dispatch_hashes(block.transactions().hashes());
+                timestamp = Some(block.header().timestamp());
             }
 
-            self.dispatch(receipts);
+            if needs_receipts {
+                let receipts = self
+                    .provider
+                    .get_block_receipts(BlockId::number(number))
+                    .await?
+                    .ok_or_else(|| eyre!("block receipts are not available yet"))?;
+
+                if receipts
+                    .iter()
+                    .any(|r| r.block_number() != Some(number) || r.block_hash().is_none())
+                {
+                    return Err(eyre!("block receipt response has inconsistent inclusion fields"));
+                }
+
+                self.dispatch(receipts);
+            }
+
+            // Only expire after checking inclusion in every block through this
+            // timestamp. Wall-clock expiry alone can race a lagging RPC node.
+            if let Some(timestamp) = timestamp {
+                self.expire(timestamp);
+            }
 
             number = number.saturating_add(1);
             *next_block = Some(number);
@@ -369,7 +474,7 @@ mod tests {
         asserter.push_success(&Value::Null);
         asserter.push_success(&"0x8");
         asserter.push_success(&vec![receipt(hash, 7)]);
-        asserter.push_success(&Vec::<Value>::new());
+        // No interests remain after block 7, so block 8 needs no receipt request.
 
         assert_eq!(waiter.wait().await.unwrap().block_number(), Some(7));
         assert!(asserter.read_q().is_empty());

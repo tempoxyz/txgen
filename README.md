@@ -608,19 +608,22 @@ bench view report.json
 ### Pending transaction limit
 
 `bench send --max-pending 50000` reserves a slot before each workload submission
-and refills it when the shared block scanner observes inclusion (including a revert)
-or the RPC definitively rejects the transaction. It counts this sender's outstanding
+and refills it when the shared block scanner observes inclusion (including a revert),
+the RPC definitively rejects the transaction, or a Tempo transaction's signed expiry
+has passed on chain. It counts this sender's outstanding
 transactions, including RPC requests in flight, not unrelated transactions in the node's
 pool. Omit the option for the existing rate-only mode. `--tps` remains an optional
 submission ceiling and `--max-concurrent` independently limits RPC requests.
 
-One head poller and one `eth_getBlockReceipts` request per observed block serve all
-pending transactions and inclusion dependencies; waiting workers receive notifications
-and never poll individual receipts. Registration happens before submission, so fast
-inclusion is not missed. A lost RPC response retains its slot until inclusion. Unsupported
-block receipt queries or a transaction missing for five minutes stop submissions with an
-error rather than forgetting outstanding transactions. Flush waits for the final inclusions;
-this measures inclusion, not finality, and does not refill slots for pool evictions.
+One head poller and one `eth_getBlockByNumber` request (transaction hashes only) per
+observed block serve all pending transactions. Full block receipts are fetched only
+for setup or explicit receipt dependencies; waiting workers never poll individual receipts.
+Registration happens before submission, so fast inclusion is not missed. A lost RPC
+response retains its slot until inclusion or signed expiry. Expiry is checked against
+observed block timestamps after scanning inclusions, not the local wall clock. Unknown
+evictions or a transaction missing for five minutes fail the run rather than forgetting
+outstanding transactions. Flush waits for final inclusion/expiry observations; this
+measures inclusion, not finality. Hash-only tracking does not report transaction revert status.
 
 ### Live Progress
 

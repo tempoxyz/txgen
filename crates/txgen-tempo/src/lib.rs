@@ -12,7 +12,7 @@ pub use late_sign::{
 pub use nonce::{prefetch_parallel_nonces, NONCE_PRECOMPILE};
 pub use txgen_cli::fetch_protocol_nonces;
 
-use alloy_eips::eip2718::Encodable2718;
+use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{keccak256, Address, Bytes, TxKind, U256};
 use alloy_provider::{network::Ethereum, DynProvider};
@@ -54,6 +54,17 @@ const EXPIRING_UNIQUENESS_COUNTER_KEY: [u8; 20] = *b"tempo-expiring-seq!!";
 const INLINE_ACCESS_KEY_MNEMONIC: &str =
     "test test test test test test test test test test test junk";
 const INLINE_ACCESS_KEY_START_INDEX: u32 = 1_000_000;
+
+/// Extract the signed validity deadline for bench's shared pending tracker.
+/// Unknown/non-Tempo envelopes retain the generic inclusion timeout.
+pub fn transaction_expiry(raw: &Bytes) -> Option<u64> {
+    TempoTxEnvelope::decode_2718(&mut raw.as_ref())
+        .ok()?
+        .as_aa()?
+        .tx()
+        .valid_before
+        .map(NonZeroU64::get)
+}
 
 /// Tempo network adapter for transaction generation.
 ///
@@ -1752,6 +1763,8 @@ nonce_key:
         assert_eq!(tx_req.request.nonce_key, Some(TEMPO_EXPIRING_NONCE_KEY));
         assert_eq!(tx_req.request.valid_before.map(NonZeroU64::get), Some(1_700_000_000));
         assert_ne!(tx_req.key, sender.0 .0);
+        let generated = sign_tempo_request(tx_req, &ctx, "expiry");
+        assert_eq!(transaction_expiry(&generated.raw), Some(1_700_000_000));
     }
 
     #[test]

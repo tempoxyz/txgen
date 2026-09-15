@@ -82,10 +82,11 @@ pub struct SendArgs {
 
     /// Maximum submitted transactions awaiting inclusion (disabled when omitted).
     ///
-    /// Reserves capacity before dispatch and refills it from shared block receipts,
-    /// including reverted transactions. RPC concurrency and --tps still apply.
-    /// The query endpoint must support eth_blockNumber and eth_getBlockReceipts.
-    /// A transaction missing for five minutes fails the run; it is not forgotten.
+    /// Reserves capacity before dispatch and refills it from shared block hashes,
+    /// including reverted transactions or Tempo transactions past their signed expiry.
+    /// RPC concurrency and --tps still apply. The query endpoint must support
+    /// eth_blockNumber and eth_getBlockByNumber. Receipt dependencies also require
+    /// eth_getBlockReceipts. Unresolved transactions time out after five minutes.
     #[arg(long)]
     pub max_pending: Option<NonZeroUsize>,
 

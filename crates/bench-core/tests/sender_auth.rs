@@ -121,6 +121,31 @@ impl MockState {
                 self.head_ready.store(true, Ordering::SeqCst);
                 HttpResponse::ok(json!(format!("0x{:x}", self.chain.lock().unwrap().blocks.len())))
             }
+            "eth_getBlockByNumber" => {
+                if self.unsupported_receipts.load(Ordering::SeqCst) {
+                    return HttpResponse::ok(json!({"code": -32601, "message": "method not found"}));
+                }
+                assert_eq!(request.params[1], false, "only transaction hashes are needed");
+                let number = usize::from_str_radix(
+                    request.params[0].as_str().unwrap().trim_start_matches("0x"),
+                    16,
+                )
+                .unwrap();
+                let chain = self.chain.lock().unwrap();
+                let hashes: Vec<_> =
+                    chain.blocks[number - 1].iter().map(|r| r["transactionHash"].clone()).collect();
+                HttpResponse::ok(json!({
+                    "number": format!("0x{number:x}"), "hash": TxHash::repeat_byte(number as u8),
+                    "parentHash": TxHash::ZERO, "sha3Uncles": TxHash::ZERO,
+                    "logsBloom": format!("0x{}", "00".repeat(256)),
+                    "transactionsRoot": TxHash::ZERO, "stateRoot": TxHash::ZERO,
+                    "receiptsRoot": TxHash::ZERO, "miner": Address::ZERO,
+                    "difficulty": "0x0", "extraData": "0x", "gasLimit": "0xffffff",
+                    "gasUsed": "0x0", "timestamp": format!("0x{number:x}"),
+                    "uncles": [], "transactions": hashes,
+                    "mixHash": TxHash::ZERO, "nonce": "0x0000000000000000"
+                }))
+            }
             "eth_getBlockReceipts" => {
                 if self.unsupported_receipts.load(Ordering::SeqCst) {
                     return HttpResponse::ok(json!({"code": -32601, "message": "method not found"}));
@@ -609,7 +634,8 @@ async fn pending_limit_refills_only_included_slots_and_shares_block_queries() {
     rpc.state.mine();
     tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap().unwrap().unwrap();
     let requests = rpc.state.requests();
-    assert_eq!(requests.iter().filter(|r| r.method == "eth_getBlockReceipts").count(), 3);
+    assert_eq!(requests.iter().filter(|r| r.method == "eth_getBlockByNumber").count(), 3);
+    assert_eq!(requests.iter().filter(|r| r.method == "eth_getBlockReceipts").count(), 0);
     assert!(requests.iter().all(|r| r.method != "eth_getTransactionReceipt"));
 }
 
@@ -623,6 +649,35 @@ async fn pending_limit_handles_inclusion_before_rpc_response() {
     }
     tokio::time::timeout(Duration::from_secs(5), sender.flush()).await.unwrap().unwrap();
     assert_eq!(rpc.state.chain.lock().unwrap().blocks.len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_limit_refills_expired_transactions_only_after_chain_deadline() {
+    let rpc = MockRpc::start();
+    rpc.state.automine.store(false, Ordering::SeqCst);
+    let mut sender = sender(&rpc, None, 8)
+        .with_max_pending(1.try_into().unwrap())
+        .with_transaction_expiry(Arc::new(|raw| Some(if raw[0] == 2 { 2 } else { 10 })));
+    sender.send(transaction(2, None, 1, false)).await.unwrap();
+    sender.send(transaction(3, None, 1, false)).await.unwrap();
+    let flush = tokio::spawn(async move { sender.flush().await });
+    wait_for_pending(&rpc, 1).await;
+    // Drop the first transaction and advance to a block before its deadline.
+    {
+        let mut chain = rpc.state.chain.lock().unwrap();
+        chain.pending.clear();
+        chain.blocks.push(vec![]);
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        rpc.state.requests().iter().filter(|r| r.method == "eth_sendRawTransaction").count(),
+        1
+    );
+    rpc.state.mine(); // timestamp == signed expiry
+    wait_for_pending(&rpc, 1).await;
+    assert_eq!(rpc.state.chain.lock().unwrap().pending, [keccak256([3])]);
+    rpc.state.mine();
+    tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap().unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -651,7 +706,7 @@ async fn pending_limit_stops_when_block_observation_is_unsupported() {
     }
     let error =
         tokio::time::timeout(Duration::from_secs(5), sender.flush()).await.unwrap().unwrap_err();
-    assert!(error.to_string().contains("eth_getBlockReceipts"));
+    assert!(error.to_string().contains("eth_getBlockByNumber"));
     assert_eq!(
         rpc.state.requests().iter().filter(|r| r.method == "eth_sendRawTransaction").count(),
         1

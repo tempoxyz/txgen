@@ -7,6 +7,7 @@
 use crate::{
     metrics::MetricsCollector,
     receipt_metrics::{ReceiptCollectorHandle, ReceiptMetricLabels},
+    receipt_tracker::Inclusion,
     ReceiptTracker, RequestAuthProvider, RpcRequestContext,
 };
 use alloy_network::{primitives::ReceiptResponse, AnyNetwork, AnyTransactionReceipt};
@@ -35,6 +36,9 @@ pub trait LateSigner: Send + Sync {
     /// Sign one deferred transaction.
     fn sign(&self, spec: &LateSignSpec) -> Result<Bytes>;
 }
+
+/// Extract a signed transaction's absolute expiry in Unix seconds, if supported.
+pub type TransactionExpiry = dyn Fn(&Bytes) -> Option<u64> + Send + Sync;
 
 /// Configuration for the sender.
 #[derive(Debug, Clone)]
@@ -793,6 +797,7 @@ impl PendingTx {
 
 /// Transaction sender.
 pub struct Sender {
+    transaction_expiry: Option<Arc<TransactionExpiry>>,
     max_pending: Option<NonZeroUsize>,
     in_flight_pending: usize,
     pending_failure: Option<String>,
@@ -867,6 +872,7 @@ impl Sender {
         let receipt_tracker = ReceiptTracker::new(endpoints[0].provider().clone());
         Self {
             max_pending: None,
+            transaction_expiry: None,
             in_flight_pending: 0,
             pending_failure: None,
             receipt_tracker,
@@ -904,6 +910,13 @@ impl Sender {
     /// rejection. Missing receipts fail the sender rather than silently refill it.
     pub fn with_max_pending(mut self, limit: NonZeroUsize) -> Self {
         self.max_pending = Some(limit);
+        self
+    }
+
+    /// Recognize network-specific expiry for pending transactions. Slots are
+    /// released only after observing a block at or beyond the signed deadline.
+    pub fn with_transaction_expiry(mut self, expiry: Arc<TransactionExpiry>) -> Self {
+        self.transaction_expiry = Some(expiry);
         self
     }
 
@@ -1250,6 +1263,7 @@ impl Sender {
         let late_signer = self.late_signer.clone();
         let receipt_tracker = self.receipt_tracker.clone();
 
+        let transaction_expiry = self.transaction_expiry.clone();
         let pending_completion = self.max_pending.map(|_| {
             self.in_flight_pending += 1;
             PendingCompletion {
@@ -1273,6 +1287,7 @@ impl Sender {
             submit_tx(
                 pending,
                 pending_completion,
+                transaction_expiry,
                 setup_completion,
                 endpoint,
                 submission_headers,
@@ -1322,6 +1337,7 @@ fn normalize_key_sets(
 async fn submit_tx(
     pending: PendingTx,
     mut pending_completion: Option<PendingCompletion>,
+    transaction_expiry: Option<Arc<TransactionExpiry>>,
     mut setup_completion: Option<SetupCompletion>,
     endpoint: RpcEndpoint,
     submission_headers: HeaderMap,
@@ -1388,7 +1404,18 @@ async fn submit_tx(
 
     let expected_hash = keccak256(&raw);
     let inclusion = match inclusion
-        .map(|registration| registration.register(expected_hash))
+        .map(|registration| {
+            if pending_completion.is_some() {
+                let expires_at = transaction_expiry.as_ref().and_then(|expiry| expiry(&raw));
+                registration.register_pending(
+                    expected_hash,
+                    pending.phase == TxPhase::Setup || !pending.inclusion_keys.is_empty(),
+                    expires_at,
+                )
+            } else {
+                registration.register(expected_hash)
+            }
+        })
         .transpose()
     {
         Ok(inclusion) => inclusion,
@@ -1431,7 +1458,7 @@ async fn submit_tx(
                 completion.error = if uncertain {
                     inclusion
                         .expect("pending limit registers inclusion")
-                        .wait()
+                        .observe()
                         .await
                         .err()
                         .map(|e| e.to_string())
@@ -1452,8 +1479,10 @@ async fn submit_tx(
 
     let Some(inclusion) = inclusion else { return };
 
-    match inclusion.wait().await {
-        Ok(receipt) if receipt.status() => {
+    match inclusion.observe().await {
+        Ok(Inclusion::Included(receipt))
+            if receipt.as_ref().is_none_or(|receipt| receipt.status()) =>
+        {
             if let Some(completion) = &mut pending_completion {
                 completion.error = None;
             }
@@ -1461,9 +1490,16 @@ async fn submit_tx(
                 completion.success = true;
             }
         }
-        Ok(_) => {
+        Ok(Inclusion::Expired) => {
             if let Some(completion) = &mut pending_completion {
-                // Reverted transactions are included and no longer pending.
+                completion.error = None;
+            }
+            tracing::debug!(%tx_hash, "Transaction expired before inclusion");
+            metrics.record_failure();
+        }
+        Ok(Inclusion::Included(_)) => {
+            if let Some(completion) = &mut pending_completion {
+                // Reverted or expired transactions no longer occupy capacity.
                 completion.error = None;
             }
             tracing::error!(

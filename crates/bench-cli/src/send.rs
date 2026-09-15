@@ -186,7 +186,9 @@ async fn execute_source<S: TxSource>(
         Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth)
             .with_receipt_tracker(receipt_tracker);
     if let Some(limit) = args.max_pending {
-        sender = sender.with_max_pending(limit);
+        sender = sender
+            .with_max_pending(limit)
+            .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
     }
     if let Some(late_signer) = late_signer {
         sender = sender.with_late_signer(late_signer);
