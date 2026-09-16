@@ -340,7 +340,7 @@ impl RpcSubmitter {
                     tokio::time::timeout_at(deadline, registration).await.map_err(|_| {
                         RpcSubmitError::deadline(
                             RpcSubmitFailureKind::BeforeSend,
-                            "submission deadline elapsed starting receipt observation",
+                            "submission deadline elapsed starting inclusion observation",
                             None,
                         )
                     })?
@@ -361,7 +361,7 @@ impl RpcSubmitter {
             .map_err(RpcSubmitError::before_send)?;
 
         let inclusion = inclusion
-            .map(|registration| registration.register(expected_hash, true, None))
+            .map(|registration| registration.register(expected_hash, false, None))
             .transpose()
             .map_err(RpcSubmitError::before_send)?;
 
@@ -389,10 +389,10 @@ impl RpcSubmitter {
         order.release_submission_keys();
 
         if let Some(inclusion_release) = order.take_inclusion_keys() {
-            let inclusion = inclusion.expect("inclusion keys have a registered receipt waiter");
+            let inclusion = inclusion.expect("inclusion keys have a registered inclusion waiter");
 
             tokio::spawn(async move {
-                if let Err(error) = inclusion.wait().await {
+                if let Err(error) = inclusion.observe().await {
                     tracing::warn!(%error, "Failed waiting for transaction inclusion");
                 }
 

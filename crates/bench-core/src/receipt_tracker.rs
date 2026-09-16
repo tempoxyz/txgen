@@ -165,6 +165,7 @@ pub(crate) struct ReceiptWaiter {
 }
 
 impl ReceiptWaiter {
+    #[cfg(test)]
     pub(crate) async fn wait(self) -> Result<Receipt> {
         match self.observe().await? {
             Inclusion::Included(Some(receipt)) => Ok(receipt),

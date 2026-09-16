@@ -781,7 +781,7 @@ async fn sequences_share_one_receipt_request_per_block_and_wait_for_inclusion() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rpc_submitter_uses_query_tracker_before_releasing_inclusion_keys() {
+async fn rpc_submitter_uses_block_hashes_before_releasing_inclusion_keys() {
     let rpc = MockRpc::start();
     rpc.state.automine.store(false, Ordering::SeqCst);
 
@@ -806,7 +806,12 @@ async fn rpc_submitter_uses_query_tracker_before_releasing_inclusion_keys() {
     assert_eq!(rpc.state.chain.lock().unwrap().pending.len(), 1);
 
     rpc.state.mine();
-    assert!(rpc.state.requests().iter().all(|r| r.method != "eth_getTransactionReceipt"));
+    let requests = rpc.state.requests();
+    assert!(requests.iter().any(|r| r.method == "eth_getBlockByNumber"));
+    assert!(requests.iter().all(|r| !matches!(
+        r.method.as_str(),
+        "eth_getTransactionReceipt" | "eth_getBlockReceipts"
+    )));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
