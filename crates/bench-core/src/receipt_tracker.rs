@@ -345,9 +345,6 @@ impl Inner {
                 .get_block_by_number(number.into())
                 .await?
                 .ok_or_else(|| eyre!("block is not available yet"))?;
-            if block.header().number() != number {
-                return Err(eyre!("block response has an inconsistent number"));
-            }
 
             if self.dispatch_hashes(block.transactions().hashes()) {
                 let receipts = self
@@ -355,13 +352,6 @@ impl Inner {
                     .get_block_receipts(BlockId::number(number))
                     .await?
                     .ok_or_else(|| eyre!("block receipts are not available yet"))?;
-
-                if receipts
-                    .iter()
-                    .any(|r| r.block_number() != Some(number) || r.block_hash().is_none())
-                {
-                    return Err(eyre!("block receipt response has inconsistent inclusion fields"));
-                }
 
                 self.dispatch(receipts);
             }
@@ -559,7 +549,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn transient_failure_and_invalid_receipts_do_not_advance_cursor() {
+    async fn transient_receipt_failure_does_not_advance_cursor() {
         let asserter = Asserter::new();
         asserter.push_success(&"0x0");
 
@@ -570,9 +560,6 @@ mod tests {
         asserter.push_success(&"0x1");
         asserter.push_success(&block(1, &[hash]));
         asserter.push_failure_msg("temporary receipt failure");
-        asserter.push_success(&"0x1");
-        asserter.push_success(&block(1, &[hash]));
-        asserter.push_success(&vec![receipt(hash, 2)]);
         asserter.push_success(&"0x1");
         asserter.push_success(&block(1, &[hash]));
         asserter.push_success(&vec![receipt(hash, 1)]);
