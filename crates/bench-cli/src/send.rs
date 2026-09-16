@@ -24,11 +24,12 @@ use txgen_tempo::TempoLateSigner;
 const SETUP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
 pub async fn execute(args: SendArgs) -> Result<()> {
+    let max_pending = args.pending_limit()?;
     tracing::info!(
         input = args.input.as_ref().map(|p| p.display().to_string()).as_deref().unwrap_or("stdin"),
         rpc_urls = ?args.rpc_urls,
         tps = args.tps,
-        max_pending = args.max_pending.map(|limit| limit.get()),
+        max_pending = max_pending.map_or(0, |limit| limit.get()),
         skip_setup = args.skip_setup,
         collect_latencies = args.collect_latencies,
         collect_receipt_metrics = args.collect_receipt_metrics,
@@ -37,9 +38,8 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     );
 
     let mut metadata = parse_metadata(&args.metadata)?;
-    if let Some(limit) = args.max_pending {
-        metadata.insert("max_pending".to_string(), limit.to_string());
-    }
+    metadata
+        .insert("max_pending".to_string(), max_pending.map_or(0, |limit| limit.get()).to_string());
     let scraper_configs =
         metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
 
@@ -186,7 +186,7 @@ async fn execute_source<S: TxSource>(
         Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth)
             .with_receipt_tracker(receipt_tracker)
             .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
-    if let Some(limit) = args.max_pending {
+    if let Some(limit) = args.pending_limit()? {
         sender = sender.with_max_pending(limit);
     }
     if let Some(late_signer) = late_signer {

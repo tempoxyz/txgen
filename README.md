@@ -355,8 +355,11 @@ bench send --input transactions.ndjson --rpc-url http://localhost:8545 --tps 500
 # From stdin (pipe from txgen)
 txgen-ethereum generate -s workload.yaml -n 1000 | bench send --rpc-url http://localhost:8545
 
-# Keep at most 50,000 submitted transactions awaiting inclusion
-txgen-tempo generate -s workload.yaml --duration 90s | bench send --max-pending 50000
+# Target 50,000 TPS and keep at most 50,000 transactions awaiting inclusion
+txgen-tempo generate -s workload.yaml --duration 90s | bench send --tps 50000
+
+# Disable the pending cap while retaining the TPS ceiling
+txgen-tempo generate -s workload.yaml --duration 90s | bench send --tps 50000 --max-pending 0
 
 # With JSON report and metadata
 bench send -i txs.ndjson --rpc-url http://localhost:8545 \
@@ -612,8 +615,12 @@ and refills it when the shared block scanner observes inclusion (including a rev
 the RPC definitively rejects the transaction, or a Tempo transaction's signed expiry
 has passed on chain. It counts this sender's outstanding
 transactions, including RPC requests in flight, not unrelated transactions in the node's
-pool. Omit the option for the existing rate-only mode. `--tps` remains an optional
-submission ceiling and `--max-concurrent` independently limits RPC requests.
+pool. When omitted, `--max-pending` defaults to the value of `--tps`. Pass
+`--max-pending 0` to disable the cap, or a positive value to override it. If `--tps`
+is omitted or zero, the pending cap is disabled unless explicitly set.
+`--tps` remains the submission ceiling and `--max-concurrent` independently limits
+RPC requests. Logs and report metadata record the effective pending limit (zero
+when disabled).
 
 One head poller and one `eth_getBlockByNumber` request (transaction hashes only) per
 observed block serve all pending transactions. Full block receipts are fetched only
