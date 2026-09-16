@@ -73,12 +73,6 @@ impl ReceiptTracker {
         Self(Arc::new(inner))
     }
 
-    /// Establish interest before the caller sends the signed transaction.
-    #[cfg(test)]
-    pub(crate) async fn register(&self, hash: TxHash) -> Result<ReceiptWaiter> {
-        self.prepare().await?.register(hash)
-    }
-
     /// Wait for the starting head before signing an expiring transaction.
     pub(crate) async fn prepare(&self) -> Result<ReceiptRegistration> {
         let (mut ready, start) = {
@@ -124,14 +118,10 @@ pub(crate) struct ReceiptRegistration {
 }
 
 impl ReceiptRegistration {
-    pub(crate) fn register(self, hash: TxHash) -> Result<ReceiptWaiter> {
-        self.register_pending(hash, true, None)
-    }
-
-    pub(crate) fn register_pending(
+    pub(crate) fn register(
         self,
         hash: TxHash,
-        receipt: bool,
+        needs_receipt: bool,
         expires_at: Option<u64>,
     ) -> Result<ReceiptWaiter> {
         let (sender, receiver) = oneshot::channel();
@@ -150,7 +140,7 @@ impl ReceiptRegistration {
                 .pending
                 .entry(hash)
                 .or_default()
-                .insert(id, Interest { sender, receipt, expires_at });
+                .insert(id, Interest { sender, receipt: needs_receipt, expires_at });
 
             id
         };
@@ -428,12 +418,13 @@ mod tests {
 
         for i in 0u64..50_000 {
             let hash = alloy_primitives::keccak256(i.to_be_bytes());
-            waiters.push(tracker.register(hash).await.unwrap());
+            waiters.push(tracker.prepare().await.unwrap().register(hash, true, None).unwrap());
             receipts.push(receipt(hash, 1));
         }
 
         let duplicate_hash = alloy_primitives::keccak256(0u64.to_be_bytes());
-        let duplicate = tracker.register(duplicate_hash).await.unwrap();
+        let duplicate =
+            tracker.prepare().await.unwrap().register(duplicate_hash, true, None).unwrap();
 
         // Unrelated receipts do not create or resolve an interest.
         receipts.push(receipt(B256::repeat_byte(0xff), 1));
@@ -461,7 +452,7 @@ mod tests {
 
         let tracker = tracker(&asserter);
         let hash = B256::repeat_byte(1);
-        let waiter = tracker.register(hash).await.unwrap();
+        let waiter = tracker.prepare().await.unwrap().register(hash, true, None).unwrap();
 
         // The head jumps three blocks; indexing of the middle block is late.
         asserter.push_success(&"0x8");
@@ -488,19 +479,11 @@ mod tests {
         let included_hash = B256::repeat_byte(2);
         let expired_hash = B256::repeat_byte(3);
         let receipt_waiter =
-            tracker.prepare().await.unwrap().register_pending(receipt_hash, true, Some(2)).unwrap();
-        let included = tracker
-            .prepare()
-            .await
-            .unwrap()
-            .register_pending(included_hash, false, Some(1))
-            .unwrap();
-        let expired = tracker
-            .prepare()
-            .await
-            .unwrap()
-            .register_pending(expired_hash, false, Some(1))
-            .unwrap();
+            tracker.prepare().await.unwrap().register(receipt_hash, true, Some(2)).unwrap();
+        let included =
+            tracker.prepare().await.unwrap().register(included_hash, false, Some(1)).unwrap();
+        let expired =
+            tracker.prepare().await.unwrap().register(expired_hash, false, Some(1)).unwrap();
 
         asserter.push_success(&"0x2");
         // A receipt waiter exists, but its hash is absent: no receipt RPC for block 1.
@@ -526,8 +509,8 @@ mod tests {
 
         let tracker = tracker(&asserter);
         let hash = B256::repeat_byte(1);
-        let first = tracker.register(hash).await.unwrap();
-        let second = tracker.register(hash).await.unwrap();
+        let first = tracker.prepare().await.unwrap().register(hash, true, None).unwrap();
+        let second = tracker.prepare().await.unwrap().register(hash, true, None).unwrap();
 
         drop(first);
         assert_eq!(tracker.0.state.lock().unwrap().pending[&hash].len(), 1);
@@ -537,7 +520,7 @@ mod tests {
         assert!(!tracker.0.state.lock().unwrap().running);
 
         asserter.push_success(&"0x64");
-        let restarted = tracker.register(hash).await.unwrap();
+        let restarted = tracker.prepare().await.unwrap().register(hash, true, None).unwrap();
 
         asserter.push_success(&"0x65");
         asserter.push_success(&block(101, &[hash]));
@@ -555,7 +538,7 @@ mod tests {
 
         let tracker = tracker(&asserter);
         let hash = B256::repeat_byte(1);
-        let waiter = tracker.register(hash).await.unwrap();
+        let waiter = tracker.prepare().await.unwrap().register(hash, true, None).unwrap();
 
         asserter.push_success(&"0x1");
         asserter.push_success(&block(1, &[hash]));
@@ -574,8 +557,10 @@ mod tests {
         asserter.push_success(&"0x0");
 
         let tracker = tracker(&asserter);
-        let first = tracker.register(B256::repeat_byte(1)).await.unwrap();
-        let second = tracker.register(B256::repeat_byte(2)).await.unwrap();
+        let first =
+            tracker.prepare().await.unwrap().register(B256::repeat_byte(1), true, None).unwrap();
+        let second =
+            tracker.prepare().await.unwrap().register(B256::repeat_byte(2), true, None).unwrap();
 
         asserter.push_success(&"0x1");
         asserter.push_success(&block(1, &[B256::repeat_byte(1)]));
@@ -598,7 +583,8 @@ mod tests {
         asserter.push_success(&"0x0");
 
         let tracker = tracker(&asserter);
-        let waiter = tracker.register(B256::repeat_byte(1)).await.unwrap();
+        let waiter =
+            tracker.prepare().await.unwrap().register(B256::repeat_byte(1), true, None).unwrap();
 
         assert!(waiter.wait().await.unwrap_err().to_string().contains("timed out"));
         assert!(tracker.0.state.lock().unwrap().pending.is_empty());

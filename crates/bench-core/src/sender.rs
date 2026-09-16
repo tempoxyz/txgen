@@ -361,7 +361,7 @@ impl RpcSubmitter {
             .map_err(RpcSubmitError::before_send)?;
 
         let inclusion = inclusion
-            .map(|registration| registration.register(expected_hash))
+            .map(|registration| registration.register(expected_hash, true, None))
             .transpose()
             .map_err(RpcSubmitError::before_send)?;
 
@@ -1405,16 +1405,16 @@ async fn submit_tx(
     let expected_hash = keccak256(&raw);
     let inclusion = match inclusion
         .map(|registration| {
-            if pending_completion.is_some() {
-                let expires_at = transaction_expiry.as_ref().and_then(|expiry| expiry(&raw));
-                registration.register_pending(
-                    expected_hash,
-                    pending.phase == TxPhase::Setup || !pending.inclusion_keys.is_empty(),
-                    expires_at,
-                )
+            let expires_at = if pending_completion.is_some() {
+                transaction_expiry.as_ref().and_then(|expiry| expiry(&raw))
             } else {
-                registration.register(expected_hash)
-            }
+                None
+            };
+            registration.register(
+                expected_hash,
+                pending.phase == TxPhase::Setup || !pending.inclusion_keys.is_empty(),
+                expires_at,
+            )
         })
         .transpose()
     {
