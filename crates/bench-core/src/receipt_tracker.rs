@@ -233,10 +233,13 @@ impl Inner {
         }
     }
 
-    fn dispatch_hashes(&self, hashes: impl Iterator<Item = TxHash>) {
+    /// Resolve hash-only observations and report whether included hashes need receipts.
+    fn dispatch_hashes(&self, hashes: impl Iterator<Item = TxHash>) -> bool {
         let mut state = self.state.lock().expect("receipt tracker state");
+        let mut needs_receipts = false;
         for hash in hashes {
             if let Some(waiters) = state.pending.get_mut(&hash) {
+                needs_receipts |= waiters.values().any(|interest| interest.receipt);
                 let included: Vec<_> = waiters
                     .iter()
                     .filter_map(|(&id, interest)| (!interest.receipt).then_some(id))
@@ -250,6 +253,7 @@ impl Inner {
                 }
             }
         }
+        needs_receipts
     }
 
     fn expire(&self, timestamp: u64) {
@@ -336,32 +340,16 @@ impl Inner {
                 break;
             }
 
-            let (needs_receipts, needs_block) = {
-                let state = self.state.lock().expect("receipt tracker state");
-                let needs_receipts =
-                    state.pending.values().flat_map(|w| w.values()).any(|i| i.receipt);
-                let needs_block = state
-                    .pending
-                    .values()
-                    .flat_map(|w| w.values())
-                    .any(|i| !i.receipt || i.expires_at.is_some());
-                (needs_receipts, needs_block)
-            };
-            let mut timestamp = None;
-            if needs_block {
-                let block = self
-                    .provider
-                    .get_block_by_number(number.into())
-                    .await?
-                    .ok_or_else(|| eyre!("block is not available yet"))?;
-                if block.header().number() != number {
-                    return Err(eyre!("block response has an inconsistent number"));
-                }
-                self.dispatch_hashes(block.transactions().hashes());
-                timestamp = Some(block.header().timestamp());
+            let block = self
+                .provider
+                .get_block_by_number(number.into())
+                .await?
+                .ok_or_else(|| eyre!("block is not available yet"))?;
+            if block.header().number() != number {
+                return Err(eyre!("block response has an inconsistent number"));
             }
 
-            if needs_receipts {
+            if self.dispatch_hashes(block.transactions().hashes()) {
                 let receipts = self
                     .provider
                     .get_block_receipts(BlockId::number(number))
@@ -380,9 +368,7 @@ impl Inner {
 
             // Only expire after checking inclusion in every block through this
             // timestamp. Wall-clock expiry alone can race a lagging RPC node.
-            if let Some(timestamp) = timestamp {
-                self.expire(timestamp);
-            }
+            self.expire(block.header().timestamp());
 
             number = number.saturating_add(1);
             *next_block = Some(number);
@@ -406,6 +392,20 @@ mod tests {
                 .connect_mocked_client(asserter.clone())
                 .erased(),
         )
+    }
+
+    fn block(number: u64, hashes: &[TxHash]) -> Value {
+        json!({
+            "number": format!("0x{number:x}"), "hash": B256::repeat_byte(number as u8),
+            "parentHash": B256::ZERO, "sha3Uncles": B256::ZERO,
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "transactionsRoot": B256::ZERO, "stateRoot": B256::ZERO,
+            "receiptsRoot": B256::ZERO, "miner": Address::ZERO,
+            "difficulty": "0x0", "extraData": "0x", "gasLimit": "0xffffff",
+            "gasUsed": "0x0", "timestamp": format!("0x{number:x}"),
+            "uncles": [], "transactions": hashes,
+            "mixHash": B256::ZERO, "nonce": "0x0000000000000000"
+        })
     }
 
     fn receipt(hash: TxHash, number: u64) -> Value {
@@ -448,6 +448,11 @@ mod tests {
         // Unrelated receipts do not create or resolve an interest.
         receipts.push(receipt(B256::repeat_byte(0xff), 1));
         asserter.push_success(&"0x1");
+        let hashes: Vec<_> = receipts
+            .iter()
+            .map(|receipt| serde_json::from_value(receipt["transactionHash"].clone()).unwrap())
+            .collect();
+        asserter.push_success(&block(1, &hashes));
         asserter.push_success(&receipts);
 
         for waiter in waiters {
@@ -470,14 +475,58 @@ mod tests {
 
         // The head jumps three blocks; indexing of the middle block is late.
         asserter.push_success(&"0x8");
-        asserter.push_success(&Vec::<Value>::new());
+        asserter.push_success(&block(6, &[]));
+        asserter.push_success(&block(7, &[hash]));
         asserter.push_success(&Value::Null);
         asserter.push_success(&"0x8");
+        asserter.push_success(&block(7, &[hash]));
         asserter.push_success(&vec![receipt(hash, 7)]);
         // No interests remain after block 7, so block 8 needs no receipt request.
+        asserter.push_success(&block(8, &[]));
 
         assert_eq!(waiter.wait().await.unwrap().block_number(), Some(7));
         assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_included_receipt_waiters_trigger_receipt_fetches() {
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x0");
+
+        let tracker = tracker(&asserter);
+        let receipt_hash = B256::repeat_byte(1);
+        let included_hash = B256::repeat_byte(2);
+        let expired_hash = B256::repeat_byte(3);
+        let receipt_waiter =
+            tracker.prepare().await.unwrap().register_pending(receipt_hash, true, Some(2)).unwrap();
+        let included = tracker
+            .prepare()
+            .await
+            .unwrap()
+            .register_pending(included_hash, false, Some(1))
+            .unwrap();
+        let expired = tracker
+            .prepare()
+            .await
+            .unwrap()
+            .register_pending(expired_hash, false, Some(1))
+            .unwrap();
+
+        asserter.push_success(&"0x2");
+        // A receipt waiter exists, but its hash is absent: no receipt RPC for block 1.
+        asserter.push_success(&block(1, &[included_hash]));
+        asserter.push_success(&block(2, &[receipt_hash]));
+        asserter.push_success(&Value::Null);
+        // Retry this block before expiry can resolve the included receipt waiter.
+        asserter.push_success(&"0x2");
+        asserter.push_success(&block(2, &[receipt_hash]));
+        asserter.push_success(&vec![receipt(receipt_hash, 2)]);
+
+        assert!(matches!(included.observe().await.unwrap(), Inclusion::Included(None)));
+        assert!(matches!(expired.observe().await.unwrap(), Inclusion::Expired));
+        assert_eq!(receipt_waiter.wait().await.unwrap().transaction_hash(), receipt_hash);
+        assert!(asserter.read_q().is_empty());
+        assert!(tracker.0.state.lock().unwrap().pending.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -501,6 +550,7 @@ mod tests {
         let restarted = tracker.register(hash).await.unwrap();
 
         asserter.push_success(&"0x65");
+        asserter.push_success(&block(101, &[hash]));
         asserter.push_success(&vec![receipt(hash, 101)]);
 
         restarted.wait().await.unwrap();
@@ -518,10 +568,13 @@ mod tests {
         let waiter = tracker.register(hash).await.unwrap();
 
         asserter.push_success(&"0x1");
+        asserter.push_success(&block(1, &[hash]));
         asserter.push_failure_msg("temporary receipt failure");
         asserter.push_success(&"0x1");
+        asserter.push_success(&block(1, &[hash]));
         asserter.push_success(&vec![receipt(hash, 2)]);
         asserter.push_success(&"0x1");
+        asserter.push_success(&block(1, &[hash]));
         asserter.push_success(&vec![receipt(hash, 1)]);
 
         assert_eq!(waiter.wait().await.unwrap().block_number(), Some(1));
@@ -538,6 +591,7 @@ mod tests {
         let second = tracker.register(B256::repeat_byte(2)).await.unwrap();
 
         asserter.push_success(&"0x1");
+        asserter.push_success(&block(1, &[B256::repeat_byte(1)]));
         asserter.push_failure(
             serde_json::from_value(json!({
                 "code": -32601, "message": "method not found"

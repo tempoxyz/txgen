@@ -617,7 +617,8 @@ submission ceiling and `--max-concurrent` independently limits RPC requests.
 
 One head poller and one `eth_getBlockByNumber` request (transaction hashes only) per
 observed block serve all pending transactions. Full block receipts are fetched only
-for setup or explicit receipt dependencies; waiting workers never poll individual receipts.
+when a block includes a transaction with a setup or explicit receipt dependency;
+waiting workers never poll individual receipts.
 Registration happens before submission, so fast inclusion is not missed. A lost RPC
 response retains its slot until inclusion or signed expiry. Expiry is checked against
 observed block timestamps after scanning inclusions, not the local wall clock. Unknown
