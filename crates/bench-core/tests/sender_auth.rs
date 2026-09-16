@@ -1003,6 +1003,29 @@ async fn reverted_setup_predecessor_never_releases_next_sender() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expired_setup_without_pending_cap_never_releases_next_sender() {
+    let rpc = MockRpc::start();
+    rpc.state.automine.store(false, Ordering::SeqCst);
+    let mut sender = sender(&rpc, None, 16).with_transaction_expiry(Arc::new(|_| Some(1)));
+    sender.send(setup_tx(2, Some(Address::repeat_byte(1)), 1)).await.unwrap();
+    sender.send(setup_tx(3, Some(Address::repeat_byte(2)), 2)).await.unwrap();
+    let flush = tokio::spawn(async move { sender.flush().await });
+    wait_for_pending(&rpc, 1).await;
+    {
+        let mut chain = rpc.state.chain.lock().unwrap();
+        chain.pending.clear();
+        chain.blocks.push(vec![]); // The chain reaches the first transaction's expiry.
+    }
+    let error =
+        tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap().unwrap().unwrap_err();
+    assert!(error.to_string().contains("setup transaction 'tx-2' failed"));
+    assert_eq!(
+        rpc.state.requests().iter().filter(|r| r.method == "eth_sendRawTransaction").count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pipelined_setup_still_requires_every_receipt_to_succeed() {
     let rpc = MockRpc::start();
     rpc.state.automine.store(false, Ordering::SeqCst);

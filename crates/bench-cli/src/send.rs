@@ -184,11 +184,10 @@ async fn execute_source<S: TxSource>(
     let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
     let mut sender =
         Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth)
-            .with_receipt_tracker(receipt_tracker);
-    if let Some(limit) = args.max_pending {
-        sender = sender
-            .with_max_pending(limit)
+            .with_receipt_tracker(receipt_tracker)
             .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
+    if let Some(limit) = args.max_pending {
+        sender = sender.with_max_pending(limit);
     }
     if let Some(late_signer) = late_signer {
         sender = sender.with_late_signer(late_signer);
@@ -376,7 +375,8 @@ async fn run_setup_phase<S: TxSource>(
         setup_metrics.clone(),
         request_auth,
     )
-    .with_receipt_tracker(receipt_tracker);
+    .with_receipt_tracker(receipt_tracker)
+    .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
     if let Some(late_signer) = late_signer {
         setup_sender = setup_sender.with_late_signer(late_signer);
     }
