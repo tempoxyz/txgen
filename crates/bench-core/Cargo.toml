@@ -35,7 +35,7 @@ hex.workspace = true
 tracing = "0.1"
 urlencoding = "2"
 uuid.workspace = true
-prometheus_remote_write = { version = "0.2", features = ["compression"] }
+prometheus_remote_write = { git = "https://github.com/theduke/prom-write", rev = "abdd5d51bd7c4a076c2d8bd9a64ff95a4bae8bbb", features = ["compression"] }
 prost = "0.12"
 flate2 = "1"
 

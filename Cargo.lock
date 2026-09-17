@@ -3965,8 +3965,7 @@ dependencies = [
 [[package]]
 name = "prometheus_remote_write"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05f1637f1aa05a571a5eca64076d7be15a218f9b0dfa1ebdbd2b9fa5168cee8d"
+source = "git+https://github.com/theduke/prom-write?rev=abdd5d51bd7c4a076c2d8bd9a64ff95a4bae8bbb#abdd5d51bd7c4a076c2d8bd9a64ff95a4bae8bbb"
 dependencies = [
  "http 0.2.12",
  "prometheus-parse",
@@ -4011,7 +4010,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
