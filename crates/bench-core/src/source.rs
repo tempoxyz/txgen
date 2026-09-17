@@ -13,6 +13,9 @@ use txgen_core::{dedup_scheduling_keys, GeneratedTx, LateSignSpec, SchedulingKey
 /// A transaction read from a source.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SourceTx {
+    /// Explicit successful-receipt prerequisites, valid only for setup transactions.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
     /// Stream phase for this transaction.
     #[serde(default)]
     pub phase: TxPhase,
@@ -41,6 +44,9 @@ pub struct SourceTx {
 impl SourceTx {
     /// Parse into a [`GeneratedTx`].
     pub fn into_generated_tx(self) -> Result<GeneratedTx> {
+        if self.phase != TxPhase::Setup && !self.depends_on.is_empty() {
+            eyre::bail!("depends_on is only supported for setup transactions");
+        }
         let raw = self
             .raw
             .strip_prefix("0x")
@@ -60,6 +66,7 @@ impl SourceTx {
         }
 
         Ok(GeneratedTx {
+            depends_on: self.depends_on,
             phase: self.phase,
             id: self.id,
             raw,

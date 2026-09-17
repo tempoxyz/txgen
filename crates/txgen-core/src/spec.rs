@@ -131,6 +131,9 @@ pub struct SetupDef {
 /// One deterministic setup step.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SetupStep {
+    /// Setup step IDs whose transactions must all succeed before this step submits.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
     /// Step identifier. Exposed to later steps and workload templates as `setup.<id>.*`.
     pub id: String,
     /// Values resolved once for this setup step.

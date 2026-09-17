@@ -380,7 +380,11 @@ async fn run_setup_phase<S: TxSource>(
     if let Some(late_signer) = late_signer {
         setup_sender = setup_sender.with_late_signer(late_signer);
     }
+    if let Some(limit) = args.pending_limit()? {
+        setup_sender = setup_sender.with_max_pending(limit);
+    }
     let mut setup_seen = 0u64;
+    let mut setup = Vec::new();
 
     while let Some(tx) = source.next_tx().await? {
         match tx.phase {
@@ -390,15 +394,17 @@ async fn run_setup_phase<S: TxSource>(
             }
             TxPhase::Setup => {
                 setup_seen += 1;
-                setup_sender.send(tx).await?;
+                setup.push(tx);
             }
             TxPhase::Workload => {
+                setup_sender.send_setup(setup).await?;
                 finish_setup_phase(args, setup_seen, &mut setup_sender, &setup_metrics).await?;
                 return Ok(Some(tx));
             }
         }
     }
 
+    setup_sender.send_setup(setup).await?;
     finish_setup_phase(args, setup_seen, &mut setup_sender, &setup_metrics).await?;
     Ok(None)
 }

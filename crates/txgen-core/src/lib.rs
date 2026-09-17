@@ -4,6 +4,7 @@ mod nonce;
 pub mod output;
 mod plugin;
 mod scheduling_key;
+mod setup;
 mod spec;
 mod value;
 mod yaml;
@@ -17,6 +18,7 @@ pub use nonce::{NonceReservation, NonceReservationKind, NonceTracker};
 pub use output::{GeneratedTx, LateSignSpec, NdjsonWriter, TxPhase};
 pub use plugin::{BuildContext, SelectedSigner};
 pub use scheduling_key::{dedup_scheduling_keys, SchedulingKey};
+pub use setup::setup_submission_order;
 pub use spec::{
     AbiEncodePackedDef, AbiHashDef, GasConfig, MixEntry, MixItem, SequenceBinding, SequenceDef,
     SequenceStep, SetupDef, SetupStep, WorkloadSpec,

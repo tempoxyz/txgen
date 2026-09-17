@@ -152,3 +152,41 @@ mix:
 "#
     )
 }
+
+#[test]
+fn explicit_dependencies_expand_to_all_transactions_in_a_step() {
+    let mut spec: serde_yaml::Value = serde_yaml::from_str(&setup_scheduling_spec()).unwrap();
+    let steps = spec["setup"]["steps"].as_sequence_mut().unwrap();
+    let mut consumer = steps[0].clone();
+    consumer["id"] = "consumer".into();
+    consumer["depends_on"] = serde_yaml::to_value(["authorize_users"]).unwrap();
+    steps.push(consumer);
+    let txs = generated(&serde_yaml::to_string(&spec).unwrap());
+    assert_eq!(
+        txs[4]["depends_on"],
+        serde_json::json!(["setup.authorize_users[0]", "setup.authorize_users[1]"])
+    );
+}
+
+#[test]
+fn setup_rejects_nonce_dependency_cycles_before_emitting_any_transaction() {
+    let mut spec: serde_yaml::Value = serde_yaml::from_str(&setup_scheduling_spec()).unwrap();
+    let steps = spec["setup"]["steps"].as_sequence_mut().unwrap();
+    steps.truncate(2);
+    steps[1]["tx"]["from"]["select"]["index"] = 0.into();
+    steps[0]["depends_on"] = serde_yaml::to_value(["warmup_two"]).unwrap();
+    let (output, txs) = generate(&serde_yaml::to_string(&spec).unwrap());
+    assert!(!output.status.success());
+    assert!(txs.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("setup dependency cycle"));
+}
+
+#[test]
+fn setup_accepts_forward_dependencies_between_independent_lanes() {
+    let mut spec: serde_yaml::Value = serde_yaml::from_str(&setup_scheduling_spec()).unwrap();
+    let steps = spec["setup"]["steps"].as_sequence_mut().unwrap();
+    steps.truncate(2);
+    steps[0]["depends_on"] = serde_yaml::to_value(["warmup_two"]).unwrap();
+    let txs = generated(&serde_yaml::to_string(&spec).unwrap());
+    assert_eq!(txs[0]["depends_on"], serde_json::json!(["setup.warmup_two"]));
+}

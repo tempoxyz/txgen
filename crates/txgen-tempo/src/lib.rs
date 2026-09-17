@@ -1032,6 +1032,7 @@ fn sign_keychain_request(
     let raw = Bytes::from(envelope.encoded_2718());
 
     Ok(GeneratedTx {
+        depends_on: Vec::new(),
         phase,
         id: Some(name),
         raw,

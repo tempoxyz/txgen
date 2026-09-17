@@ -360,6 +360,7 @@ impl RequestAuthProvider for DelayedAuth {
 
 fn transaction(raw: u8, sender: Option<Address>, key: u8, wait_for_receipt: bool) -> GeneratedTx {
     GeneratedTx {
+        depends_on: Vec::new(),
         phase: TxPhase::Workload,
         id: Some(format!("tx-{raw}")),
         raw: Bytes::from(vec![raw]),
@@ -917,8 +918,13 @@ fn setup_tx(raw: u8, sender: Option<Address>, lane: u8) -> GeneratedTx {
     tx
 }
 
+fn after(mut tx: GeneratedTx, dependencies: &[u8]) -> GeneratedTx {
+    tx.depends_on = dependencies.iter().map(|id| format!("tx-{id}")).collect();
+    tx
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn setup_pipelines_same_sender_and_waits_at_sender_changes() {
+async fn setup_pipelines_nonce_lanes_and_waits_for_explicit_dependencies() {
     let rpc = MockRpc::start();
     rpc.state.automine.store(false, Ordering::SeqCst);
     let mut sender = sender(&rpc, None, 16);
@@ -926,9 +932,9 @@ async fn setup_pipelines_same_sender_and_waits_at_sender_changes() {
     let bob = Some(Address::repeat_byte(2));
     sender.send(setup_tx(2, alice, 1)).await.unwrap();
     sender.send(setup_tx(3, alice, 1)).await.unwrap();
-    sender.send(setup_tx(4, bob, 2)).await.unwrap();
+    sender.send(after(setup_tx(4, bob, 2), &[3])).await.unwrap();
     sender.send(setup_tx(5, bob, 2)).await.unwrap();
-    sender.send(setup_tx(6, alice, 1)).await.unwrap();
+    sender.send(after(setup_tx(6, alice, 1), &[5])).await.unwrap();
     let flush = tokio::spawn(async move { sender.flush().await });
     wait_for_pending(&rpc, 2).await;
     // Including Alice's first tx must not release Bob: he waits for the
@@ -952,7 +958,7 @@ async fn setup_pipelines_same_sender_and_waits_at_sender_changes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn setup_waits_when_nonce_lanes_differ_or_sender_is_unknown() {
+async fn explicit_setup_dependencies_wait_regardless_of_sender_metadata() {
     for (first_sender, second_sender, first_lane, second_lane) in [
         (Some(Address::repeat_byte(1)), Some(Address::repeat_byte(1)), 1, 2),
         (Some(Address::repeat_byte(1)), Some(Address::repeat_byte(2)), 1, 1),
@@ -962,7 +968,7 @@ async fn setup_waits_when_nonce_lanes_differ_or_sender_is_unknown() {
         rpc.state.automine.store(false, Ordering::SeqCst);
         let mut sender = sender(&rpc, None, 16);
         sender.send(setup_tx(2, first_sender, first_lane)).await.unwrap();
-        sender.send(setup_tx(3, second_sender, second_lane)).await.unwrap();
+        sender.send(after(setup_tx(3, second_sender, second_lane), &[2])).await.unwrap();
         let flush = tokio::spawn(async move { sender.flush().await });
         wait_for_pending(&rpc, 1).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -982,7 +988,7 @@ async fn reverted_setup_predecessor_never_releases_next_sender() {
     rpc.state.automine.store(false, Ordering::SeqCst);
     let mut sender = sender(&rpc, None, 16);
     sender.send(setup_tx(2, Some(Address::repeat_byte(1)), 1)).await.unwrap();
-    sender.send(setup_tx(3, Some(Address::repeat_byte(2)), 2)).await.unwrap();
+    sender.send(after(setup_tx(3, Some(Address::repeat_byte(2)), 2), &[2])).await.unwrap();
     let flush = tokio::spawn(async move { sender.flush().await });
     wait_for_pending(&rpc, 1).await;
     {
@@ -1008,7 +1014,7 @@ async fn expired_setup_without_pending_cap_never_releases_next_sender() {
     rpc.state.automine.store(false, Ordering::SeqCst);
     let mut sender = sender(&rpc, None, 16).with_transaction_expiry(Arc::new(|_| Some(1)));
     sender.send(setup_tx(2, Some(Address::repeat_byte(1)), 1)).await.unwrap();
-    sender.send(setup_tx(3, Some(Address::repeat_byte(2)), 2)).await.unwrap();
+    sender.send(after(setup_tx(3, Some(Address::repeat_byte(2)), 2), &[2])).await.unwrap();
     let flush = tokio::spawn(async move { sender.flush().await });
     wait_for_pending(&rpc, 1).await;
     {
@@ -1069,4 +1075,106 @@ async fn setup_authentication_failure_cannot_leave_a_dangling_predecessor() {
     assert!(sender.send(setup_tx(3, Some(Address::repeat_byte(1)), 1)).await.is_err());
     assert!(tokio::time::timeout(Duration::from_secs(5), sender.flush()).await.unwrap().is_err());
     assert!(rpc.state.requests().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn independent_setup_senders_and_nonce_lanes_submit_before_any_receipt() {
+    let rpc = MockRpc::start();
+    rpc.state.automine.store(false, Ordering::SeqCst);
+    let mut sender = sender(&rpc, None, 16);
+    sender
+        .send_setup(vec![
+            setup_tx(2, Some(Address::repeat_byte(1)), 1),
+            setup_tx(3, Some(Address::repeat_byte(2)), 2),
+            setup_tx(4, Some(Address::repeat_byte(2)), 3),
+            setup_tx(5, None, 4),
+        ])
+        .await
+        .unwrap();
+    let flush = tokio::spawn(async move { sender.flush().await });
+    wait_for_pending(&rpc, 4).await;
+    assert!(!flush.is_finished());
+    rpc.state.mine();
+    tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn setup_forward_dependency_and_fan_in_wait_for_every_receipt() {
+    let rpc = MockRpc::start();
+    rpc.state.automine.store(false, Ordering::SeqCst);
+    let mut sender = sender(&rpc, None, 16);
+    sender
+        .send_setup(vec![
+            after(setup_tx(4, None, 3), &[2, 3]),
+            setup_tx(2, None, 1),
+            setup_tx(3, None, 2),
+        ])
+        .await
+        .unwrap();
+    let flush = tokio::spawn(async move { sender.flush().await });
+    wait_for_pending(&rpc, 2).await;
+    let remaining = rpc.state.chain.lock().unwrap().pending.pop().unwrap();
+    rpc.state.mine();
+    rpc.state.chain.lock().unwrap().pending.push(remaining);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(rpc.state.chain.lock().unwrap().pending, [remaining]);
+    rpc.state.mine();
+    wait_for_pending(&rpc, 1).await;
+    assert_eq!(rpc.state.chain.lock().unwrap().pending, [keccak256([4])]);
+    rpc.state.mine();
+    tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn invalid_setup_graph_never_submits_even_independent_roots() {
+    let rpc = MockRpc::start();
+    for transactions in [
+        vec![setup_tx(2, None, 1), after(setup_tx(3, None, 2), &[9])],
+        vec![setup_tx(2, None, 1), after(setup_tx(3, None, 2), &[4]), setup_tx(4, None, 2)],
+        vec![setup_tx(2, None, 1), setup_tx(2, None, 2)],
+    ] {
+        let mut sender = sender(&rpc, None, 16);
+        assert!(sender.send_setup(transactions).await.is_err());
+        assert!(!rpc.state.requests().iter().any(|r| r.method == "eth_sendRawTransaction"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn setup_forward_dependency_exceeding_buffer_respects_pending_cap() {
+    let rpc = MockRpc::start();
+    rpc.state.automine.store(false, Ordering::SeqCst);
+    let mut sender =
+        sender(&rpc, None, 1).with_max_pending(std::num::NonZeroUsize::new(2).unwrap());
+    // A one-RPC sender buffers four queued transactions. All 24 consumers
+    // precede their prerequisite in the input: enqueueing input order deadlocks.
+    let mut batch: Vec<_> = (2..26).map(|id| after(setup_tx(id, None, id), &[250])).collect();
+    batch.push(setup_tx(250, None, 250));
+    let task = tokio::spawn(async move {
+        sender.send_setup(batch).await?;
+        sender.flush().await
+    });
+    wait_for_pending(&rpc, 1).await;
+    assert_eq!(rpc.state.chain.lock().unwrap().pending, [keccak256([250])]);
+    rpc.state.mine();
+    for _ in 0..12 {
+        wait_for_pending(&rpc, 2).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(rpc.state.chain.lock().unwrap().pending.len(), 2);
+        rpc.state.mine();
+    }
+    tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn setup_batch_rejects_previously_seen_ids_before_dispatching_new_roots() {
+    let rpc = MockRpc::start();
+    let mut sender = sender(&rpc, None, 16);
+    sender.send_setup(vec![setup_tx(2, None, 1)]).await.unwrap();
+    sender.flush().await.unwrap();
+    assert!(sender.send_setup(vec![setup_tx(3, None, 2), setup_tx(2, None, 1)]).await.is_err());
+    assert!(!rpc
+        .state
+        .requests()
+        .iter()
+        .any(|r| r.method == "eth_sendRawTransaction" && r.params[0] == "0x03"));
 }
