@@ -67,7 +67,9 @@ pub struct TempoTemplate {
     /// Explicit transaction nonce.
     ///
     /// When set, txgen uses this value directly instead of fetching or
-    /// incrementing nonce state for the transaction's nonce lane.
+    /// incrementing nonce state during ordinary generation. Online scenario
+    /// execution requires it to match the lane's pending nonce and reserves it
+    /// so concurrent submissions cannot reuse the same value.
     #[serde(default)]
     pub nonce: Option<u64>,
 
@@ -94,7 +96,8 @@ pub struct TempoTemplate {
     #[serde(default)]
     pub valid_before: Option<u64>,
 
-    /// Relative expiry window in seconds, resolved at generation time.
+    /// Relative expiry window in seconds for standard and sponsored transactions.
+    /// With `--defer-signing`, these resolve it immediately before submission.
     ///
     /// Only used with `expiring_nonce: true`.
     #[serde(default)]

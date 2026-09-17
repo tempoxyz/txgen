@@ -1,6 +1,7 @@
 //! `bench send` - Send transactions from file or stdin
 
 use crate::{
+    load_metric_names,
     metrics_forwarder::{build_metrics_forwarder, finish_metrics_forwarder},
     metrics_url::metrics_scraper_configs,
     SendArgs,
@@ -10,26 +11,35 @@ use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
-    collect_block_stats, parse_reporters, start_scrapers, trim_trailing_empty_blocks,
-    ConsoleReporter, FileSource, FinalReport, GeneratedTx, MetricsCollector, ProgressState,
-    Reporter, RunClock, RunStats, SampleStore, ScraperConfig, Sender, SenderConfig, StdinSource,
-    TxPhase, TxSource,
+    collect_block_stats, parse_reporters, start_scrapers, total_fees_paid,
+    trim_trailing_empty_blocks, BlockReceiptCollector, ConsoleReporter, FileSource, FinalReport,
+    GeneratedTx, LateSigner, MetricsCollector, ProgressState, ReceiptTracker, Reporter,
+    RequestAuthProvider, RpcEndpoint, RunClock, RunStats, SampleStore, ScraperConfig, Sender,
+    SenderConfig, SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
+use txgen_tempo::TempoLateSigner;
+
+const SETUP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
 pub async fn execute(args: SendArgs) -> Result<()> {
+    let max_pending = args.pending_limit()?;
     tracing::info!(
         input = args.input.as_ref().map(|p| p.display().to_string()).as_deref().unwrap_or("stdin"),
         rpc_urls = ?args.rpc_urls,
         tps = args.tps,
+        max_pending = max_pending.map_or(0, |limit| limit.get()),
         skip_setup = args.skip_setup,
         collect_latencies = args.collect_latencies,
+        collect_receipt_metrics = args.collect_receipt_metrics,
         retries = args.retries.map_or("forever".to_string(), |retries| retries.to_string()),
         "Starting send"
     );
 
-    let metadata = parse_metadata(&args.metadata)?;
+    let mut metadata = parse_metadata(&args.metadata)?;
+    metadata
+        .insert("max_pending".to_string(), max_pending.map_or(0, |limit| limit.get()).to_string());
     let scraper_configs =
         metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
 
@@ -44,38 +54,109 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     let providers = args
         .rpc_urls
         .iter()
-        .map(|url| {
-            let url = url.parse().context("failed to parse RPC URL")?;
-            let client = RpcClient::builder()
-                .layer(retry_layer.clone())
-                .http_with_client(http_client.clone(), url);
-            Ok(ProviderBuilder::new_with_network::<AnyNetwork>().connect_client(client).erased())
-        })
+        .map(|url| build_provider(url, &http_client, &retry_layer))
         .collect::<Result<Vec<_>>>()?;
+    let endpoints = args
+        .rpc_urls
+        .iter()
+        .zip(providers.iter().cloned())
+        .map(|(url, provider)| RpcEndpoint::new(url.clone(), provider))
+        .collect::<Vec<_>>();
+    let query_provider = match args.query_rpc_url.as_deref() {
+        Some(url) => build_provider(url, &http_client, &retry_layer)
+            .wrap_err("failed to build query RPC provider")?,
+        None => providers[0].clone(),
+    };
+    let request_auth = build_request_auth(&args)?;
+    let late_signer = args
+        .late_signing_spec
+        .as_deref()
+        .map(TempoLateSigner::from_workload_file)
+        .transpose()
+        .wrap_err("failed to configure deferred signing")?
+        .map(|signer| Arc::new(signer) as Arc<dyn LateSigner>);
 
     match &args.input {
         Some(path) => {
             let mut source = FileSource::new(path).wrap_err("failed to open input file")?;
-            execute_source(&args, &metadata, providers, &mut source, &scraper_configs).await
+            execute_source(
+                &args,
+                &metadata,
+                endpoints,
+                query_provider,
+                request_auth,
+                late_signer.clone(),
+                &mut source,
+                &scraper_configs,
+            )
+            .await
         }
         None => {
             let mut source = StdinSource::new();
-            execute_source(&args, &metadata, providers, &mut source, &scraper_configs).await
+            execute_source(
+                &args,
+                &metadata,
+                endpoints,
+                query_provider,
+                request_auth,
+                late_signer,
+                &mut source,
+                &scraper_configs,
+            )
+            .await
         }
     }
 }
 
+fn build_provider(
+    url: &str,
+    http_client: &reqwest::Client,
+    retry_layer: &RetryBackoffLayer,
+) -> Result<DynProvider<AnyNetwork>> {
+    let parsed = url.parse().context("failed to parse RPC URL")?;
+    let client = RpcClient::builder()
+        .layer(retry_layer.clone())
+        .http_with_client(http_client.clone(), parsed);
+    Ok(ProviderBuilder::new_with_network::<AnyNetwork>().connect_client(client).erased())
+}
+
+fn build_request_auth(args: &SendArgs) -> Result<Option<Arc<dyn RequestAuthProvider>>> {
+    match (&args.sender_header_name, &args.sender_header_map) {
+        (None, None) => Ok(None),
+        (Some(header_name), Some(path)) => Ok(Some(Arc::new(SenderHeaderAuthProvider::from_file(
+            header_name,
+            path,
+            args.sender_header_reload_interval,
+        )?))),
+        (Some(_), None) => Err(eyre::eyre!("--sender-header-name requires --sender-header-map")),
+        (None, Some(_)) => Err(eyre::eyre!("--sender-header-map requires --sender-header-name")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn execute_source<S: TxSource>(
     args: &SendArgs,
     metadata: &HashMap<String, String>,
-    providers: Vec<DynProvider<AnyNetwork>>,
+    endpoints: Vec<RpcEndpoint>,
+    query_provider: DynProvider<AnyNetwork>,
+    request_auth: Option<Arc<dyn RequestAuthProvider>>,
+    late_signer: Option<Arc<dyn LateSigner>>,
     source: &mut S,
     scraper_configs: &[ScraperConfig],
 ) -> Result<()> {
     let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
-    let query_provider = &providers[0];
 
-    let first_workload = run_setup_phase(args, source, &providers, &config).await?;
+    let receipt_tracker = ReceiptTracker::new(query_provider.clone());
+    let first_workload = run_setup_phase(
+        args,
+        source,
+        &endpoints,
+        request_auth.clone(),
+        late_signer.clone(),
+        &config,
+        receipt_tracker.clone(),
+    )
+    .await?;
 
     let clock = if let Some(start) = args.metrics_align {
         RunClock::new_with_start_unix_ms(start)
@@ -100,9 +181,23 @@ async fn execute_source<S: TxSource>(
         Vec::new()
     };
 
-    let mut sender = Sender::new(providers.clone(), config.clone(), metrics.clone());
+    let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
+    let mut sender =
+        Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth)
+            .with_receipt_tracker(receipt_tracker)
+            .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
+    if let Some(limit) = args.pending_limit()? {
+        sender = sender.with_max_pending(limit);
+    }
+    if let Some(late_signer) = late_signer {
+        sender = sender.with_late_signer(late_signer);
+    }
+    if let Some(collector) = &receipt_collector {
+        sender = sender.with_receipt_collector(collector.handle());
+    }
 
-    let mut reporters = parse_reporters(&args.reports, "send", metadata)?;
+    let clickhouse_metric_names = load_metric_names(args.clickhouse_metrics_file.as_ref())?;
+    let mut reporters = parse_reporters(&args.reports, "send", metadata, clickhouse_metric_names)?;
     if reporters.is_empty() {
         reporters.push(Box::new(ConsoleReporter::stderr(true)));
     }
@@ -118,7 +213,8 @@ async fn execute_source<S: TxSource>(
 
     send_workload_from_source(source, &mut sender, &metrics, &config, &mut reporters).await?;
 
-    sender.flush().await;
+    sender.flush().await?;
+    drop(sender);
 
     let (sent, success, failed) = metrics.counts();
     tracing::info!(sent, success, failed, "Bench send completed; starting post-processing");
@@ -126,11 +222,42 @@ async fn execute_source<S: TxSource>(
     // Wait for the txpool to drain so all transactions are included in blocks
     // before we collect block stats. The scraper and block poller keep running.
     if args.drain_timeout > 0 {
-        wait_for_pool_drain(query_provider, args.drain_timeout).await?;
+        wait_for_pool_drain(&query_provider, args.drain_timeout).await?;
         tracing::info!("Txpool drain completed");
     } else {
         tracing::info!(reason = "--drain-timeout=0", "Skipped txpool drain");
     }
+
+    // Snapshot the range before post-processing starts. Receipt collection uses
+    // one block-level request per block rather than polling each transaction.
+    let end_block =
+        query_provider.get_block_number().await.wrap_err("failed to get ending block number")?;
+    tracing::info!(end_block, "Ending block fetched");
+
+    let receipt_collection = match receipt_collector {
+        Some(collector) => {
+            let collection = collector
+                .finish(&query_provider, start_block.saturating_add(1), end_block)
+                .await
+                .wrap_err("failed to collect block receipts")?;
+            tracing::info!(
+                groups = collection.metrics.len(),
+                records = collection.records.len(),
+                "Block receipt gas metrics finalized"
+            );
+            collection
+        }
+        None => {
+            tracing::info!(
+                reason = "--collect-receipt-metrics not set",
+                "Skipped receipt gas metrics"
+            );
+            Default::default()
+        }
+    };
+    let receipt_metrics = receipt_collection.metrics;
+    let total_fees_paid = total_fees_paid(&receipt_collection.records);
+    let receipt_records = receipt_collection.records;
 
     // Stop the scraper before finalizing.
     if !scraper_handles.is_empty() {
@@ -159,22 +286,21 @@ async fn execute_source<S: TxSource>(
     // the block that was current before sending (start_block is the last
     // existing block at that point, so start_block+1 is the first block that
     // could contain our transactions) and ends at the current latest block.
-    let end_block =
-        query_provider.get_block_number().await.wrap_err("failed to get ending block number")?;
-    tracing::info!(end_block, "Ending block fetched");
-
     let mut report = FinalReport {
         metadata: metadata.clone(),
         bench_metrics: Some(final_metrics),
         time_series: Some(time_series),
         sample_archive: Some(sample_archive),
+        receipt_metrics,
+        total_fees_paid,
+        receipt_records,
         ..Default::default()
     };
 
     if end_block > start_block {
         let block_range_start = start_block + 1;
         let mut block_stats =
-            collect_block_stats(query_provider, block_range_start, end_block).await?;
+            collect_block_stats(&query_provider, block_range_start, end_block).await?;
         tracing::info!(
             start = block_range_start,
             end = end_block,
@@ -235,13 +361,30 @@ async fn execute_source<S: TxSource>(
 async fn run_setup_phase<S: TxSource>(
     args: &SendArgs,
     source: &mut S,
-    providers: &[DynProvider<AnyNetwork>],
+    endpoints: &[RpcEndpoint],
+    request_auth: Option<Arc<dyn RequestAuthProvider>>,
+    late_signer: Option<Arc<dyn LateSigner>>,
     config: &SenderConfig,
+    receipt_tracker: ReceiptTracker,
 ) -> Result<Option<GeneratedTx>> {
     let setup_clock = RunClock::new();
     let setup_metrics = MetricsCollector::new_with_latencies(setup_clock, false);
-    let mut setup_sender = Sender::new(providers.to_vec(), config.clone(), setup_metrics.clone());
+    let mut setup_sender = Sender::new_with_request_auth(
+        endpoints.to_vec(),
+        config.clone(),
+        setup_metrics.clone(),
+        request_auth,
+    )
+    .with_receipt_tracker(receipt_tracker)
+    .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
+    if let Some(late_signer) = late_signer {
+        setup_sender = setup_sender.with_late_signer(late_signer);
+    }
+    if let Some(limit) = args.pending_limit()? {
+        setup_sender = setup_sender.with_max_pending(limit);
+    }
     let mut setup_seen = 0u64;
+    let mut setup = Vec::new();
 
     while let Some(tx) = source.next_tx().await? {
         match tx.phase {
@@ -251,15 +394,17 @@ async fn run_setup_phase<S: TxSource>(
             }
             TxPhase::Setup => {
                 setup_seen += 1;
-                setup_sender.send(tx).await?;
+                setup.push(tx);
             }
             TxPhase::Workload => {
+                setup_sender.send_setup(setup).await?;
                 finish_setup_phase(args, setup_seen, &mut setup_sender, &setup_metrics).await?;
                 return Ok(Some(tx));
             }
         }
     }
 
+    setup_sender.send_setup(setup).await?;
     finish_setup_phase(args, setup_seen, &mut setup_sender, &setup_metrics).await?;
     Ok(None)
 }
@@ -280,9 +425,42 @@ async fn finish_setup_phase(
     }
 
     tracing::info!(setup_txs = setup_seen, "Waiting for setup transactions");
-    setup_sender.flush().await;
+    let mut progress = tokio::time::interval(SETUP_PROGRESS_INTERVAL);
+    progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick so progress is only reported after the
+    // setup phase has actually been waiting for an interval.
+    progress.tick().await;
 
-    let (_, _, failed) = setup_metrics.counts();
+    let flush = setup_sender.flush();
+    tokio::pin!(flush);
+    let flush_result = loop {
+        tokio::select! {
+            result = &mut flush => break result,
+            _ = progress.tick() => {
+                let (sent, success, failed) = setup_metrics.counts();
+                tracing::info!(
+                    setup_txs = setup_seen,
+                    sent,
+                    success,
+                    failed,
+                    in_flight = sent.saturating_sub(success + failed),
+                    elapsed = ?setup_metrics.elapsed_since_start(),
+                    "Setup transaction progress"
+                );
+            }
+        }
+    };
+    flush_result?;
+
+    let (sent, success, failed) = setup_metrics.counts();
+    tracing::info!(
+        setup_txs = setup_seen,
+        sent,
+        success,
+        failed,
+        elapsed = ?setup_metrics.elapsed_since_start(),
+        "Setup transactions completed"
+    );
     if failed > 0 {
         bail!("setup phase failed: {failed} setup transaction(s) failed or reverted");
     }

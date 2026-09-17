@@ -1,23 +1,36 @@
 //! Core library for the bench tool.
 //!
 //! Provides shared foundation components:
+//! - [`call`] - RPC corpus replay: method allowlist, response digests, accounting
 //! - [`source`] - Transaction sources (file, stdin)
 //! - [`sender`] - Sending with scheduling key ordering + rate limiting
 //! - [`metrics`] - Collection (sent/success/failed counts, timing)
 //! - [`reporter`] - Output (console, JSON + NDJSON samples, ClickHouse, Prometheus remote write)
-//! - [`reth_api`] - reth custom Engine API types (`reth_newPayload`, `reth_forkchoiceUpdated`)
 
+pub mod auth;
+pub mod call;
+pub mod clickhouse;
 pub mod clock;
 pub mod metrics;
 pub mod prometheus;
 pub mod prometheus_reporter;
+pub mod receipt_clickhouse;
+pub mod receipt_metrics;
+pub mod receipt_tracker;
 pub mod reporter;
-pub mod reth_api;
 pub mod sample;
 pub mod scraper;
 pub mod sender;
 pub mod source;
 
+pub use auth::{RequestAuthProvider, RpcRequestContext, SenderHeaderAuthProvider};
+pub use call::{
+    digest_response, CallMethod, CallReport, CallRunConfig, ClosedLoopRow, Corpus, CorpusOptions,
+    CorpusRecord, CorpusSummary, MethodStats, NodeIdentity, Nondeterministic, OpenLoopRow,
+    PhaseStats, ReplayRecorder, ReplayResults, RequestOutcome, RequestStatus, ResponseBytes,
+    ResponseKind, ResponseRow, ResponseScanner, ResponseSummary, StatusCounts,
+};
+pub use clickhouse::ClickHouseClient;
 pub use clock::RunClock;
 pub use metrics::{
     collect_block_stats, compute_latency_stats, trim_trailing_empty_blocks, BenchMetrics,
@@ -29,17 +42,26 @@ pub use prometheus_reporter::{
     PrometheusConfig, PrometheusForwarder, PrometheusForwarderHandle, PrometheusForwarderSummary,
     PrometheusReporter,
 };
+pub use receipt_clickhouse::{
+    insert_receipt_gas_records, insert_receipt_gas_records_with_default_batch_size,
+    DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE,
+};
+pub use receipt_metrics::{
+    total_fees_paid, BlockReceiptCollector, ReceiptCollection, ReceiptCollector,
+    ReceiptCollectorHandle, ReceiptGasRecord, ReceiptGasSample, ReceiptMetricDistribution,
+    ReceiptMetricGroup, ReceiptMetricLabels, ReceiptMetrics, ReceiptMetricsAccumulator,
+};
+pub use receipt_tracker::ReceiptTracker;
 pub use reporter::{
     parse_reporters, ClickHouseConfig, ClickHouseReporter, ConsoleReporter, FinalReport,
     JsonLatency, JsonLatencySample, JsonReport, JsonReporter, JsonTimeSeries, ProgressState,
     Reporter,
 };
-pub use reth_api::{
-    BigBlockData, RethApi, RethForkchoiceUpdated, RethNewPayloadInput, RethPayloadStatus,
-    WaitForPersistence, DEFAULT_PERSISTENCE_THRESHOLD,
-};
 pub use sample::{Sample, SampleArchive, SampleStore};
 pub use scraper::{start_scrapers, SampleCallback, ScraperConfig, ScraperHandle};
-pub use sender::{Sender, SenderConfig};
+pub use sender::{
+    LateSigner, RpcEndpoint, RpcReceiptDetails, RpcSubmission, RpcSubmitError,
+    RpcSubmitFailureKind, RpcSubmitter, Sender, SenderConfig,
+};
 pub use source::{FileSource, SourceTx, StdinSource, TxSource};
 pub use txgen_core::{GeneratedTx, TxPhase};

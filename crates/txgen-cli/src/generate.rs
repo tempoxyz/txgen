@@ -1,15 +1,17 @@
 use alloy_consensus::{SignableTransaction, Signed};
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_eips::eip2718::Encodable2718;
-use alloy_network::{Network, NetworkTransactionBuilder, TransactionBuilder, TxSignerSync};
+use alloy_network::{
+    AnyNetwork, Network, NetworkTransactionBuilder, TransactionBuilder, TxSignerSync,
+};
 use alloy_primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
-use alloy_provider::Provider;
+use alloy_provider::{DynProvider, Provider};
 use clap::{ArgGroup, Args};
 use eyre::{bail, Result, WrapErr};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     io::Write,
     path::PathBuf,
     sync::mpsc,
@@ -17,13 +19,16 @@ use std::{
 };
 use txgen_core::{
     dedup_scheduling_keys, merge_yaml, AbiEncodePackedDef, AbiHashDef, AccountManager,
-    AddressPoolManager, ArtifactManager, BuildContext, EcdsaSigner, GeneratedTx, MixItem,
-    NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase, WorkloadSpec,
+    AddressPoolManager, ArtifactManager, BuildContext, EcdsaSigner, GeneratedTx, LateSignSpec,
+    MixItem, NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase,
+    WorkloadSpec,
 };
 
 fn default_signing_workers() -> usize {
     2
 }
+
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Args)]
 #[command(group(
@@ -64,6 +69,22 @@ pub struct GenerateArgs {
     /// Number of worker threads used to sign and encode workload transactions.
     #[arg(long, visible_alias = "workers", default_value_t = default_signing_workers())]
     pub signing_workers: usize,
+
+    /// Emit deferred-signing envelopes instead of signed workload transactions.
+    ///
+    /// The output must be consumed by a sender configured with the matching
+    /// network-specific signing key material.
+    #[arg(long)]
+    pub defer_signing: bool,
+
+    /// Save setup bindings for a separate workload run. Requires --count 0.
+    #[arg(long, conflicts_with = "setup_state_in")]
+    pub setup_state_out: Option<PathBuf>,
+
+    /// Reuse bindings from a successfully submitted setup run without emitting
+    /// setup again. Fetches current workload nonces using --rpc.
+    #[arg(long, requires = "rpc", conflicts_with = "setup_state_out")]
+    pub setup_state_in: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +100,9 @@ pub struct GenerateContext {
     rng: StdRng,
     limit: GenerationLimit,
     signing_workers: usize,
+    defer_signing: bool,
+    setup_state_in: Option<SetupState>,
+    setup_state_out: Option<PathBuf>,
 }
 
 impl GenerateContext {
@@ -89,6 +113,26 @@ impl GenerateContext {
 
         let spec = WorkloadSpec::load(&args.spec)
             .wrap_err_with(|| format!("failed to load spec: {}", args.spec.display()))?;
+        if args.setup_state_out.is_some() && args.count != Some(0) {
+            bail!("--setup-state-out requires --count 0; submit setup successfully before generating workload");
+        }
+        if (args.setup_state_in.is_some() || args.setup_state_out.is_some()) &&
+            spec.setup.as_ref().is_some_and(|setup| {
+                setup.steps.iter().any(|step| step.keychain_authorize_pool.is_some())
+            })
+        {
+            bail!("setup state does not support keychain_authorize_pool adapter state");
+        }
+        let setup_state_in = args
+            .setup_state_in
+            .as_ref()
+            .map(|path| {
+                let state: SetupState = serde_json::from_reader(std::fs::File::open(path)?)?;
+                state.validate(&spec)?;
+                Ok::<_, eyre::Report>(state)
+            })
+            .transpose()
+            .wrap_err("failed to load setup state")?;
         let base_path = args.spec.parent().unwrap_or_else(|| std::path::Path::new("."));
         let accounts = AccountManager::from_spec(&spec.accounts)?;
         let address_pools = AddressPoolManager::from_spec(&spec.address_pools)?;
@@ -108,6 +152,9 @@ impl GenerateContext {
             rng,
             limit,
             signing_workers: args.signing_workers,
+            defer_signing: args.defer_signing,
+            setup_state_in,
+            setup_state_out: args.setup_state_out.clone(),
         })
     }
 
@@ -142,6 +189,68 @@ pub struct TxRequest<R, C = ()> {
     /// access-key signer and authorized user address without adding
     /// Tempo-specific branches to the generic generation loop.
     pub sign_context: C,
+    /// Optional opaque instructions for signing at submission time.
+    pub late_sign: Option<LateSignSpec>,
+}
+
+/// One network-adapter template materialized, signed, and ready for submission.
+///
+/// This is the reusable online counterpart to the NDJSON generation path. It
+/// deliberately contains no signer material and is safe to pass to reporting
+/// and submission layers.
+#[derive(Debug)]
+pub struct MaterializedTx {
+    /// Signed transaction plus scheduling metadata used by bench senders.
+    pub generated: GeneratedTx,
+    /// Sender selected while materializing the template.
+    pub sender: Address,
+    /// Hash of the signed EIP-2718 payload, or zero until a deferred payload is signed.
+    pub tx_hash: B256,
+    /// Nonce populated by the adapter, when present.
+    pub nonce: Option<u64>,
+    /// Tracker entries consumed while building this transaction.
+    pub nonce_reservations: Vec<txgen_core::NonceReservation>,
+    /// Contract creation address, when the request creates a contract and has a nonce.
+    pub created_address: Option<Address>,
+}
+
+/// Adapter request and nonce reservations prepared before final transaction signing.
+pub(crate) struct PreparedMaterializedTx<A: NetworkAdapter> {
+    name: String,
+    phase: TxPhase,
+    tx_req: AdapterTxRequest<A>,
+    signer: EcdsaSigner,
+    inclusion_keys: Vec<SchedulingKey>,
+    sender: Address,
+    nonce: Option<u64>,
+    nonce_reservations: Vec<txgen_core::NonceReservation>,
+    created_address: Option<Address>,
+}
+
+impl<A: NetworkAdapter> PreparedMaterializedTx<A> {
+    pub(crate) fn nonce_reservations(&self) -> &[txgen_core::NonceReservation] {
+        &self.nonce_reservations
+    }
+
+    pub(crate) fn scheduling_keys(&self) -> BTreeSet<[u8; 20]> {
+        std::iter::once(self.tx_req.key)
+            .chain(self.inclusion_keys.iter().map(|key| key.into_inner()))
+            .collect()
+    }
+}
+
+/// Setup transactions and substitutions materialized from one workload spec.
+pub struct MaterializedSetup {
+    /// Signed setup transactions in workload order.
+    pub transactions: Vec<GeneratedTx>,
+    bindings: std::collections::HashMap<String, ResolvedBinding>,
+}
+
+impl MaterializedSetup {
+    /// Resolve `chain_id` and `setup.<step>.*` references in a transaction template.
+    pub fn resolve_template(&self, value: serde_yaml::Value) -> Result<serde_yaml::Value> {
+        substitute_vars(value, &self.bindings)
+    }
 }
 
 /// Converts an adapter-built request into the raw transaction emitted by txgen.
@@ -196,6 +305,7 @@ where
     <N as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <N as Network>::TxEnvelope: From<Signed<<N as Network>::UnsignedTx>> + Encodable2718,
 {
+    let sender = signer.address();
     let mut unsigned = request
         .build_unsigned()
         .map_err(|e| eyre::eyre!("failed to build unsigned tx from template '{name}': {e}"))?;
@@ -209,12 +319,381 @@ where
     let raw = Bytes::from(envelope.encoded_2718());
 
     Ok(GeneratedTx {
+        depends_on: Vec::new(),
         phase,
         id: Some(name),
         raw,
+        late_sign: None,
+        sender: Some(sender),
         submission_keys: vec![SchedulingKey::from(key)],
         inclusion_keys,
     })
+}
+
+/// Parse, build, sign, and encode one already-materialized adapter template.
+///
+/// Callers are responsible for applying overlays and resolving any outer
+/// runtime expressions before invoking this function. Network-specific signing
+/// behavior (including Tempo keychain and sponsor signatures) remains owned by
+/// the adapter's [`RequestSignContext`].
+pub fn materialize_and_sign_template<A: NetworkAdapter>(
+    adapter: &A,
+    name: &str,
+    value: serde_yaml::Value,
+    phase: TxPhase,
+    inclusion_keys: &[SchedulingKey],
+    ctx: &mut BuildContext<'_>,
+) -> Result<MaterializedTx>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let prepared = prepare_materialized_template(adapter, name, value, phase, inclusion_keys, ctx)?;
+    let reservations = prepared.nonce_reservations.clone();
+    match sign_prepared_materialized_template(prepared) {
+        Ok(transaction) => Ok(transaction),
+        Err(error) => {
+            if !rollback_nonce_reservations(ctx.nonces, &reservations) {
+                return Err(error.wrap_err("failed to rewind nonce state after materialization"));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Build a request and commit its nonce reservations without performing the final signature.
+pub(crate) fn prepare_materialized_template<A: NetworkAdapter>(
+    adapter: &A,
+    name: &str,
+    value: serde_yaml::Value,
+    phase: TxPhase,
+    inclusion_keys: &[SchedulingKey],
+    ctx: &mut BuildContext<'_>,
+) -> Result<PreparedMaterializedTx<A>> {
+    let result = (|| -> Result<_> {
+        let template: A::Template = serde_yaml::from_value(value)
+            .wrap_err_with(|| format!("failed to parse template '{name}'"))?;
+        let tx_req = adapter
+            .build_request(template, ctx)
+            .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
+        let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?.clone();
+        let sender = signer.address();
+        let nonce = tx_req.request.nonce();
+        let created_address = match (tx_req.request.kind(), nonce) {
+            (Some(TxKind::Create), Some(nonce)) => Some(sender.create(nonce)),
+            _ => None,
+        };
+        Ok((tx_req, signer, sender, nonce, created_address))
+    })();
+
+    match result {
+        Ok((tx_req, signer, sender, nonce, created_address)) => {
+            let nonce_reservations = ctx.take_nonce_reservations();
+            Ok(PreparedMaterializedTx {
+                name: name.to_string(),
+                phase,
+                tx_req,
+                signer,
+                inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),
+                sender,
+                nonce,
+                nonce_reservations,
+                created_address,
+            })
+        }
+        Err(error) => {
+            if !ctx.rollback_nonce_reservations() {
+                return Err(error.wrap_err("failed to rewind nonce state after materialization"));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Sign and encode a previously prepared adapter request.
+pub(crate) fn sign_prepared_materialized_template<A: NetworkAdapter>(
+    prepared: PreparedMaterializedTx<A>,
+) -> Result<MaterializedTx>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let PreparedMaterializedTx {
+        name,
+        phase,
+        tx_req,
+        signer,
+        inclusion_keys,
+        sender,
+        nonce,
+        nonce_reservations,
+        created_address,
+    } = prepared;
+    let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context, late_sign } =
+        tx_req;
+    let expected_keys = std::iter::once(key)
+        .chain(inclusion_keys.iter().map(|key| key.into_inner()))
+        .collect::<BTreeSet<_>>();
+    let generated = match late_sign {
+        Some(late_sign) => {
+            if phase == TxPhase::Setup {
+                bail!("deferred signing is not supported for setup transactions");
+            }
+            GeneratedTx {
+                depends_on: Vec::new(),
+                phase,
+                id: Some(name),
+                raw: Bytes::new(),
+                late_sign: Some(late_sign),
+                sender: Some(sender),
+                submission_keys: vec![SchedulingKey::from(key)],
+                inclusion_keys,
+            }
+        }
+        None => sign_context.sign_request(name, phase, request, signer, key, inclusion_keys)?,
+    };
+    let generated_keys = generated
+        .submission_keys
+        .iter()
+        .chain(&generated.inclusion_keys)
+        .map(|key| key.into_inner())
+        .collect::<BTreeSet<_>>();
+    if generated_keys != expected_keys {
+        bail!("transaction signer changed the prepared scheduling keys");
+    }
+    let tx_hash =
+        if generated.late_sign.is_some() { B256::ZERO } else { keccak256(&generated.raw) };
+    Ok(MaterializedTx { generated, sender, tx_hash, nonce, nonce_reservations, created_address })
+}
+
+fn rollback_nonce_reservations(
+    nonces: &mut NonceTracker,
+    reservations: &[txgen_core::NonceReservation],
+) -> bool {
+    let mut restored = true;
+    for reservation in reservations.iter().rev() {
+        if reservation.kind == txgen_core::NonceReservationKind::Ordered {
+            restored &= nonces.rewind(reservation.key, reservation.nonce);
+        }
+    }
+    restored
+}
+
+/// Materialize a workload's setup section for direct online submission.
+pub fn materialize_setup<A: NetworkAdapter>(
+    adapter: &mut A,
+    spec: &WorkloadSpec,
+    ctx: &mut BuildContext<'_>,
+) -> Result<MaterializedSetup>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    build_setup(adapter, spec, ctx)
+}
+
+/// Materialize setup transactions after asynchronously preparing adapter state.
+///
+/// Scenario execution uses this path because an online adapter may need to read
+/// a nonce lane selected by a setup template before its synchronous
+/// [`NetworkAdapter::build_request`] implementation can reserve that nonce.
+/// Each signed transaction is passed to `submit` before the following setup
+/// transaction is materialized, keeping relative-expiry fields fresh and
+/// preserving ordered setup side effects. Adapter preparation for each
+/// transaction is bounded by `prepare_timeout`.
+pub async fn materialize_setup_online<A, F, Fut>(
+    adapter: &mut A,
+    spec: &WorkloadSpec,
+    ctx: &mut BuildContext<'_>,
+    prepare_timeout: Duration,
+    mut submit: F,
+) -> Result<MaterializedSetup>
+where
+    A: NetworkAdapter,
+    F: FnMut(GeneratedTx) -> Fut,
+    Fut: std::future::Future<Output = Result<GeneratedTx>>,
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let mut transactions = Vec::new();
+    let mut bindings = std::collections::HashMap::new();
+    bindings.insert("chain_id".to_string(), ResolvedBinding::U64(ctx.chain_id));
+
+    let Some(setup) = &spec.setup else {
+        return Ok(MaterializedSetup { transactions, bindings });
+    };
+
+    validate_setup_steps(&setup.steps, true)?;
+
+    let mut output =
+        OnlineSetupOutput { prepare_timeout, transactions: &mut transactions, submit: &mut submit };
+    for step in &setup.steps {
+        materialize_setup_step_online(adapter, step, &mut bindings, ctx, &mut output)
+            .await
+            .wrap_err_with(|| format!("failed to materialize setup step '{}'", step.id))?;
+    }
+
+    Ok(MaterializedSetup { transactions, bindings })
+}
+
+struct OnlineSetupOutput<'a, F> {
+    prepare_timeout: Duration,
+    transactions: &'a mut Vec<GeneratedTx>,
+    submit: &'a mut F,
+}
+
+async fn materialize_setup_step_online<A, F, Fut>(
+    adapter: &mut A,
+    step: &SetupStep,
+    setup_bindings: &mut std::collections::HashMap<String, ResolvedBinding>,
+    ctx: &mut BuildContext<'_>,
+    output: &mut OnlineSetupOutput<'_, F>,
+) -> Result<()>
+where
+    A: NetworkAdapter,
+    F: FnMut(GeneratedTx) -> Fut,
+    Fut: std::future::Future<Output = Result<GeneratedTx>>,
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let has_deploy = step.deploy.is_some();
+    let has_tx = step.tx.is_some();
+    let has_keychain_authorize_pool = step.keychain_authorize_pool.is_some();
+    let action_count =
+        usize::from(has_deploy) + usize::from(has_tx) + usize::from(has_keychain_authorize_pool);
+    if action_count != 1 {
+        bail!("setup step must set exactly one of `deploy`, `tx`, or `keychain_authorize_pool`");
+    }
+
+    let local_bindings = resolve_sequence_bindings(&step.bindings, ctx, setup_bindings)?;
+    if let Some(keychain_authorize_pool) = &step.keychain_authorize_pool {
+        let materialized = substitute_vars(keychain_authorize_pool.clone(), &local_bindings)?;
+        let templates = adapter
+            .expand_setup_extension(&step.id, "keychain_authorize_pool", materialized, ctx)?
+            .ok_or_else(|| {
+                eyre::eyre!("adapter does not support setup step `keychain_authorize_pool`")
+            })?;
+        if templates.is_empty() {
+            bail!("setup step `keychain_authorize_pool` produced no transactions");
+        }
+        for (idx, value) in templates.into_iter().enumerate() {
+            let (generated, _) = materialize_setup_value_online(
+                adapter,
+                &format!("setup.{}[{idx}]", step.id),
+                value,
+                &[],
+                ctx,
+                output.prepare_timeout,
+            )
+            .await?;
+            output.transactions.push((output.submit)(generated).await?);
+        }
+        return Ok(());
+    }
+
+    let (generated, info) = if let Some(deploy) = &step.deploy {
+        let materialized = substitute_vars(deploy.clone(), &local_bindings)?;
+        let value = build_deploy_template_value(materialized, ctx)?;
+        let result = materialize_setup_value_online(
+            adapter,
+            &format!("setup.{}", step.id),
+            value,
+            &[],
+            ctx,
+            output.prepare_timeout,
+        )
+        .await?;
+        if result.1.created_address.is_none() {
+            bail!("deploy setup step did not produce a contract creation transaction");
+        }
+        result
+    } else {
+        let tx = step.tx.as_ref().expect("checked exactly one setup action");
+        let materialized = substitute_vars(tx.clone(), &local_bindings)?;
+        materialize_setup_value_online(
+            adapter,
+            &format!("setup.{}", step.id),
+            materialized,
+            &[],
+            ctx,
+            output.prepare_timeout,
+        )
+        .await?
+    };
+    output.transactions.push((output.submit)(generated).await?);
+
+    setup_bindings.insert(
+        format!("setup.{}", step.id),
+        ResolvedBinding::SetupTx {
+            address: info.created_address,
+            tx_hash: info.tx_hash,
+            sender: info.sender,
+            nonce: info.nonce,
+        },
+    );
+
+    Ok(())
+}
+
+async fn materialize_setup_value_online<A: NetworkAdapter>(
+    adapter: &A,
+    name: &str,
+    value: serde_yaml::Value,
+    inclusion_keys: &[SchedulingKey],
+    ctx: &mut BuildContext<'_>,
+    prepare_timeout: Duration,
+) -> Result<(GeneratedTx, EmittedTxInfo)>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
+    let preparation =
+        tokio::time::timeout(prepare_timeout, adapter.prepare_request(&value, ctx)).await;
+    match preparation {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            if !ctx.rollback_nonce_reservations() {
+                return Err(
+                    error.wrap_err("failed to rewind nonce state after request preparation failed")
+                );
+            }
+            return Err(error)
+                .wrap_err_with(|| format!("failed to prepare request from template '{name}'"));
+        }
+        Err(_) => {
+            if !ctx.rollback_nonce_reservations() {
+                bail!("failed to rewind nonce state after request preparation timed out");
+            }
+            bail!("timed out preparing request from template '{name}'");
+        }
+    }
+    let materialized =
+        materialize_and_sign_template(adapter, name, value, TxPhase::Setup, inclusion_keys, ctx)?;
+    let nonce =
+        materialized.nonce.ok_or_else(|| eyre::eyre!("template '{name}' did not set a nonce"))?;
+    let info = EmittedTxInfo {
+        sender: materialized.sender,
+        nonce,
+        tx_hash: materialized.tx_hash,
+        created_address: materialized.created_address,
+    };
+    Ok((materialized.generated, info))
+}
+
+/// Runtime context supplied to an adapter-defined scenario action.
+pub struct ScenarioActionContext<'a> {
+    /// Scenario-local chain name.
+    pub chain: &'a str,
+    /// Effective chain ID returned by the chain RPC.
+    pub chain_id: u64,
+    /// Provider connected to the chain's configured query endpoint.
+    pub query_provider: &'a DynProvider<AnyNetwork>,
 }
 
 /// Trait for network-specific transaction generation.
@@ -232,12 +711,69 @@ pub trait NetworkAdapter: Send + Sync {
     /// Extra per-request state needed by the signing worker.
     type SignContext: RequestSignContext<Self::Network>;
 
+    /// Stable network name used by scenario chain definitions.
+    fn network_name() -> &'static str;
+
+    /// Adapter-defined actions available to scenario `invoke` steps.
+    fn scenario_actions() -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Execute an adapter-defined scenario action without submitting a transaction.
+    fn invoke_scenario_action<'a>(
+        &'a self,
+        action: &'a str,
+        _arguments: &'a serde_yaml::Value,
+        _context: ScenarioActionContext<'a>,
+    ) -> impl std::future::Future<Output = Result<serde_yaml::Value>> + Send + 'a {
+        async move {
+            Err(eyre::eyre!(
+                "network '{}' does not support scenario action '{action}'",
+                Self::network_name()
+            ))
+        }
+    }
+
     /// Map a template to a network-specific transaction request.
     fn build_request(
         &self,
         template: Self::Template,
         ctx: &mut BuildContext<'_>,
     ) -> Result<TxRequest<<Self::Network as Network>::TransactionRequest, Self::SignContext>>;
+
+    /// Return an adapter-defined dense uniqueness group for one scenario submit.
+    ///
+    /// Steps in the same group receive deterministic consecutive identities,
+    /// independent of unrelated submits. Adapters use this for finite
+    /// per-transaction resources such as a configured signing-key range.
+    fn scenario_unique_nonce_group(
+        &self,
+        _template: &serde_yaml::Value,
+        _overlay: &serde_yaml::Value,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Build the network-specific signer used for deferred transaction envelopes.
+    fn late_signer(
+        &self,
+        _spec: &WorkloadSpec,
+    ) -> Result<Option<std::sync::Arc<dyn bench_core::LateSigner>>> {
+        Ok(None)
+    }
+
+    /// Prepare asynchronous state needed before synchronous request building.
+    ///
+    /// Ordinary adapters need no hook. Online adapters can use it to populate
+    /// lazily selected nonce lanes without blocking a runtime thread inside
+    /// [`Self::build_request`].
+    fn prepare_request<'a>(
+        &'a self,
+        _value: &'a serde_yaml::Value,
+        _ctx: &'a mut BuildContext<'_>,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async { Ok(()) }
+    }
 
     /// Expand an adapter-specific setup step into ordinary transaction templates.
     ///
@@ -252,15 +788,34 @@ pub trait NetworkAdapter: Send + Sync {
         Ok(None)
     }
 
-    /// Prefetch nonces from the chain before generation.
+    /// Prepare one chain's nonce state before online transaction materialization.
     ///
-    /// Called when `--rpc` is provided. Default is no-op.
+    /// The default handles protocol nonces through `eth_getTransactionCount`.
+    /// Adapters may additionally populate network-specific nonce lanes and retain
+    /// chain-local RPC state used for lazy nonce reads.
+    fn prepare_nonces<'a>(
+        &'a self,
+        _spec: &'a WorkloadSpec,
+        accounts: &'a AccountManager,
+        nonces: &'a mut NonceTracker,
+        rpc: &'a str,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move { fetch_pending_protocol_nonces(accounts, nonces, rpc).await }
+    }
+
+    /// Prefetch nonces from the chain before ordinary generation.
+    ///
+    /// Called when `--rpc` is provided. The legacy generation path reads the
+    /// latest mined nonce, while online scenarios use pending nonce state.
     fn prefetch_nonces<'a>(
         &'a self,
-        _ctx: &'a mut GenerateContext,
-        _rpc: &'a str,
+        ctx: &'a mut GenerateContext,
+        rpc: &'a str,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        async { Ok(()) }
+        async move {
+            let (accounts, nonces) = ctx.accounts_and_nonces();
+            fetch_protocol_nonces(accounts, nonces, rpc).await
+        }
     }
 }
 
@@ -275,12 +830,26 @@ where
     let output = args.output.clone();
     let rpc = args.rpc.clone();
     let mut ctx = GenerateContext::from_args(&args)?;
+    let started = Instant::now();
+
+    eprintln!(
+        "starting transaction generation: output={} count={:?} duration={:?} signing_workers={}",
+        output.as_ref().map_or_else(|| "stdout".to_string(), |path| path.display().to_string()),
+        args.count,
+        args.duration,
+        args.signing_workers,
+    );
 
     if let Some(ref rpc) = rpc {
+        let nonce_prefetch_started = Instant::now();
+        eprintln!("starting nonce prefetch");
         adapter.prefetch_nonces(&mut ctx, rpc).await?;
+        eprintln!("nonce prefetch completed: elapsed={:?}", nonce_prefetch_started.elapsed());
     }
 
-    generate_loop(&mut adapter, &mut ctx, output)
+    generate_loop(&mut adapter, &mut ctx, output)?;
+    eprintln!("transaction generation completed: elapsed={:?}", started.elapsed());
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -297,28 +866,60 @@ pub async fn fetch_protocol_nonces(
     nonces: &mut NonceTracker,
     rpc_url: &str,
 ) -> Result<()> {
+    fetch_protocol_nonces_with_state(accounts, nonces, rpc_url, false).await
+}
+
+/// Fetch pending protocol nonces for online transaction submission.
+pub async fn fetch_pending_protocol_nonces(
+    accounts: &AccountManager,
+    nonces: &mut NonceTracker,
+    rpc_url: &str,
+) -> Result<()> {
+    fetch_protocol_nonces_with_state(accounts, nonces, rpc_url, true).await
+}
+
+async fn fetch_protocol_nonces_with_state(
+    accounts: &AccountManager,
+    nonces: &mut NonceTracker,
+    rpc_url: &str,
+    pending: bool,
+) -> Result<()> {
     let provider =
         alloy_provider::ProviderBuilder::<_, _, alloy_provider::network::Ethereum>::new()
             .connect_http(rpc_url.parse().wrap_err("invalid RPC URL")?);
+    let state = "latest";
 
     for (pool_name, addresses) in accounts.all_addresses() {
         let total = addresses.len();
-        eprintln!("fetching nonces for {} ({} accounts)...", pool_name, total);
+        let started = Instant::now();
+        let mut last_progress = started;
+        eprintln!("fetching {state} nonces for {pool_name} ({total} accounts)...");
         for (idx, address) in addresses.iter().enumerate() {
-            let nonce = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                Provider::get_transaction_count(&provider, *address),
-            )
-            .await
-            .wrap_err_with(|| format!("timeout fetching nonce for {}[{}]", pool_name, idx))?
-            .wrap_err_with(|| {
-                format!("failed to fetch nonce for {}[{}] ({})", pool_name, idx, address)
-            })?;
+            let request = Provider::get_transaction_count(&provider, *address);
+            let request = if pending { request.pending() } else { request.latest() };
+            let nonce = tokio::time::timeout(std::time::Duration::from_secs(10), request)
+                .await
+                .wrap_err_with(|| format!("timeout fetching nonce for {}[{}]", pool_name, idx))?
+                .wrap_err_with(|| {
+                    format!("failed to fetch nonce for {}[{}] ({})", pool_name, idx, address)
+                })?;
 
             let scheduling_key = address.0 .0;
             nonces.reset(scheduling_key, nonce);
+
+            if last_progress.elapsed() >= PROGRESS_LOG_INTERVAL {
+                eprintln!(
+                    "nonce prefetch progress: pool={pool_name} completed={} total={total} state={state} elapsed={:?}",
+                    idx + 1,
+                    started.elapsed(),
+                );
+                last_progress = Instant::now();
+            }
         }
-        eprintln!("fetched nonces for {} ({} accounts)", pool_name, total);
+        eprintln!(
+            "fetched {state} nonces for {pool_name} ({total} accounts): elapsed={:?}",
+            started.elapsed(),
+        );
     }
 
     Ok(())
@@ -359,11 +960,21 @@ where
         &mut ctx.nonces,
         &mut ctx.rng,
     );
+    build_ctx.set_defer_signing(ctx.defer_signing);
 
     match output {
         Some(path) => {
             let mut writer = txgen_core::output::file_writer(&path)?;
-            let setup_bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+            let setup_bindings = if let Some(state) = &ctx.setup_state_in {
+                state.bindings()
+            } else {
+                let bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+                if let Some(path) = &ctx.setup_state_out {
+                    writer.flush()?;
+                    SetupState::from_bindings(ctx.spec.chain_id, &bindings).save(path)?;
+                }
+                bindings
+            };
             let written = generate_txs(
                 adapter,
                 &ctx.spec,
@@ -377,7 +988,16 @@ where
         }
         None => {
             let mut writer = txgen_core::output::stdout_writer();
-            let setup_bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+            let setup_bindings = if let Some(state) = &ctx.setup_state_in {
+                state.bindings()
+            } else {
+                let bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+                if let Some(path) = &ctx.setup_state_out {
+                    writer.flush()?;
+                    SetupState::from_bindings(ctx.spec.chain_id, &bindings).save(path)?;
+                }
+                bindings
+            };
             generate_txs(
                 adapter,
                 &ctx.spec,
@@ -393,6 +1013,82 @@ where
     Ok(())
 }
 
+/// Public setup outputs only; this file is not evidence that setup succeeded.
+/// The caller must wait for successful submission/inclusion before reusing it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SetupState {
+    version: u32,
+    chain_id: u64,
+    transactions: BTreeMap<String, EmittedTxInfo>,
+}
+
+impl SetupState {
+    fn from_bindings(
+        chain_id: u64,
+        bindings: &std::collections::HashMap<String, ResolvedBinding>,
+    ) -> Self {
+        let transactions = bindings
+            .iter()
+            .filter_map(|(id, binding)| {
+                if let ResolvedBinding::SetupTx { address, tx_hash, sender, nonce } = binding {
+                    Some((
+                        id.clone(),
+                        EmittedTxInfo {
+                            created_address: *address,
+                            tx_hash: *tx_hash,
+                            sender: *sender,
+                            nonce: *nonce,
+                        },
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Self { version: 1, chain_id, transactions }
+    }
+
+    fn save(&self, path: &std::path::Path) -> Result<()> {
+        std::fs::write(path, serde_json::to_vec_pretty(self)?)
+            .wrap_err_with(|| format!("failed to save setup state to {}", path.display()))
+    }
+
+    fn validate(&self, spec: &WorkloadSpec) -> Result<()> {
+        if self.version != 1 || self.chain_id != spec.chain_id {
+            bail!("setup state version or chain ID does not match this workload");
+        }
+        let expected: BTreeSet<_> = spec
+            .setup
+            .iter()
+            .flat_map(|setup| &setup.steps)
+            .map(|step| format!("setup.{}", step.id))
+            .collect();
+        if self.transactions.keys().cloned().collect::<BTreeSet<_>>() != expected {
+            bail!("setup state step IDs do not match this workload");
+        }
+        Ok(())
+    }
+
+    fn bindings(&self) -> std::collections::HashMap<String, ResolvedBinding> {
+        let mut bindings = std::collections::HashMap::from([(
+            "chain_id".to_owned(),
+            ResolvedBinding::U64(self.chain_id),
+        )]);
+        bindings.extend(self.transactions.iter().map(|(id, info)| {
+            (
+                id.clone(),
+                ResolvedBinding::SetupTx {
+                    address: info.created_address,
+                    tx_hash: info.tx_hash,
+                    sender: info.sender,
+                    nonce: info.nonce,
+                },
+            )
+        }));
+        bindings
+    }
+}
+
 #[derive(Debug, Clone)]
 enum ResolvedBinding {
     Account { pool: String, index: usize, address: Address },
@@ -405,39 +1101,66 @@ enum ResolvedBinding {
     SetupTx { address: Option<Address>, tx_hash: B256, sender: Address, nonce: u64 },
 }
 
-fn pick_workload_item(
-    spec: &WorkloadSpec,
-    rng: &mut StdRng,
-    remaining_txs: u64,
-) -> Result<Option<MixItem>> {
-    let mut total_weight = 0u64;
-    let mut candidates = Vec::new();
+struct WeightedWorkloadItem {
+    item: MixItem,
+    tx_count: u64,
+    weight: u64,
+    cumulative_weight: u64,
+}
 
-    for entry in &spec.mix {
-        let item = entry.item.clone();
-        let tx_count = workload_item_tx_count(spec, &item)?;
-        if tx_count > 0 && tx_count <= remaining_txs && entry.weight > 0 {
-            total_weight = total_weight
-                .checked_add(entry.weight)
-                .ok_or_else(|| eyre::eyre!("mix weights overflowed u64"))?;
-            candidates.push((item, entry.weight));
+/// Precompute weights and validate references once. The remaining transaction
+/// budget only decreases, so entries that stop fitting can be removed permanently.
+struct WorkloadSelector {
+    entries: Vec<WeightedWorkloadItem>,
+    total_weight: u64,
+    max_tx_count: u64,
+}
+
+impl WorkloadSelector {
+    fn new(spec: &WorkloadSpec, remaining_txs: u64) -> Result<Self> {
+        let mut selector = Self { entries: Vec::new(), total_weight: 0, max_tx_count: 0 };
+        if remaining_txs == 0 {
+            return Ok(selector);
         }
-    }
-
-    if total_weight == 0 {
-        return Ok(None);
-    }
-
-    let roll = rng.random_range(0..total_weight);
-    let mut cumulative = 0;
-    for (item, weight) in candidates {
-        cumulative += weight;
-        if roll < cumulative {
-            return Ok(Some(item));
+        for entry in &spec.mix {
+            let tx_count = workload_item_tx_count(spec, &entry.item)?;
+            if tx_count > 0 && tx_count <= remaining_txs && entry.weight > 0 {
+                selector.total_weight = selector
+                    .total_weight
+                    .checked_add(entry.weight)
+                    .ok_or_else(|| eyre::eyre!("mix weights overflowed u64"))?;
+                selector.max_tx_count = selector.max_tx_count.max(tx_count);
+                selector.entries.push(WeightedWorkloadItem {
+                    item: entry.item.clone(),
+                    tx_count,
+                    weight: entry.weight,
+                    cumulative_weight: selector.total_weight,
+                });
+            }
         }
+        Ok(selector)
     }
 
-    unreachable!("workload selection failed with roll={roll} total_weight={total_weight}")
+    fn pick(&mut self, rng: &mut StdRng, remaining_txs: u64) -> Option<&MixItem> {
+        if remaining_txs < self.max_tx_count {
+            // Rebuild only when a sequence no longer fits the remaining budget.
+            // Retaining list order preserves seeded choices from the old sampler.
+            self.entries.retain(|entry| entry.tx_count <= remaining_txs);
+            self.total_weight = 0;
+            self.max_tx_count = 0;
+            for entry in &mut self.entries {
+                self.total_weight += entry.weight;
+                entry.cumulative_weight = self.total_weight;
+                self.max_tx_count = self.max_tx_count.max(entry.tx_count);
+            }
+        }
+        if self.total_weight == 0 {
+            return None;
+        }
+        let roll = rng.random_range(0..self.total_weight);
+        let index = self.entries.partition_point(|entry| entry.cumulative_weight <= roll);
+        Some(&self.entries[index].item)
+    }
 }
 
 fn workload_item_tx_count(spec: &WorkloadSpec, item: &MixItem) -> Result<u64> {
@@ -461,7 +1184,7 @@ fn workload_item_tx_count(spec: &WorkloadSpec, item: &MixItem) -> Result<u64> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct EmittedTxInfo {
     sender: Address,
     nonce: u64,
@@ -480,27 +1203,115 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
+    let setup = build_setup(adapter, spec, ctx)?;
+    for tx in &setup.transactions {
+        writer.write(tx)?;
+    }
+    Ok(setup.bindings)
+}
+
+/// Online scenarios intentionally materialize and confirm setup in list order.
+/// Reject forward receipt dependencies there instead of silently violating them.
+fn validate_setup_steps(steps: &[SetupStep], online: bool) -> Result<()> {
+    let mut ids = std::collections::HashMap::new();
+    for (index, step) in steps.iter().enumerate() {
+        if step.id.is_empty() || ids.insert(step.id.as_str(), index).is_some() {
+            bail!("setup step IDs must be nonempty and unique: '{}'", step.id);
+        }
+    }
+    for (index, step) in steps.iter().enumerate() {
+        for dependency in &step.depends_on {
+            let Some(&prior) = ids.get(dependency.as_str()) else {
+                bail!("setup step '{}' depends on unknown step '{dependency}'", step.id);
+            };
+            if prior == index {
+                bail!("setup dependency cycle: '{}' depends on itself", step.id);
+            }
+            if online && prior > index {
+                bail!("online scenario setup runs in list order: '{}' depends on later step '{dependency}'; put prerequisites first", step.id);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_setup<A: NetworkAdapter>(
+    adapter: &mut A,
+    spec: &WorkloadSpec,
+    ctx: &mut BuildContext<'_>,
+) -> Result<MaterializedSetup>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
     let mut bindings = std::collections::HashMap::new();
     bindings.insert("chain_id".to_string(), ResolvedBinding::U64(ctx.chain_id));
 
     let Some(setup) = &spec.setup else {
-        return Ok(bindings);
+        return Ok(MaterializedSetup { transactions: Vec::new(), bindings });
     };
 
-    let setup_key = compute_setup_key();
-    for step in &setup.steps {
-        emit_setup_step(adapter, step, &mut bindings, setup_key, ctx, writer)
+    validate_setup_steps(&setup.steps, false)?;
+    let mut encoded = Vec::new();
+    let mut writer = NdjsonWriter::new(&mut encoded);
+    let mut ranges = Vec::new();
+    let started = Instant::now();
+    let mut last_progress = started;
+    let total_steps = setup.steps.len();
+    eprintln!("starting setup generation: steps={total_steps}");
+    for (idx, step) in setup.steps.iter().enumerate() {
+        let start = writer.count() as usize;
+        emit_setup_step(adapter, step, &mut bindings, ctx, &mut writer)
             .wrap_err_with(|| format!("failed to emit setup step '{}'", step.id))?;
-    }
 
-    Ok(bindings)
+        ranges.push(start..writer.count() as usize);
+        if last_progress.elapsed() >= PROGRESS_LOG_INTERVAL {
+            eprintln!(
+                "setup generation progress: completed_steps={} total_steps={total_steps} elapsed={:?}",
+                idx + 1,
+                started.elapsed(),
+            );
+            last_progress = Instant::now();
+        }
+    }
+    eprintln!("setup generation completed: steps={total_steps} elapsed={:?}", started.elapsed(),);
+
+    writer.flush()?;
+    let encoded = writer.into_inner();
+    let mut transactions = std::str::from_utf8(encoded)?
+        .lines()
+        .map(|line| serde_json::from_str::<bench_core::SourceTx>(line)?.into_generated_tx())
+        .collect::<Result<Vec<_>>>()?;
+    let outputs: std::collections::HashMap<_, Vec<_>> = setup
+        .steps
+        .iter()
+        .zip(&ranges)
+        .map(|(step, range)| {
+            (
+                step.id.as_str(),
+                transactions[range.clone()]
+                    .iter()
+                    .map(|tx| tx.id.clone().expect("generated setup id"))
+                    .collect(),
+            )
+        })
+        .collect();
+    for (step, range) in setup.steps.iter().zip(ranges) {
+        let dependencies: Vec<_> =
+            step.depends_on.iter().flat_map(|id| outputs[id.as_str()].iter().cloned()).collect();
+        for tx in &mut transactions[range] {
+            tx.depends_on = dependencies.clone();
+        }
+    }
+    txgen_core::setup_submission_order(&transactions)?;
+    Ok(MaterializedSetup { transactions, bindings })
 }
 
 fn emit_setup_step<A: NetworkAdapter, W: Write>(
     adapter: &mut A,
     step: &SetupStep,
     setup_bindings: &mut std::collections::HashMap<String, ResolvedBinding>,
-    setup_key: SchedulingKey,
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
 ) -> Result<()>
@@ -531,13 +1342,12 @@ where
             bail!("setup step `keychain_authorize_pool` produced no transactions");
         }
         for (idx, value) in templates.into_iter().enumerate() {
-            let inclusion_key = compute_setup_extension_key(&step.id, idx);
             emit_template_value(
                 adapter,
                 &format!("setup.{}[{idx}]", step.id),
                 value,
                 TxPhase::Setup,
-                &[inclusion_key],
+                &[],
                 ctx,
                 writer,
             )?;
@@ -553,7 +1363,7 @@ where
             &format!("setup.{}", step.id),
             value,
             TxPhase::Setup,
-            &[setup_key],
+            &[],
             ctx,
             writer,
         )?
@@ -570,7 +1380,7 @@ where
             &format!("setup.{}", step.id),
             materialized,
             TxPhase::Setup,
-            &[setup_key],
+            &[],
             ctx,
             writer,
         )?
@@ -808,11 +1618,25 @@ fn prepare_signing_job<A: NetworkAdapter>(
     let template: A::Template = serde_yaml::from_value(value)
         .wrap_err_with(|| format!("failed to parse template '{name}'"))?;
 
-    let tx_req = adapter
+    let tx_req = match adapter
         .build_request(template, ctx)
-        .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
+        .wrap_err_with(|| format!("failed to build request from template '{name}'"))
+    {
+        Ok(tx_req) => tx_req,
+        Err(error) => {
+            let _ = ctx.rollback_nonce_reservations();
+            return Err(error);
+        }
+    };
 
-    let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?.clone();
+    let signer = match ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index) {
+        Ok(signer) => signer.clone(),
+        Err(error) => {
+            let _ = ctx.rollback_nonce_reservations();
+            return Err(error);
+        }
+    };
+    let _ = ctx.take_nonce_reservations();
 
     Ok(SigningJob {
         sequence,
@@ -831,9 +1655,27 @@ where
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
     let SigningJob { sequence: _, name, phase, tx_req, signer, inclusion_keys } = job;
-    let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context } = tx_req;
+    let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context, late_sign } =
+        tx_req;
 
-    sign_context.sign_request(name, phase, request, signer, key, inclusion_keys)
+    match late_sign {
+        Some(late_sign) => {
+            if phase == TxPhase::Setup {
+                bail!("deferred signing is not supported for setup transactions");
+            }
+            Ok(GeneratedTx {
+                depends_on: Vec::new(),
+                phase,
+                id: Some(name),
+                raw: Bytes::new(),
+                late_sign: Some(late_sign),
+                sender: Some(signer.address()),
+                submission_keys: vec![SchedulingKey::from(key)],
+                inclusion_keys,
+            })
+        }
+        None => sign_context.sign_request(name, phase, request, signer, key, inclusion_keys),
+    }
 }
 
 fn generate_txs<A, W: Write>(
@@ -852,10 +1694,17 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
+    let mut selector = WorkloadSelector::new(spec, limit.count.unwrap_or(u64::MAX))?;
     let mut signing_pool = SigningPool::new(signing_workers)?;
     let mut written = 0u64;
     let mut sequence_instances = 0u64;
     let start = Instant::now();
+    let mut last_progress = start;
+
+    eprintln!(
+        "starting workload generation: count={:?} duration={:?} signing_workers={signing_workers}",
+        limit.count, limit.duration,
+    );
 
     while limit.count.is_none_or(|count| written < count) {
         if limit.duration.is_some_and(|duration| start.elapsed() > duration) {
@@ -863,7 +1712,7 @@ where
         }
 
         let remaining = limit.count.map(|count| count - written).unwrap_or(u64::MAX);
-        let Some(item) = pick_workload_item(spec, ctx.rng, remaining)? else {
+        let Some(item) = selector.pick(ctx.rng, remaining).cloned() else {
             break;
         };
 
@@ -899,6 +1748,8 @@ where
                     .checked_add(1)
                     .ok_or_else(|| eyre::eyre!("sequence instance counter overflowed u64"))?;
                 let sequence_key = compute_sequence_key(&name, sequence_instance);
+                // A single step has no dependent transaction to wait for its inclusion.
+                let inclusion_keys = (sequence.steps.len() > 1).then_some(sequence_key);
                 let bindings = resolve_sequence_bindings(&sequence.bindings, ctx, setup_bindings)
                     .wrap_err_with(|| {
                     format!("failed to resolve bindings for sequence '{name}'")
@@ -921,7 +1772,7 @@ where
                         format!("{name}.{label}"),
                         materialized,
                         TxPhase::Workload,
-                        &[sequence_key],
+                        inclusion_keys.as_slice(),
                         sequence,
                         ctx,
                     )?;
@@ -930,10 +1781,20 @@ where
                 }
             }
         }
+
+        if last_progress.elapsed() >= PROGRESS_LOG_INTERVAL {
+            eprintln!(
+                "workload generation progress: prepared={written} signing_in_flight={} elapsed={:?}",
+                signing_pool.in_flight,
+                start.elapsed(),
+            );
+            last_progress = Instant::now();
+        }
     }
 
     signing_pool.finish(writer)?;
     writer.flush()?;
+    eprintln!("workload generation completed: prepared={written} elapsed={:?}", start.elapsed(),);
     Ok(written)
 }
 
@@ -951,45 +1812,23 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    let template: A::Template = serde_yaml::from_value(value)
-        .wrap_err_with(|| format!("failed to parse template '{name}'"))?;
-
-    let tx_req = adapter
-        .build_request(template, ctx)
-        .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
-
-    let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?;
-    let captured = if phase == TxPhase::Setup {
-        let sender = signer.address();
-        let nonce = tx_req
-            .request
-            .nonce()
+    let materialized =
+        materialize_and_sign_template(adapter, name, value, phase, inclusion_keys, ctx)?;
+    let info = if phase == TxPhase::Setup {
+        let nonce = materialized
+            .nonce
             .ok_or_else(|| eyre::eyre!("template '{name}' did not set a nonce"))?;
-        let created_address =
-            matches!(tx_req.request.kind(), Some(TxKind::Create)).then(|| sender.create(nonce));
-        Some((sender, nonce, created_address))
+        Some(EmittedTxInfo {
+            sender: materialized.sender,
+            nonce,
+            tx_hash: materialized.tx_hash,
+            created_address: materialized.created_address,
+        })
     } else {
         None
     };
 
-    let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context } = tx_req;
-    let generated = sign_context.sign_request(
-        name.to_string(),
-        phase,
-        request,
-        signer.clone(),
-        key,
-        dedup_scheduling_keys(inclusion_keys.iter().copied()),
-    )?;
-    let raw = generated.raw.clone();
-    let info = captured.map(|(sender, nonce, created_address)| EmittedTxInfo {
-        sender,
-        nonce,
-        tx_hash: keccak256(&raw),
-        created_address,
-    });
-
-    writer.write(&generated)?;
+    writer.write(&materialized.generated)?;
     Ok(info)
 }
 
@@ -1190,15 +2029,6 @@ fn referenced_local_binding(
     }
 }
 
-fn compute_setup_key() -> SchedulingKey {
-    scheduling_key_from_hash(keccak256(b"txgen:setup"))
-}
-
-fn compute_setup_extension_key(step_id: &str, idx: usize) -> SchedulingKey {
-    let material = format!("txgen:setup:{step_id}:{idx}");
-    scheduling_key_from_hash(keccak256(material.as_bytes()))
-}
-
 fn scheduling_key_from_hash(hash: B256) -> SchedulingKey {
     let mut key = [0u8; 20];
     key.copy_from_slice(&hash[..20]);
@@ -1276,7 +2106,7 @@ fn binding_to_value(
             Ok(serde_yaml::Value::String(address.to_string()))
         }
         (ResolvedBinding::Account { .. }, None) => {
-            bail!("account binding '{name}' requires `.ref` or `.address`")
+            bail!("account binding '{name}' requires `.ref` or `.address`");
         }
         (ResolvedBinding::Address(address), None) => {
             Ok(serde_yaml::Value::String(address.to_string()))
@@ -1290,7 +2120,7 @@ fn binding_to_value(
             Ok(serde_yaml::Value::String(address.to_string()))
         }
         (ResolvedBinding::SetupTx { address: None, .. }, Some("address")) => {
-            bail!("setup transaction binding '{name}' has no deployed address")
+            bail!("setup transaction binding '{name}' has no deployed address");
         }
         (ResolvedBinding::SetupTx { tx_hash, .. }, Some("tx_hash")) => {
             Ok(serde_yaml::Value::String(tx_hash.to_string()))
@@ -1300,9 +2130,11 @@ fn binding_to_value(
         }
         (ResolvedBinding::SetupTx { nonce, .. }, Some("nonce")) => Ok(serde_yaml::to_value(nonce)?),
         (ResolvedBinding::SetupTx { .. }, None) => {
-            bail!("setup transaction binding '{name}' requires a field")
+            bail!("setup transaction binding '{name}' requires a field");
         }
-        (_, Some(field)) => bail!("binding '{name}' has no field '{field}'"),
+        (_, Some(field)) => {
+            bail!("binding '{name}' has no field '{field}'");
+        }
     }
 }
 
@@ -1345,7 +2177,219 @@ fn account_ref_value(pool: &str, index: usize) -> Result<serde_yaml::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_network::Ethereum;
+    use alloy_rpc_types_eth::TransactionRequest;
     use std::collections::HashMap;
+    use txgen_core::{derive_mnemonic_signer, GasConfig};
+
+    struct PendingPrepareAdapter;
+    struct MutatingKeyAdapter;
+    struct MutatingKeySignContext;
+
+    impl NetworkAdapter for PendingPrepareAdapter {
+        type Template = serde_yaml::Value;
+        type Network = Ethereum;
+        type SignContext = ();
+
+        fn network_name() -> &'static str {
+            "pending-test"
+        }
+
+        fn build_request(
+            &self,
+            _template: Self::Template,
+            _ctx: &mut BuildContext<'_>,
+        ) -> Result<TxRequest<TransactionRequest>> {
+            unreachable!("timed-out preparation must not build a request")
+        }
+
+        async fn prepare_request(
+            &self,
+            _value: &serde_yaml::Value,
+            ctx: &mut BuildContext<'_>,
+        ) -> Result<()> {
+            ctx.next_nonce([0x44; 20]);
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    impl RequestSignContext<Ethereum> for MutatingKeySignContext {
+        fn sign_request(
+            self,
+            name: String,
+            phase: TxPhase,
+            _request: TransactionRequest,
+            signer: EcdsaSigner,
+            _key: [u8; 20],
+            _inclusion_keys: Vec<SchedulingKey>,
+        ) -> Result<GeneratedTx> {
+            Ok(GeneratedTx {
+                depends_on: Vec::new(),
+                phase,
+                id: Some(name),
+                raw: Bytes::new(),
+                late_sign: None,
+                sender: Some(signer.address()),
+                submission_keys: vec![SchedulingKey::from([0x99; 20])],
+                inclusion_keys: Vec::new(),
+            })
+        }
+    }
+
+    impl NetworkAdapter for MutatingKeyAdapter {
+        type Template = serde_yaml::Value;
+        type Network = Ethereum;
+        type SignContext = MutatingKeySignContext;
+
+        fn network_name() -> &'static str {
+            "mutating-key-test"
+        }
+
+        fn build_request(
+            &self,
+            _template: Self::Template,
+            _ctx: &mut BuildContext<'_>,
+        ) -> Result<TxRequest<TransactionRequest, Self::SignContext>> {
+            unreachable!("test constructs its prepared request directly")
+        }
+    }
+
+    fn reference_pick_workload_item(
+        spec: &WorkloadSpec,
+        rng: &mut StdRng,
+        remaining_txs: u64,
+    ) -> Result<Option<MixItem>> {
+        let mut total_weight = 0u64;
+        let mut candidates = Vec::new();
+
+        for entry in &spec.mix {
+            let item = entry.item.clone();
+            let tx_count = workload_item_tx_count(spec, &item)?;
+            if tx_count > 0 && tx_count <= remaining_txs && entry.weight > 0 {
+                total_weight = total_weight
+                    .checked_add(entry.weight)
+                    .ok_or_else(|| eyre::eyre!("mix weights overflowed u64"))?;
+                candidates.push((item, entry.weight));
+            }
+        }
+
+        if total_weight == 0 {
+            return Ok(None);
+        }
+
+        let roll = rng.random_range(0..total_weight);
+        let mut cumulative = 0;
+        for (item, weight) in candidates {
+            cumulative += weight;
+            if roll < cumulative {
+                return Ok(Some(item));
+            }
+        }
+
+        unreachable!("workload selection failed with roll={roll} total_weight={total_weight}")
+    }
+
+    fn selector_spec() -> WorkloadSpec {
+        WorkloadSpec::parse(r#"
+chain_id: 1
+templates:
+  a: {}
+  b: {}
+sequences:
+  short:
+    steps: [{template: a}, {template: b}, {template: a}]
+  long:
+    steps: [{template: a}, {template: b}, {template: a}, {template: b}, {template: a}, {template: b}, {template: a}]
+mix:
+  - {template: a, weight: 2}
+  - {sequence: long, weight: 23}
+  - {template: b, weight: 0}
+  - {sequence: short, weight: 11}
+  - {template: b, weight: 5}
+  - {template: a, weight: 1}
+"#).unwrap()
+    }
+
+    #[test]
+    fn weighted_selector_preserves_seeded_choices_and_sequence_boundaries() -> Result<()> {
+        for sequences_only in [false, true] {
+            let mut spec = selector_spec();
+            if sequences_only {
+                spec.mix.retain(|entry| matches!(entry.item, MixItem::Sequence(_)));
+            }
+            for seed in 0..32 {
+                for count in 0..100 {
+                    let mut selector = WorkloadSelector::new(&spec, count)?;
+                    let mut expected_rng = StdRng::seed_from_u64(seed);
+                    let mut actual_rng = expected_rng.clone();
+                    let mut remaining = count;
+                    while remaining > 0 {
+                        let expected =
+                            reference_pick_workload_item(&spec, &mut expected_rng, remaining)?;
+                        let actual = selector.pick(&mut actual_rng, remaining).cloned();
+                        assert_eq!(
+                            actual, expected,
+                            "seed={seed}, count={count}, remaining={remaining}"
+                        );
+                        let Some(item) = actual else { break };
+                        let size = workload_item_tx_count(&spec, &item)?;
+                        assert!(size <= remaining);
+                        remaining -= size;
+                    }
+                    assert_eq!(actual_rng.random::<u64>(), expected_rng.random::<u64>());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn weighted_selector_handles_zero_weights_and_count_filtered_overflow() -> Result<()> {
+        let mut spec = selector_spec();
+        for entry in &mut spec.mix {
+            entry.weight = 0;
+        }
+        let mut selector = WorkloadSelector::new(&spec, u64::MAX)?;
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut untouched_rng = rng.clone();
+        assert!(selector.pick(&mut rng, u64::MAX).is_none());
+        assert_eq!(rng.random::<u64>(), untouched_rng.random::<u64>());
+
+        // A sequence that cannot fit must not contribute to the weight sum.
+        spec.mix[0].weight = u64::MAX;
+        spec.mix[1].weight = 1;
+        let mut selector = WorkloadSelector::new(&spec, 1)?;
+        assert_eq!(selector.pick(&mut rng, 1), Some(&MixItem::Template("a".to_owned())));
+        assert!(WorkloadSelector::new(&spec, 7).err().unwrap().to_string().contains("overflowed"));
+        assert!(WorkloadSelector::new(&spec, 0)?.pick(&mut rng, 0).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn weighted_selector_validates_references_and_rejects_empty_sequences() {
+        let mut spec = selector_spec();
+        spec.templates.remove("a");
+        assert!(WorkloadSelector::new(&spec, 100)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("template 'a' not found"));
+        let mut spec = selector_spec();
+        spec.sequences.remove("long");
+        assert!(WorkloadSelector::new(&spec, 100)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("sequence 'long' not found"));
+        let mut spec = selector_spec();
+        spec.sequences.get_mut("long").unwrap().steps.clear();
+        assert!(WorkloadSelector::new(&spec, 100)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("has no steps"));
+    }
 
     fn var(path: &str) -> serde_yaml::Value {
         let mut mapping = serde_yaml::Mapping::new();
@@ -1410,5 +2454,59 @@ call:
         assert_eq!(values[3], var("tick"));
         assert_eq!(yaml_get(yaml_get(&values[4], "if"), "cond"), &var("is_bid"));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn timed_out_async_preparation_rewinds_ordered_nonce_reservations() {
+        let accounts = AccountManager::empty();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut context = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let error = materialize_setup_value_online(
+            &PendingPrepareAdapter,
+            "pending",
+            serde_yaml::Value::Null,
+            &[],
+            &mut context,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("timed out preparing request"));
+        assert_eq!(context.next_nonce([0x44; 20]), 0);
+    }
+
+    #[test]
+    fn prepared_signer_cannot_change_scheduling_keys() {
+        let signer = derive_mnemonic_signer(
+            "test test test test test test test test test test test junk",
+            0,
+        )
+        .unwrap();
+        let prepared = PreparedMaterializedTx::<MutatingKeyAdapter> {
+            name: "mutating".to_string(),
+            phase: TxPhase::Workload,
+            tx_req: TxRequest {
+                request: TransactionRequest::default(),
+                signer_pool: "unused".to_string(),
+                signer_index: 0,
+                key: [0x11; 20],
+                sign_context: MutatingKeySignContext,
+                late_sign: None,
+            },
+            signer: signer.clone(),
+            inclusion_keys: vec![SchedulingKey::from([0x22; 20])],
+            sender: signer.address(),
+            nonce: None,
+            nonce_reservations: Vec::new(),
+            created_address: None,
+        };
+
+        let error = sign_prepared_materialized_template(prepared).unwrap_err();
+        assert!(error.to_string().contains("changed the prepared scheduling keys"));
     }
 }

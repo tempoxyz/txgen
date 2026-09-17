@@ -1,5 +1,5 @@
 use alloy_eips::{
-    eip7928::{AccountChanges, BlockAccessList, SlotChanges},
+    eip7928::{AccountChanges, BlockAccessIndex, BlockAccessList, SlotChanges},
     BlockId, BlockNumberOrTag,
 };
 use alloy_network::Network;
@@ -117,17 +117,18 @@ fn shift_account_changes(
     let shift = tx_index_offset + 2 * segment_idx;
     for slot_changes in &mut account_changes.storage_changes {
         for change in &mut slot_changes.changes {
-            change.block_access_index += shift;
+            change.block_access_index =
+                BlockAccessIndex::new(change.block_access_index.get() + shift);
         }
     }
     for change in &mut account_changes.balance_changes {
-        change.block_access_index += shift;
+        change.block_access_index = BlockAccessIndex::new(change.block_access_index.get() + shift);
     }
     for change in &mut account_changes.nonce_changes {
-        change.block_access_index += shift;
+        change.block_access_index = BlockAccessIndex::new(change.block_access_index.get() + shift);
     }
     for change in &mut account_changes.code_changes {
-        change.block_access_index += shift;
+        change.block_access_index = BlockAccessIndex::new(change.block_access_index.get() + shift);
     }
 }
 

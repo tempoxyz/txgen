@@ -1,5 +1,29 @@
 use std::collections::HashMap;
 
+/// One nonce value consumed from a tracker while materializing a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonceReservation {
+    /// Scheduling lane whose counter was advanced.
+    pub key: [u8; 20],
+    /// Reserved nonce value.
+    pub nonce: u64,
+    /// Whether the reservation orders transactions or only guarantees uniqueness.
+    pub kind: NonceReservationKind,
+}
+
+/// How a locally reserved nonce participates in submission ordering and rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonceReservationKind {
+    /// A chain nonce that orders transactions sharing the same scheduling lane.
+    Ordered,
+    /// A consume-once local counter used to make independently valid payloads unique.
+    ///
+    /// Unique reservations are allocated atomically, but they neither serialize
+    /// transaction submission nor get reused after a later materialization or
+    /// submission failure.
+    Unique,
+}
+
 /// Tracks nonces per scheduling key.
 ///
 /// Each scheduling key maps to a monotonically increasing nonce counter.
@@ -36,6 +60,22 @@ impl NonceTracker {
     /// Reset the nonce for a key to a specific value.
     pub fn reset(&mut self, key: [u8; 20], nonce: u64) {
         self.nonces.insert(key, nonce);
+    }
+
+    /// Rewind a just-reserved nonce when no later reservation used the same key.
+    ///
+    /// Returns `true` only when the current counter is exactly `nonce + 1`.
+    /// Online callers use this after an RPC rejects a signed transaction, while
+    /// avoiding a rollback over a concurrently materialized transaction.
+    pub fn rewind(&mut self, key: [u8; 20], nonce: u64) -> bool {
+        let Some(expected) = nonce.checked_add(1) else {
+            return false;
+        };
+        if self.current(&key) != expected {
+            return false;
+        }
+        self.reset(key, nonce);
+        true
     }
 
     /// Clear all tracked nonces.
@@ -97,5 +137,18 @@ mod tests {
         tracker.reset(key, 100);
 
         assert_eq!(tracker.next(key), 100);
+    }
+
+    #[test]
+    fn test_rewind_only_latest_reservation() {
+        let mut tracker = NonceTracker::new();
+        let key = [3u8; 20];
+        assert_eq!(tracker.next(key), 0);
+        assert!(tracker.rewind(key, 0));
+        assert_eq!(tracker.next(key), 0);
+
+        assert_eq!(tracker.next(key), 1);
+        assert!(!tracker.rewind(key, 0));
+        assert_eq!(tracker.current(&key), 2);
     }
 }

@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.93"
+rust-version = "1.94.1"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -30,9 +30,10 @@ alloy-dyn-abi = { version = "1", features = ["eip712"] }
 alloy-json-abi = "1"
 alloy-signer = "2"
 alloy-signer-local = "2"
-alloy-consensus = "2"
+alloy-consensus = { version = "2", features = ["k256"] }
 alloy-network = "2"
-alloy-provider = { version = "2", features = ["debug-api", "engine-api"] }
+alloy-provider = { version = "2.4.2", features = ["debug-api", "engine-api", "ws"] }
+alloy-reth = "0.2"
 alloy-rpc-types-eth = "2"
 alloy-eips = "2"
 alloy-rlp = "0.3"
@@ -41,11 +42,19 @@ alloy-rlp = "0.3"
 tempo-alloy = "1"
 tempo-primitives = "1"
 
+# crypto
+aes-gcm = "0.10"
+hkdf = "0.12"
+k256 = { version = "0.13", features = ["ecdh"] }
+sha2 = "0.10"
+
 # misc
 futures = "0.3"
 hex = "0.4"
 rand = "0.9"
 rayon = "1"
+rustix = { version = "1", features = ["fs"] }
 eyre = "0.6"
 tokio = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1"

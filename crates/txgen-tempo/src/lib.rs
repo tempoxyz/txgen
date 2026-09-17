@@ -1,10 +1,18 @@
+pub mod auth_token_map;
+pub mod late_sign;
 mod nonce;
 mod template;
+mod zone;
+pub mod zone_auth;
 
+pub use late_sign::{
+    sign_tempo_expiring, SignerLocator, TempoExpiringPayload, TempoLateSigner,
+    FORMAT_TEMPO_EXPIRING_RELATIVE,
+};
 pub use nonce::{prefetch_parallel_nonces, NONCE_PRECOMPILE};
 pub use txgen_cli::fetch_protocol_nonces;
 
-use alloy_eips::eip2718::Encodable2718;
+use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{keccak256, Address, Bytes, TxKind, U256};
 use alloy_provider::{network::Ethereum, DynProvider};
@@ -26,7 +34,8 @@ use tempo_primitives::{
     TempoSignature, TempoTxEnvelope,
 };
 use txgen_cli::{
-    sign_standard_request, GenerateContext, NetworkAdapter, RequestSignContext, TxRequest,
+    sign_standard_request, GenerateContext, NetworkAdapter, RequestSignContext,
+    ScenarioActionContext, TxRequest,
 };
 use txgen_core::{
     derive_mnemonic_signer, AccountPoolDef, BuildContext, EcdsaSigner, GeneratedTx, SchedulingKey,
@@ -46,6 +55,17 @@ const INLINE_ACCESS_KEY_MNEMONIC: &str =
     "test test test test test test test test test test test junk";
 const INLINE_ACCESS_KEY_START_INDEX: u32 = 1_000_000;
 
+/// Extract the signed validity deadline for bench's shared pending tracker.
+/// Unknown/non-Tempo envelopes retain the generic inclusion timeout.
+pub fn transaction_expiry(raw: &Bytes) -> Option<u64> {
+    TempoTxEnvelope::decode_2718(&mut raw.as_ref())
+        .ok()?
+        .as_aa()?
+        .tx()
+        .valid_before
+        .map(NonZeroU64::get)
+}
+
 /// Tempo network adapter for transaction generation.
 ///
 /// Supports all Ethereum transaction types (legacy, EIP-2930, EIP-1559)
@@ -59,9 +79,14 @@ const INLINE_ACCESS_KEY_START_INDEX: u32 = 1_000_000;
 pub struct TempoAdapter {
     /// Set exactly once by [`Self::prefetch_nonces`], then read lock-free
     /// on the hot path by [`Self::next_nonce_lazy`].
-    nonce_rpc: OnceLock<DynProvider<Ethereum>>,
+    nonce_rpc: OnceLock<NonceRpc>,
     /// Keychain setup state keyed by setup step id.
     keychain_setups: HashMap<String, TempoKeychainSetup>,
+}
+
+struct NonceRpc {
+    provider: DynProvider<Ethereum>,
+    pending: bool,
 }
 
 #[derive(Clone)]
@@ -78,6 +103,14 @@ pub enum TempoSignContext {
     Standard,
     /// Sign the request with an authorized access key on behalf of `user_address`.
     Keychain { user_address: Address, access_signer: EcdsaSigner },
+    /// Apply signatures that depend on the fully built request before its
+    /// primary account or keychain signature.
+    Deferred {
+        primary: Box<TempoSignContext>,
+        key_authorization: Option<KeyAuthorization>,
+        sponsor: Option<EcdsaSigner>,
+        user_address: Address,
+    },
 }
 
 impl RequestSignContext<TempoNetwork> for TempoSignContext {
@@ -85,7 +118,7 @@ impl RequestSignContext<TempoNetwork> for TempoSignContext {
         self,
         name: String,
         phase: TxPhase,
-        request: TempoTransactionRequest,
+        mut request: TempoTransactionRequest,
         signer: EcdsaSigner,
         key: [u8; 20],
         inclusion_keys: Vec<SchedulingKey>,
@@ -114,6 +147,22 @@ impl RequestSignContext<TempoNetwork> for TempoSignContext {
                 key,
                 inclusion_keys,
             ),
+            Self::Deferred { primary, key_authorization, sponsor, user_address } => {
+                if let Some(authorization) = key_authorization {
+                    let signature = signer.sign_hash_sync(&authorization.signature_hash())?;
+                    request.set_key_authorization(
+                        authorization.into_signed(PrimitiveSignature::Secp256k1(signature)),
+                    );
+                }
+                if let Some(sponsor) = sponsor {
+                    let transaction = request.clone().build_aa().map_err(|error| {
+                        eyre::eyre!("failed to build AA tx for sponsor: {error}")
+                    })?;
+                    let fee_payer_hash = transaction.fee_payer_signature_hash(user_address);
+                    request.set_fee_payer_signature(sponsor.sign_hash_sync(&fee_payer_hash)?);
+                }
+                primary.sign_request(name, phase, request, signer, key, inclusion_keys)
+            }
         }
     }
 }
@@ -180,11 +229,20 @@ impl TempoAdapter {
         nonce_key: U256,
     ) -> Result<u64> {
         if !ctx.nonces.contains(&scheduling_key) &&
-            let Some(provider) = self.nonce_rpc.get()
+            let Some(nonce_rpc) = self.nonce_rpc.get()
         {
+            if nonce_rpc.pending {
+                bail!(
+                    "online Tempo nonce lane was not prepared before synchronous materialization"
+                );
+            }
             let n = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(nonce::fetch_lane_nonce(provider, address, nonce_key))
+                tokio::runtime::Handle::current().block_on(nonce::fetch_lane_nonce(
+                    &nonce_rpc.provider,
+                    address,
+                    nonce_key,
+                    nonce_rpc.pending,
+                ))
             })?;
             ctx.nonces.reset(scheduling_key, n);
         }
@@ -241,6 +299,7 @@ impl TempoAdapter {
         selected: &SelectedSigner,
         req: &mut TempoTransactionRequest,
         sign_context: &mut TempoSignContext,
+        deferred_key_authorization: &mut Option<KeyAuthorization>,
         ctx: &mut BuildContext<'_>,
     ) -> Result<()> {
         let Some(auth) = &template.auth else {
@@ -260,11 +319,7 @@ impl TempoAdapter {
                 let access_signer = derive_inline_access_signer(auth, ctx)?;
                 let key_id = access_signer.address();
                 let authorization = build_key_authorization(auth, key_type, key_id, ctx)?;
-                let root_signer = ctx.accounts.get_by_index(&selected.pool, selected.index)?;
-                let signature = root_signer.sign_hash_sync(&authorization.signature_hash())?;
-                req.set_key_authorization(
-                    authorization.into_signed(PrimitiveSignature::Secp256k1(signature)),
-                );
+                *deferred_key_authorization = Some(authorization);
                 req.set_key_type(key_type);
                 req.set_key_id(key_id);
                 *sign_context =
@@ -343,6 +398,23 @@ impl NetworkAdapter for TempoAdapter {
     type Network = TempoNetwork;
     type SignContext = TempoSignContext;
 
+    fn network_name() -> &'static str {
+        "tempo"
+    }
+
+    fn scenario_actions() -> &'static [&'static str] {
+        zone::SCENARIO_ACTIONS
+    }
+
+    async fn invoke_scenario_action(
+        &self,
+        action: &str,
+        arguments: &serde_yaml::Value,
+        context: ScenarioActionContext<'_>,
+    ) -> Result<serde_yaml::Value> {
+        zone::invoke(action, arguments, context).await
+    }
+
     fn build_request(
         &self,
         template: Self::Template,
@@ -363,7 +435,29 @@ impl NetworkAdapter for TempoAdapter {
             );
         }
         let scheduling_key = compute_scheduling_key(selected.address, nonce_mode, ctx);
+        if matches!(nonce_mode, TempoNonceMode::Expiring) && template.nonce.is_some() {
+            bail!("`nonce` must not be set for an expiring Tempo transaction");
+        }
         let nonce = if let Some(nonce) = template.nonce {
+            if !matches!(nonce_mode, TempoNonceMode::Expiring) &&
+                self.nonce_rpc.get().is_some_and(|rpc| rpc.pending)
+            {
+                let expected = self.next_nonce_lazy(
+                    ctx,
+                    scheduling_key,
+                    selected.address,
+                    match nonce_mode {
+                        TempoNonceMode::Protocol => U256::ZERO,
+                        TempoNonceMode::Parallel(nonce_key) => nonce_key,
+                        TempoNonceMode::Expiring => unreachable!("excluded above"),
+                    },
+                )?;
+                if nonce != expected {
+                    bail!(
+                        "explicit nonce {nonce} does not match pending nonce {expected} for the selected Tempo lane"
+                    );
+                }
+            }
             nonce
         } else {
             match nonce_mode {
@@ -384,6 +478,9 @@ impl NetworkAdapter for TempoAdapter {
         req.set_nonce(nonce);
         req.set_gas_limit(template.gas_limit);
         let mut sign_context = TempoSignContext::Standard;
+        let mut deferred_key_authorization = None;
+        let mut deferred_sponsor = None;
+        let mut late_sign = None;
 
         match template.tx_type {
             TempoTxType::Tempo => {
@@ -397,6 +494,10 @@ impl NetworkAdapter for TempoAdapter {
                 req.calls = calls;
 
                 let is_expiring = matches!(nonce_mode, TempoNonceMode::Expiring);
+                let is_late_sign = ctx.defer_signing() &&
+                    is_expiring &&
+                    template.valid_for_secs.is_some() &&
+                    template.auth.is_none();
                 let valid_before = match nonce_mode {
                     TempoNonceMode::Protocol => template.valid_before,
                     TempoNonceMode::Parallel(nonce_key) => {
@@ -405,7 +506,12 @@ impl NetworkAdapter for TempoAdapter {
                     }
                     TempoNonceMode::Expiring => {
                         req.set_nonce_key(TEMPO_EXPIRING_NONCE_KEY);
-                        Some(resolve_expiring_valid_before(&template)?)
+                        if is_late_sign {
+                            validate_expiring_valid_for_secs(&template)?;
+                            None
+                        } else {
+                            Some(resolve_expiring_valid_before(&template)?)
+                        }
                     }
                 };
 
@@ -430,21 +536,54 @@ impl NetworkAdapter for TempoAdapter {
                     apply_expiring_uniqueness_bump(&mut req, ctx)?;
                 }
 
-                self.apply_auth(&template, &selected, &mut req, &mut sign_context, ctx)?;
+                self.apply_auth(
+                    &template,
+                    &selected,
+                    &mut req,
+                    &mut sign_context,
+                    &mut deferred_key_authorization,
+                    ctx,
+                )?;
 
-                // Handle sponsor signing: build a temporary TempoTransaction to
-                // compute the fee_payer_signature_hash, sign it, then set on the request.
                 if let Some(ref sponsor_ref) = template.sponsor {
-                    let temp_tx = req
-                        .clone()
-                        .build_aa()
-                        .map_err(|e| eyre::eyre!("failed to build AA tx for sponsor: {e}"))?;
-
                     let sponsor = ctx.select_signer(sponsor_ref)?;
-                    let sponsor_signer = ctx.accounts.get_by_index(&sponsor.pool, sponsor.index)?;
-                    let fee_payer_hash = temp_tx.fee_payer_signature_hash(selected.address);
-                    let fee_payer_sig = sponsor_signer.sign_hash_sync(&fee_payer_hash)?;
-                    req.set_fee_payer_signature(fee_payer_sig);
+                    if is_late_sign {
+                        late_sign = Some(
+                            TempoExpiringPayload {
+                                signer: SignerLocator {
+                                    pool: selected.pool.clone(),
+                                    index: selected.index,
+                                },
+                                sponsor: Some(SignerLocator {
+                                    pool: sponsor.pool,
+                                    index: sponsor.index,
+                                }),
+                                valid_for_secs: template
+                                    .valid_for_secs
+                                    .expect("late signing requires valid_for_secs"),
+                                request: req.clone(),
+                            }
+                            .into_spec()?,
+                        );
+                    } else {
+                        deferred_sponsor =
+                            Some(ctx.accounts.get_by_index(&sponsor.pool, sponsor.index)?.clone());
+                    }
+                } else if is_late_sign {
+                    late_sign = Some(
+                        TempoExpiringPayload {
+                            signer: SignerLocator {
+                                pool: selected.pool.clone(),
+                                index: selected.index,
+                            },
+                            sponsor: None,
+                            valid_for_secs: template
+                                .valid_for_secs
+                                .expect("late signing requires valid_for_secs"),
+                            request: req.clone(),
+                        }
+                        .into_spec()?,
+                    );
                 }
             }
             TempoTxType::Legacy => {
@@ -479,13 +618,112 @@ impl NetworkAdapter for TempoAdapter {
             }
         }
 
+        if deferred_key_authorization.is_some() || deferred_sponsor.is_some() {
+            sign_context = TempoSignContext::Deferred {
+                primary: Box::new(sign_context),
+                key_authorization: deferred_key_authorization,
+                sponsor: deferred_sponsor,
+                user_address: selected.address,
+            };
+        }
+
         Ok(TxRequest {
             request: req,
             signer_pool: selected.pool,
             signer_index: selected.index,
             key: scheduling_key,
             sign_context,
+            late_sign,
         })
+    }
+
+    fn late_signer(
+        &self,
+        spec: &txgen_core::WorkloadSpec,
+    ) -> Result<Option<std::sync::Arc<dyn bench_core::LateSigner>>> {
+        Ok(Some(std::sync::Arc::new(TempoLateSigner::from_spec(spec)?)))
+    }
+
+    fn scenario_unique_nonce_group(
+        &self,
+        template: &serde_yaml::Value,
+        overlay: &serde_yaml::Value,
+    ) -> Result<Option<String>> {
+        let mut materialized = template.clone();
+        txgen_core::merge_yaml(&mut materialized, overlay.clone());
+        let Some(auth) = materialized
+            .as_mapping()
+            .and_then(|mapping| mapping.get(serde_yaml::Value::String("auth".to_string())))
+            .filter(|auth| !auth.is_null())
+        else {
+            return Ok(None);
+        };
+        let Some(mode) = auth
+            .as_mapping()
+            .and_then(|mapping| mapping.get(serde_yaml::Value::String("mode".to_string())))
+            .and_then(serde_yaml::Value::as_str)
+        else {
+            // Dynamic auth is materialized at execution time. Conservatively
+            // reserve a dense identity: non-inline modes simply ignore it.
+            return Ok(Some("tempo:inline-access-key".to_string()));
+        };
+        match mode {
+            "key_authorization" => Ok(Some("tempo:inline-access-key".to_string())),
+            _ => Ok(None),
+        }
+    }
+
+    async fn prepare_request(
+        &self,
+        value: &serde_yaml::Value,
+        ctx: &mut BuildContext<'_>,
+    ) -> Result<()> {
+        let template: TempoTemplate = serde_yaml::from_value(value.clone())
+            .wrap_err("failed to parse Tempo template while preparing nonce state")?;
+        if template.expiring_nonce {
+            return Ok(());
+        }
+
+        // Preview only the signer and nonce-key choices. build_request performs
+        // these as its first RNG operations, so cloning the RNG finds the same
+        // lane without consuming the instance's deterministic stream twice.
+        let mut preview_rng = (*ctx.rng).clone();
+        let mut preview_nonces = txgen_core::NonceTracker::new();
+        let mut preview = BuildContext::new_with_address_pools(
+            ctx.chain_id,
+            ctx.gas,
+            ctx.accounts,
+            ctx.address_pools,
+            ctx.artifacts,
+            &mut preview_nonces,
+            &mut preview_rng,
+        );
+        let selected = preview.select_signer(&template.from)?;
+        let nonce_mode =
+            resolve_nonce_mode(&template, template.tx_type == TempoTxType::Tempo, &mut preview)?;
+        let (scheduling_key, nonce_key) = match nonce_mode {
+            TempoNonceMode::Protocol => (selected.address.0 .0, U256::ZERO),
+            TempoNonceMode::Parallel(nonce_key) => {
+                (compute_parallel_scheduling_key(selected.address, nonce_key), nonce_key)
+            }
+            TempoNonceMode::Expiring => return Ok(()),
+        };
+        if ctx.nonces.contains(&scheduling_key) {
+            return Ok(());
+        }
+        let nonce_rpc = self
+            .nonce_rpc
+            .get()
+            .ok_or_else(|| eyre::eyre!("online Tempo nonce provider is not initialized"))?;
+        let nonce = nonce::fetch_lane_nonce(
+            &nonce_rpc.provider,
+            selected.address,
+            nonce_key,
+            nonce_rpc.pending,
+        )
+        .await?;
+        ctx.nonces.reset(scheduling_key, nonce);
+        Ok(())
     }
 
     fn expand_setup_extension(
@@ -504,7 +742,13 @@ impl NetworkAdapter for TempoAdapter {
         self.expand_keychain_authorize_pool(step_id, def, ctx).map(Some)
     }
 
-    async fn prefetch_nonces(&self, ctx: &mut GenerateContext, rpc: &str) -> Result<()> {
+    async fn prepare_nonces(
+        &self,
+        spec: &txgen_core::WorkloadSpec,
+        accounts: &txgen_core::AccountManager,
+        nonces: &mut txgen_core::NonceTracker,
+        rpc: &str,
+    ) -> Result<()> {
         use alloy_provider::{Provider, ProviderBuilder};
         use eyre::WrapErr;
 
@@ -512,18 +756,31 @@ impl NetworkAdapter for TempoAdapter {
             .connect_http(rpc.parse().wrap_err("invalid RPC URL")?)
             .erased();
 
-        let (accounts, nonces) = ctx.accounts_and_nonces();
-        txgen_cli::fetch_protocol_nonces(accounts, nonces, rpc).await?;
+        txgen_cli::fetch_pending_protocol_nonces(accounts, nonces, rpc).await?;
 
-        let (spec, accounts, nonces) = ctx.prefetch_state();
-        prefetch_parallel_nonces(&provider, accounts, spec, nonces).await?;
+        nonce::prefetch_pending_parallel_nonces(&provider, accounts, spec, nonces).await?;
 
         // Keep the provider so build_request can lazy-fetch nonces for any
         // (account, nonce_key) pair not enumerated by prefetch_parallel_nonces
         // (any non-literal `nonce_key` such as `uniform` or `choice`). `set`
         // only ever fails if called twice; the second call is a no-op we
         // accept silently because prefetch is only invoked once per run.
-        let _ = self.nonce_rpc.set(provider);
+        let _ = self.nonce_rpc.set(NonceRpc { provider, pending: true });
+
+        Ok(())
+    }
+
+    async fn prefetch_nonces(&self, ctx: &mut GenerateContext, rpc: &str) -> Result<()> {
+        use alloy_provider::{Provider, ProviderBuilder};
+        use eyre::WrapErr;
+
+        let provider = ProviderBuilder::<_, _, Ethereum>::new()
+            .connect_http(rpc.parse().wrap_err("invalid RPC URL")?)
+            .erased();
+        let (spec, accounts, nonces) = ctx.prefetch_state();
+        txgen_cli::fetch_protocol_nonces(accounts, nonces, rpc).await?;
+        prefetch_parallel_nonces(&provider, accounts, spec, nonces).await?;
+        let _ = self.nonce_rpc.set(NonceRpc { provider, pending: false });
 
         Ok(())
     }
@@ -565,7 +822,7 @@ fn resolve_expiring_valid_before(template: &TempoTemplate) -> Result<u64> {
         (Some(_), Some(_)) => {
             bail!(
                 "expiring nonce templates must set either `valid_before` or `valid_for_secs`, not both"
-            )
+            );
         }
         (Some(valid_before), None) => {
             if valid_before == 0 {
@@ -593,39 +850,67 @@ fn resolve_expiring_valid_before(template: &TempoTemplate) -> Result<u64> {
                 })
         }
         (None, None) => {
-            bail!("expiring nonce templates require either `valid_before` or `valid_for_secs`")
+            bail!("expiring nonce templates require either `valid_before` or `valid_for_secs`");
         }
     }
 }
 
-/// Deterministically perturb fee fields so expiring nonce transactions never
+fn validate_expiring_valid_for_secs(template: &TempoTemplate) -> Result<()> {
+    if template.valid_before.is_some() {
+        bail!(
+            "expiring nonce templates must set either `valid_before` or `valid_for_secs`, not both"
+        );
+    }
+    let valid_for_secs = template
+        .valid_for_secs
+        .ok_or_else(|| eyre::eyre!("expiring nonce templates require `valid_for_secs`"))?;
+    if valid_for_secs == 0 {
+        bail!("expiring nonce templates require `valid_for_secs` to be greater than 0");
+    }
+    if valid_for_secs > TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS {
+        bail!(
+            "expiring nonce templates require `valid_for_secs` <= {} seconds",
+            TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS
+        );
+    }
+    Ok(())
+}
+
+/// Deterministically perturb the maximum fee so expiring nonce transactions never
 /// produce identical signed payloads within one generation run.
 ///
 /// Tempo expiring nonce replay protection is hash-based, so two otherwise
 /// identical transactions from the same sender can collide if their signed
-/// payload is identical. txgen uses a local monotonic counter to bump both fee
-/// fields before any signatures are produced. Adding the same bump to both
-/// fields preserves `max_priority_fee_per_gas <= max_fee_per_gas`.
+/// payload is identical. txgen uses a local monotonic counter to bump
+/// `max_fee_per_gas` before any signatures are produced while leaving
+/// `max_priority_fee_per_gas` exactly as configured.
 fn apply_expiring_uniqueness_bump(
     req: &mut TempoTransactionRequest,
     ctx: &mut BuildContext<'_>,
 ) -> Result<()> {
-    let bump = u128::from(ctx.next_nonce(EXPIRING_UNIQUENESS_COUNTER_KEY)) + 1;
+    let encoded_uniqueness = match ctx.unique_nonce_hint() {
+        Some(hint) => {
+            ctx.reserve_unique_nonce(EXPIRING_UNIQUENESS_COUNTER_KEY, hint);
+            hint.checked_mul(2)
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| eyre::eyre!("deterministic expiring nonce identity overflow"))?
+        }
+        None => ctx
+            .next_unique_nonce(EXPIRING_UNIQUENESS_COUNTER_KEY)
+            .checked_mul(2)
+            .ok_or_else(|| eyre::eyre!("expiring nonce uniqueness counter overflow"))?,
+    };
+    // Scenario-assigned identities use odd values while ordinary generation
+    // counters use even values. This keeps both domains disjoint without large
+    // gas-price changes, and retries of one scenario step remain idempotent.
+    let bump = u128::from(encoded_uniqueness) + 1;
 
-    let max_priority_fee_per_gas = req
-        .max_priority_fee_per_gas()
-        .ok_or_else(|| eyre::eyre!("Tempo expiring transactions require max_priority_fee_per_gas"))?
-        .checked_add(bump)
-        .ok_or_else(|| {
-            eyre::eyre!("expiring nonce max_priority_fee_per_gas overflowed uniqueness bump")
-        })?;
     let max_fee_per_gas = req
         .max_fee_per_gas()
         .ok_or_else(|| eyre::eyre!("Tempo expiring transactions require max_fee_per_gas"))?
         .checked_add(bump)
         .ok_or_else(|| eyre::eyre!("expiring nonce max_fee_per_gas overflowed uniqueness bump"))?;
 
-    req.set_max_priority_fee_per_gas(max_priority_fee_per_gas);
     req.set_max_fee_per_gas(max_fee_per_gas);
 
     Ok(())
@@ -747,9 +1032,12 @@ fn sign_keychain_request(
     let raw = Bytes::from(envelope.encoded_2718());
 
     Ok(GeneratedTx {
+        depends_on: Vec::new(),
         phase,
         id: Some(name),
         raw,
+        late_sign: None,
+        sender: Some(user_address),
         submission_keys: vec![SchedulingKey::from(key)],
         inclusion_keys,
     })
@@ -760,7 +1048,19 @@ fn derive_inline_access_signer(
     ctx: &mut BuildContext<'_>,
 ) -> Result<EcdsaSigner> {
     let source = inline_access_key_source(auth.access_key.as_ref())?;
-    let offset = u32::try_from(ctx.next_nonce(inline_access_key_counter_key()))
+    let counter_key = inline_access_key_counter_key();
+    let offset = match ctx.dense_unique_nonce_hint() {
+        Some(hint) => {
+            let offset =
+                ctx.nonces.current(&counter_key).checked_add(hint).ok_or_else(|| {
+                    eyre::eyre!("deterministic inline access-key identity overflow")
+                })?;
+            ctx.reserve_unique_nonce(counter_key, offset);
+            offset
+        }
+        None => ctx.next_unique_nonce(counter_key),
+    };
+    let offset = u32::try_from(offset)
         .map_err(|_| eyre::eyre!("inline key_authorization access-key counter exceeded u32"))?;
     match source {
         InlineAccessKeySource::Default => {
@@ -968,15 +1268,14 @@ mod tests {
     use alloy_eips::eip2718::{Decodable2718, Encodable2718};
     use alloy_network::{NetworkTransactionBuilder, TxSignerSync};
     use alloy_primitives::Address;
+    use alloy_provider::{Provider, ProviderBuilder};
+    use alloy_transport::mock::Asserter;
     use rand::{rngs::StdRng, SeedableRng};
-    use std::{
-        collections::HashMap,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::collections::HashMap;
     use tempo_primitives::TEMPO_TX_TYPE_ID;
     use txgen_core::{
         AccountManager, AccountPoolDef, AccountRef, ArtifactManager, GasConfig, GenValue,
-        Generator, NonceTracker, SelectMode,
+        Generator, NonceReservationKind, NonceTracker, SelectMode,
     };
 
     const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -1008,7 +1307,8 @@ mod tests {
     ) -> GeneratedTx {
         let signer =
             ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index).unwrap().clone();
-        let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context } = tx_req;
+        let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context, late_sign: _ } =
+            tx_req;
         sign_context
             .sign_request(name.to_string(), TxPhase::Workload, request, signer, key, Vec::new())
             .unwrap()
@@ -1121,7 +1421,8 @@ mod tests {
             serde_yaml::to_value(fee_token).unwrap(),
         ])));
 
-        let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
+        let adapter = TempoAdapter::new();
+        let tx_req = adapter.build_request(template.clone(), &mut ctx).unwrap();
 
         assert_eq!(tx_req.request.fee_token, Some(fee_token));
     }
@@ -1189,13 +1490,14 @@ input: "0x"
         .unwrap();
 
         let tx_req = adapter.build_request(workload, &mut ctx).unwrap();
-        assert_eq!(
-            tx_req.request.key_id,
-            Some(derive_mnemonic_signer(TEST_MNEMONIC, 101).unwrap().address())
-        );
+        let user_address = accounts.get_by_index("users", 1).unwrap().address();
+        let access_key_address = derive_mnemonic_signer(TEST_MNEMONIC, 101).unwrap().address();
+        assert_eq!(tx_req.request.key_id, Some(access_key_address));
 
         let generated = sign_tempo_request(tx_req, &ctx, "keychain");
         assert_eq!(generated.raw[0], TEMPO_TX_TYPE_ID);
+        assert_eq!(generated.sender, Some(user_address));
+        assert_ne!(generated.sender, Some(access_key_address));
         assert_keychain_signature(&generated.raw);
     }
 
@@ -1216,7 +1518,7 @@ auth:
   access_key:
     derive: per_tx
     mnemonic: "{TEST_MNEMONIC}"
-    range: [200, 220]
+    range: [200, 203]
   key_type: secp256k1
   limits:
     - token: "0x20c0000000000000000000000000000000000000"
@@ -1236,26 +1538,90 @@ input: "0x"
         ))
         .unwrap();
 
-        let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
-        let signed_authorization = tx_req
-            .request
-            .key_authorization
-            .as_ref()
-            .expect("inline auth should attach a signed key_authorization");
-        assert_eq!(
-            signed_authorization.recover_signer().unwrap(),
-            accounts.get_by_index("users", 0).unwrap().address()
-        );
-        assert_eq!(signed_authorization.limits.as_ref().unwrap().len(), 1);
-        assert!(signed_authorization.witness().is_some());
-        assert_eq!(
-            tx_req.request.key_id,
-            Some(derive_mnemonic_signer(TEST_MNEMONIC, 200).unwrap().address())
+        let adapter = TempoAdapter::new();
+        let tx_req = adapter.build_request(template.clone(), &mut ctx).unwrap();
+        let user_address = accounts.get_by_index("users", 0).unwrap().address();
+        let access_key_address = derive_mnemonic_signer(TEST_MNEMONIC, 200).unwrap().address();
+        assert_eq!(tx_req.request.key_id, Some(access_key_address));
+        assert!(
+            tx_req.request.key_authorization.is_none(),
+            "authorization signing should be deferred to the signing worker"
         );
 
         let generated = sign_tempo_request(tx_req, &ctx, "inline_key_authorization");
         assert_eq!(generated.raw[0], TEMPO_TX_TYPE_ID);
+        assert_eq!(generated.sender, Some(user_address));
+        assert_ne!(generated.sender, Some(access_key_address));
         assert_keychain_signature(&generated.raw);
+        let envelope = TempoTxEnvelope::decode_2718(&mut generated.raw.as_ref()).unwrap();
+        let signed_authorization = envelope
+            .as_aa()
+            .unwrap()
+            .tx()
+            .key_authorization
+            .as_ref()
+            .expect("inline auth should attach a signed key_authorization");
+        assert_eq!(signed_authorization.recover_signer().unwrap(), user_address);
+        assert_eq!(signed_authorization.limits.as_ref().unwrap().len(), 1);
+        assert!(signed_authorization.witness().is_some());
+
+        let second = adapter.build_request(template.clone(), &mut ctx).unwrap();
+        assert_eq!(
+            second.request.key_id,
+            Some(derive_mnemonic_signer(TEST_MNEMONIC, 201).unwrap().address()),
+            "ordinary generation must consume the configured access-key range densely"
+        );
+        ctx.set_dense_unique_nonce_hint(0);
+        let scenario = adapter.build_request(template, &mut ctx).unwrap();
+        assert_eq!(
+            scenario.request.key_id,
+            Some(derive_mnemonic_signer(TEST_MNEMONIC, 202).unwrap().address()),
+            "scenario hint zero must start after the ordinary/setup prefix"
+        );
+        assert_eq!(
+            ctx.take_nonce_reservations()
+                .into_iter()
+                .filter(|reservation| reservation.key == inline_access_key_counter_key())
+                .map(|reservation| (reservation.kind, reservation.nonce))
+                .collect::<Vec<_>>(),
+            vec![
+                (NonceReservationKind::Unique, 0),
+                (NonceReservationKind::Unique, 1),
+                (NonceReservationKind::Unique, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn scenario_uniqueness_group_tracks_only_inline_key_authorization() {
+        let adapter = TempoAdapter::new();
+        let ordinary: serde_yaml::Value = serde_yaml::from_str("type: tempo").unwrap();
+        let inline: serde_yaml::Value =
+            serde_yaml::from_str("type: tempo\nauth: { mode: key_authorization }").unwrap();
+        let inline_overlay: serde_yaml::Value =
+            serde_yaml::from_str("auth: { mode: key_authorization }").unwrap();
+        let dynamic_overlay: serde_yaml::Value =
+            serde_yaml::from_str("auth: \"${steps.auth.value}\"").unwrap();
+
+        assert_eq!(
+            adapter.scenario_unique_nonce_group(&ordinary, &serde_yaml::Value::Null).unwrap(),
+            None
+        );
+        assert_eq!(
+            adapter
+                .scenario_unique_nonce_group(&inline, &serde_yaml::Value::Null)
+                .unwrap()
+                .as_deref(),
+            Some("tempo:inline-access-key")
+        );
+        assert_eq!(
+            adapter.scenario_unique_nonce_group(&ordinary, &inline_overlay).unwrap().as_deref(),
+            Some("tempo:inline-access-key")
+        );
+        assert_eq!(
+            adapter.scenario_unique_nonce_group(&ordinary, &dynamic_overlay).unwrap().as_deref(),
+            Some("tempo:inline-access-key")
+        );
     }
 
     #[test]
@@ -1299,6 +1665,72 @@ input: "0x"
         assert_eq!(tx_req.request.nonce(), Some(0));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_prepare_fetches_generated_pending_lane_without_blocking() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(7));
+        let provider = ProviderBuilder::<_, _, Ethereum>::new()
+            .connect_mocked_client(asserter.clone())
+            .erased();
+        let adapter = TempoAdapter::new();
+        assert!(adapter.nonce_rpc.set(NonceRpc { provider, pending: true }).is_ok());
+
+        let value = serde_yaml::from_str::<serde_yaml::Value>(
+            r#"
+type: tempo
+from:
+  pool: users
+  select: { index: 0 }
+to: "0x0000000000000000000000000000000000000001"
+value: 0
+gas_limit: 21000
+max_fee_per_gas: 1000000000
+max_priority_fee_per_gas: 1000000000
+nonce_key:
+  choice: [42]
+"#,
+        )
+        .unwrap();
+
+        adapter.prepare_request(&value, &mut ctx).await.unwrap();
+        let template: TempoTemplate = serde_yaml::from_value(value).unwrap();
+        let request = adapter.build_request(template, &mut ctx).unwrap();
+
+        let address = accounts.get_by_index("users", 0).unwrap().address();
+        let scheduling_key = compute_parallel_scheduling_key(address, U256::from(42));
+        assert_eq!(request.request.nonce_key, Some(U256::from(42)));
+        assert_eq!(request.request.nonce(), Some(7));
+        assert_eq!(ctx.nonces.current(&scheduling_key), 8);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[test]
+    fn expiring_nonce_rejects_an_explicit_nonce() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        let mut template = base_template(TempoTxType::Tempo);
+        template.expiring_nonce = true;
+        template.valid_for_secs = Some(10);
+        template.nonce = Some(0);
+
+        let error = match TempoAdapter::new().build_request(template, &mut ctx) {
+            Ok(_) => panic!("explicit expiring nonce should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must not be set"));
+    }
+
     #[test]
     fn test_delegates_ethereum_types() {
         let accounts = test_accounts();
@@ -1337,6 +1769,8 @@ input: "0x"
         assert_eq!(tx_req.request.nonce_key, Some(TEMPO_EXPIRING_NONCE_KEY));
         assert_eq!(tx_req.request.valid_before.map(NonZeroU64::get), Some(1_700_000_000));
         assert_ne!(tx_req.key, sender.0 .0);
+        let generated = sign_tempo_request(tx_req, &ctx, "expiry");
+        assert_eq!(transaction_expiry(&generated.raw), Some(1_700_000_000));
     }
 
     #[test]
@@ -1382,7 +1816,7 @@ input: "0x"
     }
 
     #[test]
-    fn test_expiring_nonce_fee_bumps_are_monotonic() {
+    fn test_expiring_nonce_max_fee_bumps_leave_zero_priority_fee_unchanged() {
         let accounts = test_accounts();
         let artifacts = ArtifactManager::empty();
         let gas = GasConfig::default();
@@ -1394,18 +1828,38 @@ input: "0x"
         let mut template = base_template(TempoTxType::Tempo);
         template.expiring_nonce = true;
         template.valid_before = Some(1_700_000_000);
+        template.max_priority_fee_per_gas = Some(0);
 
         let first = TempoAdapter::new().build_request(template.clone(), &mut ctx).unwrap().request;
         let second = TempoAdapter::new().build_request(template, &mut ctx).unwrap().request;
 
-        assert_eq!(first.max_priority_fee_per_gas(), Some(1_000_000_001));
+        assert_eq!(first.max_priority_fee_per_gas(), Some(0));
         assert_eq!(first.max_fee_per_gas(), Some(1_000_000_001));
-        assert_eq!(second.max_priority_fee_per_gas(), Some(1_000_000_002));
-        assert_eq!(second.max_fee_per_gas(), Some(1_000_000_002));
+        assert_eq!(second.max_priority_fee_per_gas(), Some(0));
+        assert_eq!(second.max_fee_per_gas(), Some(1_000_000_003));
     }
 
     #[test]
-    fn test_expiring_nonce_valid_for_secs_is_resolved_at_build_time() {
+    fn test_expiring_nonce_valid_for_secs_is_signed_by_default() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let mut template = base_template(TempoTxType::Tempo);
+        template.expiring_nonce = true;
+        template.valid_for_secs = Some(25);
+
+        let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
+
+        assert!(tx_req.request.valid_before.is_some());
+        assert!(tx_req.late_sign.is_none());
+    }
+
+    #[test]
+    fn test_expiring_nonce_valid_for_secs_is_deferred_until_submission() {
         let accounts = test_accounts();
         let artifacts = ArtifactManager::empty();
         let gas = GasConfig::default();
@@ -1413,18 +1867,21 @@ input: "0x"
         let mut rng = StdRng::seed_from_u64(42);
 
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        ctx.set_defer_signing(true);
 
         let mut template = base_template(TempoTxType::Tempo);
         template.expiring_nonce = true;
         template.valid_for_secs = Some(25);
 
-        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
-        let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-        let valid_before = tx_req.request.valid_before.unwrap();
-        assert!(valid_before.get() >= before + 25);
-        assert!(valid_before.get() <= after + 25);
+        assert!(tx_req.request.valid_before.is_none());
+        let late_sign = tx_req.late_sign.expect("relative expiry should be deferred");
+        let payload = TempoExpiringPayload::from_spec(&late_sign).unwrap();
+        assert_eq!(payload.valid_for_secs, 25);
+        assert_eq!(payload.request.nonce_key, Some(TEMPO_EXPIRING_NONCE_KEY));
+        let raw = sign_tempo_expiring(&payload, &accounts).unwrap();
+        assert_eq!(raw[0], TEMPO_TX_TYPE_ID);
     }
 
     #[test]
@@ -1437,20 +1894,45 @@ input: "0x"
 
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
 
-        let first = TempoAdapter::new()
-            .build_request(sponsored_expiring_template(), &mut ctx)
-            .unwrap()
-            .request;
-        let second = TempoAdapter::new()
-            .build_request(sponsored_expiring_template(), &mut ctx)
-            .unwrap()
-            .request;
+        let first =
+            TempoAdapter::new().build_request(sponsored_expiring_template(), &mut ctx).unwrap();
+        let second =
+            TempoAdapter::new().build_request(sponsored_expiring_template(), &mut ctx).unwrap();
 
-        assert_ne!(first.max_fee_per_gas(), second.max_fee_per_gas());
+        assert_ne!(first.request.max_fee_per_gas(), second.request.max_fee_per_gas());
+        assert_eq!(first.request.max_priority_fee_per_gas(), Some(1_000_000_000));
+        assert_eq!(second.request.max_priority_fee_per_gas(), Some(1_000_000_000));
+        assert!(first.request.fee_payer_signature.is_none());
+        assert!(second.request.fee_payer_signature.is_none());
+        let first = sign_tempo_request(first, &ctx, "sponsored_first");
+        let second = sign_tempo_request(second, &ctx, "sponsored_second");
+        let first = TempoTxEnvelope::decode_2718(&mut first.raw.as_ref()).unwrap();
+        let second = TempoTxEnvelope::decode_2718(&mut second.raw.as_ref()).unwrap();
         assert_ne!(
-            first.fee_payer_signature, second.fee_payer_signature,
+            first.as_aa().unwrap().tx().fee_payer_signature,
+            second.as_aa().unwrap().tx().fee_payer_signature,
             "fee-payer signature must reflect the per-tx expiring uniqueness bump"
         );
+    }
+
+    #[test]
+    fn test_sponsored_transaction_uses_transaction_sender_metadata() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let transaction_sender = accounts.get_by_index("users", 0).unwrap().address();
+        let sponsor = accounts.get_by_index("users", 1).unwrap().address();
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let tx_req =
+            TempoAdapter::new().build_request(sponsored_expiring_template(), &mut ctx).unwrap();
+        let generated = sign_tempo_request(tx_req, &ctx, "sponsored");
+
+        assert_eq!(generated.sender, Some(transaction_sender));
+        assert_ne!(generated.sender, Some(sponsor));
     }
 
     #[test]

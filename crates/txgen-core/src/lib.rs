@@ -4,6 +4,7 @@ mod nonce;
 pub mod output;
 mod plugin;
 mod scheduling_key;
+mod setup;
 mod spec;
 mod value;
 mod yaml;
@@ -13,13 +14,14 @@ pub use accounts::{
     derive_mnemonic_signer, AccountManager, AccountPoolDef, AccountRef, AddressPoolDef,
     AddressPoolManager, EcdsaSigner, FastAddressPoolDef, SelectMode, SignerExt,
 };
-pub use nonce::NonceTracker;
-pub use output::{GeneratedTx, NdjsonWriter, TxPhase};
+pub use nonce::{NonceReservation, NonceReservationKind, NonceTracker};
+pub use output::{GeneratedTx, LateSignSpec, NdjsonWriter, TxPhase};
 pub use plugin::{BuildContext, SelectedSigner};
 pub use scheduling_key::{dedup_scheduling_keys, SchedulingKey};
+pub use setup::setup_submission_order;
 pub use spec::{
     AbiEncodePackedDef, AbiHashDef, GasConfig, MixEntry, MixItem, SequenceBinding, SequenceDef,
     SequenceStep, SetupDef, SetupStep, WorkloadSpec,
 };
 pub use value::{FromGenerator, GenValue, Generator, ValueResolver};
-pub use yaml::merge_yaml;
+pub use yaml::{append_yaml, expand_env_vars, merge_yaml};

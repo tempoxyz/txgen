@@ -4,27 +4,29 @@
 //! lines from stdin or file (produced by `txgen extract`). Lines may include
 //! optional RLP-encoded `bal` bytes. Submits each block via `reth_newPayload`
 //! (as `BlockRlp`) and `reth_forkchoiceUpdated`,
-//! collecting per-block timing and engine status from [`RethPayloadStatus`].
+//! collecting per-block timing and engine status from [`alloy_reth::RethPayloadStatus`].
 
 use crate::{
+    load_metric_names,
     metrics_forwarder::{build_metrics_forwarder, finish_metrics_forwarder, push_samples},
     metrics_url::metrics_scraper_configs,
     send::parse_metadata,
+    wait_for_persistence::WaitForPersistence,
     SendBlocksArgs,
 };
 use alloy_consensus::Header as ConsensusHeader;
 use alloy_network::Ethereum;
 use alloy_primitives::{Address, Bytes, B256};
 use alloy_provider::{ext::TestingApi, Provider, RootProvider};
+use alloy_reth::{BigBlockData, RethApi, RethNewPayloadInput, RethNewPayloadParams};
 use alloy_rlp::{Decodable, Header};
 use alloy_rpc_types_engine::{
     ExecutionData, ForkchoiceState, JwtSecret, PayloadAttributes, TestingBuildBlockRequestV1,
 };
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    parse_reporters, start_scrapers, BigBlockData, BlockStats, ConsoleReporter, FinalReport,
-    ProgressState, Reporter, RethApi, RethNewPayloadInput, RunClock, RunStats, Sample, SampleStore,
-    WaitForPersistence,
+    parse_reporters, start_scrapers, BlockStats, ConsoleReporter, FinalReport, ProgressState,
+    Reporter, RunClock, RunStats, Sample, SampleStore,
 };
 use eyre::{Context, Result};
 use std::{
@@ -72,20 +74,39 @@ enum InputLine {
 
 struct ReorgState {
     depth: usize,
-    fork_length: usize,
-    branch_point_hash: Option<B256>,
-    fork_parent_hash: Option<B256>,
+    gap: usize,
+    gap_remaining: usize,
+    pending: Vec<BlockLine>,
+}
+
+enum ReorgAction {
+    Pending,
+    Canonical(Vec<BlockLine>),
+    Batch(Vec<BlockLine>),
 }
 
 impl ReorgState {
-    const fn new(depth: usize) -> Self {
-        Self { depth, fork_length: 0, branch_point_hash: None, fork_parent_hash: None }
+    const fn new(depth: usize, gap: usize) -> Self {
+        Self { depth, gap, gap_remaining: 0, pending: Vec::new() }
     }
 
-    fn reset(&mut self) {
-        self.fork_length = 0;
-        self.branch_point_hash = None;
-        self.fork_parent_hash = None;
+    fn push(&mut self, block: BlockLine) -> ReorgAction {
+        if self.gap_remaining > 0 {
+            self.gap_remaining -= 1;
+            return ReorgAction::Canonical(vec![block]);
+        }
+
+        self.pending.push(block);
+        if self.pending.len() < self.depth {
+            return ReorgAction::Pending;
+        }
+
+        self.gap_remaining = self.gap;
+        ReorgAction::Batch(std::mem::take(&mut self.pending))
+    }
+
+    fn finish(&mut self) -> ReorgAction {
+        ReorgAction::Canonical(std::mem::take(&mut self.pending))
     }
 }
 
@@ -107,13 +128,13 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let scraper_configs =
         metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
     let persistence_policy = args.wait_for_persistence;
-
     tracing::info!(
         engine = %args.engine,
         input = args.input.as_ref().map_or("<stdin>", |p| p.to_str().unwrap_or("?")),
         wait_for_persistence = ?persistence_policy,
         wait_time_ms = args.wait_time.map(|d| d.as_millis()),
         reorg_depth = args.reorg,
+        reorg_gap = args.reorg.map(|_| args.reorg_gap),
         rpc = %args.rpc,
         "Starting block submission"
     );
@@ -124,7 +145,9 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let testing_provider =
         RootProvider::<Ethereum>::new_http(args.rpc.parse().wrap_err("invalid RPC URL")?);
 
-    let mut reporters = parse_reporters(&args.reports, "send-blocks", &metadata)?;
+    let clickhouse_metric_names = load_metric_names(args.clickhouse_metrics_file.as_ref())?;
+    let mut reporters =
+        parse_reporters(&args.reports, "send-blocks", &metadata, clickhouse_metric_names)?;
     if reporters.is_empty() {
         reporters.push(Box::new(ConsoleReporter::stderr(false)));
     }
@@ -149,7 +172,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     };
 
     let mut collector = MetricsCollector::new(counters);
-    let mut reorg_state = args.reorg.map(ReorgState::new);
+    let mut reorg_state = args.reorg.map(|depth| ReorgState::new(depth, args.reorg_gap));
     let start = Instant::now();
 
     if let Some(ref path) = args.input {
@@ -163,7 +186,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             process_input_and_wait(
                 &provider,
                 &testing_provider,
-                &input,
+                input,
                 ProcessingState {
                     collector: &mut collector,
                     reorg_state: reorg_state.as_mut(),
@@ -193,7 +216,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             process_input_and_wait(
                 &provider,
                 &testing_provider,
-                &input,
+                input,
                 ProcessingState {
                     collector: &mut collector,
                     reorg_state: reorg_state.as_mut(),
@@ -205,6 +228,21 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             )
             .await?;
         }
+    }
+
+    if let Some(reorg_state) = reorg_state.as_mut() {
+        process_reorg_action(
+            &provider,
+            &testing_provider,
+            reorg_state,
+            &mut collector,
+            &persistence_policy,
+            args.wait_time,
+            start,
+            &mut reporters,
+            None,
+        )
+        .await?;
     }
 
     // Stop the scraper before finalizing.
@@ -287,78 +325,73 @@ fn report_progress(
 async fn process_input_and_wait(
     provider: &(impl Provider + RethApi<Ethereum>),
     testing_provider: &(impl Provider + TestingApi<Ethereum>),
-    input: &InputLine,
+    input: InputLine,
     state: ProcessingState<'_>,
     wait_time: Option<Duration>,
     start: Instant,
     reporters: &mut [Box<dyn Reporter>],
 ) -> Result<()> {
+    let ProcessingState { collector, reorg_state, persistence_policy } = state;
+    if let Some(reorg_state) = reorg_state {
+        let InputLine::RawBlock(block) = input else {
+            eyre::bail!("--reorg is only supported for raw RLP block input");
+        };
+        return process_reorg_action(
+            provider,
+            testing_provider,
+            reorg_state,
+            collector,
+            persistence_policy,
+            wait_time,
+            start,
+            reporters,
+            Some(block),
+        )
+        .await;
+    }
+
     let block_start = Instant::now();
 
-    process_input(
-        provider,
-        testing_provider,
-        input,
-        state.collector,
-        state.reorg_state,
-        state.persistence_policy,
-    )
-    .await?;
-    report_progress(state.collector, start, reporters)?;
+    match &input {
+        InputLine::RawBlock(block) => {
+            process_block(provider, block, collector, None, persistence_policy).await?
+        }
+        InputLine::BigBlock(big_block) => {
+            process_big_block(provider, big_block, collector, persistence_policy).await?
+        }
+    }
+    report_progress(collector, start, reporters)?;
+    wait_for_next_block(block_start, wait_time).await;
+    Ok(())
+}
 
+async fn wait_for_next_block(block_start: Instant, wait_time: Option<Duration>) {
     if let Some(wait_time) = wait_time {
         let remaining = wait_time.saturating_sub(block_start.elapsed());
         if !remaining.is_zero() {
             tokio::time::sleep(remaining).await;
         }
     }
-
-    Ok(())
-}
-
-async fn process_input(
-    provider: &(impl Provider + RethApi<Ethereum>),
-    testing_provider: &(impl Provider + TestingApi<Ethereum>),
-    input: &InputLine,
-    collector: &mut MetricsCollector,
-    reorg_state: Option<&mut ReorgState>,
-    persistence_policy: &WaitForPersistence,
-) -> Result<()> {
-    match input {
-        InputLine::RawBlock(block) => {
-            process_block(
-                provider,
-                testing_provider,
-                block,
-                collector,
-                reorg_state,
-                persistence_policy,
-            )
-            .await
-        }
-        InputLine::BigBlock(big_block) => {
-            if reorg_state.is_some() {
-                eyre::bail!("--reorg is only supported for raw RLP block input");
-            }
-            process_big_block(provider, big_block, collector, persistence_policy).await
-        }
-    }
 }
 
 async fn process_block(
     provider: &(impl Provider + RethApi<Ethereum>),
-    testing_provider: &(impl Provider + TestingApi<Ethereum>),
     block: &BlockLine,
     collector: &mut MetricsCollector,
-    reorg_state: Option<&mut ReorgState>,
+    forkchoice_anchor: Option<B256>,
     persistence_policy: &WaitForPersistence,
 ) -> Result<()> {
-    let input = RethNewPayloadInput::BlockRlp { block: block.raw.clone(), bal: block.bal.clone() };
+    let input: RethNewPayloadInput<()> = match block.bal.clone() {
+        Some(bal) => RethNewPayloadInput::block_rlp_with_bal(block.raw.clone(), bal),
+        None => RethNewPayloadInput::block_rlp(block.raw.clone()),
+    };
     let wait = persistence_policy.should_wait(collector.blocks_submitted());
 
     let new_payload_start = Instant::now();
-    let payload_status =
-        provider.reth_new_payload(input, wait).await.wrap_err("reth_newPayload failed")?;
+    let payload_status = provider
+        .reth_new_payload(RethNewPayloadParams::new(input).with_wait_for_persistence(wait))
+        .await
+        .wrap_err("reth_newPayload failed")?;
     let new_payload_latency = new_payload_start.elapsed();
 
     if !payload_status.status.is_valid() {
@@ -370,45 +403,30 @@ async fn process_block(
         );
     }
 
-    let safe_hash = collector.prev_block_hash.unwrap_or(block.key);
-    if collector.finalized_hash.is_none() {
-        collector.finalized_hash = Some(block.key);
-    }
-
-    let forkchoice_state = ForkchoiceState {
-        head_block_hash: block.key,
-        safe_block_hash: safe_hash,
-        // SAFETY: finalized_hash is always Some after the check above
-        finalized_block_hash: collector.finalized_hash.unwrap(),
-    };
-    let canonical_forkchoice_state = forkchoice_state;
-    let delay_canonical_fcu = reorg_state.as_ref().is_some_and(|state| state.fork_length > 0);
-
-    let fcu_latency = if delay_canonical_fcu {
-        tracing::debug!(
-            block = block.number,
-            "Delaying canonical forkchoice update until synthetic fork reaches reorg depth"
-        );
-        Duration::ZERO
+    let (safe_block_hash, finalized_block_hash) = if let Some(anchor) = forkchoice_anchor {
+        (anchor, anchor)
     } else {
-        let fcu_start = Instant::now();
-        let fcu_result = provider
-            .reth_forkchoice_updated(forkchoice_state)
-            .await
-            .wrap_err("reth_forkchoiceUpdated failed")?;
-        let fcu_latency = fcu_start.elapsed();
-
-        if !fcu_result.is_valid() {
-            collector.record_failure();
-            eyre::bail!(
-                "reth_forkchoiceUpdated returned non-VALID status for block {}: {:?}",
-                block.number,
-                fcu_result.payload_status,
-            );
-        }
-
-        fcu_latency
+        let safe_hash = collector.prev_block_hash.unwrap_or(block.key);
+        (safe_hash, *collector.finalized_hash.get_or_insert(safe_hash))
     };
+
+    let forkchoice_state =
+        ForkchoiceState { head_block_hash: block.key, safe_block_hash, finalized_block_hash };
+    let fcu_start = Instant::now();
+    let fcu_result = provider
+        .reth_forkchoice_updated(forkchoice_state)
+        .await
+        .wrap_err("reth_forkchoiceUpdated failed")?;
+    let fcu_latency = fcu_start.elapsed();
+
+    if !fcu_result.is_valid() {
+        collector.record_failure();
+        eyre::bail!(
+            "reth_forkchoiceUpdated returned non-VALID status for block {}: {:?}",
+            block.number,
+            fcu_result.payload_status,
+        );
+    }
 
     let total_latency = new_payload_latency + fcu_latency;
     let payload_status_str = payload_status.status.status.to_string();
@@ -446,19 +464,6 @@ async fn process_block(
         "Submitted block"
     );
 
-    if let Some(reorg_state) = reorg_state {
-        process_reorg_block(
-            provider,
-            testing_provider,
-            block,
-            collector,
-            reorg_state,
-            canonical_forkchoice_state,
-            persistence_policy,
-        )
-        .await?;
-    }
-
     collector.prev_block_hash = Some(block.key);
 
     if block.number.is_multiple_of(32) {
@@ -468,42 +473,96 @@ async fn process_block(
     Ok(())
 }
 
-async fn process_reorg_block(
+#[allow(clippy::too_many_arguments)]
+async fn process_reorg_action(
+    provider: &(impl Provider + RethApi<Ethereum>),
+    testing_provider: &(impl Provider + TestingApi<Ethereum>),
+    state: &mut ReorgState,
+    collector: &mut MetricsCollector,
+    persistence_policy: &WaitForPersistence,
+    wait_time: Option<Duration>,
+    start: Instant,
+    reporters: &mut [Box<dyn Reporter>],
+    block: Option<BlockLine>,
+) -> Result<()> {
+    let action = match block {
+        Some(block) => state.push(block),
+        None => state.finish(),
+    };
+    let (blocks, forkchoice_anchor) = match action {
+        ReorgAction::Pending => return Ok(()),
+        ReorgAction::Canonical(blocks) => (blocks, None),
+        ReorgAction::Batch(blocks) => {
+            let first = blocks.first().expect("reorg batch must not be empty");
+            let branch_point_hash = extract_block_header_from_block_rlp(first.raw.as_ref())
+                .wrap_err_with(|| {
+                    format!("failed to extract parent hash from block {}", first.number)
+                })?
+                .parent_hash;
+
+            tracing::info!(
+                reorg_depth = state.depth,
+                reorg_gap = state.gap,
+                branch_point = %branch_point_hash,
+                "Starting reorg batch"
+            );
+
+            let mut parent_block_hash = branch_point_hash;
+            for (index, block) in blocks.iter().enumerate() {
+                let block_start = Instant::now();
+                let source_offset = u64::try_from(index).unwrap_or(u64::MAX);
+                let wait = persistence_policy
+                    .should_wait(collector.blocks_submitted().saturating_add(source_offset));
+                parent_block_hash = process_synthetic_block(
+                    provider,
+                    testing_provider,
+                    block,
+                    parent_block_hash,
+                    branch_point_hash,
+                    wait,
+                )
+                .await?;
+                tracing::info!(
+                    block = block.number,
+                    fork_length = index + 1,
+                    reorg_depth = state.depth,
+                    branch_point = %branch_point_hash,
+                    synthetic_head = %parent_block_hash,
+                    "Submitted synthetic fork block"
+                );
+                wait_for_next_block(block_start, wait_time).await;
+            }
+
+            (blocks, Some(branch_point_hash))
+        }
+    };
+
+    for block in &blocks {
+        let block_start = Instant::now();
+        process_block(provider, block, collector, forkchoice_anchor, persistence_policy).await?;
+        report_progress(collector, start, reporters)?;
+        wait_for_next_block(block_start, wait_time).await;
+    }
+
+    Ok(())
+}
+
+async fn process_synthetic_block(
     provider: &(impl Provider + RethApi<Ethereum>),
     testing_provider: &(impl Provider + TestingApi<Ethereum>),
     block: &BlockLine,
-    collector: &MetricsCollector,
-    reorg_state: &mut ReorgState,
-    canonical_forkchoice_state: ForkchoiceState,
-    persistence_policy: &WaitForPersistence,
-) -> Result<()> {
-    let parent_block_hash = if reorg_state.fork_length == 0 {
-        let Some(parent_hash) = collector.prev_block_hash else {
-            tracing::warn!(
-                block = block.number,
-                "Skipping first synthetic fork block because the canonical parent hash is unknown"
-            );
-            return Ok(());
-        };
-        reorg_state.branch_point_hash = Some(parent_hash);
-        parent_hash
-    } else {
-        reorg_state
-            .fork_parent_hash
-            .ok_or_else(|| eyre::eyre!("reorg state is missing synthetic fork parent hash"))?
-    };
-
-    let branch_point_hash = reorg_state
-        .branch_point_hash
-        .ok_or_else(|| eyre::eyre!("reorg state is missing branch point hash"))?;
+    parent_block_hash: B256,
+    branch_point_hash: B256,
+    wait: bool,
+) -> Result<B256> {
     let transactions = extract_tx_bytes_from_block_rlp(block.raw.as_ref()).wrap_err_with(|| {
         format!("failed to extract raw transaction bytes from block {}", block.number)
     })?;
-    let parent_beacon_block_root =
-        extract_parent_beacon_block_root_from_block_rlp(block.raw.as_ref()).wrap_err_with(
-            || format!("failed to extract parent beacon block root from block {}", block.number),
-        )?;
-
+    let parent_beacon_block_root = extract_block_header_from_block_rlp(block.raw.as_ref())
+        .wrap_err_with(|| {
+            format!("failed to extract parent beacon block root from block {}", block.number)
+        })?
+        .parent_beacon_block_root;
     let payload_attributes = PayloadAttributes {
         timestamp: block.timestamp,
         prev_randao: B256::ZERO,
@@ -511,8 +570,9 @@ async fn process_reorg_block(
         withdrawals: None,
         parent_beacon_block_root,
         slot_number: None,
+        target_gas_limit: None,
     };
-    let parent_beacon_block_root = payload_attributes.parent_beacon_block_root.unwrap_or_default();
+    let parent_beacon_block_root = parent_beacon_block_root.unwrap_or_default();
     let request = TestingBuildBlockRequestV1 {
         parent_block_hash,
         payload_attributes,
@@ -523,7 +583,8 @@ async fn process_reorg_block(
     let envelope = testing_provider.build_block_v1(request).await.wrap_err_with(|| {
         format!(
             "testing_buildBlockV1 failed for block {}. Ensure the target exposes the hidden \
-                 testing RPC, for example: reth node --http --http.api eth,testing ...",
+             testing RPC and skips invalid reorg transactions, for example: reth node \
+             --http --http.api eth,testing --testing.skip-invalid-transactions ...",
             block.number
         )
     })?;
@@ -531,9 +592,11 @@ async fn process_reorg_block(
     let (payload, sidecar) = envelope.into_payload_and_sidecar(parent_beacon_block_root);
     let execution_data = ExecutionData::new(payload, sidecar);
 
-    let wait = persistence_policy.should_wait(collector.blocks_submitted());
     let payload_status = provider
-        .reth_new_payload(RethNewPayloadInput::ExecutionData(Box::new(execution_data)), wait)
+        .reth_new_payload(
+            RethNewPayloadParams::new(RethNewPayloadInput::execution_data(execution_data))
+                .with_wait_for_persistence(wait),
+        )
         .await
         .wrap_err_with(|| {
             format!("reth_newPayload failed for synthetic fork block after block {}", block.number)
@@ -547,13 +610,14 @@ async fn process_reorg_block(
         );
     }
 
-    let forkchoice_state = ForkchoiceState {
-        head_block_hash: synthetic_block_hash,
-        safe_block_hash: branch_point_hash,
-        finalized_block_hash: branch_point_hash,
-    };
-    let fcu_result =
-        provider.reth_forkchoice_updated(forkchoice_state).await.wrap_err_with(|| {
+    let fcu_result = provider
+        .reth_forkchoice_updated(ForkchoiceState {
+            head_block_hash: synthetic_block_hash,
+            safe_block_hash: branch_point_hash,
+            finalized_block_hash: branch_point_hash,
+        })
+        .await
+        .wrap_err_with(|| {
             format!(
                 "reth_forkchoiceUpdated failed for synthetic fork block after block {}",
                 block.number
@@ -568,50 +632,10 @@ async fn process_reorg_block(
         );
     }
 
-    reorg_state.fork_length += 1;
-    reorg_state.fork_parent_hash = Some(synthetic_block_hash);
-
-    tracing::info!(
-        block = block.number,
-        fork_length = reorg_state.fork_length,
-        reorg_depth = reorg_state.depth,
-        branch_point = %branch_point_hash,
-        synthetic_head = %synthetic_block_hash,
-        "Submitted synthetic fork block"
-    );
-
-    if reorg_state.fork_length == reorg_state.depth {
-        let fcu_result = provider
-            .reth_forkchoice_updated(canonical_forkchoice_state)
-            .await
-            .wrap_err_with(|| {
-                format!(
-                    "reth_forkchoiceUpdated failed while switching back to canonical block {}",
-                    block.number
-                )
-            })?;
-
-        if !fcu_result.is_valid() {
-            eyre::bail!(
-                "reth_forkchoiceUpdated returned non-VALID status while switching back to canonical block {}: {:?}",
-                block.number,
-                fcu_result.payload_status,
-            );
-        }
-
-        tracing::info!(
-            block = block.number,
-            reorg_depth = reorg_state.depth,
-            canonical_head = %block.key,
-            "Switched forkchoice back to canonical head"
-        );
-        reorg_state.reset();
-    }
-
-    Ok(())
+    Ok(synthetic_block_hash)
 }
 
-fn extract_parent_beacon_block_root_from_block_rlp(raw: &[u8]) -> Result<Option<B256>> {
+fn extract_block_header_from_block_rlp(raw: &[u8]) -> Result<ConsensusHeader> {
     let mut block_buf = raw;
     let mut block_payload = Header::decode_bytes(&mut block_buf, true)
         .wrap_err("failed to decode outer block RLP list")?;
@@ -619,10 +643,7 @@ fn extract_parent_beacon_block_root_from_block_rlp(raw: &[u8]) -> Result<Option<
         eyre::bail!("block RLP has trailing bytes after outer list");
     }
 
-    let header =
-        ConsensusHeader::decode(&mut block_payload).wrap_err("failed to decode block header")?;
-
-    Ok(header.parent_beacon_block_root)
+    ConsensusHeader::decode(&mut block_payload).wrap_err("failed to decode block header")
 }
 
 fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<Vec<Bytes>> {
@@ -730,6 +751,46 @@ mod tests {
         rlp_list_from_encoded(&[header, transactions, ommers])
     }
 
+    fn scheduler_block(number: u64) -> BlockLine {
+        BlockLine {
+            raw: Bytes::new(),
+            bal: None,
+            key: B256::ZERO,
+            number,
+            timestamp: 0,
+            gas_used: 0,
+            gas_limit: 0,
+            tx_count: 0,
+        }
+    }
+
+    fn record_action(action: ReorgAction, observed: &mut String) {
+        match action {
+            ReorgAction::Pending => {}
+            ReorgAction::Canonical(blocks) => observed.push_str(&"C".repeat(blocks.len())),
+            ReorgAction::Batch(blocks) => {
+                observed.push_str(&"S".repeat(blocks.len()));
+                observed.push_str(&"C".repeat(blocks.len()));
+            }
+        }
+    }
+
+    fn schedule(depth: usize, gap: usize, count: u64) -> String {
+        let mut state = ReorgState::new(depth, gap);
+        let mut observed = String::new();
+        for number in 1..=count {
+            record_action(state.push(scheduler_block(number)), &mut observed);
+        }
+        record_action(state.finish(), &mut observed);
+        observed
+    }
+
+    #[test]
+    fn schedules_non_overlapping_reorgs_with_canonical_gaps_and_eof_tails() {
+        assert_eq!(schedule(2, 0, 4), "SSCCSSCC");
+        assert_eq!(schedule(2, 1, 7), "SSCCCSSCCCC");
+    }
+
     #[test]
     fn extracts_nine_of_ten_non_blob_transactions_for_reorg_payloads() {
         let source_transactions = (0..10).map(legacy_tx).collect::<Vec<_>>();
@@ -787,11 +848,13 @@ async fn process_big_block(
     let gas_limit = big_block.env_switches.iter().map(|data| data.payload.gas_limit()).sum();
     let wait = persistence_policy.should_wait(collector.blocks_submitted());
 
-    let input = RethNewPayloadInput::BigBlockData(Box::new(big_block.clone()));
+    let input = RethNewPayloadInput::big_block_data(big_block.clone());
 
     let new_payload_start = Instant::now();
-    let payload_status =
-        provider.reth_new_payload(input, wait).await.wrap_err("reth_newPayload failed")?;
+    let payload_status = provider
+        .reth_new_payload(RethNewPayloadParams::new(input).with_wait_for_persistence(wait))
+        .await
+        .wrap_err("reth_newPayload failed")?;
     let new_payload_latency = new_payload_start.elapsed();
 
     if !payload_status.status.is_valid() {

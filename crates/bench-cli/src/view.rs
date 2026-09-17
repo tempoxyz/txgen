@@ -1,5 +1,6 @@
 //! `bench view` - Print an existing JSON report with the console reporter.
 
+use alloy_primitives::U256;
 use bench_core::{BenchMetrics, ConsoleReporter, FinalReport, JsonReport, LatencyStats, Reporter};
 use eyre::{Context, Result};
 use std::{fs, time::Duration};
@@ -33,8 +34,14 @@ pub fn execute(args: ViewArgs) -> Result<()> {
 
     let final_report = FinalReport {
         bench_metrics,
+        call: report.call,
         run_stats: report.run_stats,
         blocks: report.blocks.unwrap_or_default(),
+        total_fees_paid: report
+            .total_fees_paid
+            .map(|fees| fees.parse::<U256>())
+            .transpose()
+            .wrap_err("invalid total_fees_paid in JSON report")?,
         ..Default::default()
     };
 

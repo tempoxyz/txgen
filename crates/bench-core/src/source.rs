@@ -4,15 +4,18 @@
 //! - file (reads NDJSON from a file)
 //! - stdin (reads NDJSON from stdin)
 
-use alloy_primitives::Bytes;
+use alloy_primitives::{Address, Bytes};
 use eyre::{Context, Result};
 use std::{io::BufRead, path::Path};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey, TxPhase};
+use txgen_core::{dedup_scheduling_keys, GeneratedTx, LateSignSpec, SchedulingKey, TxPhase};
 
 /// A transaction read from a source.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SourceTx {
+    /// Explicit successful-receipt prerequisites, valid only for setup transactions.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
     /// Stream phase for this transaction.
     #[serde(default)]
     pub phase: TxPhase,
@@ -21,6 +24,15 @@ pub struct SourceTx {
     pub id: Option<String>,
     /// Raw transaction bytes (hex-encoded with 0x prefix).
     pub raw: String,
+    /// Optional network-specific instructions for signing `raw` at submission time.
+    #[serde(default)]
+    pub late_sign: Option<LateSignSpec>,
+    /// Logical on-chain transaction sender.
+    ///
+    /// This is optional for compatibility with NDJSON generated before sender
+    /// metadata was introduced.
+    #[serde(default)]
+    pub sender: Option<Address>,
     /// Scheduling keys released once RPC submission succeeds (hex-encoded with 0x prefix).
     pub submission_keys: Vec<SchedulingKey>,
     /// Scheduling keys released once a transaction receipt is observed (hex-encoded with 0x
@@ -32,12 +44,19 @@ pub struct SourceTx {
 impl SourceTx {
     /// Parse into a [`GeneratedTx`].
     pub fn into_generated_tx(self) -> Result<GeneratedTx> {
+        if self.phase != TxPhase::Setup && !self.depends_on.is_empty() {
+            eyre::bail!("depends_on is only supported for setup transactions");
+        }
         let raw = self
             .raw
             .strip_prefix("0x")
             .unwrap_or(&self.raw)
             .parse::<Bytes>()
             .context("invalid raw tx hex")?;
+
+        if self.late_sign.is_some() && !raw.is_empty() {
+            eyre::bail!("deferred transactions must leave `raw` empty");
+        }
 
         let submission_keys = dedup_scheduling_keys(self.submission_keys);
         let inclusion_keys = dedup_scheduling_keys(self.inclusion_keys);
@@ -46,7 +65,16 @@ impl SourceTx {
             eyre::bail!("transactions must have at least one submission or inclusion key");
         }
 
-        Ok(GeneratedTx { phase: self.phase, id: self.id, raw, submission_keys, inclusion_keys })
+        Ok(GeneratedTx {
+            depends_on: self.depends_on,
+            phase: self.phase,
+            id: self.id,
+            raw,
+            late_sign: self.late_sign,
+            sender: self.sender,
+            submission_keys,
+            inclusion_keys,
+        })
     }
 }
 
@@ -132,7 +160,7 @@ mod tests {
     fn parses_submission_and_inclusion_keys() {
         let source_tx: SourceTx = serde_json::from_str(
             r#"{
-                "raw": "0x02f870",
+            "raw": "0x02f870",
                 "submission_keys": [
                     "0x1111111111111111111111111111111111111111",
                     "0x1111111111111111111111111111111111111111"
@@ -146,7 +174,60 @@ mod tests {
 
         let generated = source_tx.into_generated_tx().unwrap();
         assert_eq!(generated.phase, TxPhase::Workload);
+        assert_eq!(generated.sender, None);
         assert_eq!(generated.submission_keys, vec![SchedulingKey::from([0x11; 20])]);
         assert_eq!(generated.inclusion_keys, vec![SchedulingKey::from([0x22; 20])]);
+        assert!(generated.late_sign.is_none());
+    }
+
+    #[test]
+    fn parses_sender_metadata() {
+        let source_tx: SourceTx = serde_json::from_str(
+            r#"{
+                "raw": "0x02f870",
+                "sender": "0x3333333333333333333333333333333333333333",
+                "submission_keys": [
+                    "0x1111111111111111111111111111111111111111"
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let generated = source_tx.into_generated_tx().unwrap();
+        assert_eq!(generated.sender, Some(Address::repeat_byte(0x33)));
+    }
+
+    #[test]
+    fn parses_deferred_signing_metadata() {
+        let source_tx: SourceTx = serde_json::from_str(
+            r#"{
+                "raw": "0x",
+                "late_sign": {"format": "test", "payload": {"ttl": 25}},
+                "submission_keys": [
+                    "0x1111111111111111111111111111111111111111"
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let generated = source_tx.into_generated_tx().unwrap();
+        assert!(generated.raw.is_empty());
+        assert_eq!(generated.late_sign.as_ref().unwrap().format, "test");
+    }
+
+    #[test]
+    fn rejects_deferred_signing_with_raw_bytes() {
+        let source_tx: SourceTx = serde_json::from_str(
+            r#"{
+                "raw": "0x02f870",
+                "late_sign": {"format": "test", "payload": {}},
+                "submission_keys": [
+                    "0x1111111111111111111111111111111111111111"
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(source_tx.into_generated_tx().is_err());
     }
 }

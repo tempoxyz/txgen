@@ -4,8 +4,8 @@ use rand::rngs::StdRng;
 use std::sync::OnceLock;
 
 use crate::{
-    AccountManager, AccountRef, AddressPoolManager, ArtifactManager, GasConfig, NonceTracker,
-    SelectMode,
+    AccountManager, AccountRef, AddressPoolManager, ArtifactManager, GasConfig, NonceReservation,
+    NonceReservationKind, NonceTracker, SelectMode,
 };
 
 /// Result of selecting a signer from a pool.
@@ -37,6 +37,12 @@ pub struct BuildContext<'a> {
 
     /// Nonce tracker for ordering.
     pub nonces: &'a mut NonceTracker,
+
+    nonce_reservations: Vec<NonceReservation>,
+
+    unique_nonce_hint: Option<u64>,
+    dense_unique_nonce_hint: Option<u64>,
+    defer_signing: bool,
 
     /// Random number generator.
     pub rng: &'a mut StdRng,
@@ -78,12 +84,115 @@ impl<'a> BuildContext<'a> {
         nonces: &'a mut NonceTracker,
         rng: &'a mut StdRng,
     ) -> Self {
-        Self { chain_id, gas, accounts, address_pools, artifacts, nonces, rng }
+        Self {
+            chain_id,
+            gas,
+            accounts,
+            address_pools,
+            artifacts,
+            nonces,
+            rng,
+            nonce_reservations: Vec::new(),
+            unique_nonce_hint: None,
+            dense_unique_nonce_hint: None,
+            defer_signing: false,
+        }
+    }
+
+    /// Select deferred signing for adapters that support it.
+    pub fn set_defer_signing(&mut self, defer_signing: bool) {
+        self.defer_signing = defer_signing;
+    }
+
+    /// Whether the caller requested deferred signing.
+    pub const fn defer_signing(&self) -> bool {
+        self.defer_signing
+    }
+
+    /// Set a deterministic transaction identity for consume-once nonce reservations.
+    ///
+    /// Scenario execution uses this to decouple uniqueness from concurrent task
+    /// scheduling. Adapters that do not use unique nonces ignore the hint.
+    pub fn set_unique_nonce_hint(&mut self, hint: u64) {
+        self.unique_nonce_hint = Some(hint);
+    }
+
+    /// Return the deterministic transaction identity, when the caller supplied one.
+    pub fn unique_nonce_hint(&self) -> Option<u64> {
+        self.unique_nonce_hint
+    }
+
+    /// Set a deterministic dense identity within an adapter-defined scenario group.
+    ///
+    /// Unlike [`Self::unique_nonce_hint`], this rank counts only submits in the
+    /// same adapter uniqueness group and is suitable for finite key ranges.
+    pub fn set_dense_unique_nonce_hint(&mut self, hint: u64) {
+        self.dense_unique_nonce_hint = Some(hint);
+    }
+
+    /// Return the adapter-group-local deterministic identity, when available.
+    pub fn dense_unique_nonce_hint(&self) -> Option<u64> {
+        self.dense_unique_nonce_hint
     }
 
     /// Get the next nonce for a scheduling key.
     pub fn next_nonce(&mut self, key: [u8; 20]) -> u64 {
-        self.nonces.next(key)
+        let nonce = self.nonces.next(key);
+        self.nonce_reservations.push(NonceReservation {
+            key,
+            nonce,
+            kind: NonceReservationKind::Ordered,
+        });
+        nonce
+    }
+
+    /// Atomically consume a local uniqueness value without creating an ordering lane.
+    ///
+    /// This is for protocols whose replay protection permits independent
+    /// transactions but still requires every signed payload to differ. The
+    /// value is never rewound or reused after it has been handed out.
+    pub fn next_unique_nonce(&mut self, key: [u8; 20]) -> u64 {
+        let nonce = self.nonces.next(key);
+        self.nonce_reservations.push(NonceReservation {
+            key,
+            nonce,
+            kind: NonceReservationKind::Unique,
+        });
+        nonce
+    }
+
+    /// Record an exact deterministic consume-once value.
+    ///
+    /// Callers must derive values from an injective transaction identity. The
+    /// reservation is metadata for submission handling and never creates an
+    /// ordering lane or rewinds a shared counter.
+    pub fn reserve_unique_nonce(&mut self, key: [u8; 20], value: u64) {
+        self.nonce_reservations.push(NonceReservation {
+            key,
+            nonce: value,
+            kind: NonceReservationKind::Unique,
+        });
+    }
+
+    /// Commit and return nonce values consumed since the previous drain.
+    pub fn take_nonce_reservations(&mut self) -> Vec<NonceReservation> {
+        std::mem::take(&mut self.nonce_reservations)
+    }
+
+    /// Rewind nonce values consumed since the previous drain.
+    ///
+    /// Reservations are unwound in reverse order so multiple uses of one lane
+    /// are restored correctly. Returns false if external mutation made a
+    /// reservation unsafe to rewind.
+    pub fn rollback_nonce_reservations(&mut self) -> bool {
+        let reservations = std::mem::take(&mut self.nonce_reservations);
+        let mut restored = true;
+        for reservation in reservations.into_iter().rev() {
+            if reservation.kind == NonceReservationKind::Ordered {
+                restored &= self.nonces.rewind(reservation.key, reservation.nonce);
+            }
+        }
+        restored
     }
 
     /// Create a value resolver for this context.

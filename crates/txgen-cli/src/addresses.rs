@@ -40,7 +40,9 @@ pub(crate) fn run_addresses(args: AddressesArgs) -> Result<()> {
             let line: Vec<_> = all_addresses.iter().map(|a| a.to_string()).collect();
             println!("{}", line.join(" "));
         }
-        other => bail!("unknown format: {}", other),
+        other => {
+            bail!("unknown format: {}", other);
+        }
     }
 
     Ok(())

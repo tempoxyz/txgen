@@ -4,22 +4,41 @@
 //! - Respecting scheduling key ordering (shared key = sequential, disjoint keys = parallel)
 //! - Applying rate limiting
 
-use crate::metrics::MetricsCollector;
-use alloy_network::{primitives::ReceiptResponse, AnyNetwork};
-use alloy_primitives::Bytes;
+use crate::{
+    metrics::MetricsCollector,
+    receipt_metrics::{ReceiptCollectorHandle, ReceiptMetricLabels},
+    receipt_tracker::Inclusion,
+    ReceiptTracker, RequestAuthProvider, RpcRequestContext,
+};
+use alloy_network::{primitives::ReceiptResponse, AnyNetwork, AnyTransactionReceipt};
+use alloy_primitives::{keccak256, Address, Bytes, TxHash, U256};
 use alloy_provider::{DynProvider, Provider};
-use eyre::Result;
+use alloy_transport::RpcError;
+use eyre::{Context, Result};
 use rand::seq::IndexedRandom;
+use reqwest::header::HeaderMap;
 use std::{
     collections::{HashSet, VecDeque},
-    sync::Arc,
-    time::{Duration, Instant},
+    fmt,
+    num::NonZeroUsize,
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
-    sync::{mpsc, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
 };
-use txgen_core::{dedup_scheduling_keys, GeneratedTx, SchedulingKey, TxPhase};
+use txgen_core::{dedup_scheduling_keys, GeneratedTx, LateSignSpec, SchedulingKey, TxPhase};
+
+/// Materializes raw transaction bytes from a network-specific deferred-signing
+/// envelope immediately before submission.
+pub trait LateSigner: Send + Sync {
+    /// Sign one deferred transaction.
+    fn sign(&self, spec: &LateSignSpec) -> Result<Bytes>;
+}
+
+/// Extract a signed transaction's absolute expiry in Unix seconds, if supported.
+pub type TransactionExpiry = dyn Fn(&Bytes) -> Option<u64> + Send + Sync;
 
 /// Configuration for the sender.
 #[derive(Debug, Clone)]
@@ -42,19 +61,731 @@ impl Default for SenderConfig {
     }
 }
 
+impl SenderConfig {
+    /// Validate configuration shared by transaction submission clients.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_concurrent == 0 {
+            eyre::bail!("max_concurrent must be greater than zero");
+        }
+
+        Ok(())
+    }
+}
+
+/// Result returned after an RPC endpoint accepts a raw transaction.
+#[derive(Debug, Clone, Copy)]
+pub struct RpcSubmission {
+    /// Hash returned by `eth_sendRawTransaction`.
+    pub tx_hash: TxHash,
+    /// Time spent awaiting RPC acceptance, measured with a monotonic clock.
+    pub acceptance_latency: Duration,
+    /// Wall-clock time at which the RPC submission started.
+    pub submitted_at: SystemTime,
+}
+
+/// Receipt fields retained for gas reporting without losing whether the RPC
+/// response actually supplied a fee field.
+#[derive(Debug)]
+pub struct RpcReceiptDetails {
+    /// Fully decoded transaction receipt.
+    pub receipt: AnyTransactionReceipt,
+    /// Gas consumed by the outer transaction receipt.
+    pub gas_used: U256,
+    /// Effective gas price when supplied by the RPC response.
+    pub effective_gas_price: Option<U256>,
+}
+
+/// Point at which an individual RPC submission failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcSubmitFailureKind {
+    /// The request was not sent, so its nonce can be safely reused.
+    BeforeSend,
+    /// The node returned a JSON-RPC rejection.
+    Rejected,
+    /// The transport failed after dispatch and acceptance is unknown.
+    Ambiguous,
+}
+
+/// Classified failure from [`RpcSubmitter::submit_classified`].
+#[derive(Debug)]
+pub struct RpcSubmitError {
+    kind: RpcSubmitFailureKind,
+    timed_out: bool,
+    diagnostic: String,
+    tx_hash: Option<TxHash>,
+}
+
+impl RpcSubmitError {
+    /// Submission failure category used for nonce recovery.
+    pub const fn kind(&self) -> RpcSubmitFailureKind {
+        self.kind
+    }
+
+    /// Whether the submission failed because its caller-supplied deadline elapsed.
+    pub const fn is_timeout(&self) -> bool {
+        self.timed_out
+    }
+
+    /// Hash of the payload when signing completed before the submission failed.
+    pub const fn tx_hash(&self) -> Option<TxHash> {
+        self.tx_hash
+    }
+
+    fn before_send(error: impl std::fmt::Display) -> Self {
+        Self {
+            kind: RpcSubmitFailureKind::BeforeSend,
+            timed_out: false,
+            diagnostic: error.to_string(),
+            tx_hash: None,
+        }
+    }
+
+    fn deadline(
+        kind: RpcSubmitFailureKind,
+        diagnostic: &'static str,
+        tx_hash: Option<TxHash>,
+    ) -> Self {
+        Self { kind, timed_out: true, diagnostic: diagnostic.to_string(), tx_hash }
+    }
+
+    fn from_transport(
+        error: alloy_transport::TransportError,
+        redact: bool,
+        tx_hash: TxHash,
+    ) -> Self {
+        let kind = classify_transport_failure(&error);
+        let diagnostic = if redact {
+            "authenticated RPC submission failed".to_string()
+        } else {
+            error.to_string()
+        };
+        Self { kind, timed_out: false, diagnostic, tx_hash: Some(tx_hash) }
+    }
+}
+
+fn classify_transport_failure(error: &alloy_transport::TransportError) -> RpcSubmitFailureKind {
+    match error {
+        RpcError::ErrorResp(_) => RpcSubmitFailureKind::Rejected,
+        RpcError::UnsupportedFeature(_) | RpcError::LocalUsageError(_) | RpcError::SerError(_) => {
+            RpcSubmitFailureKind::BeforeSend
+        }
+        RpcError::NullResp | RpcError::DeserError { .. } | RpcError::Transport(_) => {
+            RpcSubmitFailureKind::Ambiguous
+        }
+    }
+}
+
+fn submission_may_have_been_accepted(error: &alloy_transport::TransportError) -> bool {
+    if classify_transport_failure(error) == RpcSubmitFailureKind::Ambiguous {
+        return true;
+    }
+    let RpcError::ErrorResp(payload) = error else { return false };
+    known_transaction_error(&payload.message)
+}
+
+fn known_transaction_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("already known") ||
+        message.starts_with("known transaction") ||
+        message.contains("transaction already known") ||
+        message.contains("already imported")
+}
+
+impl std::fmt::Display for RpcSubmitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.diagnostic)
+    }
+}
+
+impl std::error::Error for RpcSubmitError {}
+
+/// Cloneable client for submitting individual transactions through bench's
+/// concurrency and transaction-rate controls.
+///
+/// Clones share the same semaphore and token bucket. Separately constructed
+/// clients have independent rate limits, allowing scenario-instance start rate
+/// limiting to remain separate from transaction submission rate limiting.
+/// Generated transactions are ordered using the same submission and inclusion
+/// key semantics as [`Sender`]. Raw submissions bypass key ordering.
+#[derive(Clone)]
+pub struct RpcSubmitter {
+    endpoints: Arc<[RpcEndpoint]>,
+    request_auth: Option<Arc<dyn RequestAuthProvider>>,
+    semaphore: Arc<Semaphore>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+    ordering: Arc<RpcOrdering>,
+    late_signer: Option<Arc<dyn LateSigner>>,
+    receipt_tracker: ReceiptTracker,
+}
+
+impl RpcSubmitter {
+    /// Create an RPC submitter backed by one or more interchangeable providers.
+    pub fn new(providers: Vec<DynProvider<AnyNetwork>>, config: SenderConfig) -> Result<Self> {
+        let endpoints = providers
+            .into_iter()
+            .enumerate()
+            .map(|(index, provider)| RpcEndpoint::new(format!("rpc-{index}"), provider))
+            .collect();
+        Self::new_with_request_auth(endpoints, config, None)
+    }
+
+    /// Create an RPC submitter with request-scoped authentication.
+    pub fn new_with_request_auth(
+        endpoints: Vec<RpcEndpoint>,
+        config: SenderConfig,
+        request_auth: Option<Arc<dyn RequestAuthProvider>>,
+    ) -> Result<Self> {
+        if endpoints.is_empty() {
+            eyre::bail!("at least one RPC provider is required");
+        }
+        config.validate()?;
+
+        let rate_limiter =
+            (config.rate_limit > 0).then(|| Arc::new(RateLimiter::new(config.rate_limit)));
+
+        let receipt_tracker = ReceiptTracker::new(endpoints[0].provider().clone());
+        Ok(Self {
+            receipt_tracker,
+            endpoints: endpoints.into(),
+            request_auth,
+            semaphore: Arc::new(Semaphore::new(config.max_concurrent)),
+            rate_limiter,
+            ordering: Arc::new(RpcOrdering::default()),
+            late_signer: None,
+        })
+    }
+
+    /// Register the signer used for deferred transactions.
+    pub fn with_late_signer(mut self, signer: Arc<dyn LateSigner>) -> Self {
+        self.late_signer = Some(signer);
+        self
+    }
+
+    /// Share an inclusion tracker backed by the chain's aggregate query endpoint.
+    pub fn with_receipt_tracker(mut self, tracker: ReceiptTracker) -> Self {
+        self.receipt_tracker = tracker;
+        self
+    }
+
+    /// Submit a generated transaction and wait until an RPC endpoint accepts it.
+    pub async fn submit(&self, tx: &GeneratedTx) -> Result<RpcSubmission> {
+        self.submit_classified(tx).await.map_err(Into::into)
+    }
+
+    /// Submit a generated transaction while retaining whether an error happened
+    /// before dispatch, was an RPC rejection, or had an ambiguous transport outcome.
+    pub async fn submit_classified(
+        &self,
+        tx: &GeneratedTx,
+    ) -> std::result::Result<RpcSubmission, RpcSubmitError> {
+        self.submit_classified_inner(tx, None).await
+    }
+
+    /// Submit a generated transaction before an absolute deadline.
+    ///
+    /// Expiry while waiting for ordering, rate, or concurrency capacity is
+    /// classified as [`RpcSubmitFailureKind::BeforeSend`]. Expiry after the raw
+    /// RPC starts is classified as [`RpcSubmitFailureKind::Ambiguous`].
+    pub async fn submit_classified_until(
+        &self,
+        tx: &GeneratedTx,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<RpcSubmission, RpcSubmitError> {
+        self.submit_classified_inner(tx, Some(deadline)).await
+    }
+
+    async fn submit_classified_inner(
+        &self,
+        tx: &GeneratedTx,
+        deadline: Option<tokio::time::Instant>,
+    ) -> std::result::Result<RpcSubmission, RpcSubmitError> {
+        let order = self
+            .ordering
+            .clone()
+            .enqueue(tx.submission_keys.clone(), tx.inclusion_keys.clone())
+            .map_err(RpcSubmitError::before_send)?;
+        let mut order = match deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline, order.acquire()).await.map_err(|_| {
+                    RpcSubmitError::deadline(
+                        RpcSubmitFailureKind::BeforeSend,
+                        "submission deadline elapsed before dispatch",
+                        None,
+                    )
+                })?
+            }
+            None => order.acquire().await,
+        };
+        let permit = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, self.acquire_permit())
+                .await
+                .map_err(|_| {
+                    RpcSubmitError::deadline(
+                        RpcSubmitFailureKind::BeforeSend,
+                        "submission deadline elapsed before dispatch",
+                        None,
+                    )
+                })?
+                .map_err(RpcSubmitError::before_send)?,
+            None => self.acquire_permit().await.map_err(RpcSubmitError::before_send)?,
+        };
+
+        let inclusion = if tx.inclusion_keys.is_empty() {
+            None
+        } else {
+            let registration = self.receipt_tracker.prepare();
+
+            let waiter = match deadline {
+                Some(deadline) => {
+                    tokio::time::timeout_at(deadline, registration).await.map_err(|_| {
+                        RpcSubmitError::deadline(
+                            RpcSubmitFailureKind::BeforeSend,
+                            "submission deadline elapsed starting inclusion observation",
+                            None,
+                        )
+                    })?
+                }
+                None => registration.await,
+            }
+            .map_err(RpcSubmitError::before_send)?;
+
+            Some(waiter)
+        };
+
+        let raw = resolve_raw(&tx.raw, tx.late_sign.as_ref(), self.late_signer.as_deref())
+            .map_err(RpcSubmitError::before_send)?;
+        let expected_hash = keccak256(&raw);
+        let endpoint = self.endpoint_for_hash(expected_hash);
+        let headers = self
+            .headers_for(&endpoint, "eth_sendRawTransaction", tx.sender, None)
+            .map_err(RpcSubmitError::before_send)?;
+
+        let inclusion = inclusion
+            .map(|registration| registration.register(expected_hash, false, None))
+            .transpose()
+            .map_err(RpcSubmitError::before_send)?;
+
+        let redact = self.request_auth.is_some();
+        let submission = match deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline, submit_raw_rpc(&endpoint, &raw, headers))
+                    .await
+                    .map_err(|_| {
+                        RpcSubmitError::deadline(
+                            RpcSubmitFailureKind::Ambiguous,
+                            "submission deadline elapsed after RPC dispatch; acceptance is unknown",
+                            Some(expected_hash),
+                        )
+                    })?
+                    .map_err(|error| RpcSubmitError::from_transport(error, redact, expected_hash))?
+            }
+            None => submit_raw_rpc(&endpoint, &raw, headers)
+                .await
+                .map_err(|error| RpcSubmitError::from_transport(error, redact, expected_hash))?,
+        };
+
+        drop(permit);
+
+        order.release_submission_keys();
+
+        if let Some(inclusion_release) = order.take_inclusion_keys() {
+            let inclusion = inclusion.expect("inclusion keys have a registered inclusion waiter");
+
+            tokio::spawn(async move {
+                if let Err(error) = inclusion.observe().await {
+                    tracing::warn!(%error, "Failed waiting for transaction inclusion");
+                }
+
+                drop(inclusion_release);
+            });
+        }
+
+        Ok(submission)
+    }
+
+    /// Submit raw EIP-2718 transaction bytes and wait for RPC acceptance.
+    pub async fn submit_raw(&self, raw: &Bytes) -> Result<RpcSubmission> {
+        let _permit = self.acquire_permit().await?;
+
+        let endpoint = self.endpoint_for_hash(keccak256(raw));
+        let headers = self.headers_for(&endpoint, "eth_sendRawTransaction", None, None)?;
+        submit_raw_rpc(&endpoint, raw, headers)
+            .await
+            .map_err(|error| rpc_request_error(error, self.request_auth.is_some(), "submission"))
+    }
+
+    /// Fetch a transaction receipt through a sender-authenticated endpoint.
+    pub async fn get_transaction_receipt(
+        &self,
+        sender: Option<Address>,
+        tx_hash: TxHash,
+    ) -> Result<Option<AnyTransactionReceipt>> {
+        Ok(self
+            .get_transaction_receipt_details(sender, tx_hash)
+            .await?
+            .map(|details| details.receipt))
+    }
+
+    /// Fetch a transaction receipt while preserving optional fee-field
+    /// presence from the raw RPC response.
+    pub async fn get_transaction_receipt_details(
+        &self,
+        sender: Option<Address>,
+        tx_hash: TxHash,
+    ) -> Result<Option<RpcReceiptDetails>> {
+        let endpoint = self.endpoint_for_hash(tx_hash);
+        let headers =
+            self.headers_for(&endpoint, "eth_getTransactionReceipt", sender, Some(tx_hash))?;
+        let value = endpoint
+            .provider()
+            .client()
+            .request::<_, Option<serde_json::Value>>("eth_getTransactionReceipt", (tx_hash,))
+            .map_meta(|mut meta| {
+                meta.headers_mut().extend(headers);
+                meta
+            })
+            .await
+            .map_err(|error| {
+                rpc_request_error(error, self.request_auth.is_some(), "receipt lookup")
+            })?;
+
+        let details = value.map(decode_receipt_details).transpose()?;
+        if let Some(details) = &details &&
+            details.receipt.transaction_hash() != tx_hash
+        {
+            eyre::bail!("receipt lookup returned a different transaction hash");
+        }
+        Ok(details)
+    }
+
+    /// Check whether a transaction is known through a sender-authenticated endpoint.
+    pub async fn transaction_exists(
+        &self,
+        sender: Option<Address>,
+        tx_hash: TxHash,
+    ) -> Result<bool> {
+        let endpoint = self.endpoint_for_hash(tx_hash);
+        let headers =
+            self.headers_for(&endpoint, "eth_getTransactionByHash", sender, Some(tx_hash))?;
+        endpoint
+            .provider()
+            .get_transaction_by_hash(tx_hash)
+            .with_headers(headers)
+            .map_err(|_| eyre::eyre!("cannot attach request headers to eth_getTransactionByHash"))?
+            .await
+            .map(|transaction| transaction.is_some())
+            .map_err(|error| {
+                rpc_request_error(error, self.request_auth.is_some(), "transaction lookup")
+            })
+    }
+
+    /// Validate submission authentication for a sender without dispatching an
+    /// RPC request.
+    ///
+    /// Every configured endpoint is checked because authentication providers
+    /// may use endpoint identity when selecting credentials.
+    pub fn validate_submission_auth(&self, sender: Option<Address>) -> Result<()> {
+        for endpoint in self.endpoints.iter() {
+            self.headers_for(endpoint, "eth_sendRawTransaction", sender, None)?;
+        }
+        Ok(())
+    }
+
+    fn endpoint_for_hash(&self, tx_hash: TxHash) -> RpcEndpoint {
+        // SAFETY: construction rejects an empty endpoint list.
+        let mut prefix = [0u8; 8];
+        prefix.copy_from_slice(&tx_hash[..8]);
+        let index =
+            (u64::from_be_bytes(prefix) % u64::try_from(self.endpoints.len()).unwrap()) as usize;
+        self.endpoints[index].clone()
+    }
+
+    fn headers_for(
+        &self,
+        endpoint: &RpcEndpoint,
+        method: &str,
+        sender: Option<Address>,
+        tx_hash: Option<TxHash>,
+    ) -> Result<HeaderMap> {
+        let headers = match &self.request_auth {
+            Some(auth) => auth.headers_for(&RpcRequestContext {
+                endpoint: endpoint.identity(),
+                method,
+                sender,
+                tx_hash,
+            }),
+            None => Ok(HeaderMap::new()),
+        }?;
+        Ok(mark_headers_sensitive(headers))
+    }
+
+    async fn acquire_permit(&self) -> Result<OwnedSemaphorePermit> {
+        loop {
+            let permit = self
+                .semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| eyre::eyre!("RPC submitter semaphore closed"))?;
+
+            if let Some(limiter) = &self.rate_limiter &&
+                let Some(delay) = limiter.try_acquire_or_delay().await
+            {
+                drop(permit);
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            return Ok(permit);
+        }
+    }
+}
+
+#[derive(Default)]
+struct RpcOrdering {
+    state: StdMutex<RpcOrderingState>,
+    notify: Notify,
+}
+
+#[derive(Default)]
+struct RpcOrderingState {
+    next_id: u64,
+    pending: VecDeque<RpcPendingOrder>,
+    active_keys: HashSet<SchedulingKey>,
+}
+
+struct RpcPendingOrder {
+    id: u64,
+    submission_keys: SchedulingKeys,
+    inclusion_keys: SchedulingKeys,
+}
+
+impl RpcPendingOrder {
+    fn scheduling_keys(&self) -> impl Iterator<Item = &SchedulingKey> {
+        self.submission_keys.iter().chain(self.inclusion_keys.iter())
+    }
+}
+
+impl RpcOrdering {
+    fn enqueue(
+        self: Arc<Self>,
+        submission_keys: SchedulingKeys,
+        inclusion_keys: SchedulingKeys,
+    ) -> Result<RpcOrderTicket> {
+        let (submission_keys, inclusion_keys) =
+            normalize_key_sets(submission_keys, inclusion_keys)?;
+        let mut state = self.state.lock().expect("RPC ordering mutex poisoned");
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1);
+        state.pending.push_back(RpcPendingOrder {
+            id,
+            submission_keys: submission_keys.clone(),
+            inclusion_keys: inclusion_keys.clone(),
+        });
+        drop(state);
+        self.notify.notify_waiters();
+
+        Ok(RpcOrderTicket { ordering: self, id, submission_keys, inclusion_keys, acquired: false })
+    }
+
+    fn try_acquire(&self, id: u64) -> bool {
+        let mut state = self.state.lock().expect("RPC ordering mutex poisoned");
+        let Some(index) = next_ready_order_index(&state.pending, &state.active_keys) else {
+            return false;
+        };
+        if state.pending[index].id != id {
+            return false;
+        }
+
+        let pending = state.pending.remove(index).expect("pending RPC order exists");
+        state.active_keys.extend(pending.scheduling_keys().copied());
+        true
+    }
+
+    fn cancel_pending(&self, id: u64) {
+        let mut state = self.state.lock().expect("RPC ordering mutex poisoned");
+        if let Some(index) = state.pending.iter().position(|pending| pending.id == id) {
+            state.pending.remove(index);
+        }
+        drop(state);
+        self.notify.notify_waiters();
+    }
+
+    fn release(&self, keys: &[SchedulingKey]) {
+        let mut state = self.state.lock().expect("RPC ordering mutex poisoned");
+        for key in keys {
+            state.active_keys.remove(key);
+        }
+        drop(state);
+        self.notify.notify_waiters();
+    }
+}
+
+fn next_ready_order_index(
+    pending: &VecDeque<RpcPendingOrder>,
+    active_keys: &HashSet<SchedulingKey>,
+) -> Option<usize> {
+    let mut blocked_keys = active_keys.clone();
+    for (index, pending) in pending.iter().enumerate() {
+        if pending.scheduling_keys().any(|key| blocked_keys.contains(key)) {
+            blocked_keys.extend(pending.scheduling_keys().copied());
+        } else {
+            return Some(index);
+        }
+    }
+    None
+}
+
+struct RpcOrderTicket {
+    ordering: Arc<RpcOrdering>,
+    id: u64,
+    submission_keys: SchedulingKeys,
+    inclusion_keys: SchedulingKeys,
+    acquired: bool,
+}
+
+impl RpcOrderTicket {
+    async fn acquire(mut self) -> Self {
+        loop {
+            let ordering = Arc::clone(&self.ordering);
+            let notified = ordering.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if ordering.try_acquire(self.id) {
+                self.acquired = true;
+                return self;
+            }
+            notified.await;
+        }
+    }
+
+    fn release_submission_keys(&mut self) {
+        self.ordering.release(&self.submission_keys);
+        self.submission_keys.clear();
+    }
+
+    fn take_inclusion_keys(&mut self) -> Option<RpcInclusionRelease> {
+        if self.inclusion_keys.is_empty() {
+            return None;
+        }
+        let keys = std::mem::take(&mut self.inclusion_keys);
+        Some(RpcInclusionRelease { ordering: self.ordering.clone(), keys })
+    }
+}
+
+impl Drop for RpcOrderTicket {
+    fn drop(&mut self) {
+        if self.acquired {
+            self.ordering.release(&self.submission_keys);
+            self.ordering.release(&self.inclusion_keys);
+        } else {
+            self.ordering.cancel_pending(self.id);
+        }
+    }
+}
+
+struct RpcInclusionRelease {
+    ordering: Arc<RpcOrdering>,
+    keys: SchedulingKeys,
+}
+
+impl Drop for RpcInclusionRelease {
+    fn drop(&mut self) {
+        self.ordering.release(&self.keys);
+    }
+}
+
 type SchedulingKeys = Vec<SchedulingKey>;
 
 type KeySets = (SchedulingKeys, SchedulingKeys);
 
-const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
 const PENDING_BACKLOG_FACTOR: usize = 4;
+
+/// A submission RPC provider and the identity exposed to request authentication.
+#[derive(Clone)]
+pub struct RpcEndpoint {
+    identity: Arc<str>,
+    provider: DynProvider<AnyNetwork>,
+}
+
+impl RpcEndpoint {
+    /// Create an endpoint with an opaque identity and provider.
+    pub fn new(identity: impl Into<Arc<str>>, provider: DynProvider<AnyNetwork>) -> Self {
+        Self { identity: identity.into(), provider }
+    }
+
+    /// Return this endpoint's authentication identity.
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// Return the Alloy provider for this endpoint.
+    pub fn provider(&self) -> &DynProvider<AnyNetwork> {
+        &self.provider
+    }
+}
+
+impl fmt::Debug for RpcEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RpcEndpoint").field("identity", &self.identity).finish_non_exhaustive()
+    }
+}
+
+/// Worker notifications for scheduling keys and setup prerequisites.
+enum Completion {
+    Release(SchedulingKeys),
+    SetupFinished { id: Option<String>, success: bool },
+    PendingFinished { result: std::result::Result<(), String> },
+}
+
+/// Reports pending-slot completion once, including task cancellation.
+struct PendingCompletion {
+    tx: Option<mpsc::UnboundedSender<Completion>>,
+}
+
+impl PendingCompletion {
+    fn finish(mut self, result: Result<()>) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Completion::PendingFinished {
+                result: result.map_err(|error| error.to_string()),
+            });
+        }
+    }
+}
+
+impl Drop for PendingCompletion {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Completion::PendingFinished {
+                result: Err("submission worker stopped before resolving inclusion".to_string()),
+            });
+        }
+    }
+}
+
+// Report every setup exit path, including task cancellation and pre-submission errors.
+struct SetupCompletion {
+    tx: mpsc::UnboundedSender<Completion>,
+    id: Option<String>,
+    success: bool,
+}
+
+impl Drop for SetupCompletion {
+    fn drop(&mut self) {
+        let _ =
+            self.tx.send(Completion::SetupFinished { id: self.id.take(), success: self.success });
+    }
+}
 
 /// A transaction to be sent.
 struct PendingTx {
+    depends_on: Vec<String>,
+    queue_id: u64,
     phase: TxPhase,
     id: Option<String>,
     raw: Bytes,
+    late_sign: Option<LateSignSpec>,
+    sender: Option<Address>,
     submission_keys: SchedulingKeys,
     inclusion_keys: SchedulingKeys,
 }
@@ -67,15 +798,24 @@ impl PendingTx {
 
 /// Transaction sender.
 pub struct Sender {
-    providers: Vec<DynProvider<AnyNetwork>>,
+    transaction_expiry: Option<Arc<TransactionExpiry>>,
+    max_pending: Option<NonZeroUsize>,
+    in_flight_pending: usize,
+    pending_failure: Option<String>,
+    endpoints: Vec<RpcEndpoint>,
+    request_auth: Option<Arc<dyn RequestAuthProvider>>,
     metrics: Arc<MetricsCollector>,
     semaphore: Arc<Semaphore>,
     /// Transactions waiting for all of their scheduling keys to become free.
     pending: VecDeque<PendingTx>,
     /// Scheduling keys currently held by dispatched transactions.
     active_keys: HashSet<SchedulingKey>,
-    completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
-    completion_rx: mpsc::UnboundedReceiver<SchedulingKeys>,
+    completion_tx: mpsc::UnboundedSender<Completion>,
+    completion_rx: mpsc::UnboundedReceiver<Completion>,
+    known_setup: HashSet<String>,
+    completed_setup: HashSet<String>,
+    in_flight_setup: usize,
+    setup_failure: Option<String>,
     /// Worker tasks for awaiting completion and reaping completed task state.
     worker_tasks: JoinSet<()>,
     /// Rate limiter tokens.
@@ -83,6 +823,17 @@ pub struct Sender {
     /// Maximum number of transactions buffered internally before applying
     /// backpressure to the transaction source.
     max_buffered: usize,
+    /// Monotonic identity used to remove a newly queued transaction if
+    /// dispatch preparation reports an error.
+    next_queue_id: u64,
+    /// Authentication failures discovered after the `send` call's own
+    /// transaction was already dispatched. These are reported by `flush`.
+    deferred_errors: VecDeque<eyre::Report>,
+    /// Optional receipt collector for workload gas reporting.
+    receipt_collector: Option<ReceiptCollectorHandle>,
+    /// Optional signer for deferred transactions.
+    late_signer: Option<Arc<dyn LateSigner>>,
+    receipt_tracker: ReceiptTracker,
 }
 
 impl Sender {
@@ -92,6 +843,22 @@ impl Sender {
         config: SenderConfig,
         metrics: Arc<MetricsCollector>,
     ) -> Self {
+        let endpoints = providers
+            .into_iter()
+            .enumerate()
+            .map(|(index, provider)| RpcEndpoint::new(format!("rpc-{index}"), provider))
+            .collect();
+        Self::new_with_request_auth(endpoints, config, metrics, None)
+    }
+
+    /// Create a sender with request-scoped authentication.
+    pub fn new_with_request_auth(
+        endpoints: Vec<RpcEndpoint>,
+        config: SenderConfig,
+        metrics: Arc<MetricsCollector>,
+        request_auth: Option<Arc<dyn RequestAuthProvider>>,
+    ) -> Self {
+        assert!(!endpoints.is_empty(), "sender requires at least one RPC endpoint");
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
 
         let rate_limiter = if config.rate_limit > 0 {
@@ -103,18 +870,85 @@ impl Sender {
         let max_buffered = max_buffered_transactions(&config, rate_limiter.as_deref());
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
 
+        let receipt_tracker = ReceiptTracker::new(endpoints[0].provider().clone());
         Self {
-            providers,
+            max_pending: None,
+            transaction_expiry: None,
+            in_flight_pending: 0,
+            pending_failure: None,
+            receipt_tracker,
+            endpoints,
+            request_auth,
             metrics,
             semaphore,
             pending: VecDeque::new(),
             active_keys: HashSet::new(),
             completion_tx,
             completion_rx,
+            known_setup: HashSet::new(),
+            completed_setup: HashSet::new(),
+            in_flight_setup: 0,
+            setup_failure: None,
             worker_tasks: JoinSet::new(),
             rate_limiter,
             max_buffered,
+            next_queue_id: 0,
+            deferred_errors: VecDeque::new(),
+            receipt_collector: None,
+            late_signer: None,
         }
+    }
+
+    /// Register the signer used for deferred transactions.
+    pub fn with_late_signer(mut self, signer: Arc<dyn LateSigner>) -> Self {
+        self.late_signer = Some(signer);
+        self
+    }
+
+    /// Limit dispatched transactions awaiting inclusion, independently of RPC
+    /// concurrency and TPS. Counts this sender's transactions, not the whole pool.
+    /// Slots are reserved before dispatch and released on inclusion or definite
+    /// rejection. Missing receipts fail the sender rather than silently refill it.
+    pub fn with_max_pending(mut self, limit: NonZeroUsize) -> Self {
+        self.max_pending = Some(limit);
+        self
+    }
+
+    /// Recognize network-specific expiry for tracked transactions, with or without
+    /// a pending cap. Expiry resolves after observing a block at the signed deadline.
+    pub fn with_transaction_expiry(mut self, expiry: Arc<TransactionExpiry>) -> Self {
+        self.transaction_expiry = Some(expiry);
+        self
+    }
+
+    /// Share an inclusion tracker backed by the chain's aggregate query endpoint.
+    pub fn with_receipt_tracker(mut self, tracker: ReceiptTracker) -> Self {
+        self.receipt_tracker = tracker;
+        self
+    }
+
+    /// Attach receipt collection for every RPC-accepted workload transaction.
+    pub fn with_receipt_collector(mut self, collector: ReceiptCollectorHandle) -> Self {
+        self.receipt_collector = Some(collector);
+        self
+    }
+
+    /// Validate the full setup graph before sending any transaction. Ordering
+    /// the batch first also prevents forward dependencies from deadlocking the
+    /// bounded submission buffer. Independent lanes still dispatch concurrently.
+    pub async fn send_setup(&mut self, transactions: Vec<GeneratedTx>) -> Result<()> {
+        let order = txgen_core::setup_submission_order(&transactions)?;
+        for tx in &transactions {
+            let id = tx.id.as_ref().expect("validated setup id");
+            if self.known_setup.contains(id) {
+                eyre::bail!("duplicate setup transaction id '{id}'");
+            }
+        }
+        let mut transactions: Vec<_> = transactions.into_iter().map(Some).collect();
+        for index in order {
+            self.send(transactions[index].take().expect("unique setup index")).await?;
+        }
+        Ok(())
     }
 
     /// Send a transaction.
@@ -123,26 +957,122 @@ impl Sender {
     /// are sent sequentially, while transactions with disjoint key sets can be
     /// sent in parallel.
     pub async fn send(&mut self, tx: GeneratedTx) -> Result<()> {
-        self.wait_for_buffer_capacity().await;
+        if let Some(error) = self.deferred_errors.pop_front() {
+            // A previous call dispatched its own transaction before discovering
+            // an older authentication failure. Report that failure before
+            // accepting more work, and cancel everything that has not reached
+            // the wire so a missing nonce cannot be skipped implicitly.
+            self.deferred_errors.clear();
+            self.pending.clear();
+            return Err(error);
+        }
 
-        let GeneratedTx { phase, id, raw, submission_keys, inclusion_keys } = tx;
+        self.wait_for_buffer_capacity().await?;
+
+        let queue_id = self.next_queue_id;
+        self.next_queue_id = self
+            .next_queue_id
+            .checked_add(1)
+            .ok_or_else(|| eyre::eyre!("sender transaction queue identity overflowed"))?;
+        let GeneratedTx {
+            phase,
+            id,
+            raw,
+            late_sign,
+            sender,
+            submission_keys,
+            inclusion_keys,
+            depends_on,
+        } = tx;
+        if let Some(spec) = &late_sign &&
+            self.late_signer.is_none()
+        {
+            eyre::bail!(
+                "transaction has `late_sign` envelope (format `{}`) but sender has no late signer registered",
+                spec.format
+            );
+        }
         let (submission_keys, inclusion_keys) =
             normalize_key_sets(submission_keys, inclusion_keys)?;
-        self.pending.push_back(PendingTx { phase, id, raw, submission_keys, inclusion_keys });
-        self.pump().await;
+        if phase == TxPhase::Setup {
+            let name = id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| eyre::eyre!("setup transaction requires a nonempty id"))?;
+            if self.known_setup.contains(name) {
+                eyre::bail!("duplicate setup transaction id '{name}'");
+            }
+            for dependency in &depends_on {
+                if !self.known_setup.contains(dependency) {
+                    eyre::bail!("setup transaction '{name}' depends on unknown or unqueued transaction '{dependency}'; use send_setup for forward dependencies");
+                }
+            }
+            self.known_setup.insert(name.to_string());
+        } else if !depends_on.is_empty() {
+            eyre::bail!("depends_on is only supported for setup transactions");
+        }
+        self.pending.push_back(PendingTx {
+            depends_on,
+            queue_id,
+            phase,
+            id,
+            raw,
+            late_sign,
+            sender,
+            submission_keys,
+            inclusion_keys,
+        });
+        if let Err(failure) = self.pump().await {
+            let current_is_pending =
+                self.pending.iter().any(|pending| pending.queue_id == queue_id);
+            self.pending.clear();
+
+            if failure.queue_id == queue_id {
+                return Err(failure.error);
+            }
+
+            // `pump` removes the transaction whose authentication failed. If
+            // the error came from an older queued transaction, also retract the
+            // transaction accepted by this call so retrying it cannot later
+            // produce a duplicate submission.
+            if current_is_pending {
+                return Err(failure.error);
+            }
+
+            // The transaction accepted by this call is already on the wire, so
+            // returning `Err` would invite an unsafe retry. Defer the unrelated
+            // older failure until `flush` instead.
+            self.deferred_errors.push_back(failure.error);
+        }
 
         Ok(())
     }
 
     /// Wait for all pending transactions to complete.
-    pub async fn flush(&mut self) {
-        self.pump().await;
+    pub async fn flush(&mut self) -> Result<()> {
+        let mut first_error = self.deferred_errors.pop_front();
+        self.deferred_errors.clear();
+        if first_error.is_some() {
+            self.pending.clear();
+        } else if let Err(failure) = self.pump().await {
+            self.pending.clear();
+            first_error = Some(failure.error);
+        }
 
-        while !self.pending.is_empty() || !self.active_keys.is_empty() {
+        while !self.pending.is_empty() ||
+            !self.active_keys.is_empty() ||
+            self.in_flight_setup > 0 ||
+            self.in_flight_pending > 0
+        {
             match self.completion_rx.recv().await {
-                Some(keys) => {
-                    self.release_keys(&keys);
-                    self.pump().await;
+                Some(completion) => {
+                    self.handle_completion(completion);
+                    if first_error.is_none() &&
+                        let Err(failure) = self.pump().await
+                    {
+                        self.pending.clear();
+                        first_error = Some(failure.error);
+                    }
                 }
                 None => break,
             }
@@ -153,11 +1083,16 @@ impl Sender {
                 tracing::warn!(%err, "sender worker task failed");
             }
         }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn drain_completions(&mut self) {
-        while let Ok(keys) = self.completion_rx.try_recv() {
-            self.release_keys(&keys);
+        while let Ok(completion) = self.completion_rx.try_recv() {
+            self.handle_completion(completion);
         }
         self.reap_worker_tasks();
     }
@@ -170,29 +1105,74 @@ impl Sender {
         }
     }
 
+    fn handle_completion(&mut self, completion: Completion) {
+        match completion {
+            Completion::Release(keys) => self.release_keys(&keys),
+            Completion::PendingFinished { result } => {
+                self.in_flight_pending -= 1;
+                if let Err(error) = result {
+                    self.pending_failure.get_or_insert(error);
+                }
+            }
+            Completion::SetupFinished { id, success } => {
+                self.in_flight_setup -= 1;
+                if success {
+                    self.completed_setup.insert(id.expect("setup transaction has an id"));
+                } else {
+                    self.setup_failure.get_or_insert_with(|| {
+                        format!(
+                            "setup transaction '{}' failed; cancelling queued setup",
+                            id.as_deref().unwrap_or("<unnamed>")
+                        )
+                    });
+                }
+            }
+        }
+    }
+
     fn release_keys(&mut self, keys: &[SchedulingKey]) {
         for key in keys {
             self.active_keys.remove(key);
         }
     }
 
-    async fn wait_for_buffer_capacity(&mut self) {
+    async fn wait_for_buffer_capacity(&mut self) -> Result<()> {
         while self.pending.len() >= self.max_buffered {
-            self.pump().await;
+            if let Err(failure) = self.pump().await {
+                self.pending.clear();
+                return Err(failure.error);
+            }
             if self.pending.len() < self.max_buffered {
                 break;
             }
 
             match self.completion_rx.recv().await {
-                Some(keys) => self.release_keys(&keys),
+                Some(completion) => self.handle_completion(completion),
                 None => break,
             }
         }
+        Ok(())
     }
 
-    async fn pump(&mut self) {
+    async fn pump(&mut self) -> std::result::Result<(), DispatchPreparationError> {
         loop {
             self.drain_completions();
+            if let Some(error) = &self.pending_failure {
+                return Err(DispatchPreparationError {
+                    queue_id: u64::MAX,
+                    error: eyre::eyre!("pending transaction tracking failed: {error}"),
+                });
+            }
+            if let Some(error) = &self.setup_failure {
+                return Err(DispatchPreparationError {
+                    queue_id: u64::MAX,
+                    error: eyre::eyre!("{error}"),
+                });
+            }
+
+            if self.max_pending.is_some_and(|limit| self.in_flight_pending >= limit.get()) {
+                break;
+            }
 
             let Some(index) = self.next_ready_index() else {
                 break;
@@ -210,17 +1190,49 @@ impl Sender {
                 continue;
             }
 
+            // Resolve authentication immediately before dispatch so queued
+            // transactions observe a freshly reloaded sender map. Do this while
+            // the transaction is still queued so any error is propagated and no
+            // HTTP request is made.
+            let endpoint = self
+                .endpoints
+                .choose(&mut rand::rng())
+                .expect("sender has at least one endpoint")
+                .clone();
+            let pending = self.pending.get(index).expect("pending index exists");
+            let id = pending.id.as_deref().unwrap_or("<unnamed>").to_string();
+            let submission_headers = match self
+                .headers_for(&endpoint, "eth_sendRawTransaction", pending.sender, None)
+                .wrap_err_with(|| format!("failed to authenticate transaction {id}"))
+            {
+                Ok(headers) => headers,
+                Err(error) => {
+                    // A failed `send`/`flush` must not leave this transaction
+                    // queued for an implicit later submission.
+                    let pending = self.pending.remove(index).expect("pending index exists");
+                    if pending.phase == TxPhase::Setup {
+                        self.setup_failure = Some(format!(
+                            "setup transaction '{id}' failed authentication; cancelling queued setup"
+                        ));
+                    }
+                    return Err(DispatchPreparationError { queue_id: pending.queue_id, error });
+                }
+            };
+
             let pending = self.pending.remove(index).expect("pending index exists");
             self.activate_keys(&pending);
-            self.dispatch(pending, permit);
+            self.dispatch(pending, endpoint, submission_headers, permit);
         }
+
+        Ok(())
     }
 
     fn next_ready_index(&self) -> Option<usize> {
         let mut blocked_keys = self.active_keys.clone();
 
         for (index, pending) in self.pending.iter().enumerate() {
-            let is_blocked = pending.scheduling_keys().any(|key| blocked_keys.contains(key));
+            let is_blocked = pending.scheduling_keys().any(|key| blocked_keys.contains(key)) ||
+                pending.depends_on.iter().any(|id| !self.completed_setup.contains(id));
 
             if is_blocked {
                 for key in pending.scheduling_keys() {
@@ -240,15 +1252,82 @@ impl Sender {
         }
     }
 
-    fn dispatch(&mut self, pending: PendingTx, permit: OwnedSemaphorePermit) {
-        let providers = self.providers.clone();
+    fn headers_for(
+        &self,
+        endpoint: &RpcEndpoint,
+        method: &str,
+        sender: Option<Address>,
+        tx_hash: Option<TxHash>,
+    ) -> Result<HeaderMap> {
+        let headers = match &self.request_auth {
+            Some(auth) => auth.headers_for(&RpcRequestContext {
+                endpoint: endpoint.identity(),
+                method,
+                sender,
+                tx_hash,
+            }),
+            None => Ok(HeaderMap::new()),
+        }?;
+        Ok(mark_headers_sensitive(headers))
+    }
+
+    fn dispatch(
+        &mut self,
+        pending: PendingTx,
+        endpoint: RpcEndpoint,
+        submission_headers: HeaderMap,
+        permit: OwnedSemaphorePermit,
+    ) {
         let metrics = self.metrics.clone();
         let completion_tx = self.completion_tx.clone();
+        let request_auth = self.request_auth.clone();
+        let receipt_collector = self.receipt_collector.clone();
+        let late_signer = self.late_signer.clone();
+        let receipt_tracker = self.receipt_tracker.clone();
 
+        let transaction_expiry = self.transaction_expiry.clone();
+        let pending_completion = self.max_pending.map(|_| {
+            self.in_flight_pending += 1;
+            PendingCompletion { tx: Some(completion_tx.clone()) }
+        });
+
+        let setup_completion = if pending.phase == TxPhase::Setup {
+            self.in_flight_setup += 1;
+            Some(SetupCompletion {
+                tx: completion_tx.clone(),
+                id: pending.id.clone(),
+                success: false,
+            })
+        } else {
+            None
+        };
         self.worker_tasks.spawn(async move {
-            submit_tx(pending, providers, metrics, permit, completion_tx).await;
+            let result = submit_tx(
+                pending,
+                pending_completion.is_some(),
+                transaction_expiry,
+                setup_completion,
+                endpoint,
+                submission_headers,
+                request_auth,
+                receipt_collector,
+                receipt_tracker,
+                metrics,
+                permit,
+                completion_tx,
+                late_signer,
+            )
+            .await;
+            if let Some(completion) = pending_completion {
+                completion.finish(result);
+            }
         });
     }
+}
+
+struct DispatchPreparationError {
+    queue_id: u64,
+    error: eyre::Report,
 }
 
 fn max_buffered_transactions(config: &SenderConfig, limiter: Option<&RateLimiter>) -> usize {
@@ -275,13 +1354,24 @@ fn normalize_key_sets(
     Ok((submission_keys, inclusion_keys))
 }
 
+/// Returns an error only when pending tracking cannot be resolved reliably.
+/// Rejected, included, and expired transactions all release pending capacity normally.
+#[allow(clippy::too_many_arguments)]
 async fn submit_tx(
     pending: PendingTx,
-    providers: Vec<DynProvider<AnyNetwork>>,
+    track_pending: bool,
+    transaction_expiry: Option<Arc<TransactionExpiry>>,
+    mut setup_completion: Option<SetupCompletion>,
+    endpoint: RpcEndpoint,
+    submission_headers: HeaderMap,
+    request_auth: Option<Arc<dyn RequestAuthProvider>>,
+    receipt_collector: Option<ReceiptCollectorHandle>,
+    receipt_tracker: ReceiptTracker,
     metrics: Arc<MetricsCollector>,
     permit: OwnedSemaphorePermit,
-    completion_tx: mpsc::UnboundedSender<SchedulingKeys>,
-) {
+    completion_tx: mpsc::UnboundedSender<Completion>,
+    late_signer: Option<Arc<dyn LateSigner>>,
+) -> Result<()> {
     let release_all_keys = || {
         let mut keys = pending.submission_keys.clone();
         keys.extend_from_slice(&pending.inclusion_keys);
@@ -290,71 +1380,242 @@ async fn submit_tx(
 
     metrics.record_sent();
 
-    // Pick a random provider for this request.
-    // SAFETY: `providers` is guaranteed to be non-empty by construction.
-    let provider = providers.choose(&mut rand::rng()).unwrap();
+    let inclusion =
+        if pending.inclusion_keys.is_empty() && pending.phase != TxPhase::Setup && !track_pending {
+            None
+        } else {
+            match receipt_tracker.prepare().await {
+                Ok(waiter) => Some(waiter),
+                Err(error) => {
+                    tracing::error!(%error, "Failed to start block receipt observation");
+                    metrics.record_failure();
+                    drop(permit);
+                    release_keys(&completion_tx, release_all_keys());
 
-    let start = Instant::now();
-    let tx_hash = match provider.send_raw_transaction(&pending.raw).await {
-        Ok(pending_tx) => {
-            metrics.record_success(start.elapsed());
-            *pending_tx.tx_hash()
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to send transaction");
+                    return Err(error);
+                }
+            }
+        };
+
+    let raw = match resolve_raw(&pending.raw, pending.late_sign.as_ref(), late_signer.as_deref()) {
+        Ok(raw) => raw,
+        Err(error) => {
+            tracing::error!(
+                id = pending.id.as_deref(),
+                phase = ?pending.phase,
+                error = %error,
+                "failed to materialize deferred transaction",
+            );
             metrics.record_failure();
             drop(permit);
             release_keys(&completion_tx, release_all_keys());
-            return;
+
+            // Signing failed before submission: no transaction can be pending.
+            return Ok(());
+        }
+    };
+
+    let expected_hash = keccak256(&raw);
+    let inclusion = match inclusion
+        .map(|registration| {
+            let expires_at = transaction_expiry.as_ref().and_then(|expiry| expiry(&raw));
+            registration.register(
+                expected_hash,
+                pending.phase == TxPhase::Setup || !pending.inclusion_keys.is_empty(),
+                expires_at,
+            )
+        })
+        .transpose()
+    {
+        Ok(inclusion) => inclusion,
+        Err(error) => {
+            tracing::error!(%error, "Failed to register transaction for block receipt observation");
+
+            metrics.record_failure();
+            drop(permit);
+            release_keys(&completion_tx, release_all_keys());
+
+            return Err(error);
+        }
+    };
+
+    let start = Instant::now();
+    let tx_hash = match send_raw_transaction(&endpoint, &raw, submission_headers).await {
+        Ok(tx_hash) => {
+            metrics.record_success(start.elapsed());
+            tx_hash
+        }
+        Err(e) => {
+            let uncertain = submission_may_have_been_accepted(&e);
+            if uncertain {
+                track_workload_receipt(receipt_collector.as_ref(), &pending, expected_hash);
+            }
+
+            if request_auth.is_some() {
+                tracing::warn!("Failed to send authenticated transaction");
+            } else {
+                tracing::warn!(error = %e, "Failed to send transaction");
+            }
+
+            metrics.record_failure();
+            drop(permit);
+            release_keys(&completion_tx, release_all_keys());
+
+            if track_pending && uncertain {
+                // A lost response does not prove rejection. Keep tracking this slot.
+                inclusion.expect("pending limit registers inclusion").observe().await?;
+            }
+
+            return Ok(());
         }
     };
 
     drop(permit);
 
+    track_workload_receipt(receipt_collector.as_ref(), &pending, expected_hash);
+
     release_keys(&completion_tx, pending.submission_keys);
 
-    if pending.inclusion_keys.is_empty() && pending.phase != TxPhase::Setup {
-        return;
-    }
+    let Some(inclusion) = inclusion else { return Ok(()) };
 
-    match wait_for_receipt(provider, tx_hash).await {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::error!(id = pending.id.as_deref(), phase = ?pending.phase, %tx_hash, "Transaction reverted");
-            metrics.record_failure();
+    let result = match inclusion.observe().await {
+        Ok(Inclusion::Included(None)) => Ok(()),
+        Ok(Inclusion::Included(Some(receipt))) => {
+            if receipt.status() {
+                if let Some(completion) = &mut setup_completion {
+                    completion.success = true;
+                }
+            } else {
+                tracing::error!(
+                    id = pending.id.as_deref(),
+                    phase = ?pending.phase,
+                    %tx_hash,
+                    "Transaction reverted",
+                );
+                metrics.record_failure();
+            }
+            Ok(())
         }
-        Err(e) => {
-            tracing::error!(error = %e, %tx_hash, "Failed waiting for transaction receipt");
+        Ok(Inclusion::Expired) => {
+            tracing::debug!(%tx_hash, "Transaction expired before inclusion");
             metrics.record_failure();
+            Ok(())
         }
-    }
+        Err(error) => {
+            // The tracker only returns static diagnostics without RPC credentials.
+            tracing::error!(%error, %tx_hash, "Failed waiting for transaction inclusion");
+            metrics.record_failure();
+            Err(error)
+        }
+    };
 
     release_keys(&completion_tx, pending.inclusion_keys);
+    result
 }
 
-fn release_keys(completion_tx: &mpsc::UnboundedSender<SchedulingKeys>, keys: SchedulingKeys) {
+fn resolve_raw(
+    raw: &Bytes,
+    late_sign: Option<&LateSignSpec>,
+    late_signer: Option<&dyn LateSigner>,
+) -> Result<Bytes> {
+    match late_sign {
+        Some(spec) => late_signer
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "transaction has `late_sign` envelope (format `{}`) but sender has no late signer registered",
+                    spec.format
+                )
+            })?
+            .sign(spec),
+        None => Ok(raw.clone()),
+    }
+}
+
+fn track_workload_receipt(
+    collector: Option<&ReceiptCollectorHandle>,
+    pending: &PendingTx,
+    tx_hash: TxHash,
+) {
+    if pending.phase != TxPhase::Workload {
+        return;
+    }
+    let Some(collector) = collector else { return };
+
+    let mut labels = ReceiptMetricLabels::new();
+    if let Some(input) = pending.id.clone() {
+        labels.insert("input".to_string(), input);
+    }
+    collector.track(pending.sender, tx_hash, labels);
+}
+
+async fn send_raw_transaction(
+    endpoint: &RpcEndpoint,
+    raw: &Bytes,
+    headers: HeaderMap,
+) -> alloy_transport::TransportResult<TxHash> {
+    let encoded = format!("0x{}", hex::encode(raw));
+    endpoint
+        .provider()
+        .client()
+        .request::<_, TxHash>("eth_sendRawTransaction", (encoded,))
+        .map_meta(|mut meta| {
+            meta.headers_mut().extend(headers);
+            meta
+        })
+        .await
+}
+
+async fn submit_raw_rpc(
+    endpoint: &RpcEndpoint,
+    raw: &Bytes,
+    headers: HeaderMap,
+) -> alloy_transport::TransportResult<RpcSubmission> {
+    let submitted_at = SystemTime::now();
+    let start = Instant::now();
+    let tx_hash = send_raw_transaction(endpoint, raw, headers).await?;
+
+    Ok(RpcSubmission { tx_hash, acceptance_latency: start.elapsed(), submitted_at })
+}
+
+pub(crate) fn decode_receipt_details(value: serde_json::Value) -> Result<RpcReceiptDetails> {
+    let effective_gas_price = value
+        .get("effectiveGasPrice")
+        .filter(|value| !value.is_null())
+        .or_else(|| value.get("gasPrice").filter(|value| !value.is_null()))
+        .map(|value| {
+            serde_json::from_value::<U256>(value.clone())
+                .wrap_err("invalid effective gas price in transaction receipt")
+        })
+        .transpose()?;
+    let receipt: AnyTransactionReceipt =
+        serde_json::from_value(value).wrap_err("invalid transaction receipt response")?;
+
+    Ok(RpcReceiptDetails { gas_used: U256::from(receipt.gas_used()), effective_gas_price, receipt })
+}
+
+fn rpc_request_error(
+    error: alloy_transport::TransportError,
+    redact: bool,
+    operation: &str,
+) -> eyre::Report {
+    if redact {
+        eyre::eyre!("authenticated RPC {operation} failed")
+    } else {
+        error.into()
+    }
+}
+
+fn release_keys(completion_tx: &mpsc::UnboundedSender<Completion>, keys: SchedulingKeys) {
     if !keys.is_empty() {
-        let _ = completion_tx.send(keys);
+        let _ = completion_tx.send(Completion::Release(keys));
     }
 }
 
-async fn wait_for_receipt(
-    provider: &DynProvider<AnyNetwork>,
-    tx_hash: alloy_primitives::TxHash,
-) -> Result<bool> {
-    let deadline = tokio::time::Instant::now() + RECEIPT_TIMEOUT;
-
-    loop {
-        if let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? {
-            return Ok(receipt.status());
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            eyre::bail!("timed out waiting for transaction receipt");
-        }
-
-        tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
+fn mark_headers_sensitive(mut headers: HeaderMap) -> HeaderMap {
+    for value in headers.values_mut() {
+        value.set_sensitive(true);
     }
+    headers
 }
 
 const RATE_LIMITER_MAX_BURST: Duration = Duration::from_millis(10);
@@ -417,12 +1678,422 @@ impl RateLimiterState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ReceiptCollector, RunClock};
+    use alloy_provider::ProviderBuilder;
+    use alloy_transport::mock::Asserter;
+
+    #[derive(Default)]
+    struct RecordingAuth {
+        endpoints: StdMutex<Vec<String>>,
+    }
+
+    struct StaticLateSigner {
+        raw: Bytes,
+        calls: StdMutex<usize>,
+    }
+
+    impl LateSigner for StaticLateSigner {
+        fn sign(&self, _spec: &LateSignSpec) -> Result<Bytes> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(self.raw.clone())
+        }
+    }
+
+    impl RequestAuthProvider for RecordingAuth {
+        fn headers_for(&self, context: &RpcRequestContext<'_>) -> Result<HeaderMap> {
+            if context.sender != Some(Address::repeat_byte(0x11)) {
+                eyre::bail!("missing sender mapping");
+            }
+            self.endpoints.lock().unwrap().push(context.endpoint.to_string());
+            Ok(HeaderMap::new())
+        }
+    }
+
+    fn mocked_provider(asserter: Asserter) -> DynProvider<AnyNetwork> {
+        ProviderBuilder::new_with_network::<AnyNetwork>().connect_mocked_client(asserter).erased()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_timeout_stops_refill_and_fails_flush() {
+        let asserter = Asserter::new();
+        let raw = Bytes::from_static(&[2]);
+        asserter.push_success(&"0x0");
+        asserter.push_success(&keccak256(&raw));
+        let metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
+        let mut sender =
+            Sender::new(vec![mocked_provider(asserter)], SenderConfig::default(), metrics.clone())
+                .with_max_pending(1.try_into().unwrap());
+        for key in 1..=2 {
+            sender
+                .send(GeneratedTx {
+                    depends_on: Vec::new(),
+                    phase: TxPhase::Workload,
+                    id: None,
+                    raw: raw.clone(),
+                    late_sign: None,
+                    sender: None,
+                    submission_keys: vec![SchedulingKey::from([key; 20])],
+                    inclusion_keys: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let error = sender.flush().await.unwrap_err();
+        assert!(error.to_string().contains("timed out waiting for transaction inclusion"));
+        assert_eq!(metrics.counts().0, 1, "timeout must not refill the pending window");
+    }
+
+    #[tokio::test]
+    async fn pending_worker_cancellation_releases_slot_and_stops_refill() {
+        let metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
+        let mut sender =
+            Sender::new(vec![mocked_provider(Asserter::new())], SenderConfig::default(), metrics)
+                .with_max_pending(1.try_into().unwrap());
+        sender
+            .send(GeneratedTx {
+                depends_on: Vec::new(),
+                phase: TxPhase::Workload,
+                id: None,
+                raw: Bytes::from_static(&[2]),
+                late_sign: None,
+                sender: None,
+                submission_keys: vec![SchedulingKey::from([1; 20])],
+                inclusion_keys: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(sender.in_flight_pending, 1);
+
+        // Abort before the worker's first poll: its reserved slot must still resolve.
+        sender.worker_tasks.abort_all();
+        sender.worker_tasks.join_next().await.unwrap().unwrap_err();
+        sender.drain_completions();
+        assert_eq!(sender.in_flight_pending, 0);
+        let error = sender.pump().await.expect_err("cancelled tracking must stop refill");
+        assert!(error.error.to_string().contains("submission worker stopped"));
+    }
+
+    fn receipt_json(
+        transaction_hash: TxHash,
+        effective_gas_price: Option<&str>,
+    ) -> serde_json::Value {
+        let mut receipt = serde_json::json!({
+            "transactionHash": transaction_hash,
+            "transactionIndex": "0x0",
+            "blockHash": TxHash::repeat_byte(0x44),
+            "blockNumber": "0x1",
+            "from": Address::repeat_byte(0x55),
+            "to": Address::repeat_byte(0x66),
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "contractAddress": null,
+            "logs": [],
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "status": "0x1",
+            "type": "0x2"
+        });
+        if let Some(price) = effective_gas_price {
+            receipt["effectiveGasPrice"] = serde_json::Value::String(price.to_string());
+        }
+        receipt
+    }
+
+    #[test]
+    fn receipt_details_preserve_gas_and_effective_price() {
+        let details =
+            decode_receipt_details(receipt_json(TxHash::repeat_byte(0x42), Some("0x3b9aca00")))
+                .unwrap();
+
+        assert_eq!(details.gas_used, U256::from(21_000));
+        assert_eq!(details.effective_gas_price, Some(U256::from(1_000_000_000u64)));
+    }
+
+    #[test]
+    fn receipt_details_preserve_missing_fee_fields() {
+        let details =
+            decode_receipt_details(receipt_json(TxHash::repeat_byte(0x42), None)).unwrap();
+
+        assert_eq!(details.gas_used, U256::from(21_000));
+        assert_eq!(details.effective_gas_price, None);
+    }
+
+    #[test]
+    fn only_known_transaction_errors_are_receipt_trackable() {
+        assert!(known_transaction_error("already known"));
+        assert!(known_transaction_error("Known transaction: 0x1234"));
+        assert!(known_transaction_error("transaction already imported"));
+        assert!(!known_transaction_error("unknown transaction type 0x7f"));
+        assert!(!known_transaction_error("nonce too low"));
+    }
+
+    #[tokio::test]
+    async fn sender_collects_receipts_without_inclusion_keys() {
+        let asserter = Asserter::new();
+        let raw = Bytes::from_static(&[0x02, 0xf8, 0x70]);
+        let tx_hash = keccak256(&raw);
+        asserter.push_success(&tx_hash);
+        asserter.push_success(&receipt_json(tx_hash, Some("0x2")));
+        let provider = mocked_provider(asserter.clone());
+        let config = SenderConfig { rate_limit: 0, max_concurrent: 1 };
+        let collector = ReceiptCollector::start(
+            RpcSubmitter::new(vec![provider.clone()], config.clone()).unwrap(),
+            1,
+        );
+        let metrics = MetricsCollector::new(RunClock::new());
+        let mut sender =
+            Sender::new(vec![provider], config, metrics).with_receipt_collector(collector.handle());
+
+        sender
+            .send(GeneratedTx {
+                depends_on: Vec::new(),
+                phase: TxPhase::Workload,
+                id: Some("transfer".to_string()),
+                sender: Some(Address::repeat_byte(0x55)),
+                raw,
+                late_sign: None,
+                submission_keys: vec![SchedulingKey::from([0x11; 20])],
+                inclusion_keys: Vec::new(),
+            })
+            .await
+            .unwrap();
+        sender.flush().await.unwrap();
+        drop(sender);
+
+        let collection = collector.finish().await;
+        let groups = &collection.metrics;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].labels["input"], "transfer");
+        assert_eq!(groups[0].gas_used.count, 1);
+        assert_eq!(groups[0].gas_used.min, Some(21_000.0));
+        assert_eq!(groups[0].effective_gas_price.min, Some(2.0));
+        assert_eq!(groups[0].fee_paid.min, Some(42_000.0));
+        assert_eq!(collection.records.len(), 1);
+        assert_eq!(collection.records[0].tx_hash, tx_hash);
+        assert!(asserter.read_q().is_empty());
+    }
 
     #[test]
     fn test_sender_config_default() {
         let config = SenderConfig::default();
         assert_eq!(config.rate_limit, 0);
         assert_eq!(config.max_concurrent, 100);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_sender_config_rejects_zero_concurrency() {
+        let config = SenderConfig { rate_limit: 0, max_concurrent: 0 };
+        assert!(config.validate().is_err());
+
+        let provider = mocked_provider(Asserter::new());
+        assert!(RpcSubmitter::new(vec![provider], config).is_err());
+    }
+
+    #[test]
+    fn test_rpc_submitter_rejects_empty_provider_list() {
+        let result = RpcSubmitter::new(Vec::new(), SenderConfig::default());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rpc_submitter_preflights_auth_for_every_endpoint() {
+        let auth = Arc::new(RecordingAuth::default());
+        let submitter = RpcSubmitter::new_with_request_auth(
+            vec![
+                RpcEndpoint::new("first", mocked_provider(Asserter::new())),
+                RpcEndpoint::new("second", mocked_provider(Asserter::new())),
+            ],
+            SenderConfig::default(),
+            Some(auth.clone()),
+        )
+        .unwrap();
+
+        submitter.validate_submission_auth(Some(Address::repeat_byte(0x11))).unwrap();
+        assert_eq!(auth.endpoints.lock().unwrap().as_slice(), ["first", "second"]);
+        assert!(submitter.validate_submission_auth(Some(Address::repeat_byte(0x22))).is_err());
+    }
+
+    #[test]
+    fn rpc_submitter_uses_a_stable_endpoint_for_a_transaction_hash() {
+        let submitter = RpcSubmitter::new(
+            vec![mocked_provider(Asserter::new()), mocked_provider(Asserter::new())],
+            SenderConfig::default(),
+        )
+        .unwrap();
+        let transaction_hash = keccak256([0x02, 0xf8, 0x70]);
+
+        let first = submitter.endpoint_for_hash(transaction_hash);
+        let second = submitter.endpoint_for_hash(transaction_hash);
+        assert_eq!(first.identity(), second.identity());
+    }
+
+    #[tokio::test]
+    async fn test_rpc_submitter_returns_acceptance_result() {
+        let asserter = Asserter::new();
+        let tx_hash = TxHash::repeat_byte(0x42);
+        asserter.push_success(&tx_hash);
+
+        let submitter = RpcSubmitter::new(
+            vec![mocked_provider(asserter.clone())],
+            SenderConfig { rate_limit: 0, max_concurrent: 1 },
+        )
+        .unwrap();
+
+        let submission =
+            submitter.submit_raw(&Bytes::from_static(&[0x02, 0xf8, 0x70])).await.unwrap();
+
+        assert_eq!(submission.tx_hash, tx_hash);
+        assert!(submission.submitted_at.duration_since(std::time::UNIX_EPOCH).is_ok());
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rpc_submitter_signs_deferred_transaction_before_submission() {
+        let asserter = Asserter::new();
+        let raw = Bytes::from_static(&[0x76, 0x01, 0x02]);
+        let tx_hash = keccak256(&raw);
+        asserter.push_success(&tx_hash);
+        let signer = Arc::new(StaticLateSigner { raw, calls: StdMutex::new(0) });
+        let submitter = RpcSubmitter::new(
+            vec![mocked_provider(asserter.clone())],
+            SenderConfig { rate_limit: 0, max_concurrent: 1 },
+        )
+        .unwrap()
+        .with_late_signer(signer.clone());
+
+        let submission = submitter
+            .submit(&GeneratedTx {
+                depends_on: Vec::new(),
+                phase: TxPhase::Workload,
+                id: Some("deferred".to_string()),
+                sender: None,
+                raw: Bytes::new(),
+                late_sign: Some(LateSignSpec {
+                    format: "test".to_string(),
+                    payload: serde_json::json!({}),
+                }),
+                submission_keys: vec![SchedulingKey::from([0x11; 20])],
+                inclusion_keys: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(submission.tx_hash, tx_hash);
+        assert_eq!(*signer.calls.lock().unwrap(), 1);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sender_signs_deferred_transaction_in_worker() {
+        let asserter = Asserter::new();
+        let raw = Bytes::from_static(&[0x76, 0x03, 0x04]);
+        let tx_hash = keccak256(&raw);
+        asserter.push_success(&tx_hash);
+        let signer = Arc::new(StaticLateSigner { raw, calls: StdMutex::new(0) });
+        let provider = mocked_provider(asserter.clone());
+        let metrics = MetricsCollector::new(RunClock::new());
+        let mut sender =
+            Sender::new(vec![provider], SenderConfig { rate_limit: 0, max_concurrent: 1 }, metrics)
+                .with_late_signer(signer.clone());
+
+        sender
+            .send(GeneratedTx {
+                depends_on: Vec::new(),
+                phase: TxPhase::Workload,
+                id: Some("deferred".to_string()),
+                sender: None,
+                raw: Bytes::new(),
+                late_sign: Some(LateSignSpec {
+                    format: "test".to_string(),
+                    payload: serde_json::json!({}),
+                }),
+                submission_keys: vec![SchedulingKey::from([0x22; 20])],
+                inclusion_keys: Vec::new(),
+            })
+            .await
+            .unwrap();
+        sender.flush().await.unwrap();
+
+        assert_eq!(*signer.calls.lock().unwrap(), 1);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deadline_while_rate_limited_is_classified_before_send() {
+        let asserter = Asserter::new();
+        asserter.push_success(&TxHash::repeat_byte(0x42));
+        let submitter = RpcSubmitter::new(
+            vec![mocked_provider(asserter.clone())],
+            SenderConfig { rate_limit: 1, max_concurrent: 1 },
+        )
+        .unwrap();
+        let transaction = GeneratedTx {
+            depends_on: Vec::new(),
+            phase: TxPhase::Workload,
+            id: None,
+            sender: None,
+            raw: Bytes::from_static(&[0x02, 0xf8, 0x70]),
+            late_sign: None,
+            submission_keys: vec![SchedulingKey::from([0x11; 20])],
+            inclusion_keys: Vec::new(),
+        };
+
+        submitter.submit_classified(&transaction).await.unwrap();
+        let error = submitter
+            .submit_classified_until(
+                &transaction,
+                tokio::time::Instant::now() + Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), RpcSubmitFailureKind::BeforeSend);
+        assert!(error.is_timeout());
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rpc_ordering_serializes_shared_keys_and_allows_disjoint_keys() {
+        let ordering = Arc::new(RpcOrdering::default());
+        let shared = SchedulingKey::from([0x11; 20]);
+        let disjoint = SchedulingKey::from([0x22; 20]);
+
+        let mut first = ordering.clone().enqueue(vec![shared], Vec::new()).unwrap().acquire().await;
+        let second = ordering.clone().enqueue(vec![shared], Vec::new()).unwrap();
+        let disjoint_ticket = ordering.clone().enqueue(vec![disjoint], Vec::new()).unwrap();
+
+        let disjoint_ticket =
+            tokio::time::timeout(Duration::from_millis(50), disjoint_ticket.acquire())
+                .await
+                .expect("disjoint key should be dispatched");
+        let mut second_task = tokio::spawn(second.acquire());
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut second_task).await.is_err());
+
+        first.release_submission_keys();
+        let second = tokio::time::timeout(Duration::from_millis(50), second_task)
+            .await
+            .expect("shared key should be released")
+            .unwrap();
+        drop(second);
+        drop(disjoint_ticket);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_queued_order_unblocks_later_conflicts() {
+        let ordering = Arc::new(RpcOrdering::default());
+        let first_key = SchedulingKey::from([0x11; 20]);
+        let second_key = SchedulingKey::from([0x22; 20]);
+
+        let first = ordering.clone().enqueue(vec![first_key], Vec::new()).unwrap().acquire().await;
+        let blocked = ordering.clone().enqueue(vec![first_key, second_key], Vec::new()).unwrap();
+        let later = ordering.clone().enqueue(vec![second_key], Vec::new()).unwrap();
+
+        drop(blocked);
+        let later = tokio::time::timeout(Duration::from_millis(50), later.acquire())
+            .await
+            .expect("cancelled queue entry should not retain its keys");
+        drop(later);
+        drop(first);
     }
 
     #[test]
@@ -449,6 +2120,17 @@ mod tests {
         assert!(state.tokens > 8.0, "tokens: {}", state.tokens);
     }
 
+    #[tokio::test]
+    async fn test_rate_limiters_have_independent_token_buckets() {
+        let first = RateLimiter::new(1);
+        let second = RateLimiter::new(1);
+
+        assert_eq!(first.try_acquire_or_delay().await, None);
+        assert_eq!(second.try_acquire_or_delay().await, None);
+        assert!(first.try_acquire_or_delay().await.is_some());
+        assert!(second.try_acquire_or_delay().await.is_some());
+    }
+
     #[test]
     fn test_max_buffered_transactions_uses_existing_sender_knobs() {
         let config = SenderConfig { rate_limit: 10_000, max_concurrent: 100 };
@@ -458,5 +2140,15 @@ mod tests {
         let config = SenderConfig { rate_limit: 100_000, max_concurrent: 100 };
         let limiter = RateLimiter::new(config.rate_limit);
         assert_eq!(max_buffered_transactions(&config, Some(&limiter)), 2_000);
+    }
+
+    #[test]
+    fn authentication_headers_are_marked_sensitive_at_the_request_boundary() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-test-auth", "fixture-sensitive-value".parse().unwrap());
+
+        let headers = mark_headers_sensitive(headers);
+
+        assert!(!format!("{headers:?}").contains("fixture-sensitive-value"));
     }
 }
