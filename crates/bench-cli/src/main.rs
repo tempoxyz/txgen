@@ -18,6 +18,7 @@ use crate::{
 mod call;
 mod metrics_forwarder;
 mod metrics_url;
+mod preparation;
 mod send;
 mod send_blocks;
 mod view;
@@ -69,6 +70,25 @@ pub struct SendArgs {
     /// Keep the input running for warmup plus the desired measurement duration.
     #[arg(long, default_value = "0s", value_parser = humantime::parse_duration, conflicts_with = "metrics_align")]
     pub warmup: Duration,
+
+    /// Validator endpoint JSON: gate warmup on finalized self-proposals, then
+    /// drain all pools and wait for their Finish checkpoints before measurement.
+    /// Requires state masking to be disabled on validators.
+    #[arg(long, conflicts_with_all = ["warmup", "metrics_align"], requires = "duration")]
+    pub warmup_validators: Option<PathBuf>,
+
+    /// Maximum time for all validators to propose during warmup.
+    #[arg(long, default_value = "300s", value_parser = humantime::parse_duration)]
+    pub warmup_timeout: Duration,
+
+    /// Maximum time to flush submissions, empty pools and persist warmup blocks.
+    #[arg(long, default_value = "300s", value_parser = humantime::parse_duration)]
+    pub cooldown_timeout: Duration,
+
+    /// Measured workload duration, starting after preparation. Input must last
+    /// through this interval; outstanding submissions are flushed afterwards.
+    #[arg(long, value_parser = humantime::parse_duration)]
+    pub duration: Option<Duration>,
 
     /// Maximum transactions submitted per second (0 = unlimited).
     ///

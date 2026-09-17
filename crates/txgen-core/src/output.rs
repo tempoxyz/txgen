@@ -82,13 +82,14 @@ struct OutputTx<'a> {
 /// Writes generated transactions as newline-delimited JSON.
 pub struct NdjsonWriter<W: Write> {
     writer: W,
+    buffer: Vec<u8>,
     count: u64,
 }
 
 impl<W: Write> NdjsonWriter<W> {
     /// Create a new NDJSON writer.
     pub fn new(writer: W) -> Self {
-        Self { writer, count: 0 }
+        Self { writer, buffer: Vec::new(), count: 0 }
     }
 
     /// Write a generated transaction.
@@ -104,8 +105,12 @@ impl<W: Write> NdjsonWriter<W> {
             inclusion_keys: &tx.inclusion_keys,
         };
 
-        serde_json::to_writer(&mut self.writer, &out)?;
-        self.writer.write_all(b"\n")?;
+        // Keep I/O failures outside serde's formatter: a closing pipe may fail
+        // midway through serializing a hex value. Reuse the buffer per record.
+        self.buffer.clear();
+        serde_json::to_writer(&mut self.buffer, &out)?;
+        self.buffer.push(b'\n');
+        self.writer.write_all(&self.buffer)?;
         self.count += 1;
 
         Ok(())
@@ -176,6 +181,36 @@ mod tests {
             output.contains("\"inclusion_keys\":[\"0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\"]")
         );
         assert!(output.ends_with('\n'));
+    }
+
+    #[test]
+    fn closed_pipe_returns_io_error_without_counting_a_record() {
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = NdjsonWriter::new(Closed);
+        let tx = GeneratedTx {
+            depends_on: Vec::new(),
+            phase: TxPhase::Workload,
+            id: None,
+            raw: Bytes::from(vec![0x02; 1024]),
+            late_sign: None,
+            sender: Some(Address::ZERO),
+            submission_keys: Vec::new(),
+            inclusion_keys: Vec::new(),
+        };
+        let error = writer.write(&tx).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(writer.count(), 0);
     }
 
     #[test]
