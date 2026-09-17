@@ -24,6 +24,9 @@ use txgen_tempo::TempoLateSigner;
 const SETUP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
 pub async fn execute(args: SendArgs) -> Result<()> {
+    if args.duration.is_some_and(|duration| duration.is_zero()) {
+        bail!("--duration must be positive");
+    }
     let max_pending = args.pending_limit()?;
     tracing::info!(
         input = args.input.as_ref().map(|p| p.display().to_string()).as_deref().unwrap_or("stdin"),
@@ -158,13 +161,98 @@ async fn execute_source<S: TxSource>(
     )
     .await?;
 
+    // Keep one sender across warmup and measurement, including its pending work,
+    // nonce ordering, rate limiter and HTTP connection pool.
+    let warmup_metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
+    let mut sender = Sender::new_with_request_auth(
+        endpoints,
+        config.clone(),
+        warmup_metrics.clone(),
+        request_auth,
+    )
+    .with_receipt_tracker(receipt_tracker)
+    .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
+    if let Some(limit) = args.pending_limit()? {
+        sender = sender.with_max_pending(limit);
+    }
+    if let Some(late_signer) = late_signer {
+        sender = sender.with_late_signer(late_signer);
+    }
+    let mut start_block =
+        query_provider.get_block_number().await.wrap_err("failed to get starting block number")?;
+    let mut preparation_metadata = HashMap::new();
+    let first_workload = if let Some(path) = &args.warmup_validators {
+        let preparation = crate::preparation::Preparation::load(path)?;
+        let baseline = preparation.proposer_counts().await?;
+        let warmup_clock = RunClock::new();
+        let mut observers = tokio::task::JoinSet::new();
+        observers.spawn(async move {
+            let evidence = preparation.wait_for_proposers(baseline).await?;
+            Ok::<_, eyre::Report>((preparation, evidence))
+        });
+        let mut next = first_workload;
+        let (preparation, evidence) = tokio::time::timeout(args.warmup_timeout, async {
+            loop {
+                if let Some(result) = observers.try_join_next() {
+                    return result?;
+                }
+                let tx = match next.take() {
+                    Some(tx) => tx,
+                    None => source
+                        .next_tx()
+                        .await?
+                        .ok_or_else(|| eyre::eyre!("input ended during warmup"))?,
+                };
+                if tx.phase == TxPhase::Setup {
+                    bail!("setup transaction appeared during warmup");
+                }
+                sender.send(tx).await?;
+            }
+        })
+        .await
+        .wrap_err("proposer warmup timed out; see waiting validators above")??;
+        preparation_metadata
+            .insert("warmup_start_unix_ms".into(), warmup_clock.start_unix_ms().to_string());
+        preparation_metadata
+            .insert("warmup_secs".into(), warmup_clock.elapsed().as_secs_f64().to_string());
+        preparation_metadata.insert("proposer_coverage".into(), evidence.to_string());
+        let cooldown_clock = RunClock::new();
+        let evidence = tokio::time::timeout(args.cooldown_timeout, async {
+            sender.flush().await?;
+            preparation.cooldown().await
+        })
+        .await
+        .wrap_err("cooldown timed out; see validator pools and checkpoints above")??;
+        preparation_metadata
+            .insert("cooldown_start_unix_ms".into(), cooldown_clock.start_unix_ms().to_string());
+        preparation_metadata
+            .insert("cooldown_secs".into(), cooldown_clock.elapsed().as_secs_f64().to_string());
+        preparation_metadata.insert("cooldown_readiness".into(), evidence.to_string());
+        start_block = query_provider.get_block_number().await?;
+        None
+    } else {
+        warm_up(source, &mut sender, first_workload, args.warmup).await?
+    };
+
     let clock = if let Some(start) = args.metrics_align {
         RunClock::new_with_start_unix_ms(start)
     } else {
         RunClock::new()
     };
-    let store = SampleStore::with_labels(metadata.clone())?;
+    let measurement_deadline = args.duration.map(|d| tokio::time::Instant::now() + d);
     let metrics = MetricsCollector::new_with_latencies(clock.clone(), args.collect_latencies);
+    sender.set_metrics(metrics.clone());
+    let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
+    if let Some(collector) = &receipt_collector {
+        sender = sender.with_receipt_collector(collector.handle());
+    }
+    let mut metadata = metadata.clone();
+    if !args.warmup.is_zero() {
+        metadata.insert("warmup_secs".into(), args.warmup.as_secs_f64().to_string());
+    }
+    metadata.insert("measurement_start_unix_ms".into(), clock.start_unix_ms().to_string());
+    let metadata = &metadata;
+    let store = SampleStore::with_labels(metadata.clone())?;
     let metrics_forwarder =
         build_metrics_forwarder(args.metrics_forward.as_deref(), metadata, scraper_configs)?;
 
@@ -181,42 +269,33 @@ async fn execute_source<S: TxSource>(
         Vec::new()
     };
 
-    let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
-    let mut sender =
-        Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth)
-            .with_receipt_tracker(receipt_tracker)
-            .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
-    if let Some(limit) = args.pending_limit()? {
-        sender = sender.with_max_pending(limit);
-    }
-    if let Some(late_signer) = late_signer {
-        sender = sender.with_late_signer(late_signer);
-    }
-    if let Some(collector) = &receipt_collector {
-        sender = sender.with_receipt_collector(collector.handle());
-    }
-
     let clickhouse_metric_names = load_metric_names(args.clickhouse_metrics_file.as_ref())?;
     let mut reporters = parse_reporters(&args.reports, "send", metadata, clickhouse_metric_names)?;
     if reporters.is_empty() {
         reporters.push(Box::new(ConsoleReporter::stderr(true)));
     }
 
-    // Record the block number after setup and before workload sending so per-block
-    // stats exclude setup blocks.
-    let start_block =
-        query_provider.get_block_number().await.wrap_err("failed to get starting block number")?;
-
     if let Some(tx) = first_workload {
         send_workload_tx(tx, &mut sender, &metrics, &config, &mut reporters).await?;
     }
 
-    send_workload_from_source(source, &mut sender, &metrics, &config, &mut reporters).await?;
+    send_workload_from_source(
+        source,
+        &mut sender,
+        &metrics,
+        &config,
+        &mut reporters,
+        measurement_deadline,
+    )
+    .await?;
 
     sender.flush().await?;
     drop(sender);
 
     let (sent, success, failed) = metrics.counts();
+    if (!args.warmup.is_zero() || args.warmup_validators.is_some()) && sent == 0 {
+        bail!("input ended before any measured requests were dispatched");
+    }
     tracing::info!(sent, success, failed, "Bench send completed; starting post-processing");
 
     // Wait for the txpool to drain so all transactions are included in blocks
@@ -297,6 +376,8 @@ async fn execute_source<S: TxSource>(
         ..Default::default()
     };
 
+    report.metadata.extend(preparation_metadata);
+
     if end_block > start_block {
         let block_range_start = start_block + 1;
         let mut block_stats =
@@ -307,6 +388,10 @@ async fn execute_source<S: TxSource>(
             blocks = block_stats.len(),
             "Block stats collected"
         );
+
+        if !args.warmup.is_zero() {
+            block_stats.retain(|block| block.timestamp_ms >= clock.start_unix_ms());
+        }
 
         // Trim trailing empty blocks (system-only, gas_used == 0) that
         // accumulated during the txpool drain wait. Also trim metric
@@ -482,18 +567,70 @@ pub(crate) fn parse_metadata(args: &[String]) -> Result<HashMap<String, String>>
     Ok(map)
 }
 
+/// Consume warmup workload without flushing or replacing the sender. Requests already
+/// dispatched keep their warmup collector even if they complete during measurement.
+async fn warm_up<S: TxSource>(
+    source: &mut S,
+    sender: &mut Sender,
+    mut next: Option<GeneratedTx>,
+    duration: Duration,
+) -> Result<Option<GeneratedTx>> {
+    if duration.is_zero() {
+        return Ok(next);
+    }
+    let start = std::time::Instant::now();
+    tracing::info!(?duration, "Starting workload warmup");
+    while start.elapsed() < duration {
+        let tx = match next.take() {
+            Some(tx) => tx,
+            None => source.next_tx().await?.ok_or_else(|| {
+                eyre::eyre!("input ended during warmup; generate warmup plus measurement duration")
+            })?,
+        };
+        if tx.phase == TxPhase::Setup {
+            bail!("setup transaction appeared after workload started");
+        }
+        sender.send(tx).await?;
+    }
+    tracing::info!(elapsed = ?start.elapsed(), "Warmup complete; starting measurement");
+    Ok(None)
+}
+
 async fn send_workload_from_source<S: TxSource>(
     source: &mut S,
     sender: &mut Sender,
     metrics: &MetricsCollector,
     config: &SenderConfig,
     reporters: &mut [Box<dyn Reporter>],
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<()> {
-    while let Some(tx) = source.next_tx().await? {
+    loop {
+        let next = if let Some(deadline) = deadline {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            match tokio::time::timeout_at(deadline, source.next_tx()).await {
+                Ok(next) => next?,
+                Err(_) => break,
+            }
+        } else {
+            source.next_tx().await?
+        };
+        let Some(tx) = next else {
+            ensure_input_duration(deadline)?;
+            break;
+        };
         if tx.phase == TxPhase::Setup {
             bail!("setup transaction appeared after workload started");
         }
         send_workload_tx(tx, sender, metrics, config, reporters).await?;
+    }
+    Ok(())
+}
+
+fn ensure_input_duration(deadline: Option<tokio::time::Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() < deadline) {
+        bail!("input ended before the requested measurement duration");
     }
     Ok(())
 }
