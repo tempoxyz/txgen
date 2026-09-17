@@ -338,7 +338,7 @@ address_pools:
     range: [10, 20]
 "#;
         let spec = WorkloadSpec::parse(yaml).unwrap();
-        assert_eq!(spec.accounts["users"].mnemonic, "test test test");
+        assert_eq!(spec.accounts["users"].mnemonic.as_deref(), Some("test test test"));
         assert_eq!(spec.address_pools["recipients"].mnemonic.as_deref(), Some("test test test"));
         // SAFETY: Test cleanup
         unsafe {

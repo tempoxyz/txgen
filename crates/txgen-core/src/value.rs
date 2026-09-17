@@ -237,7 +237,7 @@ impl FromGenerator for Address {
         match generator {
             Generator::Pool { pool, select } => {
                 let signer = match select {
-                    SelectMode::Random => resolver.accounts.get_random(pool, resolver.rng)?,
+                    SelectMode::Random => resolver.accounts.select_random(pool, resolver.rng)?.1,
                     SelectMode::Index(idx) => resolver.accounts.get_by_index(pool, *idx)?,
                 };
                 Ok(signer.address())
@@ -337,7 +337,7 @@ impl FromGenerator for serde_yaml::Value {
             }
             Generator::Pool { pool, select } => {
                 let signer = match select {
-                    SelectMode::Random => resolver.accounts.get_random(pool, resolver.rng)?,
+                    SelectMode::Random => resolver.accounts.select_random(pool, resolver.rng)?.1,
                     SelectMode::Index(idx) => resolver.accounts.get_by_index(pool, *idx)?,
                 };
                 Ok(serde_yaml::Value::String(signer.address().to_string()))
@@ -459,6 +459,7 @@ uniform:
                 index: None,
                 range: None,
                 fast: None,
+                fast_signable: None,
             },
         )]))?;
         let mut rng = StdRng::seed_from_u64(42);

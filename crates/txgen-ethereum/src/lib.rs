@@ -129,9 +129,10 @@ mod tests {
         accounts_map.insert(
             "users".to_string(),
             AccountPoolDef {
-                mnemonic: TEST_MNEMONIC.to_string(),
+                mnemonic: Some(TEST_MNEMONIC.to_string()),
                 index: None,
                 range: Some([0, 10]),
+                fast_signable: None,
             },
         );
         let accounts = AccountManager::from_spec(&accounts_map).unwrap();

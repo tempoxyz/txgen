@@ -208,12 +208,12 @@ impl<'a> BuildContext<'a> {
     pub fn select_signer(&mut self, from: &AccountRef) -> Result<SelectedSigner> {
         match from.select {
             SelectMode::Random => {
-                let signer = self.accounts.get_random(&from.pool, self.rng)?;
-                let addr = signer.address();
-                let pool = self.accounts.get_pool(&from.pool)?;
-                // SAFETY: the signer came from this pool, so it must be present
-                let idx = pool.iter().position(|s| s.address() == addr).unwrap_or(0);
-                Ok(SelectedSigner { address: addr, pool: from.pool.clone(), index: idx })
+                let (idx, signer) = self.accounts.select_random(&from.pool, self.rng)?;
+                Ok(SelectedSigner {
+                    address: signer.address(),
+                    pool: from.pool.clone(),
+                    index: idx,
+                })
             }
             SelectMode::Index(idx) => {
                 let signer = self.accounts.get_by_index(&from.pool, idx)?;
@@ -265,9 +265,10 @@ mod tests {
     #[test]
     fn test_select_signer_by_index() {
         let pool_def = AccountPoolDef {
-            mnemonic: "test test test test test test test test test test test junk".into(),
+            mnemonic: Some("test test test test test test test test test test test junk".into()),
             index: None,
             range: Some([0, 3]),
+            fast_signable: None,
         };
         let accounts =
             AccountManager::from_spec(&HashMap::from([("default".to_string(), pool_def)])).unwrap();
@@ -290,9 +291,10 @@ mod tests {
     #[test]
     fn test_select_signer_random() {
         let pool_def = AccountPoolDef {
-            mnemonic: "test test test test test test test test test test test junk".into(),
+            mnemonic: Some("test test test test test test test test test test test junk".into()),
             index: None,
             range: Some([0, 3]),
+            fast_signable: None,
         };
         let accounts =
             AccountManager::from_spec(&HashMap::from([("default".to_string(), pool_def)])).unwrap();
