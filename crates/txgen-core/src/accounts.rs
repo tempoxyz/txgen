@@ -725,14 +725,22 @@ mod tests {
 }
 
 #[cfg(test)]
-mod fast_signable_probe {
+mod fast_signable_tests {
     use super::*;
+
     #[test]
-    fn print_first_addresses() {
-        let seed = keccak256("test test test test test test test test test test test junk".as_bytes());
-        for i in 0..3u64 {
-            let s = derive_fast_signable_signer(seed, i);
-            println!("idx {i}: {}", Signer::address(&s));
+    fn matches_tempo_state_bloat_derivation() {
+        let seed =
+            keccak256("test test test test test test test test test test test junk".as_bytes());
+        let expected = [
+            "0x15080067756Ccd1EFd4115E70B6c47709E8C4FD7",
+            "0x02738A984d839EC408Db40b8a37Ec2d6c7bCBF09",
+            "0xbA0310493D7270495F8A2F2d3B6f411633E1260D",
+        ];
+
+        for (index, expected) in expected.into_iter().enumerate() {
+            let signer = derive_fast_signable_signer(seed, index as u64);
+            assert_eq!(Signer::address(&signer), expected.parse::<Address>().unwrap());
         }
     }
 }
