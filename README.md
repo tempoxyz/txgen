@@ -1427,7 +1427,8 @@ Transactions are output as NDJSON with scheduling keys split by release policy:
 | Field | Description |
 |-------|-------------|
 | `phase` | `setup` or `workload`; missing phase is treated as `workload` by `bench` |
-| `id` | Optional diagnostic identifier |
+| `id` | Diagnostic identifier; required and unique for setup transactions |
+| `depends_on` | Setup transaction IDs whose successful receipts are required before submission; omitted/empty means no explicit prerequisites |
 | `raw` | RLP-encoded signed transaction (EIP-2718 envelope); empty when `late_sign` is present |
 | `late_sign` | Optional network-specific signing instructions for materializing `raw` at submission time |
 | `sender` | Logical on-chain transaction sender used for request-scoped authentication |
@@ -1780,19 +1781,50 @@ Use `setup.steps` for deterministic transactions that prepare the chain before t
 
 `bench send` treats the first workload transaction as a setup barrier: it requires all setup transactions to succeed, resets benchmark timing/metrics, and only then sends workload transactions. Use `bench send --skip-setup` to ignore setup transactions when the target chain is already prepared.
 
-Setup ordering is inferred automatically from consecutive emitted transactions.
-Transactions from the same sender on the same ordered nonce lane are submitted
-back-to-back without waiting for receipts. When the sender changes, the next
-transaction waits for the previous transaction's successful receipt. The same
-receipt barrier applies when a sender switches nonce lanes, uses expiring nonces,
-or has no ordering metadata. Expanded setup steps follow the same rule for each
-emitted transaction. No additional YAML fields are needed.
+**Breaking change:** setup no longer infers receipt barriers from sender or nonce-lane
+changes. Independent setup transactions submit concurrently, subject to TPS, RPC
+concurrency, and `--max-pending`. Transactions on the same ordered nonce lane still
+submit in nonce order, without waiting for receipts. Expiring nonces provide no
+implicit execution ordering.
+
+Declare real receipt dependencies with `depends_on`, referencing setup **step IDs**:
+
+```yaml
+setup:
+  steps:
+    - id: deploy_token
+      deploy: # existing deployment fields
+        # ...
+    - id: configure_token
+      depends_on: [deploy_token]
+      tx: # existing transaction fields
+        # ...
+```
+
+Every transaction emitted by a dependent step waits for **all** transactions from
+every prerequisite step to have successful receipts. Independent transactions,
+including transactions expanded from `keychain_authorize_pool`, do not wait for
+one another. A `setup.<id>.address` binding resolves an address; it does not create
+a receipt dependency. Add dependencies for deployment/configuration/funding that
+must be complete before another lane can submit or execute.
+
+Generation materializes and validates the complete setup before emitting it.
+`bench send` buffers the setup prefix and validates it before submitting any of it.
+Validation rejects missing or duplicate IDs, unknown dependencies, and cycles in
+the combined explicit-dependency and nonce/scheduling-key graph. Forward receipt
+references are supported when they do not contradict nonce order; forward value
+bindings remain unsupported. NDJSON `depends_on` contains concrete transaction IDs
+(e.g. `setup.authorize_users[0]`), expanded from the YAML step dependencies.
 
 A failed setup transaction cancels queued setup and prevents workload startup;
-already submitted transactions may still execute. Nonce ordering guarantees
-execution order, but senders must already have enough funds for transaction
-admission. This optimization applies to `generate | bench send`; `scenario run`
-continues to initialize setup serially.
+already submitted transactions may still execute. The final barrier requires
+every setup transaction to succeed, even when no other step depends on it.
+Nonce ordering guarantees execution order, but accounts must already meet node
+admission requirements, including funding and key authorization.
+
+This scheduling model applies to `generate | bench send`. `scenario run` keeps
+its existing just-in-time serial initialization; dependencies there must refer
+to earlier setup steps, and invalid or forward references fail before submission.
 
 For a timed workload with a long setup, run setup separately so pipe backpressure
 does not consume `generate --duration` or age short-lived workload signatures:

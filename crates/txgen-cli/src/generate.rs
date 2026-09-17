@@ -319,6 +319,7 @@ where
     let raw = Bytes::from(envelope.encoded_2718());
 
     Ok(GeneratedTx {
+        depends_on: Vec::new(),
         phase,
         id: Some(name),
         raw,
@@ -441,6 +442,7 @@ where
                 bail!("deferred signing is not supported for setup transactions");
             }
             GeneratedTx {
+                depends_on: Vec::new(),
                 phase,
                 id: Some(name),
                 raw: Bytes::new(),
@@ -490,23 +492,7 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    let mut encoded = Vec::new();
-    let bindings = {
-        let mut writer = NdjsonWriter::new(&mut encoded);
-        let bindings = emit_setup(adapter, spec, ctx, &mut writer)?;
-        writer.flush()?;
-        bindings
-    };
-    let transactions = std::str::from_utf8(&encoded)
-        .wrap_err("setup transaction stream was not UTF-8")?
-        .lines()
-        .map(|line| {
-            serde_json::from_str::<bench_core::SourceTx>(line)
-                .wrap_err("failed to parse materialized setup transaction")?
-                .into_generated_tx()
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(MaterializedSetup { transactions, bindings })
+    build_setup(adapter, spec, ctx)
 }
 
 /// Materialize setup transactions after asynchronously preparing adapter state.
@@ -540,6 +526,8 @@ where
     let Some(setup) = &spec.setup else {
         return Ok(MaterializedSetup { transactions, bindings });
     };
+
+    validate_setup_steps(&setup.steps, true)?;
 
     let mut output =
         OnlineSetupOutput { prepare_timeout, transactions: &mut transactions, submit: &mut submit };
@@ -1215,21 +1203,69 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
+    let setup = build_setup(adapter, spec, ctx)?;
+    for tx in &setup.transactions {
+        writer.write(tx)?;
+    }
+    Ok(setup.bindings)
+}
+
+/// Online scenarios intentionally materialize and confirm setup in list order.
+/// Reject forward receipt dependencies there instead of silently violating them.
+fn validate_setup_steps(steps: &[SetupStep], online: bool) -> Result<()> {
+    let mut ids = std::collections::HashMap::new();
+    for (index, step) in steps.iter().enumerate() {
+        if step.id.is_empty() || ids.insert(step.id.as_str(), index).is_some() {
+            bail!("setup step IDs must be nonempty and unique: '{}'", step.id);
+        }
+    }
+    for (index, step) in steps.iter().enumerate() {
+        for dependency in &step.depends_on {
+            let Some(&prior) = ids.get(dependency.as_str()) else {
+                bail!("setup step '{}' depends on unknown step '{dependency}'", step.id);
+            };
+            if prior == index {
+                bail!("setup dependency cycle: '{}' depends on itself", step.id);
+            }
+            if online && prior > index {
+                bail!("online scenario setup runs in list order: '{}' depends on later step '{dependency}'; put prerequisites first", step.id);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_setup<A: NetworkAdapter>(
+    adapter: &mut A,
+    spec: &WorkloadSpec,
+    ctx: &mut BuildContext<'_>,
+) -> Result<MaterializedSetup>
+where
+    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
+    <A::Network as Network>::TxEnvelope:
+        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
+{
     let mut bindings = std::collections::HashMap::new();
     bindings.insert("chain_id".to_string(), ResolvedBinding::U64(ctx.chain_id));
 
     let Some(setup) = &spec.setup else {
-        return Ok(bindings);
+        return Ok(MaterializedSetup { transactions: Vec::new(), bindings });
     };
 
+    validate_setup_steps(&setup.steps, false)?;
+    let mut encoded = Vec::new();
+    let mut writer = NdjsonWriter::new(&mut encoded);
+    let mut ranges = Vec::new();
     let started = Instant::now();
     let mut last_progress = started;
     let total_steps = setup.steps.len();
     eprintln!("starting setup generation: steps={total_steps}");
     for (idx, step) in setup.steps.iter().enumerate() {
-        emit_setup_step(adapter, step, &mut bindings, ctx, writer)
+        let start = writer.count() as usize;
+        emit_setup_step(adapter, step, &mut bindings, ctx, &mut writer)
             .wrap_err_with(|| format!("failed to emit setup step '{}'", step.id))?;
 
+        ranges.push(start..writer.count() as usize);
         if last_progress.elapsed() >= PROGRESS_LOG_INTERVAL {
             eprintln!(
                 "setup generation progress: completed_steps={} total_steps={total_steps} elapsed={:?}",
@@ -1241,7 +1277,35 @@ where
     }
     eprintln!("setup generation completed: steps={total_steps} elapsed={:?}", started.elapsed(),);
 
-    Ok(bindings)
+    writer.flush()?;
+    let encoded = writer.into_inner();
+    let mut transactions = std::str::from_utf8(encoded)?
+        .lines()
+        .map(|line| serde_json::from_str::<bench_core::SourceTx>(line)?.into_generated_tx())
+        .collect::<Result<Vec<_>>>()?;
+    let outputs: std::collections::HashMap<_, Vec<_>> = setup
+        .steps
+        .iter()
+        .zip(&ranges)
+        .map(|(step, range)| {
+            (
+                step.id.as_str(),
+                transactions[range.clone()]
+                    .iter()
+                    .map(|tx| tx.id.clone().expect("generated setup id"))
+                    .collect(),
+            )
+        })
+        .collect();
+    for (step, range) in setup.steps.iter().zip(ranges) {
+        let dependencies: Vec<_> =
+            step.depends_on.iter().flat_map(|id| outputs[id.as_str()].iter().cloned()).collect();
+        for tx in &mut transactions[range] {
+            tx.depends_on = dependencies.clone();
+        }
+    }
+    txgen_core::setup_submission_order(&transactions)?;
+    Ok(MaterializedSetup { transactions, bindings })
 }
 
 fn emit_setup_step<A: NetworkAdapter, W: Write>(
@@ -1600,6 +1664,7 @@ where
                 bail!("deferred signing is not supported for setup transactions");
             }
             Ok(GeneratedTx {
+                depends_on: Vec::new(),
                 phase,
                 id: Some(name),
                 raw: Bytes::new(),
@@ -2160,6 +2225,7 @@ mod tests {
             _inclusion_keys: Vec<SchedulingKey>,
         ) -> Result<GeneratedTx> {
             Ok(GeneratedTx {
+                depends_on: Vec::new(),
                 phase,
                 id: Some(name),
                 raw: Bytes::new(),

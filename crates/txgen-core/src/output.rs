@@ -31,6 +31,8 @@ pub struct LateSignSpec {
 /// A generated transaction ready for output.
 #[derive(Debug, Clone)]
 pub struct GeneratedTx {
+    /// Setup transaction IDs whose successful receipts are required before submission.
+    pub depends_on: Vec<String>,
     /// Stream phase for this transaction.
     pub phase: TxPhase,
     /// Optional human-readable transaction identifier for diagnostics.
@@ -63,6 +65,8 @@ pub struct GeneratedTx {
 /// JSON output format for NDJSON stream.
 #[derive(Serialize)]
 struct OutputTx<'a> {
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    depends_on: &'a [String],
     phase: TxPhase,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<&'a str>,
@@ -90,6 +94,7 @@ impl<W: Write> NdjsonWriter<W> {
     /// Write a generated transaction.
     pub fn write(&mut self, tx: &GeneratedTx) -> Result<()> {
         let out = OutputTx {
+            depends_on: &tx.depends_on,
             phase: tx.phase,
             id: tx.id.as_deref(),
             raw: &tx.raw,
@@ -147,6 +152,7 @@ mod tests {
         let mut writer = NdjsonWriter::new(&mut buf);
 
         let tx = GeneratedTx {
+            depends_on: Vec::new(),
             phase: TxPhase::Workload,
             id: None,
             raw: Bytes::from(vec![0x02, 0xf8, 0x70]),
@@ -178,6 +184,7 @@ mod tests {
         let mut writer = NdjsonWriter::new(&mut buf);
 
         let tx = GeneratedTx {
+            depends_on: Vec::new(),
             phase: TxPhase::Workload,
             id: None,
             raw: Bytes::from(vec![0x00]),
@@ -199,6 +206,7 @@ mod tests {
         let mut buf = Vec::new();
         let mut writer = NdjsonWriter::new(&mut buf);
         let tx = GeneratedTx {
+            depends_on: Vec::new(),
             phase: TxPhase::Workload,
             id: Some("deferred".to_string()),
             raw: Bytes::new(),

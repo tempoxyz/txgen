@@ -734,7 +734,7 @@ impl fmt::Debug for RpcEndpoint {
 /// Worker notifications for scheduling keys and setup prerequisites.
 enum Completion {
     Release(SchedulingKeys),
-    SetupFinished { queue_id: u64, id: Option<String>, success: bool },
+    SetupFinished { id: Option<String>, success: bool },
     PendingFinished { result: std::result::Result<(), String> },
 }
 
@@ -765,7 +765,6 @@ impl Drop for PendingCompletion {
 
 // Report every setup exit path, including task cancellation and pre-submission errors.
 struct SetupCompletion {
-    queue_id: u64,
     tx: mpsc::UnboundedSender<Completion>,
     id: Option<String>,
     success: bool,
@@ -773,24 +772,14 @@ struct SetupCompletion {
 
 impl Drop for SetupCompletion {
     fn drop(&mut self) {
-        let _ = self.tx.send(Completion::SetupFinished {
-            queue_id: self.queue_id,
-            id: self.id.take(),
-            success: self.success,
-        });
+        let _ =
+            self.tx.send(Completion::SetupFinished { id: self.id.take(), success: self.success });
     }
-}
-
-/// The immediately preceding setup transaction, used to infer receipt barriers.
-struct SetupPredecessor {
-    queue_id: u64,
-    sender: Option<Address>,
-    submission_keys: SchedulingKeys,
 }
 
 /// A transaction to be sent.
 struct PendingTx {
-    wait_for_setup: Option<u64>,
+    depends_on: Vec<String>,
     queue_id: u64,
     phase: TxPhase,
     id: Option<String>,
@@ -823,8 +812,8 @@ pub struct Sender {
     active_keys: HashSet<SchedulingKey>,
     completion_tx: mpsc::UnboundedSender<Completion>,
     completion_rx: mpsc::UnboundedReceiver<Completion>,
-    previous_setup: Option<SetupPredecessor>,
-    completed_setup: HashSet<u64>,
+    known_setup: HashSet<String>,
+    completed_setup: HashSet<String>,
     in_flight_setup: usize,
     setup_failure: Option<String>,
     /// Worker tasks for awaiting completion and reaping completed task state.
@@ -896,7 +885,7 @@ impl Sender {
             active_keys: HashSet::new(),
             completion_tx,
             completion_rx,
-            previous_setup: None,
+            known_setup: HashSet::new(),
             completed_setup: HashSet::new(),
             in_flight_setup: 0,
             setup_failure: None,
@@ -944,6 +933,24 @@ impl Sender {
         self
     }
 
+    /// Validate the full setup graph before sending any transaction. Ordering
+    /// the batch first also prevents forward dependencies from deadlocking the
+    /// bounded submission buffer. Independent lanes still dispatch concurrently.
+    pub async fn send_setup(&mut self, transactions: Vec<GeneratedTx>) -> Result<()> {
+        let order = txgen_core::setup_submission_order(&transactions)?;
+        for tx in &transactions {
+            let id = tx.id.as_ref().expect("validated setup id");
+            if self.known_setup.contains(id) {
+                eyre::bail!("duplicate setup transaction id '{id}'");
+            }
+        }
+        let mut transactions: Vec<_> = transactions.into_iter().map(Some).collect();
+        for index in order {
+            self.send(transactions[index].take().expect("unique setup index")).await?;
+        }
+        Ok(())
+    }
+
     /// Send a transaction.
     ///
     /// This respects scheduling key ordering: transactions that share any key
@@ -967,7 +974,16 @@ impl Sender {
             .next_queue_id
             .checked_add(1)
             .ok_or_else(|| eyre::eyre!("sender transaction queue identity overflowed"))?;
-        let GeneratedTx { phase, id, raw, late_sign, sender, submission_keys, inclusion_keys } = tx;
+        let GeneratedTx {
+            phase,
+            id,
+            raw,
+            late_sign,
+            sender,
+            submission_keys,
+            inclusion_keys,
+            depends_on,
+        } = tx;
         if let Some(spec) = &late_sign &&
             self.late_signer.is_none()
         {
@@ -978,31 +994,25 @@ impl Sender {
         }
         let (submission_keys, inclusion_keys) =
             normalize_key_sets(submission_keys, inclusion_keys)?;
-        let wait_for_setup = if phase == TxPhase::Setup {
-            let predecessor = self
-                .previous_setup
-                .as_ref()
-                .filter(|previous| {
-                    // Only the same sender on the same ordered nonce lane can
-                    // pipeline safely. Expiring nonces have distinct keys; missing
-                    // sender/lane metadata is conservatively treated as a barrier.
-                    !(sender.is_some() &&
-                        sender == previous.sender &&
-                        submission_keys.len() == 1 &&
-                        submission_keys == previous.submission_keys)
-                })
-                .map(|previous| previous.queue_id);
-            self.previous_setup = Some(SetupPredecessor {
-                queue_id,
-                sender,
-                submission_keys: submission_keys.clone(),
-            });
-            predecessor
-        } else {
-            None
-        };
+        if phase == TxPhase::Setup {
+            let name = id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| eyre::eyre!("setup transaction requires a nonempty id"))?;
+            if self.known_setup.contains(name) {
+                eyre::bail!("duplicate setup transaction id '{name}'");
+            }
+            for dependency in &depends_on {
+                if !self.known_setup.contains(dependency) {
+                    eyre::bail!("setup transaction '{name}' depends on unknown or unqueued transaction '{dependency}'; use send_setup for forward dependencies");
+                }
+            }
+            self.known_setup.insert(name.to_string());
+        } else if !depends_on.is_empty() {
+            eyre::bail!("depends_on is only supported for setup transactions");
+        }
         self.pending.push_back(PendingTx {
-            wait_for_setup,
+            depends_on,
             queue_id,
             phase,
             id,
@@ -1104,10 +1114,10 @@ impl Sender {
                     self.pending_failure.get_or_insert(error);
                 }
             }
-            Completion::SetupFinished { queue_id, id, success } => {
+            Completion::SetupFinished { id, success } => {
                 self.in_flight_setup -= 1;
                 if success {
-                    self.completed_setup.insert(queue_id);
+                    self.completed_setup.insert(id.expect("setup transaction has an id"));
                 } else {
                     self.setup_failure.get_or_insert_with(|| {
                         format!(
@@ -1222,7 +1232,7 @@ impl Sender {
 
         for (index, pending) in self.pending.iter().enumerate() {
             let is_blocked = pending.scheduling_keys().any(|key| blocked_keys.contains(key)) ||
-                pending.wait_for_setup.is_some_and(|id| !self.completed_setup.contains(&id));
+                pending.depends_on.iter().any(|id| !self.completed_setup.contains(id));
 
             if is_blocked {
                 for key in pending.scheduling_keys() {
@@ -1284,7 +1294,6 @@ impl Sender {
         let setup_completion = if pending.phase == TxPhase::Setup {
             self.in_flight_setup += 1;
             Some(SetupCompletion {
-                queue_id: pending.queue_id,
                 tx: completion_tx.clone(),
                 id: pending.id.clone(),
                 success: false,
@@ -1717,6 +1726,7 @@ mod tests {
         for key in 1..=2 {
             sender
                 .send(GeneratedTx {
+                    depends_on: Vec::new(),
                     phase: TxPhase::Workload,
                     id: None,
                     raw: raw.clone(),
@@ -1741,6 +1751,7 @@ mod tests {
                 .with_max_pending(1.try_into().unwrap());
         sender
             .send(GeneratedTx {
+                depends_on: Vec::new(),
                 phase: TxPhase::Workload,
                 id: None,
                 raw: Bytes::from_static(&[2]),
@@ -1834,6 +1845,7 @@ mod tests {
 
         sender
             .send(GeneratedTx {
+                depends_on: Vec::new(),
                 phase: TxPhase::Workload,
                 id: Some("transfer".to_string()),
                 sender: Some(Address::repeat_byte(0x55)),
@@ -1951,6 +1963,7 @@ mod tests {
 
         let submission = submitter
             .submit(&GeneratedTx {
+                depends_on: Vec::new(),
                 phase: TxPhase::Workload,
                 id: Some("deferred".to_string()),
                 sender: None,
@@ -1985,6 +1998,7 @@ mod tests {
 
         sender
             .send(GeneratedTx {
+                depends_on: Vec::new(),
                 phase: TxPhase::Workload,
                 id: Some("deferred".to_string()),
                 sender: None,
@@ -2014,6 +2028,7 @@ mod tests {
         )
         .unwrap();
         let transaction = GeneratedTx {
+            depends_on: Vec::new(),
             phase: TxPhase::Workload,
             id: None,
             sender: None,
