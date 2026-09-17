@@ -24,6 +24,9 @@
 //! | `PROMETHEUS_ENCODE_WORKERS`   | Parallel final-report encode workers (default: up to 8) |
 //! | `PROMETHEUS_TIMEOUT_SECS`     | Per-request timeout in seconds (default: 60)         |
 //! | `PROMETHEUS_QUEUE_SIZE`       | Real-time forwarder queue size (default: 16 batches) |
+//!
+//! Sample batches are also split to keep each uncompressed protobuf request at
+//! most 8 MiB. A single sample exceeding that limit is rejected locally.
 
 use crate::{reporter::FinalReport, sample::Sample, Reporter};
 use eyre::{bail, eyre, Context, Result};
@@ -31,12 +34,16 @@ use prometheus_remote_write::{
     Label, Sample as PromSample, TimeSeries, WriteRequest, CONTENT_TYPE,
     HEADER_NAME_REMOTE_WRITE_VERSION, LABEL_NAME, REMOTE_WRITE_VERSION_01,
 };
+use prost::Message as _;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use std::{collections::BTreeMap, time::Duration};
 use tokio::{sync::mpsc, task::JoinSet};
 
 /// Default samples per ingestion request.
 const DEFAULT_BATCH_SIZE: usize = 50_000;
+/// Bound the uncompressed protobuf, not the much smaller snappy body. Leave
+/// headroom below the benchmark receiver's 32 MiB remote-write request limit.
+const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum default number of CPU workers used to prepare final-report batches.
 const MAX_DEFAULT_ENCODE_WORKERS: usize = 8;
 /// Default per-request HTTP timeout.
@@ -168,59 +175,62 @@ impl PrometheusReporter {
         Ok(h)
     }
 
-    /// Send a single batch of samples as a snappy-compressed protobuf WriteRequest.
-    async fn send_batch_async(&self, batch: &[Sample], batch_idx: usize) -> Result<()> {
+    /// Send size-bounded requests for a sample batch, returning the request count.
+    async fn send_batch_async(&self, batch: &[Sample], batch_idx: usize) -> Result<usize> {
         if batch.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let prepared = prepare_batch(batch, batch_idx)?;
         self.send_prepared_batch_async(prepared).await
     }
 
-    /// Send an already encoded remote-write request.
-    async fn send_prepared_batch_async(&self, prepared: PreparedBatch) -> Result<()> {
-        let PreparedBatch { idx, samples, timeseries, body } = prepared;
-        let body_len = body.len();
+    /// Send already encoded requests in order, returning the request count.
+    async fn send_prepared_batch_async(&self, prepared: PreparedBatch) -> Result<usize> {
+        let PreparedBatch { idx, samples, bodies } = prepared;
+        let requests = bodies.len();
+        for (part, body) in bodies.into_iter().enumerate() {
+            let body_len = body.len();
 
-        tracing::info!(
-            batch = idx,
-            samples,
-            timeseries,
-            body_bytes = body_len,
-            url = %self.import_url,
-            "Sending remote write batch"
-        );
+            tracing::info!(
+                batch = idx,
+                batch_samples = samples,
+                part,
+                body_bytes = body_len,
+                url = %self.import_url,
+                "Sending remote write batch"
+            );
 
-        let headers = self.headers()?;
-        let mut req = self.client.post(&self.import_url).headers(headers).body(body);
-        if let Some((user, password)) = &self.config.basic_auth {
-            req = req.basic_auth(user, Some(password));
-        }
+            let headers = self.headers()?;
+            let mut req = self.client.post(&self.import_url).headers(headers).body(body);
+            if let Some((user, password)) = &self.config.basic_auth {
+                req = req.basic_auth(user, Some(password));
+            }
 
-        let resp = req.send().await.wrap_err("failed to POST remote write")?;
+            let resp = req.send().await.wrap_err("failed to POST remote write")?;
 
-        let status = resp.status();
-        let resp_body = resp.text().await.unwrap_or_else(|_| "<no body>".to_string());
+            let status = resp.status();
+            let resp_body = resp.text().await.unwrap_or_else(|_| "<no body>".to_string());
 
-        if !status.is_success() {
-            tracing::error!(
+            if !status.is_success() {
+                tracing::error!(
+                    batch = idx,
+                    %status,
+                    body = %resp_body,
+                    url = %self.import_url,
+                    "Remote write batch failed"
+                );
+                bail!("remote write failed (HTTP {status}): {resp_body}");
+            }
+
+            tracing::info!(
                 batch = idx,
                 %status,
                 body = %resp_body,
-                url = %self.import_url,
-                "Remote write batch failed"
+                "Remote write batch accepted"
             );
-            bail!("remote write failed (HTTP {status}): {resp_body}");
         }
-
-        tracing::info!(
-            batch = idx,
-            %status,
-            body = %resp_body,
-            "Remote write batch accepted"
-        );
-        Ok(())
+        Ok(requests)
     }
 
     /// Push final-report samples with parallel encode/compress workers and ordered upload.
@@ -395,8 +405,7 @@ async fn run_forwarder(
 
     while let Some(samples) = rx.recv().await {
         for chunk in samples.chunks(writer.config.batch_size) {
-            writer.send_batch_async(chunk, batch_idx).await?;
-            summary.batches += 1;
+            summary.batches += writer.send_batch_async(chunk, batch_idx).await?;
             summary.samples += chunk.len();
             batch_idx += 1;
         }
@@ -428,8 +437,7 @@ fn default_encode_workers() -> usize {
 struct PreparedBatch {
     idx: usize,
     samples: usize,
-    timeseries: usize,
-    body: Vec<u8>,
+    bodies: Vec<Vec<u8>>,
 }
 
 fn prepare_owned_batch(batch: Vec<Sample>, idx: usize) -> Result<PreparedBatch> {
@@ -437,11 +445,33 @@ fn prepare_owned_batch(batch: Vec<Sample>, idx: usize) -> Result<PreparedBatch> 
 }
 
 fn prepare_batch(batch: &[Sample], idx: usize) -> Result<PreparedBatch> {
-    let write_req = build_write_request(batch);
-    let timeseries = write_req.timeseries.len();
-    let body = write_req.encode_compressed().context("snappy compression failed")?;
+    let mut bodies = Vec::new();
+    encode_bounded_requests(batch, MAX_REQUEST_BYTES, &mut bodies)?;
+    Ok(PreparedBatch { idx, samples: batch.len(), bodies })
+}
 
-    Ok(PreparedBatch { idx, samples: batch.len(), timeseries, body })
+/// Split before sending, so an oversized request never reaches the endpoint and
+/// no accepted request needs to be retried. Keep sample chunks in input order.
+fn encode_bounded_requests(
+    batch: &[Sample],
+    max_bytes: usize,
+    bodies: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    let write_req = build_write_request(batch);
+    let bytes = write_req.encoded_len();
+    if bytes > max_bytes {
+        if batch.len() <= 1 {
+            bail!("remote write sample exceeds uncompressed request limit: {bytes} > {max_bytes} bytes");
+        }
+        drop(write_req);
+        let (left, right) = batch.split_at(batch.len() / 2);
+        encode_bounded_requests(left, max_bytes, bodies)?;
+        encode_bounded_requests(right, max_bytes, bodies)?;
+    } else if !write_req.timeseries.is_empty() {
+        bodies.push(write_req.encode_compressed().context("snappy compression failed")?);
+    }
+
+    Ok(())
 }
 
 /// Build a [`WriteRequest`] from a batch of [`Sample`]s.
@@ -542,7 +572,6 @@ fn sanitize_label_name(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::{FinalReport, SampleStore};
-    use prost::Message as _;
     use std::io::{Read, Write};
 
     fn sample(name: &str, value: f64, labels: &[(&str, &str)]) -> Sample {
@@ -622,6 +651,49 @@ mod tests {
     }
 
     #[test]
+    fn bounded_requests_preserve_labels_samples_and_order() {
+        let samples: Vec<_> = (0..5)
+            .map(|i| Sample {
+                unix_ms: 1_700_000_000_000 + i,
+                ..sample("metric", i as f64, &[("large_label", &"x".repeat(200))])
+            })
+            .collect();
+        let limit = samples
+            .iter()
+            .map(|sample| build_write_request(std::slice::from_ref(sample)).encoded_len())
+            .max()
+            .unwrap();
+        let mut bodies = Vec::new();
+        encode_bounded_requests(&samples, limit, &mut bodies).unwrap();
+        assert_eq!(bodies.len(), samples.len());
+        for (body, original) in bodies.iter().zip(&samples) {
+            let protobuf = snap::raw::Decoder::new().decompress_vec(body).unwrap();
+            assert!(protobuf.len() <= limit);
+            assert_eq!(
+                WriteRequest::decode(protobuf.as_slice()).unwrap(),
+                build_write_request(std::slice::from_ref(original))
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_single_sample_is_rejected_before_upload() {
+        let samples = [sample("metric", 1.0, &[("large_label", &"x".repeat(200))])];
+        let limit = build_write_request(&samples).encoded_len() - 1;
+        let mut bodies = Vec::new();
+        let error = encode_bounded_requests(&samples, limit, &mut bodies).unwrap_err();
+        assert!(error.to_string().contains("sample exceeds uncompressed request limit"));
+        assert!(bodies.is_empty());
+    }
+
+    #[test]
+    fn empty_or_filtered_batch_emits_no_requests() {
+        for samples in [vec![], vec![sample("invalid-name", 1.0, &[])]] {
+            assert!(prepare_batch(&samples, 0).unwrap().bodies.is_empty());
+        }
+    }
+
+    #[test]
     fn sanitize_label_name_basic() {
         assert_eq!(sanitize_label_name("git-sha"), "git_sha");
         assert_eq!(sanitize_label_name("scenario"), "scenario");
@@ -644,7 +716,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn forwarder_uploads_enqueued_samples_in_batches() {
+    async fn forwarder_splits_oversized_enqueued_batch() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
@@ -663,13 +735,17 @@ mod tests {
 
         let mut cfg =
             PrometheusConfig::from_metadata(&base_url, &std::collections::HashMap::new()).unwrap();
-        cfg.batch_size = 1;
+        cfg.batch_size = 2;
         cfg.timeout = Duration::from_secs(5);
 
         let forwarder = PrometheusForwarder::spawn(cfg).unwrap();
         let handle = forwarder.handle();
+        let label = "x".repeat(MAX_REQUEST_BYTES / 2);
         handle
-            .push_batch(vec![sample("metric_a", 1.0, &[]), sample("metric_b", 2.0, &[])])
+            .push_batch(vec![
+                sample("metric_a", 1.0, &[("large_label", &label)]),
+                sample("metric_b", 2.0, &[("large_label", &label)]),
+            ])
             .await
             .unwrap();
         drop(handle);
@@ -682,7 +758,8 @@ mod tests {
 
         assert_eq!(summary, PrometheusForwarderSummary { batches: 2, samples: 2 });
         assert_eq!(bodies.len(), 2);
-        assert!(bodies.iter().all(|body| !body.is_empty()));
+        assert_eq!(remote_write_metric_name(&bodies[0]), "metric_a");
+        assert_eq!(remote_write_metric_name(&bodies[1]), "metric_b");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -705,10 +782,11 @@ mod tests {
         });
 
         let store = SampleStore::new().unwrap();
+        let label = "x".repeat(MAX_REQUEST_BYTES / 2);
         store
             .push_batch(vec![
-                sample("metric_0", 0.0, &[]),
-                sample("metric_1", 1.0, &[]),
+                sample("metric_0", 0.0, &[("large_label", &label)]),
+                sample("metric_1", 1.0, &[("large_label", &label)]),
                 sample("metric_2", 2.0, &[]),
             ])
             .await
@@ -716,7 +794,7 @@ mod tests {
 
         let mut cfg =
             PrometheusConfig::from_metadata(&base_url, &std::collections::HashMap::new()).unwrap();
-        cfg.batch_size = 1;
+        cfg.batch_size = 2;
         cfg.encode_workers = 2;
         cfg.timeout = Duration::from_secs(5);
 
@@ -760,6 +838,7 @@ mod tests {
 
     fn remote_write_metric_name(body: &[u8]) -> String {
         let decompressed = snap::raw::Decoder::new().decompress_vec(body).unwrap();
+        assert!(decompressed.len() <= MAX_REQUEST_BYTES);
         let request = WriteRequest::decode(decompressed.as_slice()).unwrap();
         assert_eq!(request.timeseries.len(), 1);
         request.timeseries[0]

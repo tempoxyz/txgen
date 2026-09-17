@@ -23,14 +23,18 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@1d24cba4cc91d718c9dada1c397baf11dc188fc1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@6f436eb3a168279692739e8c0c9fdb52b94bfae7
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@6f436eb3a168279692739e8c0c9fdb52b94bfae7
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@1d24cba4cc91d718c9dada1c397baf11dc188fc1
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@1d24cba4cc91d718c9dada1c397baf11dc188fc1
       - run: cargo test --workspace
 
   decode-tx:
@@ -39,6 +43,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      id-token: write
     strategy:
       matrix:
         include:
@@ -49,14 +54,17 @@ jobs:
             bin: txgen-tempo
             spec: tests/specs/tempo-all-types.yaml
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Secure runner
+        uses: tempoxyz/gh-actions/actions/secure-runner@1d24cba4cc91d718c9dada1c397baf11dc188fc1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@6f436eb3a168279692739e8c0c9fdb52b94bfae7
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@6f436eb3a168279692739e8c0c9fdb52b94bfae7
-      - uses: tempoxyz/gh-actions/actions/setup-foundry@487be2d19b0ba9ae1903143016444ab752c3e939
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@1d24cba4cc91d718c9dada1c397baf11dc188fc1
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@1d24cba4cc91d718c9dada1c397baf11dc188fc1
+      - uses: tempoxyz/gh-actions/actions/setup-foundry@1d24cba4cc91d718c9dada1c397baf11dc188fc1
         with:
           version: nightly
       - name: Generate and decode transactions
