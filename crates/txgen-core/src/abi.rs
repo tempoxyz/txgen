@@ -825,7 +825,9 @@ tag: "0x33333333333333333333333333333333"
                 mnemonic: None,
                 index: None,
                 range: None,
-                fast: None, fast_signable: None },
+                fast: None,
+                fast_signable: None,
+            },
         )]))?;
         let mut rng = rand::rng();
         let mut resolver =

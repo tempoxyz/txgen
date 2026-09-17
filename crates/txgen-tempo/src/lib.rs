@@ -1083,9 +1083,10 @@ fn derive_inline_access_signer(
                 eyre::eyre!("inline key_authorization access-key index overflowed")
             })?;
             derive_mnemonic_signer(
-                source.mnemonic.as_deref().ok_or_else(|| {
-                    eyre::eyre!("inline access_key pool requires a mnemonic")
-                })?,
+                source
+                    .mnemonic
+                    .as_deref()
+                    .ok_or_else(|| eyre::eyre!("inline access_key pool requires a mnemonic"))?,
                 index,
             )
         }
@@ -1327,9 +1328,10 @@ mod tests {
         accounts_map.insert(
             "users".to_string(),
             AccountPoolDef {
-                mnemonic: TEST_MNEMONIC.to_string(),
+                mnemonic: Some(TEST_MNEMONIC.to_string()),
                 index: None,
                 range: Some([0, 10]),
+                fast_signable: None,
             },
         );
         AccountManager::from_spec(&accounts_map).unwrap()

@@ -109,9 +109,9 @@ impl AccountManager {
     pub fn get_pool(&self, name: &str) -> Result<&[EcdsaSigner]> {
         match self.pool(name)? {
             SignerPool::Eager(v) => Ok(v.as_slice()),
-            SignerPool::FastSignable(_) => {
-                bail!("account pool '{name}' is lazily derived; enumerating it is not supported")
-            }
+            SignerPool::FastSignable(_) => Err(eyre::eyre!(
+                "account pool '{name}' is lazily derived; enumerating it is not supported"
+            )),
         }
     }
 
@@ -340,7 +340,9 @@ impl AccountPoolDef {
                     len,
                 }))
             }
-            _ => bail!("account pool must set exactly one of 'mnemonic' or 'fast_signable'"),
+            _ => Err(eyre::eyre!(
+                "account pool must set exactly one of 'mnemonic' or 'fast_signable'"
+            )),
         }
     }
 }
@@ -588,8 +590,12 @@ mod tests {
 
     #[test]
     fn test_derive_single_signer() {
-        let def =
-            AccountPoolDef { mnemonic: Some(TEST_MNEMONIC.to_string()), index: Some(0), range: None, fast_signable: None };
+        let def = AccountPoolDef {
+            mnemonic: Some(TEST_MNEMONIC.to_string()),
+            index: Some(0),
+            range: None,
+            fast_signable: None,
+        };
         let signers = def.derive_signers().unwrap();
         assert_eq!(signers.len(), 1);
     }
@@ -599,7 +605,9 @@ mod tests {
         let def = AccountPoolDef {
             mnemonic: Some(TEST_MNEMONIC.to_string()),
             index: None,
-            range: Some([0, 10]), fast_signable: None };
+            range: Some([0, 10]),
+            fast_signable: None,
+        };
         let signers = def.derive_signers().unwrap();
         assert_eq!(signers.len(), 10);
 
@@ -618,7 +626,9 @@ mod tests {
             AccountPoolDef {
                 mnemonic: Some(TEST_MNEMONIC.to_string()),
                 index: None,
-                range: Some([0, 5]), fast_signable: None },
+                range: Some([0, 5]),
+                fast_signable: None,
+            },
         );
         let manager = AccountManager::from_spec(&accounts).unwrap();
 
@@ -634,14 +644,21 @@ mod tests {
             mnemonic: Some(TEST_MNEMONIC.to_string()),
             index: None,
             range: Some([0, 3]),
-            fast: None, fast_signable: None };
+            fast: None,
+            fast_signable: None,
+        };
 
         let addresses = def.derive_addresses()?;
         assert_eq!(addresses.len(), 3);
         assert_eq!(
             addresses[0],
-            AccountPoolDef { mnemonic: Some(TEST_MNEMONIC.to_string()), index: Some(0), range: None, fast_signable: None }
-                .derive_signers()?[0]
+            AccountPoolDef {
+                mnemonic: Some(TEST_MNEMONIC.to_string()),
+                index: Some(0),
+                range: None,
+                fast_signable: None
+            }
+            .derive_signers()?[0]
                 .address()
         );
 
@@ -660,7 +677,9 @@ mod tests {
                 mnemonic: None,
                 index: None,
                 range: None,
-                fast: None, fast_signable: None },
+                fast: None,
+                fast_signable: None,
+            },
         );
 
         let manager = AddressPoolManager::from_spec(&defs)?;
@@ -680,7 +699,9 @@ mod tests {
                 mnemonic: Some(TEST_MNEMONIC.to_string()),
                 index: None,
                 range: Some([0, 1_000_000]),
-                fast: None, fast_signable: None },
+                fast: None,
+                fast_signable: None,
+            },
         );
 
         let manager = AddressPoolManager::from_spec(&defs)?;
@@ -688,7 +709,9 @@ mod tests {
         let expected = AccountPoolDef {
             mnemonic: Some(TEST_MNEMONIC.to_string()),
             index: Some(999_999),
-            range: None, fast_signable: None }
+            range: None,
+            fast_signable: None,
+        }
         .derive_signers()?[0]
             .address();
 

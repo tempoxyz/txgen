@@ -638,9 +638,10 @@ mod tests {
 
     fn test_signers(start: u32, end: u32) -> Vec<EcdsaSigner> {
         AccountPoolDef {
-            mnemonic: TEST_MNEMONIC.to_string(),
+            mnemonic: Some(TEST_MNEMONIC.to_string()),
             index: None,
             range: Some([start, end]),
+            fast_signable: None,
         }
         .derive_signers()
         .unwrap()

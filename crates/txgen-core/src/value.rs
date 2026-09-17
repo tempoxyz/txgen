@@ -458,7 +458,9 @@ uniform:
                 mnemonic: None,
                 index: None,
                 range: None,
-                fast: None, fast_signable: None },
+                fast: None,
+                fast_signable: None,
+            },
         )]))?;
         let mut rng = StdRng::seed_from_u64(42);
         let mut resolver =

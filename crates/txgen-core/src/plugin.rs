@@ -267,7 +267,9 @@ mod tests {
         let pool_def = AccountPoolDef {
             mnemonic: Some("test test test test test test test test test test test junk".into()),
             index: None,
-            range: Some([0, 3]), fast_signable: None };
+            range: Some([0, 3]),
+            fast_signable: None,
+        };
         let accounts =
             AccountManager::from_spec(&HashMap::from([("default".to_string(), pool_def)])).unwrap();
         let gas = GasConfig::default();
@@ -291,7 +293,9 @@ mod tests {
         let pool_def = AccountPoolDef {
             mnemonic: Some("test test test test test test test test test test test junk".into()),
             index: None,
-            range: Some([0, 3]), fast_signable: None };
+            range: Some([0, 3]),
+            fast_signable: None,
+        };
         let accounts =
             AccountManager::from_spec(&HashMap::from([("default".to_string(), pool_def)])).unwrap();
         let gas = GasConfig::default();
