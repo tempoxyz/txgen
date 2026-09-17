@@ -344,6 +344,13 @@ txgen-ethereum extract-big-blocks \
 
 #### `bench send`
 
+Use `--warmup 40s` to send the same workload before measurement, preserving the
+sender's connections and scheduling state. Generate **warmup + measurement** time:
+`txgen-tempo generate -s workload.yaml --duration 130s | bench send --warmup 40s`.
+Warmup requests (including their late replies) are excluded from transaction
+statistics. Metric scraping and report time start after warmup; chain statistics
+exclude blocks timestamped before that boundary. Warmup defaults to zero.
+
 Send pre-generated transactions from NDJSON file or stdin.
 
 After sending completes, queries the node for per-block statistics (transaction count, gas used) and includes them in the report.

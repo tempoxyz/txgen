@@ -65,6 +65,11 @@ pub struct SendArgs {
     #[arg(long, default_value = "1s", value_parser = humantime::parse_duration)]
     pub sender_header_reload_interval: Duration,
 
+    /// Send workload for this long before collecting benchmark results.
+    /// Keep the input running for warmup plus the desired measurement duration.
+    #[arg(long, default_value = "0s", value_parser = humantime::parse_duration, conflicts_with = "metrics_align")]
+    pub warmup: Duration,
+
     /// Maximum transactions submitted per second (0 = unlimited).
     ///
     /// Controls throughput via a token bucket. Provides backpressure to the

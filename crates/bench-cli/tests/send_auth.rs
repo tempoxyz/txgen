@@ -216,3 +216,56 @@ fn query_rpc_is_separate_and_credentials_are_redacted_from_outputs() {
     assert!(query_requests.iter().all(|request| request.method == "eth_blockNumber"));
     assert!(query_requests.iter().all(|request| request.auth.is_none()));
 }
+
+#[test]
+fn warmup_excludes_early_requests_from_report() {
+    let submission = MockServer::start(ServerKind::Submission);
+    let query = MockServer::start(ServerKind::Query);
+    let temp = tempfile::tempdir().unwrap();
+    let report = temp.path().join("report.json");
+    let tx = json!({"phase":"workload", "raw":"0x01", "sender":SENDER,
+        "submission_keys":[SENDER], "inclusion_keys":[]});
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bench"))
+        .args([
+            "send",
+            "--rpc-url",
+            &submission.url,
+            "--query-rpc-url",
+            &query.url,
+            "--tps",
+            "5",
+            "--max-concurrent",
+            "1",
+            "--max-pending",
+            "0",
+            "--warmup",
+            "100ms",
+            "--retries",
+            "0",
+            "--drain-timeout",
+            "0",
+            "--report",
+            &format!("json:{}", report.display()),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let producer = thread::spawn(move || {
+        for _ in 0..5 {
+            writeln!(input, "{tx}").unwrap();
+            thread::sleep(Duration::from_millis(80));
+        }
+    });
+    let output = child.wait_with_output().unwrap();
+    producer.join().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let report: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+    let sent = report["sent"].as_u64().unwrap();
+    assert_eq!(submission.requests().len(), 5);
+    assert!(sent > 0 && sent < 5, "warmup must exclude only early requests: {report}");
+    assert_eq!(report["failed"].as_u64(), Some(sent));
+    assert_eq!(report["metadata"]["warmup_secs"], "0.1");
+}

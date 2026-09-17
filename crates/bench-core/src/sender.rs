@@ -1271,6 +1271,13 @@ impl Sender {
         Ok(mark_headers_sensitive(headers))
     }
 
+    /// Use a new collector for subsequently dispatched requests.
+    /// In-flight requests retain their original collector; scheduling and connections are
+    /// preserved.
+    pub fn set_metrics(&mut self, metrics: Arc<MetricsCollector>) {
+        self.metrics = metrics;
+    }
+
     fn dispatch(
         &mut self,
         pending: PendingTx,
@@ -1711,6 +1718,42 @@ mod tests {
 
     fn mocked_provider(asserter: Asserter) -> DynProvider<AnyNetwork> {
         ProviderBuilder::new_with_network::<AnyNetwork>().connect_mocked_client(asserter).erased()
+    }
+
+    #[tokio::test]
+    async fn measurement_switch_keeps_in_flight_requests_in_warmup() {
+        let asserter = Asserter::new();
+        let raw = Bytes::from_static(&[2]);
+        asserter.push_success(&keccak256(&raw));
+        asserter.push_success(&keccak256(&raw));
+        let warmup = MetricsCollector::new(RunClock::new());
+        let measured = MetricsCollector::new(RunClock::new());
+        let mut sender = Sender::new(
+            vec![mocked_provider(asserter)],
+            SenderConfig { rate_limit: 0, max_concurrent: 2 },
+            warmup.clone(),
+        );
+        for key in 1..=2 {
+            if key == 2 {
+                sender.set_metrics(measured.clone());
+            }
+            sender
+                .send(GeneratedTx {
+                    depends_on: vec![],
+                    phase: TxPhase::Workload,
+                    id: None,
+                    raw: raw.clone(),
+                    late_sign: None,
+                    sender: None,
+                    submission_keys: vec![SchedulingKey::from([key; 20])],
+                    inclusion_keys: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        sender.flush().await.unwrap();
+        assert_eq!(warmup.counts(), (1, 1, 0));
+        assert_eq!(measured.counts(), (1, 1, 0));
     }
 
     #[tokio::test(start_paused = true)]
