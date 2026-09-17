@@ -8,7 +8,7 @@
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eyre::{bail, Context, Result};
-use std::{collections::HashSet, path::PathBuf, time::Duration};
+use std::{collections::HashSet, num::NonZeroUsize, path::PathBuf, time::Duration};
 
 use crate::{
     metrics_url::{parse_metrics_url, MetricsURL},
@@ -79,6 +79,16 @@ pub struct SendArgs {
     /// connections are open at once to avoid overwhelming the RPC endpoint.
     #[arg(long, default_value = "100")]
     pub max_concurrent: usize,
+
+    /// Maximum submitted transactions awaiting inclusion (defaults to --tps; 0 disables).
+    ///
+    /// Reserves capacity before dispatch and refills it from shared block hashes,
+    /// including reverted transactions or Tempo transactions past their signed expiry.
+    /// RPC concurrency and --tps still apply. The query endpoint must support
+    /// eth_blockNumber and eth_getBlockByNumber. Receipt dependencies also require
+    /// eth_getBlockReceipts. Unresolved transactions time out after five minutes.
+    #[arg(long)]
+    pub max_pending: Option<u64>,
 
     /// Number of times to retry failed transaction submissions.
     ///
@@ -161,6 +171,14 @@ pub struct SendArgs {
     /// Set to 0 to disable. Keeps the metrics scraper running during the wait.
     #[arg(long, default_value = "0")]
     pub drain_timeout: u64,
+}
+
+impl SendArgs {
+    fn pending_limit(&self) -> Result<Option<NonZeroUsize>> {
+        let limit = usize::try_from(self.max_pending.unwrap_or(self.tps))
+            .context("pending limit exceeds this platform's capacity")?;
+        Ok(NonZeroUsize::new(limit))
+    }
 }
 
 /// Arguments for the `send-blocks` subcommand.
@@ -614,6 +632,24 @@ mod tests {
             "--reorg-gap=0",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn test_send_pending_limit_defaults_and_overrides() {
+        for (flags, expected) in [
+            (vec![], None),
+            (vec!["--tps", "0"], None),
+            (vec!["--tps", "50000"], Some(50000)),
+            (vec!["--tps", "50000", "--max-pending", "0"], None),
+            (vec!["--tps", "50000", "--max-pending", "10000"], Some(10000)),
+            (vec!["--max-pending", "10000"], Some(10000)),
+        ] {
+            let cli = Cli::try_parse_from(["bench", "send"].into_iter().chain(flags)).unwrap();
+            let Command::Send(args) = cli.command else {
+                panic!("expected send command");
+            };
+            assert_eq!(args.pending_limit().unwrap().map(NonZeroUsize::get), expected);
+        }
     }
 
     #[test]

@@ -1,13 +1,14 @@
-//! Shared block receipt observation for transaction inclusion dependencies.
+//! Shared block observation for pending limits and receipt dependencies.
 //!
 //! Register before dispatching a transaction. Registration waits for a shared
 //! starting head, so even inclusion before the submission response is covered.
-//! HTTP endpoints use one head poller; receipt RPC traffic scales with blocks,
+//! HTTP endpoints use one head poller; block RPC traffic scales with blocks,
 //! never with the number of pending transactions. This observes inclusion only,
 //! not finality or additional confirmations.
 
+use alloy_consensus::BlockHeader;
 use alloy_eips::BlockId;
-use alloy_network::{AnyNetwork, AnyTransactionReceipt};
+use alloy_network::{primitives::BlockResponse, AnyNetwork, AnyTransactionReceipt};
 use alloy_primitives::TxHash;
 use alloy_provider::{DynProvider, Provider};
 use eyre::{eyre, Result};
@@ -23,7 +24,19 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
 
 type Receipt = Arc<AnyTransactionReceipt>;
-type ReceiptResult = Result<Receipt, String>;
+type ReceiptResult = Result<Inclusion, String>;
+
+#[derive(Debug)]
+pub(crate) enum Inclusion {
+    Included(Option<Receipt>),
+    Expired,
+}
+
+struct Interest {
+    sender: oneshot::Sender<ReceiptResult>,
+    receipt: bool,
+    expires_at: Option<u64>,
+}
 
 /// Cloneable, lazy receipt service for one chain's aggregate query provider.
 #[derive(Clone)]
@@ -39,11 +52,12 @@ struct State {
     preparing: usize,
     next_id: u64,
     ready: watch::Sender<Option<Result<(), String>>>,
-    pending: HashMap<TxHash, HashMap<u64, oneshot::Sender<ReceiptResult>>>,
+    pending: HashMap<TxHash, HashMap<u64, Interest>>,
 }
 
 impl ReceiptTracker {
-    /// Use an endpoint authorized for `eth_blockNumber` and `eth_getBlockReceipts`.
+    /// Use an endpoint authorized for `eth_blockNumber`, `eth_getBlockByNumber`,
+    /// and (for receipt dependencies) `eth_getBlockReceipts`.
     /// Sender-specific submission credentials are not used for aggregate queries.
     pub fn new(provider: DynProvider<AnyNetwork>) -> Self {
         let state = State {
@@ -57,12 +71,6 @@ impl ReceiptTracker {
         let inner = Inner { provider, state: Mutex::new(state) };
 
         Self(Arc::new(inner))
-    }
-
-    /// Establish interest before the caller sends the signed transaction.
-    #[cfg(test)]
-    pub(crate) async fn register(&self, hash: TxHash) -> Result<ReceiptWaiter> {
-        self.prepare().await?.register(hash)
     }
 
     /// Wait for the starting head before signing an expiring transaction.
@@ -110,7 +118,12 @@ pub(crate) struct ReceiptRegistration {
 }
 
 impl ReceiptRegistration {
-    pub(crate) fn register(self, hash: TxHash) -> Result<ReceiptWaiter> {
+    pub(crate) fn register(
+        self,
+        hash: TxHash,
+        needs_receipt: bool,
+        expires_at: Option<u64>,
+    ) -> Result<ReceiptWaiter> {
         let (sender, receiver) = oneshot::channel();
 
         let id = {
@@ -123,7 +136,11 @@ impl ReceiptRegistration {
             let id = state.next_id;
             state.next_id += 1;
 
-            state.pending.entry(hash).or_default().insert(id, sender);
+            state
+                .pending
+                .entry(hash)
+                .or_default()
+                .insert(id, Interest { sender, receipt: needs_receipt, expires_at });
 
             id
         };
@@ -148,7 +165,15 @@ pub(crate) struct ReceiptWaiter {
 }
 
 impl ReceiptWaiter {
-    pub(crate) async fn wait(mut self) -> Result<Receipt> {
+    #[cfg(test)]
+    pub(crate) async fn wait(self) -> Result<Receipt> {
+        match self.observe().await? {
+            Inclusion::Included(Some(receipt)) => Ok(receipt),
+            _ => Err(eyre!("transaction expired before receipt observation")),
+        }
+    }
+
+    pub(crate) async fn observe(mut self) -> Result<Inclusion> {
         tokio::time::timeout(RECEIPT_TIMEOUT, &mut self.receiver)
             .await
             .map_err(|_| eyre!("timed out waiting for transaction inclusion"))?
@@ -192,11 +217,51 @@ impl Inner {
             if let Some(waiters) = state.pending.remove(&receipt.transaction_hash()) {
                 let receipt = Arc::new(receipt);
 
-                for sender in waiters.into_values() {
-                    let _ = sender.send(Ok(receipt.clone()));
+                for interest in waiters.into_values() {
+                    let _ = interest.sender.send(Ok(Inclusion::Included(Some(receipt.clone()))));
                 }
             }
         }
+    }
+
+    /// Resolve hash-only observations and report whether included hashes need receipts.
+    fn dispatch_hashes(&self, hashes: impl Iterator<Item = TxHash>) -> bool {
+        let mut state = self.state.lock().expect("receipt tracker state");
+        let mut needs_receipts = false;
+        for hash in hashes {
+            if let Some(waiters) = state.pending.get_mut(&hash) {
+                needs_receipts |= waiters.values().any(|interest| interest.receipt);
+                let included: Vec<_> = waiters
+                    .iter()
+                    .filter_map(|(&id, interest)| (!interest.receipt).then_some(id))
+                    .collect();
+                for id in included {
+                    let interest = waiters.remove(&id).expect("included interest exists");
+                    let _ = interest.sender.send(Ok(Inclusion::Included(None)));
+                }
+                if waiters.is_empty() {
+                    state.pending.remove(&hash);
+                }
+            }
+        }
+        needs_receipts
+    }
+
+    fn expire(&self, timestamp: u64) {
+        let mut state = self.state.lock().expect("receipt tracker state");
+        state.pending.retain(|_, waiters| {
+            let expired: Vec<_> = waiters
+                .iter()
+                .filter_map(|(&id, interest)| {
+                    interest.expires_at.filter(|&expiry| expiry <= timestamp).map(|_| id)
+                })
+                .collect();
+            for id in expired {
+                let interest = waiters.remove(&id).expect("expired interest exists");
+                let _ = interest.sender.send(Ok(Inclusion::Expired));
+            }
+            !waiters.is_empty()
+        });
     }
 
     async fn run(self: Arc<Self>) {
@@ -215,14 +280,14 @@ impl Inner {
                         Some(alloy_transport::RpcError::ErrorResp(payload)) if payload.code == -32601
                     ) =>
                 {
-                    let message = "receipt observation requires eth_blockNumber and eth_getBlockReceipts on the query endpoint";
+                    let message = "inclusion observation requires eth_blockNumber and eth_getBlockByNumber (eth_getBlockReceipts for receipt dependencies) on the query endpoint";
 
                     let mut state = self.state.lock().expect("receipt tracker state");
                     state.ready.send_replace(Some(Err(message.to_string())));
 
                     for (_, waiters) in state.pending.drain() {
-                        for sender in waiters.into_values() {
-                            let _ = sender.send(Err(message.to_string()));
+                        for interest in waiters.into_values() {
+                            let _ = interest.sender.send(Err(message.to_string()));
                         }
                     }
 
@@ -266,18 +331,25 @@ impl Inner {
                 break;
             }
 
-            let receipts = self
+            let block = self
                 .provider
-                .get_block_receipts(BlockId::number(number))
+                .get_block_by_number(number.into())
                 .await?
-                .ok_or_else(|| eyre!("block receipts are not available yet"))?;
+                .ok_or_else(|| eyre!("block is not available yet"))?;
 
-            if receipts.iter().any(|r| r.block_number() != Some(number) || r.block_hash().is_none())
-            {
-                return Err(eyre!("block receipt response has inconsistent inclusion fields"));
+            if self.dispatch_hashes(block.transactions().hashes()) {
+                let receipts = self
+                    .provider
+                    .get_block_receipts(BlockId::number(number))
+                    .await?
+                    .ok_or_else(|| eyre!("block receipts are not available yet"))?;
+
+                self.dispatch(receipts);
             }
 
-            self.dispatch(receipts);
+            // Only expire after checking inclusion in every block through this
+            // timestamp. Wall-clock expiry alone can race a lagging RPC node.
+            self.expire(block.header().timestamp());
 
             number = number.saturating_add(1);
             *next_block = Some(number);
@@ -303,6 +375,20 @@ mod tests {
         )
     }
 
+    fn block(number: u64, hashes: &[TxHash]) -> Value {
+        json!({
+            "number": format!("0x{number:x}"), "hash": B256::repeat_byte(number as u8),
+            "parentHash": B256::ZERO, "sha3Uncles": B256::ZERO,
+            "logsBloom": format!("0x{}", "00".repeat(256)),
+            "transactionsRoot": B256::ZERO, "stateRoot": B256::ZERO,
+            "receiptsRoot": B256::ZERO, "miner": Address::ZERO,
+            "difficulty": "0x0", "extraData": "0x", "gasLimit": "0xffffff",
+            "gasUsed": "0x0", "timestamp": format!("0x{number:x}"),
+            "uncles": [], "transactions": hashes,
+            "mixHash": B256::ZERO, "nonce": "0x0000000000000000"
+        })
+    }
+
     fn receipt(hash: TxHash, number: u64) -> Value {
         json!({
             "transactionHash": hash,
@@ -323,7 +409,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn ten_thousand_interests_share_a_block_response_and_duplicate_waiters() {
+    async fn fifty_thousand_interests_share_a_block_response_and_duplicate_waiters() {
         let asserter = Asserter::new();
         asserter.push_success(&"0x0");
 
@@ -331,18 +417,24 @@ mod tests {
         let mut waiters = Vec::new();
         let mut receipts = Vec::new();
 
-        for i in 0u64..10_000 {
+        for i in 0u64..50_000 {
             let hash = alloy_primitives::keccak256(i.to_be_bytes());
-            waiters.push(tracker.register(hash).await.unwrap());
+            waiters.push(tracker.prepare().await.unwrap().register(hash, true, None).unwrap());
             receipts.push(receipt(hash, 1));
         }
 
         let duplicate_hash = alloy_primitives::keccak256(0u64.to_be_bytes());
-        let duplicate = tracker.register(duplicate_hash).await.unwrap();
+        let duplicate =
+            tracker.prepare().await.unwrap().register(duplicate_hash, true, None).unwrap();
 
         // Unrelated receipts do not create or resolve an interest.
         receipts.push(receipt(B256::repeat_byte(0xff), 1));
         asserter.push_success(&"0x1");
+        let hashes: Vec<_> = receipts
+            .iter()
+            .map(|receipt| serde_json::from_value(receipt["transactionHash"].clone()).unwrap())
+            .collect();
+        asserter.push_success(&block(1, &hashes));
         asserter.push_success(&receipts);
 
         for waiter in waiters {
@@ -361,18 +453,54 @@ mod tests {
 
         let tracker = tracker(&asserter);
         let hash = B256::repeat_byte(1);
-        let waiter = tracker.register(hash).await.unwrap();
+        let waiter = tracker.prepare().await.unwrap().register(hash, true, None).unwrap();
 
         // The head jumps three blocks; indexing of the middle block is late.
         asserter.push_success(&"0x8");
-        asserter.push_success(&Vec::<Value>::new());
+        asserter.push_success(&block(6, &[]));
+        asserter.push_success(&block(7, &[hash]));
         asserter.push_success(&Value::Null);
         asserter.push_success(&"0x8");
+        asserter.push_success(&block(7, &[hash]));
         asserter.push_success(&vec![receipt(hash, 7)]);
-        asserter.push_success(&Vec::<Value>::new());
+        // No interests remain after block 7, so block 8 needs no receipt request.
+        asserter.push_success(&block(8, &[]));
 
         assert_eq!(waiter.wait().await.unwrap().block_number(), Some(7));
         assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_included_receipt_waiters_trigger_receipt_fetches() {
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x0");
+
+        let tracker = tracker(&asserter);
+        let receipt_hash = B256::repeat_byte(1);
+        let included_hash = B256::repeat_byte(2);
+        let expired_hash = B256::repeat_byte(3);
+        let receipt_waiter =
+            tracker.prepare().await.unwrap().register(receipt_hash, true, Some(2)).unwrap();
+        let included =
+            tracker.prepare().await.unwrap().register(included_hash, false, Some(1)).unwrap();
+        let expired =
+            tracker.prepare().await.unwrap().register(expired_hash, false, Some(1)).unwrap();
+
+        asserter.push_success(&"0x2");
+        // A receipt waiter exists, but its hash is absent: no receipt RPC for block 1.
+        asserter.push_success(&block(1, &[included_hash]));
+        asserter.push_success(&block(2, &[receipt_hash]));
+        asserter.push_success(&Value::Null);
+        // Retry this block before expiry can resolve the included receipt waiter.
+        asserter.push_success(&"0x2");
+        asserter.push_success(&block(2, &[receipt_hash]));
+        asserter.push_success(&vec![receipt(receipt_hash, 2)]);
+
+        assert!(matches!(included.observe().await.unwrap(), Inclusion::Included(None)));
+        assert!(matches!(expired.observe().await.unwrap(), Inclusion::Expired));
+        assert_eq!(receipt_waiter.wait().await.unwrap().transaction_hash(), receipt_hash);
+        assert!(asserter.read_q().is_empty());
+        assert!(tracker.0.state.lock().unwrap().pending.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -382,8 +510,8 @@ mod tests {
 
         let tracker = tracker(&asserter);
         let hash = B256::repeat_byte(1);
-        let first = tracker.register(hash).await.unwrap();
-        let second = tracker.register(hash).await.unwrap();
+        let first = tracker.prepare().await.unwrap().register(hash, true, None).unwrap();
+        let second = tracker.prepare().await.unwrap().register(hash, true, None).unwrap();
 
         drop(first);
         assert_eq!(tracker.0.state.lock().unwrap().pending[&hash].len(), 1);
@@ -393,9 +521,10 @@ mod tests {
         assert!(!tracker.0.state.lock().unwrap().running);
 
         asserter.push_success(&"0x64");
-        let restarted = tracker.register(hash).await.unwrap();
+        let restarted = tracker.prepare().await.unwrap().register(hash, true, None).unwrap();
 
         asserter.push_success(&"0x65");
+        asserter.push_success(&block(101, &[hash]));
         asserter.push_success(&vec![receipt(hash, 101)]);
 
         restarted.wait().await.unwrap();
@@ -404,19 +533,19 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn transient_failure_and_invalid_receipts_do_not_advance_cursor() {
+    async fn transient_receipt_failure_does_not_advance_cursor() {
         let asserter = Asserter::new();
         asserter.push_success(&"0x0");
 
         let tracker = tracker(&asserter);
         let hash = B256::repeat_byte(1);
-        let waiter = tracker.register(hash).await.unwrap();
+        let waiter = tracker.prepare().await.unwrap().register(hash, true, None).unwrap();
 
         asserter.push_success(&"0x1");
+        asserter.push_success(&block(1, &[hash]));
         asserter.push_failure_msg("temporary receipt failure");
         asserter.push_success(&"0x1");
-        asserter.push_success(&vec![receipt(hash, 2)]);
-        asserter.push_success(&"0x1");
+        asserter.push_success(&block(1, &[hash]));
         asserter.push_success(&vec![receipt(hash, 1)]);
 
         assert_eq!(waiter.wait().await.unwrap().block_number(), Some(1));
@@ -429,10 +558,13 @@ mod tests {
         asserter.push_success(&"0x0");
 
         let tracker = tracker(&asserter);
-        let first = tracker.register(B256::repeat_byte(1)).await.unwrap();
-        let second = tracker.register(B256::repeat_byte(2)).await.unwrap();
+        let first =
+            tracker.prepare().await.unwrap().register(B256::repeat_byte(1), true, None).unwrap();
+        let second =
+            tracker.prepare().await.unwrap().register(B256::repeat_byte(2), true, None).unwrap();
 
         asserter.push_success(&"0x1");
+        asserter.push_success(&block(1, &[B256::repeat_byte(1)]));
         asserter.push_failure(
             serde_json::from_value(json!({
                 "code": -32601, "message": "method not found"
@@ -452,7 +584,8 @@ mod tests {
         asserter.push_success(&"0x0");
 
         let tracker = tracker(&asserter);
-        let waiter = tracker.register(B256::repeat_byte(1)).await.unwrap();
+        let waiter =
+            tracker.prepare().await.unwrap().register(B256::repeat_byte(1), true, None).unwrap();
 
         assert!(waiter.wait().await.unwrap_err().to_string().contains("timed out"));
         assert!(tracker.0.state.lock().unwrap().pending.is_empty());

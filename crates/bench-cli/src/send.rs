@@ -24,10 +24,12 @@ use txgen_tempo::TempoLateSigner;
 const SETUP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
 pub async fn execute(args: SendArgs) -> Result<()> {
+    let max_pending = args.pending_limit()?;
     tracing::info!(
         input = args.input.as_ref().map(|p| p.display().to_string()).as_deref().unwrap_or("stdin"),
         rpc_urls = ?args.rpc_urls,
         tps = args.tps,
+        max_pending = max_pending.map_or(0, |limit| limit.get()),
         skip_setup = args.skip_setup,
         collect_latencies = args.collect_latencies,
         collect_receipt_metrics = args.collect_receipt_metrics,
@@ -35,7 +37,9 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         "Starting send"
     );
 
-    let metadata = parse_metadata(&args.metadata)?;
+    let mut metadata = parse_metadata(&args.metadata)?;
+    metadata
+        .insert("max_pending".to_string(), max_pending.map_or(0, |limit| limit.get()).to_string());
     let scraper_configs =
         metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
 
@@ -180,7 +184,11 @@ async fn execute_source<S: TxSource>(
     let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
     let mut sender =
         Sender::new_with_request_auth(endpoints, config.clone(), metrics.clone(), request_auth)
-            .with_receipt_tracker(receipt_tracker);
+            .with_receipt_tracker(receipt_tracker)
+            .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
+    if let Some(limit) = args.pending_limit()? {
+        sender = sender.with_max_pending(limit);
+    }
     if let Some(late_signer) = late_signer {
         sender = sender.with_late_signer(late_signer);
     }
@@ -367,7 +375,8 @@ async fn run_setup_phase<S: TxSource>(
         setup_metrics.clone(),
         request_auth,
     )
-    .with_receipt_tracker(receipt_tracker);
+    .with_receipt_tracker(receipt_tracker)
+    .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
     if let Some(late_signer) = late_signer {
         setup_sender = setup_sender.with_late_signer(late_signer);
     }

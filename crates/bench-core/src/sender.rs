@@ -7,6 +7,7 @@
 use crate::{
     metrics::MetricsCollector,
     receipt_metrics::{ReceiptCollectorHandle, ReceiptMetricLabels},
+    receipt_tracker::Inclusion,
     ReceiptTracker, RequestAuthProvider, RpcRequestContext,
 };
 use alloy_network::{primitives::ReceiptResponse, AnyNetwork, AnyTransactionReceipt};
@@ -19,6 +20,7 @@ use reqwest::header::HeaderMap;
 use std::{
     collections::{HashSet, VecDeque},
     fmt,
+    num::NonZeroUsize,
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime},
 };
@@ -34,6 +36,9 @@ pub trait LateSigner: Send + Sync {
     /// Sign one deferred transaction.
     fn sign(&self, spec: &LateSignSpec) -> Result<Bytes>;
 }
+
+/// Extract a signed transaction's absolute expiry in Unix seconds, if supported.
+pub type TransactionExpiry = dyn Fn(&Bytes) -> Option<u64> + Send + Sync;
 
 /// Configuration for the sender.
 #[derive(Debug, Clone)]
@@ -335,7 +340,7 @@ impl RpcSubmitter {
                     tokio::time::timeout_at(deadline, registration).await.map_err(|_| {
                         RpcSubmitError::deadline(
                             RpcSubmitFailureKind::BeforeSend,
-                            "submission deadline elapsed starting receipt observation",
+                            "submission deadline elapsed starting inclusion observation",
                             None,
                         )
                     })?
@@ -356,7 +361,7 @@ impl RpcSubmitter {
             .map_err(RpcSubmitError::before_send)?;
 
         let inclusion = inclusion
-            .map(|registration| registration.register(expected_hash))
+            .map(|registration| registration.register(expected_hash, false, None))
             .transpose()
             .map_err(RpcSubmitError::before_send)?;
 
@@ -384,10 +389,10 @@ impl RpcSubmitter {
         order.release_submission_keys();
 
         if let Some(inclusion_release) = order.take_inclusion_keys() {
-            let inclusion = inclusion.expect("inclusion keys have a registered receipt waiter");
+            let inclusion = inclusion.expect("inclusion keys have a registered inclusion waiter");
 
             tokio::spawn(async move {
-                if let Err(error) = inclusion.wait().await {
+                if let Err(error) = inclusion.observe().await {
                     tracing::warn!(%error, "Failed waiting for transaction inclusion");
                 }
 
@@ -730,6 +735,32 @@ impl fmt::Debug for RpcEndpoint {
 enum Completion {
     Release(SchedulingKeys),
     SetupFinished { queue_id: u64, id: Option<String>, success: bool },
+    PendingFinished { result: std::result::Result<(), String> },
+}
+
+/// Reports pending-slot completion once, including task cancellation.
+struct PendingCompletion {
+    tx: Option<mpsc::UnboundedSender<Completion>>,
+}
+
+impl PendingCompletion {
+    fn finish(mut self, result: Result<()>) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Completion::PendingFinished {
+                result: result.map_err(|error| error.to_string()),
+            });
+        }
+    }
+}
+
+impl Drop for PendingCompletion {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Completion::PendingFinished {
+                result: Err("submission worker stopped before resolving inclusion".to_string()),
+            });
+        }
+    }
 }
 
 // Report every setup exit path, including task cancellation and pre-submission errors.
@@ -778,6 +809,10 @@ impl PendingTx {
 
 /// Transaction sender.
 pub struct Sender {
+    transaction_expiry: Option<Arc<TransactionExpiry>>,
+    max_pending: Option<NonZeroUsize>,
+    in_flight_pending: usize,
+    pending_failure: Option<String>,
     endpoints: Vec<RpcEndpoint>,
     request_auth: Option<Arc<dyn RequestAuthProvider>>,
     metrics: Arc<MetricsCollector>,
@@ -848,6 +883,10 @@ impl Sender {
 
         let receipt_tracker = ReceiptTracker::new(endpoints[0].provider().clone());
         Self {
+            max_pending: None,
+            transaction_expiry: None,
+            in_flight_pending: 0,
+            pending_failure: None,
             receipt_tracker,
             endpoints,
             request_auth,
@@ -874,6 +913,22 @@ impl Sender {
     /// Register the signer used for deferred transactions.
     pub fn with_late_signer(mut self, signer: Arc<dyn LateSigner>) -> Self {
         self.late_signer = Some(signer);
+        self
+    }
+
+    /// Limit dispatched transactions awaiting inclusion, independently of RPC
+    /// concurrency and TPS. Counts this sender's transactions, not the whole pool.
+    /// Slots are reserved before dispatch and released on inclusion or definite
+    /// rejection. Missing receipts fail the sender rather than silently refill it.
+    pub fn with_max_pending(mut self, limit: NonZeroUsize) -> Self {
+        self.max_pending = Some(limit);
+        self
+    }
+
+    /// Recognize network-specific expiry for tracked transactions, with or without
+    /// a pending cap. Expiry resolves after observing a block at the signed deadline.
+    pub fn with_transaction_expiry(mut self, expiry: Arc<TransactionExpiry>) -> Self {
+        self.transaction_expiry = Some(expiry);
         self
     }
 
@@ -994,7 +1049,11 @@ impl Sender {
             first_error = Some(failure.error);
         }
 
-        while !self.pending.is_empty() || !self.active_keys.is_empty() || self.in_flight_setup > 0 {
+        while !self.pending.is_empty() ||
+            !self.active_keys.is_empty() ||
+            self.in_flight_setup > 0 ||
+            self.in_flight_pending > 0
+        {
             match self.completion_rx.recv().await {
                 Some(completion) => {
                     self.handle_completion(completion);
@@ -1039,6 +1098,12 @@ impl Sender {
     fn handle_completion(&mut self, completion: Completion) {
         match completion {
             Completion::Release(keys) => self.release_keys(&keys),
+            Completion::PendingFinished { result } => {
+                self.in_flight_pending -= 1;
+                if let Err(error) = result {
+                    self.pending_failure.get_or_insert(error);
+                }
+            }
             Completion::SetupFinished { queue_id, id, success } => {
                 self.in_flight_setup -= 1;
                 if success {
@@ -1082,11 +1147,21 @@ impl Sender {
     async fn pump(&mut self) -> std::result::Result<(), DispatchPreparationError> {
         loop {
             self.drain_completions();
+            if let Some(error) = &self.pending_failure {
+                return Err(DispatchPreparationError {
+                    queue_id: u64::MAX,
+                    error: eyre::eyre!("pending transaction tracking failed: {error}"),
+                });
+            }
             if let Some(error) = &self.setup_failure {
                 return Err(DispatchPreparationError {
                     queue_id: u64::MAX,
                     error: eyre::eyre!("{error}"),
                 });
+            }
+
+            if self.max_pending.is_some_and(|limit| self.in_flight_pending >= limit.get()) {
+                break;
             }
 
             let Some(index) = self.next_ready_index() else {
@@ -1200,6 +1275,12 @@ impl Sender {
         let late_signer = self.late_signer.clone();
         let receipt_tracker = self.receipt_tracker.clone();
 
+        let transaction_expiry = self.transaction_expiry.clone();
+        let pending_completion = self.max_pending.map(|_| {
+            self.in_flight_pending += 1;
+            PendingCompletion { tx: Some(completion_tx.clone()) }
+        });
+
         let setup_completion = if pending.phase == TxPhase::Setup {
             self.in_flight_setup += 1;
             Some(SetupCompletion {
@@ -1212,8 +1293,10 @@ impl Sender {
             None
         };
         self.worker_tasks.spawn(async move {
-            submit_tx(
+            let result = submit_tx(
                 pending,
+                pending_completion.is_some(),
+                transaction_expiry,
                 setup_completion,
                 endpoint,
                 submission_headers,
@@ -1226,6 +1309,9 @@ impl Sender {
                 late_signer,
             )
             .await;
+            if let Some(completion) = pending_completion {
+                completion.finish(result);
+            }
         });
     }
 }
@@ -1259,9 +1345,13 @@ fn normalize_key_sets(
     Ok((submission_keys, inclusion_keys))
 }
 
+/// Returns an error only when pending tracking cannot be resolved reliably.
+/// Rejected, included, and expired transactions all release pending capacity normally.
 #[allow(clippy::too_many_arguments)]
 async fn submit_tx(
     pending: PendingTx,
+    track_pending: bool,
+    transaction_expiry: Option<Arc<TransactionExpiry>>,
     mut setup_completion: Option<SetupCompletion>,
     endpoint: RpcEndpoint,
     submission_headers: HeaderMap,
@@ -1272,7 +1362,7 @@ async fn submit_tx(
     permit: OwnedSemaphorePermit,
     completion_tx: mpsc::UnboundedSender<Completion>,
     late_signer: Option<Arc<dyn LateSigner>>,
-) {
+) -> Result<()> {
     let release_all_keys = || {
         let mut keys = pending.submission_keys.clone();
         keys.extend_from_slice(&pending.inclusion_keys);
@@ -1281,22 +1371,22 @@ async fn submit_tx(
 
     metrics.record_sent();
 
-    let inclusion = if pending.inclusion_keys.is_empty() && pending.phase != TxPhase::Setup {
-        None
-    } else {
-        match receipt_tracker.prepare().await {
-            Ok(waiter) => Some(waiter),
-            Err(error) => {
-                tracing::error!(%error, "Failed to start block receipt observation");
+    let inclusion =
+        if pending.inclusion_keys.is_empty() && pending.phase != TxPhase::Setup && !track_pending {
+            None
+        } else {
+            match receipt_tracker.prepare().await {
+                Ok(waiter) => Some(waiter),
+                Err(error) => {
+                    tracing::error!(%error, "Failed to start block receipt observation");
+                    metrics.record_failure();
+                    drop(permit);
+                    release_keys(&completion_tx, release_all_keys());
 
-                metrics.record_failure();
-                drop(permit);
-                release_keys(&completion_tx, release_all_keys());
-
-                return;
+                    return Err(error);
+                }
             }
-        }
-    };
+        };
 
     let raw = match resolve_raw(&pending.raw, pending.late_sign.as_ref(), late_signer.as_deref()) {
         Ok(raw) => raw,
@@ -1307,18 +1397,25 @@ async fn submit_tx(
                 error = %error,
                 "failed to materialize deferred transaction",
             );
-
             metrics.record_failure();
             drop(permit);
             release_keys(&completion_tx, release_all_keys());
 
-            return;
+            // Signing failed before submission: no transaction can be pending.
+            return Ok(());
         }
     };
 
     let expected_hash = keccak256(&raw);
     let inclusion = match inclusion
-        .map(|registration| registration.register(expected_hash))
+        .map(|registration| {
+            let expires_at = transaction_expiry.as_ref().and_then(|expiry| expiry(&raw));
+            registration.register(
+                expected_hash,
+                pending.phase == TxPhase::Setup || !pending.inclusion_keys.is_empty(),
+                expires_at,
+            )
+        })
         .transpose()
     {
         Ok(inclusion) => inclusion,
@@ -1329,7 +1426,7 @@ async fn submit_tx(
             drop(permit);
             release_keys(&completion_tx, release_all_keys());
 
-            return;
+            return Err(error);
         }
     };
 
@@ -1340,7 +1437,8 @@ async fn submit_tx(
             tx_hash
         }
         Err(e) => {
-            if submission_may_have_been_accepted(&e) {
+            let uncertain = submission_may_have_been_accepted(&e);
+            if uncertain {
                 track_workload_receipt(receipt_collector.as_ref(), &pending, expected_hash);
             }
 
@@ -1354,7 +1452,12 @@ async fn submit_tx(
             drop(permit);
             release_keys(&completion_tx, release_all_keys());
 
-            return;
+            if track_pending && uncertain {
+                // A lost response does not prove rejection. Keep tracking this slot.
+                inclusion.expect("pending limit registers inclusion").observe().await?;
+            }
+
+            return Ok(());
         }
     };
 
@@ -1364,33 +1467,41 @@ async fn submit_tx(
 
     release_keys(&completion_tx, pending.submission_keys);
 
-    let Some(inclusion) = inclusion else { return };
+    let Some(inclusion) = inclusion else { return Ok(()) };
 
-    match inclusion.wait().await {
-        Ok(receipt) if receipt.status() => {
-            if let Some(completion) = &mut setup_completion {
-                completion.success = true;
+    let result = match inclusion.observe().await {
+        Ok(Inclusion::Included(None)) => Ok(()),
+        Ok(Inclusion::Included(Some(receipt))) => {
+            if receipt.status() {
+                if let Some(completion) = &mut setup_completion {
+                    completion.success = true;
+                }
+            } else {
+                tracing::error!(
+                    id = pending.id.as_deref(),
+                    phase = ?pending.phase,
+                    %tx_hash,
+                    "Transaction reverted",
+                );
+                metrics.record_failure();
             }
+            Ok(())
         }
-        Ok(_) => {
-            tracing::error!(
-                id = pending.id.as_deref(),
-                phase = ?pending.phase,
-                %tx_hash,
-                "Transaction reverted",
-            );
-
+        Ok(Inclusion::Expired) => {
+            tracing::debug!(%tx_hash, "Transaction expired before inclusion");
             metrics.record_failure();
+            Ok(())
         }
         Err(error) => {
             // The tracker only returns static diagnostics without RPC credentials.
             tracing::error!(%error, %tx_hash, "Failed waiting for transaction inclusion");
-
             metrics.record_failure();
+            Err(error)
         }
-    }
+    };
 
     release_keys(&completion_tx, pending.inclusion_keys);
+    result
 }
 
 fn resolve_raw(
@@ -1591,6 +1702,64 @@ mod tests {
 
     fn mocked_provider(asserter: Asserter) -> DynProvider<AnyNetwork> {
         ProviderBuilder::new_with_network::<AnyNetwork>().connect_mocked_client(asserter).erased()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_timeout_stops_refill_and_fails_flush() {
+        let asserter = Asserter::new();
+        let raw = Bytes::from_static(&[2]);
+        asserter.push_success(&"0x0");
+        asserter.push_success(&keccak256(&raw));
+        let metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
+        let mut sender =
+            Sender::new(vec![mocked_provider(asserter)], SenderConfig::default(), metrics.clone())
+                .with_max_pending(1.try_into().unwrap());
+        for key in 1..=2 {
+            sender
+                .send(GeneratedTx {
+                    phase: TxPhase::Workload,
+                    id: None,
+                    raw: raw.clone(),
+                    late_sign: None,
+                    sender: None,
+                    submission_keys: vec![SchedulingKey::from([key; 20])],
+                    inclusion_keys: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let error = sender.flush().await.unwrap_err();
+        assert!(error.to_string().contains("timed out waiting for transaction inclusion"));
+        assert_eq!(metrics.counts().0, 1, "timeout must not refill the pending window");
+    }
+
+    #[tokio::test]
+    async fn pending_worker_cancellation_releases_slot_and_stops_refill() {
+        let metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
+        let mut sender =
+            Sender::new(vec![mocked_provider(Asserter::new())], SenderConfig::default(), metrics)
+                .with_max_pending(1.try_into().unwrap());
+        sender
+            .send(GeneratedTx {
+                phase: TxPhase::Workload,
+                id: None,
+                raw: Bytes::from_static(&[2]),
+                late_sign: None,
+                sender: None,
+                submission_keys: vec![SchedulingKey::from([1; 20])],
+                inclusion_keys: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(sender.in_flight_pending, 1);
+
+        // Abort before the worker's first poll: its reserved slot must still resolve.
+        sender.worker_tasks.abort_all();
+        sender.worker_tasks.join_next().await.unwrap().unwrap_err();
+        sender.drain_completions();
+        assert_eq!(sender.in_flight_pending, 0);
+        let error = sender.pump().await.expect_err("cancelled tracking must stop refill");
+        assert!(error.error.to_string().contains("submission worker stopped"));
     }
 
     fn receipt_json(
