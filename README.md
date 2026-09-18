@@ -2029,7 +2029,7 @@ templates:
     valid_for_secs: 25           # Relative expiry window for standard/sponsored txs
     valid_before: 1700100000     # Absolute expiry timestamp (alternative to valid_for_secs)
     fee_token: "0x..."           # Pay gas in stablecoin
-    valid_after: 1700000000      # Scheduled: valid after timestamp
+    valid_after: 1700000000      # Scheduled: valid after timestamp (see the note below)
     
     # Batched calls
     calls:
@@ -2052,7 +2052,20 @@ templates:
 
 `valid_for_secs` must be `<= 30`, matching Tempo's expiring nonce validity window.
 
-With `--defer-signing`, relative expiry on standard or sponsored transactions emits a deferred-signing record with an empty `raw` field. `bench send --late-signing-spec workload.yaml` resolves the account references and signs each record immediately before the RPC request. The same option works for a pre-generated file and for a pipe; the workload spec supplies signing keys and is never embedded in the NDJSON output. Without `--defer-signing`, generation retains the existing signed output. Txgen still applies a deterministic per-transaction bump to `max_fee_per_gas` before the final sender and sponsor signatures, so otherwise identical expiring transactions have unique signed payloads. `max_priority_fee_per_gas` remains exactly as configured, including zero. Tempo keychain-auth records retain the existing generation-time signing path.
+**Expiring nonce uniqueness:** TIP-1009 replay protection is hash-based, so two otherwise identical
+expiring transactions from the same sender must not produce the same signed payload. txgen derives a
+deterministic per-transaction uniqueness value and writes it into `valid_after` (values start at `1`,
+which is always in the past, and the node only bounds `valid_after` from above). `valid_after` is
+signed but invisible to the node's pool ordering and to block packing, so generated transactions all
+carry the same effective tip and the pool does not prefer the newest ones.
+
+If a template sets `valid_after` explicitly, that value wins - the workload is assumed to be
+exercising the time window on purpose - and txgen falls back to bumping `max_fee_per_gas` per
+transaction instead, printing a warning once. That fallback makes later transactions outrank earlier
+ones in the pool, so avoid combining an explicit `valid_after` with high-throughput expiring-nonce
+workloads.
+
+With `--defer-signing`, relative expiry on standard or sponsored transactions emits a deferred-signing record with an empty `raw` field. `bench send --late-signing-spec workload.yaml` resolves the account references and signs each record immediately before the RPC request. The same option works for a pre-generated file and for a pipe; the workload spec supplies signing keys and is never embedded in the NDJSON output. Without `--defer-signing`, generation retains the existing signed output. Txgen still assigns a deterministic per-transaction `valid_after` value before the final sender and sponsor signatures, so otherwise identical expiring transactions have unique signed payloads. `max_fee_per_gas` and `max_priority_fee_per_gas` remain exactly as configured, including zero. Tempo keychain-auth records retain the existing generation-time signing path.
 
 Recommended benchmark setting: `valid_for_secs: 25`. This matches `tempo-bench`'s default behavior and stays inside Tempo's 30-second protocol limit while leaving some propagation slack.
 
