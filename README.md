@@ -402,8 +402,55 @@ txgen-tempo generate -s workload.yaml -n 1000 --defer-signing | bench send --lat
 | `--collect-receipt-metrics` | Collect non-system transaction gas and fee metrics with block-level receipt requests after sending |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 0, set >0 to enable) |
+| `--duration <DUR>` | Send for this long after the measured window starts, then stop (default: until the input ends) |
+| `--warmup <auto\|off\|DUR>` | Warm-up before the measured window: readiness-gated (`auto`, default), disabled (`off`), or a fixed duration (see [Warm-up](#warm-up)) |
+| `--warmup-tps <N>` | Cap on the send rate during the warm-up (default: 2000; `0` warms up at `--tps`) |
+| `--warmup-ramp <DUR>` | Ramp the send rate from 10% of the warm-up rate to the warm-up rate, and later from the warm-up rate to `--tps`, over this duration (default: 10s, `0s` disables) |
+| `--warmup-min <DUR>` / `--warmup-max <DUR>` | Bounds for an `auto` warm-up (default: 30s / 90s); at the maximum, measurement starts anyway and the run is flagged `timeout` |
+| `--warmup-proposals <N>` | Full blocks each proposer must have produced before `auto` ends (default: 2) |
+| `--warmup-proposers <N>` | Distinct proposers expected, identified by block beneficiary (default: number of distinct `--rpc-url` endpoints) |
+| `--warmup-stable-blocks <N>` / `--warmup-stable-tolerance <F>` | Plateau check: medians of two consecutive N-block windows must agree within F (default: 10 / 0.10) |
+| `--warmup-pool-check <BOOL>` | Also require `txpool_status` pending counts to be stable over 10s (default: true; skipped when unsupported) |
 
-**Required RPC methods:** `eth_sendRawTransaction`, `eth_blockNumber`, `eth_getBlockByNumber`; `eth_getBlockReceipts` for setup, sequence inclusion waits, and `--collect-receipt-metrics`; `txpool_status` (for `--drain-timeout`)
+**Required RPC methods:** `eth_sendRawTransaction`, `eth_blockNumber`, `eth_getBlockByNumber`; `eth_getBlockReceipts` for setup, sequence inclusion waits, and `--collect-receipt-metrics`; `txpool_status` (for `--drain-timeout` and the optional warm-up pool check)
+
+##### Warm-up
+
+A benchmark that starts measuring with its first transaction measures a cold network: the first
+multi-megabyte block body over each proposer→peer connection arrives several times slower than
+later ones, execution caches and node-side build estimators need full blocks to converge, and an
+instant jump to the target rate fills every pool within seconds and phase-locks transaction expiry
+to that burst. `bench send` therefore warms up by default:
+
+1. **Ramp** the send rate from 10% of the warm-up rate to the warm-up rate over `--warmup-ramp`.
+   The warm-up rate is `--tps` capped at `--warmup-tps` (default 2000), so a cold network is not
+   hit with a 50k–100k target before it is warm.
+2. **Hold** at the warm-up rate until readiness holds: every expected proposer (block beneficiary)
+   has produced `--warmup-proposals` blocks with at least half the running median transaction
+   count, the median transaction count of the last `--warmup-stable-blocks` blocks agrees with the
+   previous window within `--warmup-stable-tolerance`, pool occupancy is stable (only checked when
+   the warm-up runs at the target rate), and at least `--warmup-min` elapsed. `--warmup-max` ends
+   the warm-up regardless and flags the run `timeout`.
+3. **Hand off.** When the warm-up rate was capped, the rate ramps from the cap to `--tps` over
+   `--warmup-ramp`, still inside the warm-up.
+4. **Move the origin.** At the boundary the start block, the report's `started_at`, and metric and
+   sample offsets are moved to that moment. Load never pauses, so the measured window starts at
+   full rate. Console, JSON (`warmup`, `started_unix_ms`), and ClickHouse (`warmup_*` run
+   metadata) reports describe the phase.
+
+The transaction source must hold enough transactions for warm-up plus measurement. Because the
+warm-up length varies, generate an upper bound (for example `--tps × (--warmup-max + --warmup-ramp
++ duration)`) and pass `--duration` so the measured window has a fixed length regardless of how
+many transactions remain. If the source runs dry before the warm-up ends, the whole run is reported
+as before and the warm-up is flagged `source-exhausted`. Use `--warmup off` for the previous
+behaviour or `--warmup 45s` for a fixed phase. The defaults are derived from multi-region Tempo
+runs; the derivations are documented on each flag in `bench send --help`.
+
+```bash
+# 90 s measured window at 50k TPS after a capped, readiness-gated warm-up
+txgen-tempo generate -s workload.yaml -n $((50000 * (90 + 100))) --duration 190s |
+  bench send --tps 50000 --warmup auto --warmup-tps 2000 --duration 90s
+```
 
 Setup and sequence inclusion waits share one lazy receipt tracker per chain. It polls the head every 100 ms while transactions are waiting, fetches `eth_getBlockReceipts` once per new block, and dispatches matching receipts to their waiting sequences. Transactions register before submission so fast inclusion is not missed. Failed or unavailable block receipt requests are retried centrally, and skipped block heights are backfilled. The tracker stops polling when there are no waiting transactions. This preserves inclusion ordering and the existing five-minute inclusion timeout.
 

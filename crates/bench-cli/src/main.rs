@@ -6,6 +6,7 @@
 //! - `call` - Replay an RPC corpus against a node
 //! - `view` - Print an existing JSON report to console
 
+use bench_core::{WarmupConfig, WarmupMode};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eyre::{bail, Context, Result};
 use std::{collections::HashSet, num::NonZeroUsize, path::PathBuf, time::Duration};
@@ -22,6 +23,7 @@ mod send;
 mod send_blocks;
 mod view;
 mod wait_for_persistence;
+mod warmup;
 
 /// Arguments for the `send` subcommand.
 #[derive(Args)]
@@ -171,6 +173,115 @@ pub struct SendArgs {
     /// Set to 0 to disable. Keeps the metrics scraper running during the wait.
     #[arg(long, default_value = "0")]
     pub drain_timeout: u64,
+
+    /// Warm-up before the measured window: `auto` (default), `off`, or a fixed
+    /// duration such as `45s`.
+    ///
+    /// The warm-up sends the same workload at the target rate (after a ramp)
+    /// and then moves the measurement origin (start block, `started_at`,
+    /// metric and sample offsets) to the moment the network is warm. Load never
+    /// pauses at the boundary. `auto` waits for chain-observable readiness
+    /// (see the other --warmup-* flags); `off` measures from the first
+    /// transaction as before. The transaction source must hold enough
+    /// transactions for warm-up plus measurement; if it runs dry first, the
+    /// whole run is reported and the warm-up is flagged `source-exhausted`.
+    #[arg(
+        long,
+        default_value = "auto",
+        value_name = "auto|off|DURATION",
+        value_parser = parse_warmup_mode
+    )]
+    pub warmup: WarmupMode,
+
+    /// Cap on the send rate during the warm-up, in transactions per second
+    /// (0 = warm up at --tps).
+    ///
+    /// Default 2000: a cold network should not see the full 50k–100k target
+    /// before its connections, caches and estimators are warm, and 2k TPS still
+    /// produces non-empty blocks from every proposer within the minimum
+    /// warm-up (~1.4k transactions per 0.7s block). When the cap is below
+    /// --tps, the rate ramps from the cap to --tps over --warmup-ramp once
+    /// readiness holds, so the measured window starts at full rate.
+    #[arg(long, default_value = "2000")]
+    pub warmup_tps: u64,
+
+    /// Ramp the send rate from 10% of the warm-up rate to the warm-up rate
+    /// over this duration, and from the warm-up rate to --tps over the same
+    /// duration once readiness holds (0 = no ramps).
+    ///
+    /// Default 10s: an instant start at 50k TPS filled 50k-transaction pools in
+    /// under two seconds and phase-locked transaction expiry to that burst.
+    /// Ten seconds spreads first admissions over ~40% of the 25s validity
+    /// window used by the public workload and gives ~14 blocks for connections
+    /// and caches to grow before full pressure.
+    #[arg(long, default_value = "10s", value_parser = humantime::parse_duration)]
+    pub warmup_ramp: Duration,
+
+    /// Send for this long after the measured window starts, then stop.
+    ///
+    /// Without it, sending continues until the input ends. With a warm-up, the
+    /// window starts at the warm-up boundary; the buffered backlog is still
+    /// dispatched after the deadline. Lets a generator over-provision
+    /// transactions for a warm-up of unknown length while keeping the measured
+    /// window a fixed length.
+    #[arg(long, value_parser = humantime::parse_duration)]
+    pub duration: Option<Duration>,
+
+    /// Earliest end of an `auto` warm-up.
+    ///
+    /// Default 30s: with random leader election among ten validators, every
+    /// validator has proposed once after ~29 blocks (about 20s at 0.7s blocks);
+    /// rounded up to span one full 25s validity window so pool turnover is in
+    /// steady state.
+    #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
+    pub warmup_min: Duration,
+
+    /// Latest end of an `auto` warm-up; measurement then starts anyway and the
+    /// run is flagged `timeout`.
+    ///
+    /// Default 90s: two full blocks from each of ten proposers take 45–50
+    /// blocks (~35s); 90s is 2.5x that. Past it, something is wrong with the
+    /// network, and a flagged measurement is more useful than none.
+    #[arg(long, default_value = "90s", value_parser = humantime::parse_duration)]
+    pub warmup_max: Duration,
+
+    /// Full blocks each proposer must have produced before `auto` ends.
+    ///
+    /// Default 2: the first multi-megabyte body over each proposer→peer
+    /// connection arrived 5–10x slower than the second one. Two confirms warm
+    /// connections and tolerates a small first block during the ramp. A block
+    /// counts as full at or above half the running median transaction count.
+    #[arg(long, default_value = "2")]
+    pub warmup_proposals: u32,
+
+    /// Number of distinct proposers expected (default: number of distinct --rpc-url endpoints).
+    ///
+    /// Proposers are identified by block beneficiary, which Tempo resolves per
+    /// validator. Set this explicitly when submitting through a load balancer
+    /// or to a subset of the validators.
+    #[arg(long)]
+    pub warmup_proposers: Option<usize>,
+
+    /// Block window for the throughput plateau check.
+    ///
+    /// Default 10: the builder's fill rate plateaued after ~15 loaded blocks;
+    /// two consecutive 10-block windows whose median transaction counts agree
+    /// within --warmup-stable-tolerance detect that within a few blocks, and a
+    /// median ignores single-block dips.
+    #[arg(long, default_value = "10")]
+    pub warmup_stable_blocks: usize,
+
+    /// Relative tolerance for the plateau and pool-occupancy checks.
+    ///
+    /// Default 0.10: steady-state windows differed by about ±5%, windows
+    /// during the ramp by 30–50%.
+    #[arg(long, default_value = "0.10")]
+    pub warmup_stable_tolerance: f64,
+
+    /// Require `txpool_status` pending counts to be stable over 10s before
+    /// `auto` ends (default: true). Skipped when the endpoint lacks `txpool_status`.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub warmup_pool_check: bool,
 }
 
 impl SendArgs {
@@ -178,6 +289,38 @@ impl SendArgs {
         let limit = usize::try_from(self.max_pending.unwrap_or(self.tps))
             .context("pending limit exceeds this platform's capacity")?;
         Ok(NonZeroUsize::new(limit))
+    }
+
+    /// Warm-up configuration derived from the CLI flags.
+    fn warmup_config(&self) -> Result<WarmupConfig> {
+        let distinct_endpoints =
+            self.rpc_urls.iter().map(|url| url.trim_end_matches('/')).collect::<HashSet<_>>().len();
+        let config = WarmupConfig {
+            mode: self.warmup,
+            target_tps: self.tps,
+            rate_cap: self.warmup_tps,
+            ramp: self.warmup_ramp,
+            min_duration: self.warmup_min,
+            max_duration: self.warmup_max,
+            proposals_per_proposer: self.warmup_proposals,
+            expected_proposers: self.warmup_proposers.unwrap_or(distinct_endpoints.max(1)),
+            stable_blocks: self.warmup_stable_blocks,
+            stable_tolerance: self.warmup_stable_tolerance,
+            pool_check: self.warmup_pool_check,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+/// Parse `--warmup`: `auto`, `off`, or a duration.
+fn parse_warmup_mode(s: &str) -> Result<WarmupMode, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" | "false" | "0" => Ok(WarmupMode::Off),
+        "auto" | "on" | "true" => Ok(WarmupMode::Auto),
+        other => humantime::parse_duration(other)
+            .map(WarmupMode::Fixed)
+            .map_err(|err| format!("expected `auto`, `off`, or a duration such as `45s`: {err}")),
     }
 }
 
@@ -595,6 +738,86 @@ mod tests {
     fn test_parse_duration_millis_fallback_errors() {
         assert!(parse_duration_millis_fallback("abc").is_err());
         assert!(parse_duration_millis_fallback("").is_err());
+    }
+
+    #[test]
+    fn test_parse_warmup_mode() {
+        assert_eq!(parse_warmup_mode("auto"), Ok(WarmupMode::Auto));
+        assert_eq!(parse_warmup_mode("Off"), Ok(WarmupMode::Off));
+        assert_eq!(parse_warmup_mode("0"), Ok(WarmupMode::Off));
+        assert_eq!(parse_warmup_mode("45s"), Ok(WarmupMode::Fixed(Duration::from_secs(45))));
+        assert_eq!(parse_warmup_mode("1m 30s"), Ok(WarmupMode::Fixed(Duration::from_secs(90))));
+        assert!(parse_warmup_mode("soon").is_err());
+    }
+
+    #[test]
+    fn warmup_defaults_and_proposer_inference() {
+        let cli = Cli::try_parse_from([
+            "bench",
+            "send",
+            "--rpc-url",
+            "http://a:8545,http://b:8545,http://a:8545/",
+            "--tps",
+            "1000",
+        ])
+        .unwrap();
+        let Command::Send(args) = cli.command else { panic!("expected send") };
+        assert_eq!(args.warmup, WarmupMode::Auto);
+        let config = args.warmup_config().unwrap();
+        assert_eq!(config.expected_proposers, 2);
+        assert_eq!(config.target_tps, 1000);
+        assert_eq!(config.rate_cap, 2000);
+        assert!(!config.is_rate_capped(), "cap above the target has no effect");
+        assert_eq!(config.ramp, Duration::from_secs(10));
+        assert!(args.duration.is_none());
+        assert_eq!(config.min_duration, Duration::from_secs(30));
+        assert_eq!(config.max_duration, Duration::from_secs(90));
+        assert_eq!(config.proposals_per_proposer, 2);
+        assert_eq!(config.stable_blocks, 10);
+        assert!(config.pool_check);
+    }
+
+    #[test]
+    fn warmup_overrides_and_validation() {
+        let cli = Cli::try_parse_from([
+            "bench",
+            "send",
+            "--warmup",
+            "45s",
+            "--warmup-proposers",
+            "10",
+            "--warmup-pool-check",
+            "false",
+            "--warmup-ramp",
+            "0s",
+            "--tps",
+            "50000",
+            "--warmup-tps",
+            "1000",
+            "--duration",
+            "90s",
+        ])
+        .unwrap();
+        let Command::Send(args) = cli.command else { panic!("expected send") };
+        let config = args.warmup_config().unwrap();
+        assert_eq!(config.mode, WarmupMode::Fixed(Duration::from_secs(45)));
+        assert_eq!(config.expected_proposers, 10);
+        assert!(!config.pool_check);
+        assert!(config.ramp.is_zero());
+        assert_eq!(config.warmup_rate(), 1000);
+        assert!(config.is_rate_capped());
+        assert_eq!(args.duration, Some(Duration::from_secs(90)));
+
+        let cli =
+            Cli::try_parse_from(["bench", "send", "--warmup-min", "2m", "--warmup-max", "1m"])
+                .unwrap();
+        let Command::Send(args) = cli.command else { panic!("expected send") };
+        assert!(args.warmup_config().is_err());
+
+        let cli = Cli::try_parse_from(["bench", "send", "--warmup", "off", "--warmup-min", "2m"])
+            .unwrap();
+        let Command::Send(args) = cli.command else { panic!("expected send") };
+        assert!(!args.warmup_config().unwrap().is_enabled());
     }
 
     #[test]

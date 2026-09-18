@@ -21,7 +21,10 @@ use std::{
     collections::{HashSet, VecDeque},
     fmt,
     num::NonZeroUsize,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
+    },
     time::{Duration, Instant, SystemTime},
 };
 use tokio::{
@@ -933,6 +936,24 @@ impl Sender {
         self
     }
 
+    /// Adjust the submission rate limit while sending (used by the warm-up
+    /// ramp). `0` removes the limit; a limiter is created when none exists.
+    pub async fn set_rate_limit(&mut self, tokens_per_sec: u64) {
+        if tokens_per_sec == 0 {
+            self.rate_limiter = None;
+            return;
+        }
+        match &self.rate_limiter {
+            Some(limiter) => limiter.set_rate(tokens_per_sec).await,
+            None => self.rate_limiter = Some(Arc::new(RateLimiter::new(tokens_per_sec))),
+        }
+    }
+
+    /// Current submission rate limit in transactions per second (0 = unlimited).
+    pub fn rate_limit(&self) -> u64 {
+        self.rate_limiter.as_ref().map_or(0, |limiter| limiter.rate().round() as u64)
+    }
+
     /// Validate the full setup graph before sending any transaction. Ordering
     /// the batch first also prevents forward dependencies from deadlocking the
     /// bounded submission buffer. Independent lanes still dispatch concurrently.
@@ -1046,6 +1067,64 @@ impl Sender {
         }
 
         Ok(())
+    }
+
+    /// Make progress on queued and in-flight transactions for at most `budget`.
+    ///
+    /// Returns `Ok(true)` while work remains and `Ok(false)` once everything
+    /// completed. Lets a caller interleave its own bookkeeping (the warm-up
+    /// ramp and readiness checks) with draining the buffered backlog after the
+    /// transaction source ended; [`Sender::flush`] remains the final barrier.
+    pub async fn flush_step(&mut self, budget: Duration) -> Result<bool> {
+        if let Some(error) = self.deferred_errors.pop_front() {
+            self.deferred_errors.clear();
+            self.pending.clear();
+            return Err(error);
+        }
+        if let Err(failure) = self.pump().await {
+            self.pending.clear();
+            return Err(failure.error);
+        }
+
+        let deadline = tokio::time::Instant::now() + budget;
+        while self.has_outstanding_work() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(true);
+            }
+            match tokio::time::timeout(remaining, self.completion_rx.recv()).await {
+                Ok(Some(completion)) => {
+                    self.handle_completion(completion);
+                    if let Err(failure) = self.pump().await {
+                        self.pending.clear();
+                        return Err(failure.error);
+                    }
+                }
+                Ok(None) => break,
+                Err(_elapsed) => return Ok(true),
+            }
+        }
+        Ok(false)
+    }
+
+    fn has_outstanding_work(&self) -> bool {
+        !self.pending.is_empty() ||
+            !self.active_keys.is_empty() ||
+            self.in_flight_setup > 0 ||
+            self.in_flight_pending > 0
+    }
+
+    /// Drop transactions that were accepted by [`Sender::send`] but not yet
+    /// dispatched, returning how many were dropped. Dispatched requests are
+    /// unaffected and still complete through [`Sender::flush`].
+    ///
+    /// Used when a measured window's `--duration` ends: the buffered backlog
+    /// (up to `max_concurrent x 4` transactions) would otherwise extend the
+    /// window by however long it takes to send at the configured rate.
+    pub fn discard_queued(&mut self) -> usize {
+        let dropped = self.pending.len();
+        self.pending.clear();
+        dropped
     }
 
     /// Wait for all pending transactions to complete.
@@ -1333,7 +1412,7 @@ struct DispatchPreparationError {
 fn max_buffered_transactions(config: &SenderConfig, limiter: Option<&RateLimiter>) -> usize {
     let concurrency_buffer = config.max_concurrent.saturating_mul(PENDING_BACKLOG_FACTOR).max(1);
     let burst_buffer =
-        limiter.map(|l| (l.burst_capacity.ceil() as usize).saturating_mul(2)).unwrap_or(0);
+        limiter.map(|l| (l.burst_capacity().ceil() as usize).saturating_mul(2)).unwrap_or(0);
     concurrency_buffer.max(burst_buffer)
 }
 
@@ -1627,8 +1706,11 @@ const RATE_LIMITER_MAX_BURST: Duration = Duration::from_millis(10);
 /// batches enough tokens to avoid sub-millisecond sleeps at high TPS, but caps
 /// accumulated credit to a small time window.
 struct RateLimiter {
-    rate: f64,
-    burst_capacity: f64,
+    /// Tokens per second, stored as `f64` bits so the rate can be adjusted
+    /// while the limiter is shared (warm-up ramp).
+    rate_bits: AtomicU64,
+    /// Burst budget in tokens, stored as `f64` bits.
+    burst_capacity_bits: AtomicU64,
     state: tokio::sync::Mutex<RateLimiterState>,
 }
 
@@ -1639,12 +1721,11 @@ struct RateLimiterState {
 
 impl RateLimiter {
     fn new(tokens_per_sec: u64) -> Self {
-        let rate = tokens_per_sec as f64;
-        let burst_capacity = (rate * RATE_LIMITER_MAX_BURST.as_secs_f64()).max(1.0);
+        let (rate, burst_capacity) = Self::rate_and_burst(tokens_per_sec);
 
         Self {
-            rate,
-            burst_capacity,
+            rate_bits: AtomicU64::new(rate.to_bits()),
+            burst_capacity_bits: AtomicU64::new(burst_capacity.to_bits()),
             state: tokio::sync::Mutex::new(RateLimiterState {
                 tokens: burst_capacity,
                 last_refill: Instant::now(),
@@ -1652,16 +1733,42 @@ impl RateLimiter {
         }
     }
 
-    async fn try_acquire_or_delay(&self) -> Option<Duration> {
+    fn rate_and_burst(tokens_per_sec: u64) -> (f64, f64) {
+        let rate = tokens_per_sec as f64;
+        let burst_capacity = (rate * RATE_LIMITER_MAX_BURST.as_secs_f64()).max(1.0);
+        (rate, burst_capacity)
+    }
+
+    fn rate(&self) -> f64 {
+        f64::from_bits(self.rate_bits.load(Ordering::Relaxed))
+    }
+
+    fn burst_capacity(&self) -> f64 {
+        f64::from_bits(self.burst_capacity_bits.load(Ordering::Relaxed))
+    }
+
+    /// Change the rate. Takes effect on the next refill; accumulated credit is
+    /// capped to the new burst budget.
+    async fn set_rate(&self, tokens_per_sec: u64) {
+        let (rate, burst_capacity) = Self::rate_and_burst(tokens_per_sec);
         let mut state = self.state.lock().await;
-        state.refill(self.rate, self.burst_capacity);
+        state.refill(self.rate(), self.burst_capacity());
+        self.rate_bits.store(rate.to_bits(), Ordering::Relaxed);
+        self.burst_capacity_bits.store(burst_capacity.to_bits(), Ordering::Relaxed);
+        state.tokens = state.tokens.min(burst_capacity);
+    }
+
+    async fn try_acquire_or_delay(&self) -> Option<Duration> {
+        let rate = self.rate();
+        let mut state = self.state.lock().await;
+        state.refill(rate, self.burst_capacity());
 
         if state.tokens >= 1.0 {
             state.tokens -= 1.0;
             None
         } else {
             let missing_tokens = 1.0 - state.tokens;
-            Some(Duration::from_secs_f64(missing_tokens / self.rate))
+            Some(Duration::from_secs_f64(missing_tokens / rate))
         }
     }
 }
@@ -2099,13 +2206,34 @@ mod tests {
     #[test]
     fn test_rate_limiter_burst_capacity_is_bounded() {
         let limiter = RateLimiter::new(10_000);
-        assert_eq!(limiter.burst_capacity, 100.0);
+        assert_eq!(limiter.burst_capacity(), 100.0);
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_set_rate_caps_credit_to_new_burst() {
+        let limiter = RateLimiter::new(10_000);
+        assert_eq!(limiter.rate(), 10_000.0);
+        assert_eq!(limiter.burst_capacity(), 100.0);
+
+        limiter.set_rate(1_000).await;
+        assert_eq!(limiter.rate(), 1_000.0);
+        assert_eq!(limiter.burst_capacity(), 10.0);
+        // Accumulated credit from the old burst budget does not carry over.
+        assert!(limiter.state.lock().await.tokens <= 10.0);
+
+        // Ten tokens are available immediately at the new burst budget; the
+        // eleventh has to wait about a millisecond at 1k tokens per second.
+        for _ in 0..10 {
+            assert!(limiter.try_acquire_or_delay().await.is_none());
+        }
+        let delay = limiter.try_acquire_or_delay().await.expect("bucket drained");
+        assert!(delay <= Duration::from_millis(2));
     }
 
     #[tokio::test]
     async fn test_rate_limiter_does_not_accumulate_unbounded_catch_up_credit() {
         let limiter = RateLimiter::new(1_000);
-        assert_eq!(limiter.burst_capacity, 10.0);
+        assert_eq!(limiter.burst_capacity(), 10.0);
 
         {
             let mut state = limiter.state.lock().await;

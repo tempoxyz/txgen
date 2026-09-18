@@ -22,6 +22,7 @@ pub mod sample;
 pub mod scraper;
 pub mod sender;
 pub mod source;
+pub mod warmup;
 
 pub use auth::{RequestAuthProvider, RpcRequestContext, SenderHeaderAuthProvider};
 pub use call::{
@@ -33,9 +34,9 @@ pub use call::{
 pub use clickhouse::ClickHouseClient;
 pub use clock::RunClock;
 pub use metrics::{
-    collect_block_stats, compute_latency_stats, trim_trailing_empty_blocks, BenchMetrics,
-    BlockStats, LatencySample, LatencyStats, MetricsCollector, MetricsCollectorOptions, RunStats,
-    ThroughputSample, TimeSeriesMetrics,
+    block_timestamp_ms, collect_block_stats, compute_latency_stats, trim_trailing_empty_blocks,
+    BenchMetrics, BlockStats, LatencySample, LatencyStats, MetricsCheckpoint, MetricsCollector,
+    MetricsCollectorOptions, RunStats, ThroughputSample, TimeSeriesMetrics,
 };
 pub use prometheus::parse_prometheus_text;
 pub use prometheus_reporter::{
@@ -54,8 +55,8 @@ pub use receipt_metrics::{
 pub use receipt_tracker::ReceiptTracker;
 pub use reporter::{
     parse_reporters, ClickHouseConfig, ClickHouseReporter, ConsoleReporter, FinalReport,
-    JsonLatency, JsonLatencySample, JsonReport, JsonReporter, JsonTimeSeries, ProgressState,
-    Reporter,
+    JsonLatency, JsonLatencySample, JsonReport, JsonReporter, JsonTimeSeries, MeasurementStart,
+    ProgressState, Reporter,
 };
 pub use sample::{Sample, SampleArchive, SampleStore};
 pub use scraper::{start_scrapers, SampleCallback, ScraperConfig, ScraperHandle};
@@ -65,3 +66,9 @@ pub use sender::{
 };
 pub use source::{FileSource, SourceTx, StdinSource, TxSource};
 pub use txgen_core::{GeneratedTx, TxPhase};
+pub use warmup::{
+    ObservedBlock, WarmupConditions, WarmupConfig, WarmupDecision, WarmupMode, WarmupOutcome,
+    WarmupStatus, WarmupSummary, WarmupTracker, DEFAULT_WARMUP_MAX, DEFAULT_WARMUP_MIN,
+    DEFAULT_WARMUP_PROPOSALS, DEFAULT_WARMUP_RAMP, DEFAULT_WARMUP_STABLE_BLOCKS,
+    DEFAULT_WARMUP_STABLE_TOLERANCE, DEFAULT_WARMUP_TPS_CAP,
+};

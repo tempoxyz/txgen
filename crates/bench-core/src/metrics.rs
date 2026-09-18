@@ -331,8 +331,7 @@ pub async fn collect_block_stats<N: Network, P: Provider<N>>(
                 .wrap_err_with(|| format!("failed to fetch block {number}"))?
                 .ok_or_else(|| eyre::eyre!("block {number} not found"))?;
 
-            let timestamp_secs = block.header().timestamp();
-            let timestamp_ms = extract_timestamp_ms(&block, timestamp_secs);
+            let timestamp_ms = block_timestamp_ms(&block);
 
             Ok::<_, eyre::Report>((
                 number,
@@ -400,8 +399,13 @@ pub fn trim_trailing_empty_blocks(blocks: &mut Vec<BlockStats>) -> Option<u64> {
 ///
 /// Checks `other_fields` for Tempo's `timestampMillisPart` field and
 /// combines it with the second-precision timestamp. Falls back to
-/// `timestamp_secs * 1000` for standard Ethereum blocks.
-fn extract_timestamp_ms<B: BlockResponse>(block: &B, timestamp_secs: u64) -> u64 {
+/// `timestamp * 1000` for standard Ethereum blocks.
+pub fn block_timestamp_ms<B>(block: &B) -> u64
+where
+    B: BlockResponse,
+    B::Header: BlockHeader,
+{
+    let timestamp_secs = block.header().timestamp();
     if let Some(other) = block.other_fields() &&
         let Some(Ok(ms_part)) =
             other.get_deserialized::<alloy_primitives::U64>("timestampMillisPart")
@@ -691,15 +695,45 @@ impl MetricsCollector {
         }
     }
 
+    /// Capture the current counters and clock offset as a measurement origin.
+    ///
+    /// Used when a warm-up phase ends: everything recorded before the
+    /// checkpoint is excluded from the final metrics without resetting the
+    /// live counters, so exported counter samples stay monotonic.
+    pub fn checkpoint(&self) -> MetricsCheckpoint {
+        MetricsCheckpoint {
+            offset: self.elapsed(),
+            sent: self.sent.load(Ordering::Relaxed),
+            success: self.success.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+        }
+    }
+
     /// Compute final metrics.
     pub async fn finalize(&self) -> BenchMetrics {
+        self.finalize_since(None).await
+    }
+
+    /// Compute final metrics for the run since `checkpoint`.
+    ///
+    /// `None` covers the whole run. With a checkpoint, counts are relative to
+    /// it, `elapsed` is measured from it, and latency samples recorded before
+    /// it are ignored. Responses are counted when they arrive, so transactions
+    /// in flight at the checkpoint add to `success`/`failed` but not `sent`;
+    /// see [`MetricsCheckpoint::inflight`].
+    pub async fn finalize_since(&self, checkpoint: Option<MetricsCheckpoint>) -> BenchMetrics {
         let elapsed = self.clock.elapsed();
         self.finish_aggregation().await;
+        let base = checkpoint.unwrap_or_default();
 
         let latency = if self.collect_latencies {
             let aggregation = self.aggregation.lock().await;
-            let mut durations: Vec<Duration> =
-                aggregation.latencies.iter().map(|l| l.latency).collect();
+            let mut durations: Vec<Duration> = aggregation
+                .latencies
+                .iter()
+                .filter(|l| l.offset >= base.offset)
+                .map(|l| l.latency)
+                .collect();
             durations.sort();
             Some(LatencyStats::from_sorted(&durations))
         } else {
@@ -707,26 +741,42 @@ impl MetricsCollector {
         };
 
         BenchMetrics {
-            sent: self.sent.load(Ordering::Relaxed),
-            success: self.success.load(Ordering::Relaxed),
-            failed: self.failed.load(Ordering::Relaxed),
-            elapsed,
+            sent: self.sent.load(Ordering::Relaxed).saturating_sub(base.sent),
+            success: self.success.load(Ordering::Relaxed).saturating_sub(base.success),
+            failed: self.failed.load(Ordering::Relaxed).saturating_sub(base.failed),
+            elapsed: elapsed.saturating_sub(base.offset),
             latency,
         }
     }
 
     /// Extract time-series metrics for graphing.
     pub async fn time_series(&self) -> TimeSeriesMetrics {
+        self.time_series_since(None).await
+    }
+
+    /// Extract time-series metrics since `checkpoint`, rebased so that second 0
+    /// and offset 0 are the checkpoint.
+    ///
+    /// The per-second bucket containing the checkpoint is kept whole and
+    /// becomes second 0, so at most one second of pre-checkpoint traffic can
+    /// leak into the first bucket.
+    pub async fn time_series_since(
+        &self,
+        checkpoint: Option<MetricsCheckpoint>,
+    ) -> TimeSeriesMetrics {
         let total_elapsed = self.clock.elapsed();
+        let base = checkpoint.unwrap_or_default();
+        let base_second = base.offset.as_secs();
+        let base_ms = u64::try_from(base.offset.as_millis()).unwrap_or(u64::MAX);
         let total_seconds = total_elapsed.as_secs() + 1;
         self.finish_aggregation().await;
 
         let aggregation = self.aggregation.lock().await;
-        let mut throughput = Vec::with_capacity(total_seconds as usize);
-        for second in 0..total_seconds {
+        let mut throughput = Vec::with_capacity(total_seconds.saturating_sub(base_second) as usize);
+        for second in base_second..total_seconds {
             let counts = aggregation.throughput.get(&second).copied().unwrap_or_default();
             throughput.push(ThroughputSample {
-                second,
+                second: second - base_second,
                 sent: counts.sent,
                 success: counts.success,
                 failed: counts.failed,
@@ -736,10 +786,36 @@ impl MetricsCollector {
         let latency_samples: Vec<LatencySample> = aggregation
             .latencies
             .iter()
-            .map(|l| LatencySample { offset_ms: l.offset.as_millis() as u64, latency: l.latency })
+            .filter(|l| l.offset >= base.offset)
+            .map(|l| LatencySample {
+                offset_ms: (l.offset.as_millis() as u64).saturating_sub(base_ms),
+                latency: l.latency,
+            })
             .collect();
 
         TimeSeriesMetrics { throughput, latencies: latency_samples }
+    }
+}
+
+/// Counter and clock snapshot marking where measurement starts.
+///
+/// See [`MetricsCollector::checkpoint`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetricsCheckpoint {
+    /// Clock offset at the checkpoint.
+    pub offset: Duration,
+    /// Transactions sent before the checkpoint.
+    pub sent: u64,
+    /// Transactions confirmed before the checkpoint.
+    pub success: u64,
+    /// Transactions failed before the checkpoint.
+    pub failed: u64,
+}
+
+impl MetricsCheckpoint {
+    /// Transactions sent before the checkpoint whose response had not arrived.
+    pub fn inflight(&self) -> u64 {
+        self.sent.saturating_sub(self.success.saturating_add(self.failed))
     }
 }
 
@@ -1138,5 +1214,50 @@ mod tests {
         let cutoff = trim_trailing_empty_blocks(&mut blocks);
         assert!(blocks.is_empty());
         assert_eq!(cutoff, None);
+    }
+    #[tokio::test]
+    async fn finalize_since_excludes_pre_checkpoint_work() {
+        let collector = MetricsCollector::new(RunClock::new());
+        collector.record_sent();
+        collector.record_sent();
+        collector.record_success(Duration::from_millis(900));
+        collector.record_failure();
+        // Let the aggregation task drain before taking the checkpoint so the
+        // pre-checkpoint latency has an offset strictly before it.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let checkpoint = collector.checkpoint();
+        assert_eq!((checkpoint.sent, checkpoint.success, checkpoint.failed), (2, 1, 1));
+
+        collector.record_sent();
+        collector.record_success(Duration::from_millis(100));
+
+        let metrics = collector.finalize_since(Some(checkpoint)).await;
+        assert_eq!((metrics.sent, metrics.success, metrics.failed), (1, 1, 0));
+        let latency = metrics.latency.expect("latency stats");
+        assert_eq!(latency.max, Duration::from_millis(100));
+        assert!(metrics.elapsed < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn time_series_since_rebases_offsets() {
+        let clock = RunClock::new();
+        let collector = MetricsCollector::new(clock.clone());
+        collector.record_sent();
+        collector.record_success(Duration::from_millis(5));
+        let checkpoint = MetricsCheckpoint {
+            offset: Duration::from_millis(1_500),
+            sent: 1,
+            success: 1,
+            failed: 0,
+        };
+        let series = collector.time_series_since(Some(checkpoint)).await;
+        // The clock is well below 1.5 s, so no bucket remains after rebasing.
+        assert!(series.throughput.is_empty());
+        assert!(series.latencies.is_empty());
+
+        let whole = collector.time_series_since(None).await;
+        assert_eq!(whole.throughput[0].second, 0);
+        assert_eq!(whole.throughput[0].sent, 1);
+        assert_eq!(whole.latencies.len(), 1);
     }
 }
