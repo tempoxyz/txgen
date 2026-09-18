@@ -1,12 +1,12 @@
 //! Unified metric sample type and disk-backed store.
 //!
 //! Both internal benchmark metrics and scraped node Prometheus metrics are
-//! streamed into an uncompressed NDJSON file. Reporters read the file back in
+//! streamed into a gzip-compressed NDJSON file. Reporters read the file back in
 //! batches at finalization time, which avoids retaining all metric samples in
-//! memory for long benchmark runs. File JSON reports compress the archive only
-//! when writing the final sidecar.
+//! memory or writing large uncompressed archives during benchmark runs.
 
 use eyre::{Context, Result};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -40,7 +40,7 @@ pub struct Sample {
     pub unix_ms: u64,
 }
 
-/// A finalized NDJSON sample archive.
+/// A finalized gzip-compressed NDJSON sample archive.
 #[derive(Debug)]
 pub struct SampleArchive {
     path: PathBuf,
@@ -49,7 +49,7 @@ pub struct SampleArchive {
 }
 
 impl SampleArchive {
-    /// Path to the NDJSON sample file.
+    /// Path to the gzip-compressed NDJSON sample file.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -77,20 +77,14 @@ impl SampleArchive {
 
     /// Write NDJSON samples to `writer`, applying any lazy cutoff.
     pub fn write_ndjson_to<W: Write>(&self, writer: &mut W) -> Result<usize> {
+        let mut reader = sample_reader(&self.path)?;
         let Some(cutoff_ms) = self.retain_until_unix_ms else {
-            let mut reader = BufReader::new(File::open(&self.path).wrap_err_with(|| {
-                format!("failed to open sample archive {}", self.path.display())
-            })?);
             std::io::copy(&mut reader, writer).wrap_err_with(|| {
                 format!("failed to copy sample archive {}", self.path.display())
             })?;
             return Ok(self.len);
         };
 
-        let mut reader =
-            BufReader::new(File::open(&self.path).wrap_err_with(|| {
-                format!("failed to open sample archive {}", self.path.display())
-            })?);
         let mut line = Vec::with_capacity(1024);
         let mut written = 0usize;
         loop {
@@ -120,19 +114,17 @@ impl Drop for SampleArchive {
     }
 }
 
-/// Iterator over an NDJSON sample archive.
+/// Iterator over a gzip-compressed NDJSON sample archive.
 pub struct SampleArchiveIter {
-    reader: BufReader<File>,
+    reader: SampleReader,
     line: Vec<u8>,
     retain_until_unix_ms: Option<u64>,
 }
 
 impl SampleArchiveIter {
     fn open(path: &Path, retain_until_unix_ms: Option<u64>) -> Result<Self> {
-        let file = File::open(path)
-            .wrap_err_with(|| format!("failed to open sample archive {}", path.display()))?;
         Ok(Self {
-            reader: BufReader::new(file),
+            reader: sample_reader(path)?,
             line: Vec::with_capacity(1024),
             retain_until_unix_ms,
         })
@@ -221,7 +213,10 @@ fn skip_json_whitespace(line: &[u8], mut index: usize) -> usize {
     index
 }
 
-type SampleWriter = BufWriter<File>;
+// Buffer both JSON serialization and compressed I/O so small writes do not
+// repeatedly enter the compressor or issue a syscall.
+type SampleWriter = BufWriter<GzEncoder<BufWriter<File>>>;
+type SampleReader = BufReader<GzDecoder<BufReader<File>>>;
 
 #[derive(Debug)]
 struct SampleStoreInner {
@@ -234,7 +229,7 @@ struct SampleStoreInner {
 /// Append-only sample store.
 ///
 /// Shared between the internal metrics snapshotter and Prometheus scrapers via
-/// `Arc`. Batches are serialized to an uncompressed NDJSON file immediately
+/// `Arc`. Batches are serialized to a gzip-compressed NDJSON file immediately
 /// instead of being retained in memory.
 #[derive(Debug, Clone)]
 pub struct SampleStore {
@@ -322,8 +317,9 @@ impl SampleStore {
     /// Finalize the sample archive.
     pub async fn finish(&self) -> Result<SampleArchive> {
         let mut inner = self.inner.lock().await;
-        if let Some(mut writer) = inner.writer.take() {
-            writer.flush()?;
+        if let Some(writer) = inner.writer.take() {
+            let encoder = writer.into_inner().map_err(|err| err.into_error())?;
+            encoder.finish()?.flush()?;
         }
 
         Ok(SampleArchive { path: inner.path.clone(), len: inner.len, retain_until_unix_ms: None })
@@ -349,7 +345,13 @@ fn apply_labels(sample: &mut Sample, labels: &HashMap<String, String>) {
 fn sample_writer(path: &Path) -> Result<SampleWriter> {
     let file = File::create(path)
         .wrap_err_with(|| format!("failed to create sample archive {}", path.display()))?;
-    Ok(BufWriter::new(file))
+    Ok(BufWriter::new(GzEncoder::new(BufWriter::new(file), Compression::fast())))
+}
+
+fn sample_reader(path: &Path) -> Result<SampleReader> {
+    let file = File::open(path)
+        .wrap_err_with(|| format!("failed to open sample archive {}", path.display()))?;
+    Ok(BufReader::new(GzDecoder::new(BufReader::new(file))))
 }
 
 fn temporary_sample_path() -> PathBuf {
@@ -362,7 +364,7 @@ fn temporary_sample_path() -> PathBuf {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 
     std::env::temp_dir()
-        .join(format!("txgen-samples-{}-{nanos}-{id}.samples.ndjson", std::process::id()))
+        .join(format!("txgen-samples-{}-{nanos}-{id}.samples.ndjson.gz", std::process::id()))
 }
 
 #[cfg(test)]
@@ -393,6 +395,56 @@ mod tests {
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].name, "a");
         assert_eq!(samples[1].value, 2.0);
+    }
+
+    #[tokio::test]
+    async fn compressed_archive_preserves_multiple_batches() {
+        let store = SampleStore::new().unwrap();
+        let mut expected_ndjson = Vec::new();
+        for batch in 0..4 {
+            let samples: Vec<_> = (0..256)
+                .map(|index| make_sample("repeated_metric", 1.0, batch * 256 + index))
+                .collect();
+            for sample in &samples {
+                serde_json::to_writer(&mut expected_ndjson, sample).unwrap();
+                writeln!(&mut expected_ndjson).unwrap();
+            }
+            store.push_batch(samples).await.unwrap();
+        }
+
+        let archive = store.finish().await.unwrap();
+        let compressed = std::fs::read(archive.path()).unwrap();
+        assert!(compressed.starts_with(&[0x1f, 0x8b]));
+        assert!(compressed.len() < expected_ndjson.len());
+
+        let mut ndjson = Vec::new();
+        assert_eq!(archive.write_ndjson_to(&mut ndjson).unwrap(), 1024);
+        assert_eq!(ndjson, expected_ndjson);
+        let samples = archive.iter().unwrap().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(samples.len(), 1024);
+        assert_eq!(samples[1023].offset_ms, 1023);
+    }
+
+    #[tokio::test]
+    async fn empty_archive_is_valid_gzip() {
+        let archive = SampleStore::new().unwrap().finish().await.unwrap();
+        assert!(archive.is_empty());
+        assert!(archive.iter().unwrap().next().is_none());
+        let mut ndjson = Vec::new();
+        assert_eq!(archive.write_ndjson_to(&mut ndjson).unwrap(), 0);
+        assert!(ndjson.is_empty());
+    }
+
+    #[tokio::test]
+    async fn truncated_archive_reports_decompression_error() {
+        let store = SampleStore::new().unwrap();
+        store.push_batch(vec![make_sample("x", 1.0, 0)]).await.unwrap();
+        let archive = store.finish().await.unwrap();
+        let file = File::options().write(true).open(archive.path()).unwrap();
+        file.set_len(file.metadata().unwrap().len() - 4).unwrap();
+
+        assert!(archive.iter().unwrap().collect::<Result<Vec<_>>>().is_err());
+        assert!(archive.write_ndjson_to(&mut Vec::new()).is_err());
     }
 
     #[tokio::test]
@@ -482,12 +534,12 @@ mod tests {
 
         let mut archive = store.finish().await.unwrap();
         let original_path = archive.path().to_path_buf();
-        let original_content = std::fs::read_to_string(&original_path).unwrap();
+        let original_content = std::fs::read(&original_path).unwrap();
 
         archive.retain_until(1_700_000_000_000);
 
         assert_eq!(archive.path(), original_path);
-        assert_eq!(std::fs::read_to_string(&original_path).unwrap(), original_content);
+        assert_eq!(std::fs::read(&original_path).unwrap(), original_content);
 
         let samples = archive.iter().unwrap().collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(samples.len(), 1);
