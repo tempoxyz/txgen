@@ -22,6 +22,7 @@ use tokio::sync::{oneshot, watch};
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(300);
+const INCLUSION_TIMEOUT: Duration = Duration::from_secs(3000);
 
 type Receipt = Arc<AnyTransactionReceipt>;
 type ReceiptResult = Result<Inclusion, String>;
@@ -174,7 +175,7 @@ impl ReceiptWaiter {
     }
 
     pub(crate) async fn observe(mut self) -> Result<Inclusion> {
-        tokio::time::timeout(RECEIPT_TIMEOUT, &mut self.receiver)
+        tokio::time::timeout(INCLUSION_TIMEOUT, &mut self.receiver)
             .await
             .map_err(|_| eyre!("timed out waiting for transaction inclusion"))?
             .map_err(|_| eyre!("receipt tracker stopped"))?
