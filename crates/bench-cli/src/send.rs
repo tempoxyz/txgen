@@ -4,6 +4,7 @@ use crate::{
     load_metric_names,
     metrics_forwarder::{build_metrics_forwarder, finish_metrics_forwarder},
     metrics_url::metrics_scraper_configs,
+    warmup::WarmupPhase,
     SendArgs,
 };
 use alloy_network::AnyNetwork;
@@ -13,9 +14,10 @@ use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     collect_block_stats, parse_reporters, start_scrapers, total_fees_paid,
     trim_trailing_empty_blocks, BlockReceiptCollector, ConsoleReporter, FileSource, FinalReport,
-    GeneratedTx, LateSigner, MetricsCollector, ProgressState, ReceiptTracker, Reporter,
-    RequestAuthProvider, RpcEndpoint, RunClock, RunStats, SampleStore, ScraperConfig, Sender,
-    SenderConfig, SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
+    GeneratedTx, LateSigner, MeasurementStart, MetricsCheckpoint, MetricsCollector, ProgressState,
+    ReceiptTracker, Reporter, RequestAuthProvider, RpcEndpoint, RunClock, RunStats, SampleStore,
+    ScraperConfig, Sender, SenderConfig, SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
+    WarmupOutcome, WarmupSummary,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -203,18 +205,102 @@ async fn execute_source<S: TxSource>(
     }
 
     // Record the block number after setup and before workload sending so per-block
-    // stats exclude setup blocks.
+    // stats exclude setup blocks. A warm-up moves this to its boundary later.
     let start_block =
         query_provider.get_block_number().await.wrap_err("failed to get starting block number")?;
 
-    if let Some(tx) = first_workload {
-        send_workload_tx(tx, &mut sender, &metrics, &config, &mut reporters).await?;
-    }
+    let warmup_config = args.warmup_config()?;
+    let warmup = if warmup_config.is_enabled() {
+        tracing::info!(
+            mode = %warmup_config.mode,
+            ramp = ?warmup_config.ramp,
+            min = ?warmup_config.min_duration,
+            max = ?warmup_config.max_duration,
+            proposals_per_proposer = warmup_config.proposals_per_proposer,
+            expected_proposers = warmup_config.expected_proposers,
+            stable_blocks = warmup_config.stable_blocks,
+            stable_tolerance = warmup_config.stable_tolerance,
+            pool_check = warmup_config.pool_check,
+            "Warm-up started"
+        );
+        if args.tps == 0 {
+            tracing::info!(reason = "--tps=0 (unlimited)", "Skipped warm-up ramp");
+        }
+        let mut phase = WarmupPhase::start(
+            warmup_config,
+            query_provider.clone(),
+            start_block,
+            args.tps,
+            &clock,
+        );
+        phase.apply_initial_rate(&sender).await;
+        Some(phase)
+    } else {
+        tracing::info!(reason = "--warmup=off", "Skipped warm-up");
+        None
+    };
 
-    send_workload_from_source(source, &mut sender, &metrics, &config, &mut reporters).await?;
+    let mut run = WorkloadRun {
+        start_block,
+        checkpoint: None,
+        measurement_start_unix_ms: clock.start_unix_ms(),
+        warmup: None,
+    };
+    {
+        let mut ctx = WorkloadContext {
+            sender: &mut sender,
+            metrics: &metrics,
+            config: &config,
+            reporters: &mut reporters,
+            warmup,
+            run: &mut run,
+            query_provider: &query_provider,
+            clock: &clock,
+        };
+
+        if let Some(tx) = first_workload {
+            send_workload_tx(tx, &mut ctx).await?;
+        }
+
+        send_workload_from_source(source, &mut ctx).await?;
+
+        // The source is drained, but the sender still holds a buffered backlog
+        // (up to `max_concurrent x 4` transactions). Keep the warm-up ticking
+        // while that backlog goes out so the boundary can still be reached;
+        // give up once nothing is left to send.
+        while ctx.warmup.is_some() {
+            let remaining = ctx.sender.flush_step(Duration::from_millis(100)).await?;
+            let outcome = match ctx.warmup.as_mut() {
+                Some(phase) => phase.tick(ctx.sender).await,
+                None => None,
+            };
+            if let Some(outcome) = outcome {
+                finish_warmup(&mut ctx, outcome).await?;
+                break;
+            }
+            if !remaining {
+                break;
+            }
+        }
+
+        if let Some(phase) = ctx.warmup.take() {
+            let summary = phase.abandon().await;
+            tracing::warn!(
+                duration_secs = summary.duration_ms as f64 / 1000.0,
+                blocks = summary.blocks,
+                proposers_ready = summary.proposers_ready,
+                proposers_expected = summary.expected_proposers,
+                "Transaction source ended before the warm-up finished; reporting the whole run"
+            );
+            ctx.run.warmup = Some(summary);
+        }
+    }
 
     sender.flush().await?;
     drop(sender);
+
+    // From here on, `start_block` is the last block before the measured window.
+    let start_block = run.start_block;
 
     let (sent, success, failed) = metrics.counts();
     tracing::info!(sent, success, failed, "Bench send completed; starting post-processing");
@@ -272,10 +358,10 @@ async fn execute_source<S: TxSource>(
         tracing::info!(reason = "no metrics scrapers", "Skipped metrics scraper stop");
     }
 
-    let final_metrics = metrics.finalize().await;
+    let final_metrics = metrics.finalize_since(run.checkpoint).await;
     tracing::info!("Metrics finalized");
 
-    let time_series = metrics.time_series().await;
+    let time_series = metrics.time_series_since(run.checkpoint).await;
     tracing::info!("Time series built");
 
     // Finalize the sample archive before reporters read it.
@@ -294,8 +380,15 @@ async fn execute_source<S: TxSource>(
         receipt_metrics,
         total_fees_paid,
         receipt_records,
+        warmup: run.warmup.clone(),
         ..Default::default()
     };
+
+    // After a warm-up, drop samples from before the measured window and report
+    // offsets relative to its start so they line up with the block range.
+    if run.checkpoint.is_some() {
+        report.rebase_samples_to(run.measurement_start_unix_ms)?;
+    }
 
     if end_block > start_block {
         let block_range_start = start_block + 1;
@@ -315,10 +408,9 @@ async fn execute_source<S: TxSource>(
         if let Some(cutoff_ms) = cutoff_ms {
             report.retain_samples_until(cutoff_ms)?;
             if let Some(ts) = report.time_series.as_mut() {
-                ts.latencies
-                    .retain(|l| l.offset_ms <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
-                ts.throughput
-                    .retain(|t| t.second * 1000 <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
+                let origin_ms = run.measurement_start_unix_ms;
+                ts.latencies.retain(|l| l.offset_ms <= cutoff_ms.saturating_sub(origin_ms));
+                ts.throughput.retain(|t| t.second * 1000 <= cutoff_ms.saturating_sub(origin_ms));
             }
         }
         tracing::info!(cutoff_ms = ?cutoff_ms, "Report trimmed");
@@ -482,45 +574,126 @@ pub(crate) fn parse_metadata(args: &[String]) -> Result<HashMap<String, String>>
     Ok(map)
 }
 
+/// Measurement bookkeeping. A warm-up moves all of it to its boundary.
+struct WorkloadRun {
+    /// Last block before the measured window; measured blocks start at `+1`.
+    start_block: u64,
+    /// Metrics origin when a warm-up ended, `None` for the whole run.
+    checkpoint: Option<MetricsCheckpoint>,
+    /// Wall-clock origin of the measured window in Unix milliseconds.
+    measurement_start_unix_ms: u64,
+    /// Warm-up summary, when a warm-up ran.
+    warmup: Option<WarmupSummary>,
+}
+
+/// Everything the workload send loop touches.
+struct WorkloadContext<'a> {
+    sender: &'a mut Sender,
+    metrics: &'a MetricsCollector,
+    config: &'a SenderConfig,
+    reporters: &'a mut [Box<dyn Reporter>],
+    /// Running warm-up, `None` once it finished or when disabled.
+    warmup: Option<WarmupPhase>,
+    run: &'a mut WorkloadRun,
+    query_provider: &'a DynProvider<AnyNetwork>,
+    clock: &'a RunClock,
+}
+
 async fn send_workload_from_source<S: TxSource>(
     source: &mut S,
-    sender: &mut Sender,
-    metrics: &MetricsCollector,
-    config: &SenderConfig,
-    reporters: &mut [Box<dyn Reporter>],
+    ctx: &mut WorkloadContext<'_>,
 ) -> Result<()> {
     while let Some(tx) = source.next_tx().await? {
         if tx.phase == TxPhase::Setup {
             bail!("setup transaction appeared after workload started");
         }
-        send_workload_tx(tx, sender, metrics, config, reporters).await?;
+        send_workload_tx(tx, ctx).await?;
     }
     Ok(())
 }
 
-async fn send_workload_tx(
-    tx: GeneratedTx,
-    sender: &mut Sender,
-    metrics: &MetricsCollector,
-    config: &SenderConfig,
-    reporters: &mut [Box<dyn Reporter>],
-) -> Result<()> {
-    sender.send(tx).await?;
+async fn send_workload_tx(tx: GeneratedTx, ctx: &mut WorkloadContext<'_>) -> Result<()> {
+    ctx.sender.send(tx).await?;
 
-    let (sent, success, failed) = metrics.counts();
+    let (sent, success, failed) = ctx.metrics.counts();
     if sent.is_multiple_of(1000) {
+        // Report the live limit so the warm-up ramp is visible in progress output.
+        let rate_limit = ctx.sender.rate_limit();
         let state = ProgressState {
             sent,
             success,
             failed,
-            elapsed: metrics.elapsed_since_start(),
-            max_concurrent: config.max_concurrent,
-            target_tps: (config.rate_limit > 0).then_some(config.rate_limit),
+            elapsed: ctx.metrics.elapsed_since_start(),
+            max_concurrent: ctx.config.max_concurrent,
+            target_tps: (rate_limit > 0).then_some(rate_limit),
             unit: "tx",
         };
-        for reporter in reporters.iter_mut() {
+        for reporter in ctx.reporters.iter_mut() {
             reporter.on_progress(&state)?;
         }
+    }
+
+    let outcome = match ctx.warmup.as_mut() {
+        Some(phase) => phase.tick(ctx.sender).await,
+        None => None,
+    };
+    if let Some(outcome) = outcome {
+        finish_warmup(ctx, outcome).await?;
+    }
+
+    Ok(())
+}
+
+/// Move the measurement origin to now: the warm-up is over.
+///
+/// Sending continues uninterrupted; only the bookkeeping changes. Blocks up to
+/// the current head belong to the warm-up, metrics recorded so far are
+/// excluded through a checkpoint, and reporters learn the new `started_at`.
+async fn finish_warmup(ctx: &mut WorkloadContext<'_>, outcome: WarmupOutcome) -> Result<()> {
+    let Some(phase) = ctx.warmup.take() else {
+        return Ok(());
+    };
+
+    // The ramp is over either way; the measured window runs at the full rate.
+    if ctx.config.rate_limit > 0 {
+        ctx.sender.set_rate_limit(ctx.config.rate_limit).await;
+    }
+
+    let start_block = ctx
+        .query_provider
+        .get_block_number()
+        .await
+        .wrap_err("failed to get block number at the warm-up boundary")?;
+    let ended_unix_ms = ctx.clock.unix_ms();
+    let checkpoint = ctx.metrics.checkpoint();
+    let mut summary = phase.finish(outcome, ended_unix_ms).await;
+    summary.inflight_at_boundary = Some(checkpoint.inflight());
+
+    tracing::info!(
+        outcome = %summary.outcome,
+        ready = summary.ready,
+        duration_secs = summary.duration_ms as f64 / 1000.0,
+        blocks = summary.blocks,
+        proposers_ready = summary.proposers_ready,
+        proposers_expected = summary.expected_proposers,
+        full_block_threshold = summary.full_block_threshold,
+        inflight_at_boundary = checkpoint.inflight(),
+        first_measured_block = start_block + 1,
+        "Warm-up finished; measurement window starts"
+    );
+
+    ctx.run.start_block = start_block;
+    ctx.run.checkpoint = Some(checkpoint);
+    ctx.run.measurement_start_unix_ms = ended_unix_ms;
+    ctx.run.warmup = Some(summary.clone());
+
+    let start = MeasurementStart {
+        started_at: std::time::UNIX_EPOCH + Duration::from_millis(ended_unix_ms),
+        first_block: start_block + 1,
+        warmup: summary,
+    };
+    for reporter in ctx.reporters.iter_mut() {
+        reporter.on_measurement_start(&start)?;
     }
 
     Ok(())

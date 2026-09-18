@@ -402,8 +402,40 @@ txgen-tempo generate -s workload.yaml -n 1000 --defer-signing | bench send --lat
 | `--collect-receipt-metrics` | Collect non-system transaction gas and fee metrics with block-level receipt requests after sending |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 0, set >0 to enable) |
+| `--warmup <auto\|off\|DUR>` | Warm-up before the measured window: readiness-gated (`auto`, default), disabled (`off`), or a fixed duration (see [Warm-up](#warm-up)) |
+| `--warmup-ramp <DUR>` | Ramp the send rate from 10% of `--tps` to `--tps` over this duration (default: 10s, `0s` disables) |
+| `--warmup-min <DUR>` / `--warmup-max <DUR>` | Bounds for an `auto` warm-up (default: 30s / 90s); at the maximum, measurement starts anyway and the run is flagged `timeout` |
+| `--warmup-proposals <N>` | Full blocks each proposer must have produced before `auto` ends (default: 2) |
+| `--warmup-proposers <N>` | Distinct proposers expected, identified by block beneficiary (default: number of distinct `--rpc-url` endpoints) |
+| `--warmup-stable-blocks <N>` / `--warmup-stable-tolerance <F>` | Plateau check: medians of two consecutive N-block windows must agree within F (default: 10 / 0.10) |
+| `--warmup-pool-check <BOOL>` | Also require `txpool_status` pending counts to be stable over 10s (default: true; skipped when unsupported) |
 
-**Required RPC methods:** `eth_sendRawTransaction`, `eth_blockNumber`, `eth_getBlockByNumber`; `eth_getBlockReceipts` for setup, sequence inclusion waits, and `--collect-receipt-metrics`; `txpool_status` (for `--drain-timeout`)
+**Required RPC methods:** `eth_sendRawTransaction`, `eth_blockNumber`, `eth_getBlockByNumber`; `eth_getBlockReceipts` for setup, sequence inclusion waits, and `--collect-receipt-metrics`; `txpool_status` (for `--drain-timeout` and the optional warm-up pool check)
+
+##### Warm-up
+
+A benchmark that starts measuring with its first transaction measures a cold network: the first
+multi-megabyte block body over each proposer→peer connection arrives several times slower than
+later ones, execution caches and node-side build estimators need full blocks to converge, and an
+instant jump to the target rate fills every pool within seconds and phase-locks transaction expiry
+to that burst. `bench send` therefore warms up by default:
+
+1. **Ramp** the send rate from 10% of `--tps` to `--tps` over `--warmup-ramp`.
+2. **Hold** at the target rate until readiness holds: every expected proposer (block beneficiary)
+   has produced `--warmup-proposals` blocks with at least half the running median transaction
+   count, the median transaction count of the last `--warmup-stable-blocks` blocks agrees with the
+   previous window within `--warmup-stable-tolerance`, pool occupancy is stable, and at least
+   `--warmup-min` elapsed. `--warmup-max` ends the warm-up regardless and flags the run `timeout`.
+3. **Move the origin.** At the boundary the start block, the report's `started_at`, and metric and
+   sample offsets are moved to that moment. Load never pauses, so the measured window starts in
+   steady state. Console, JSON (`warmup`), and ClickHouse (`warmup_*` run metadata) reports
+   describe the phase.
+
+The transaction source must contain enough transactions for warm-up plus measurement (for example,
+generate `--tps × (warm-up + duration)` transactions). If it runs dry before the warm-up ends, the
+whole run is reported as before and the warm-up is flagged `source-exhausted`. Use `--warmup off`
+for the previous behaviour or `--warmup 45s` for a fixed phase. The defaults are derived from
+multi-region Tempo runs; the derivations are documented on each flag in `bench send --help`.
 
 Setup and sequence inclusion waits share one lazy receipt tracker per chain. It polls the head every 100 ms while transactions are waiting, fetches `eth_getBlockReceipts` once per new block, and dispatches matching receipts to their waiting sequences. Transactions register before submission so fast inclusion is not missed. Failed or unavailable block receipt requests are retried centrally, and skipped block heights are backfilled. The tracker stops polling when there are no waiting transactions. This preserves inclusion ordering and the existing five-minute inclusion timeout.
 

@@ -192,6 +192,10 @@ fn query_rpc_is_separate_and_credentials_are_redacted_from_outputs() {
             "0",
             "--timeout",
             "2s",
+            // The warm-up polls blocks and `txpool_status` on the query RPC;
+            // this test pins the exact query traffic of a plain send.
+            "--warmup",
+            "off",
             "--report",
             &format!("json:{}", report.display()),
         ])

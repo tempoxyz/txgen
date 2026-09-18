@@ -12,6 +12,7 @@ use crate::{
     receipt_clickhouse::{insert_receipt_gas_records, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE},
     receipt_metrics::{ReceiptGasRecord, ReceiptMetricGroup},
     sample::{Sample, SampleArchive},
+    warmup::WarmupSummary,
 };
 use alloy_primitives::U256;
 use eyre::{bail, Context, Result};
@@ -50,6 +51,8 @@ pub struct FinalReport {
     pub receipt_records: Vec<ReceiptGasRecord>,
     /// RPC corpus replay results (call mode only).
     pub call: Option<CallReport>,
+    /// Warm-up phase summary (send mode only).
+    pub warmup: Option<WarmupSummary>,
 }
 
 impl FinalReport {
@@ -100,6 +103,27 @@ impl FinalReport {
         }
         Ok(())
     }
+
+    /// Retain only samples at or after `start_ms` and report their offsets
+    /// relative to it. Used after a warm-up moved the measurement origin.
+    pub fn rebase_samples_to(&mut self, start_ms: u64) -> Result<()> {
+        if let Some(archive) = self.sample_archive.as_mut() {
+            archive.retain_since(start_ms);
+            archive.rebase_offsets(start_ms);
+        }
+        Ok(())
+    }
+}
+
+/// Notification that the measured window started after a warm-up.
+#[derive(Debug, Clone)]
+pub struct MeasurementStart {
+    /// Wall-clock time the measured window starts at.
+    pub started_at: std::time::SystemTime,
+    /// First block that belongs to the measured window.
+    pub first_block: u64,
+    /// The warm-up that preceded it.
+    pub warmup: WarmupSummary,
 }
 
 /// Snapshot of progress state passed to reporters.
@@ -146,6 +170,11 @@ pub trait Reporter: Send {
 
     /// Called for each block during block stats collection.
     fn on_block(&mut self, _block: &BlockStats) -> Result<()> {
+        Ok(())
+    }
+
+    /// Called once when a warm-up phase ends and the measured window begins.
+    fn on_measurement_start(&mut self, _start: &MeasurementStart) -> Result<()> {
         Ok(())
     }
 
@@ -293,6 +322,22 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
         Ok(())
     }
 
+    fn on_measurement_start(&mut self, start: &MeasurementStart) -> Result<()> {
+        let warmup = &start.warmup;
+        writeln!(
+            self.writer,
+            "Warm-up {} after {:.1}s and {} block(s); measuring from block {} ({}/{} proposers ready)",
+            warmup.outcome,
+            warmup.duration_ms as f64 / 1000.0,
+            warmup.blocks,
+            start.first_block,
+            warmup.proposers_ready,
+            warmup.expected_proposers,
+        )?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
         if let Some(call) = &report.call {
             return self.write_call_report(call);
@@ -309,6 +354,30 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
         writeln!(self.writer, "═══════════════════════════════════════")?;
         writeln!(self.writer, "              Benchmark Results")?;
         writeln!(self.writer, "═══════════════════════════════════════")?;
+
+        if let Some(warmup) = &report.warmup {
+            writeln!(self.writer)?;
+            writeln!(self.writer, "  Warm-up:")?;
+            writeln!(self.writer, "    Mode:          {:>10}", warmup.mode)?;
+            writeln!(self.writer, "    Outcome:       {:>10}", warmup.outcome)?;
+            writeln!(
+                self.writer,
+                "    Duration:      {:>10.1}s",
+                warmup.duration_ms as f64 / 1000.0
+            )?;
+            writeln!(self.writer, "    Blocks:        {:>10}", warmup.blocks)?;
+            writeln!(
+                self.writer,
+                "    Proposers:     {:>10} ready of {} expected ({} seen)",
+                warmup.proposers_ready, warmup.expected_proposers, warmup.proposers_seen
+            )?;
+            if !warmup.completed {
+                writeln!(
+                    self.writer,
+                    "    Note:          warm-up did not finish; results cover the whole run"
+                )?;
+            }
+        }
 
         if let Some(metrics) = &report.bench_metrics {
             writeln!(self.writer)?;
@@ -434,6 +503,9 @@ pub struct JsonReport {
     /// RPC corpus replay results (call mode only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call: Option<CallReport>,
+    /// Warm-up phase summary (send mode only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmup: Option<WarmupSummary>,
 }
 
 /// Latency statistics in JSON format.
@@ -605,6 +677,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             total_fees_paid: report.total_fees_paid.map(|fees| fees.to_string()),
             samples: Vec::new(),
             call: report.call.clone(),
+            warmup: report.warmup.clone(),
         };
 
         serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
@@ -816,7 +889,11 @@ impl ClickHouseReporter {
     }
 
     /// Build the run row for insertion.
-    fn build_run_row(&self, finished_at: std::time::SystemTime) -> ClickHouseRunRow<'_> {
+    fn build_run_row<'a>(
+        &'a self,
+        finished_at: std::time::SystemTime,
+        metadata: &'a HashMap<String, String>,
+    ) -> ClickHouseRunRow<'a> {
         ClickHouseRunRow {
             run_id: self.config.run_id,
             started_at: system_time_to_millis(self.config.started_at),
@@ -827,8 +904,26 @@ impl ClickHouseReporter {
             git_sha: &self.config.git_sha,
             git_ref: &self.config.git_ref,
             config: &self.config.config,
-            metadata: &self.config.metadata,
+            metadata,
         }
+    }
+
+    /// Run metadata plus warm-up facts, so dashboards can tell warmed runs
+    /// apart without a schema change.
+    fn run_metadata(&self, report: &FinalReport) -> HashMap<String, String> {
+        let mut metadata = self.config.metadata.clone();
+        if let Some(warmup) = &report.warmup {
+            metadata.insert("warmup_mode".to_string(), warmup.mode.clone());
+            metadata.insert("warmup_outcome".to_string(), warmup.outcome.clone());
+            metadata.insert("warmup_completed".to_string(), warmup.completed.to_string());
+            metadata.insert("warmup_ready".to_string(), warmup.ready.to_string());
+            metadata.insert("warmup_duration_ms".to_string(), warmup.duration_ms.to_string());
+            metadata.insert("warmup_blocks".to_string(), warmup.blocks.to_string());
+            if let Some(last_block) = warmup.last_block {
+                metadata.insert("warmup_last_block".to_string(), last_block.to_string());
+            }
+        }
+        metadata
     }
 
     /// Build block rows for insertion.
@@ -892,6 +987,14 @@ impl ClickHouseReporter {
 }
 
 impl Reporter for ClickHouseReporter {
+    fn on_measurement_start(&mut self, start: &MeasurementStart) -> Result<()> {
+        // The run row's `started_at` is the origin dashboards use for metric
+        // offsets, so it must be the measured window's start, not the
+        // process start.
+        self.config.started_at = start.started_at;
+        Ok(())
+    }
+
     fn finalize(&mut self, report: &FinalReport) -> Result<()> {
         let finished_at = std::time::SystemTime::now();
 
@@ -923,7 +1026,8 @@ impl Reporter for ClickHouseReporter {
         )?;
 
         // Insert the run synchronously and last as the visibility marker.
-        let run_row = self.build_run_row(finished_at);
+        let metadata = self.run_metadata(report);
+        let run_row = self.build_run_row(finished_at, &metadata);
         self.client.insert_rows_synchronous("txgen_runs", &[run_row])?;
 
         tracing::info!(

@@ -46,6 +46,10 @@ pub struct SampleArchive {
     path: PathBuf,
     len: usize,
     retain_until_unix_ms: Option<u64>,
+    retain_since_unix_ms: Option<u64>,
+    /// When set, `offset_ms` is recomputed as `unix_ms - origin` on read so
+    /// offsets are relative to a measurement origin moved after a warm-up.
+    offset_origin_unix_ms: Option<u64>,
 }
 
 impl SampleArchive {
@@ -70,13 +74,44 @@ impl SampleArchive {
             Some(self.retain_until_unix_ms.map_or(cutoff_ms, |current| current.min(cutoff_ms)));
     }
 
-    /// Iterate over samples in the archive.
-    pub fn iter(&self) -> Result<SampleArchiveIter> {
-        SampleArchiveIter::open(&self.path, self.retain_until_unix_ms)
+    /// Set a lazy start so reads skip samples before `start_ms`.
+    pub fn retain_since(&mut self, start_ms: u64) {
+        self.retain_since_unix_ms =
+            Some(self.retain_since_unix_ms.map_or(start_ms, |current| current.max(start_ms)));
     }
 
-    /// Write NDJSON samples to `writer`, applying any lazy cutoff.
+    /// Recompute `offset_ms` on read as `unix_ms - origin_unix_ms` (saturating).
+    pub fn rebase_offsets(&mut self, origin_unix_ms: u64) {
+        self.offset_origin_unix_ms = Some(origin_unix_ms);
+    }
+
+    fn filters(&self) -> SampleFilters {
+        SampleFilters {
+            retain_until_unix_ms: self.retain_until_unix_ms,
+            retain_since_unix_ms: self.retain_since_unix_ms,
+            offset_origin_unix_ms: self.offset_origin_unix_ms,
+        }
+    }
+
+    /// Iterate over samples in the archive.
+    pub fn iter(&self) -> Result<SampleArchiveIter> {
+        SampleArchiveIter::open(&self.path, self.filters())
+    }
+
+    /// Write NDJSON samples to `writer`, applying any lazy cutoff, start, or
+    /// offset rebase.
     pub fn write_ndjson_to<W: Write>(&self, writer: &mut W) -> Result<usize> {
+        if self.retain_since_unix_ms.is_some() || self.offset_origin_unix_ms.is_some() {
+            // Rebased offsets change the line content, so re-serialize.
+            let mut written = 0usize;
+            for sample in self.iter()? {
+                serde_json::to_writer(&mut *writer, &sample?)?;
+                writeln!(writer)?;
+                written += 1;
+            }
+            return Ok(written);
+        }
+
         let Some(cutoff_ms) = self.retain_until_unix_ms else {
             let mut reader = BufReader::new(File::open(&self.path).wrap_err_with(|| {
                 format!("failed to open sample archive {}", self.path.display())
@@ -120,22 +155,37 @@ impl Drop for SampleArchive {
     }
 }
 
+/// Lazy read-side filters of a [`SampleArchive`].
+#[derive(Debug, Clone, Copy, Default)]
+struct SampleFilters {
+    retain_until_unix_ms: Option<u64>,
+    retain_since_unix_ms: Option<u64>,
+    offset_origin_unix_ms: Option<u64>,
+}
+
+impl SampleFilters {
+    fn needs_timestamp(&self) -> bool {
+        self.retain_until_unix_ms.is_some() || self.retain_since_unix_ms.is_some()
+    }
+
+    fn keeps(&self, unix_ms: u64) -> bool {
+        self.retain_until_unix_ms.is_none_or(|cutoff| unix_ms <= cutoff) &&
+            self.retain_since_unix_ms.is_none_or(|start| unix_ms >= start)
+    }
+}
+
 /// Iterator over an NDJSON sample archive.
 pub struct SampleArchiveIter {
     reader: BufReader<File>,
     line: Vec<u8>,
-    retain_until_unix_ms: Option<u64>,
+    filters: SampleFilters,
 }
 
 impl SampleArchiveIter {
-    fn open(path: &Path, retain_until_unix_ms: Option<u64>) -> Result<Self> {
+    fn open(path: &Path, filters: SampleFilters) -> Result<Self> {
         let file = File::open(path)
             .wrap_err_with(|| format!("failed to open sample archive {}", path.display()))?;
-        Ok(Self {
-            reader: BufReader::new(file),
-            line: Vec::with_capacity(1024),
-            retain_until_unix_ms,
-        })
+        Ok(Self { reader: BufReader::new(file), line: Vec::with_capacity(1024), filters })
     }
 }
 
@@ -151,24 +201,27 @@ impl Iterator for SampleArchiveIter {
                 Err(err) => return Some(Err(err).context("failed to read sample archive line")),
             }
 
-            if let Some(cutoff_ms) = self.retain_until_unix_ms {
+            if self.filters.needs_timestamp() {
                 let unix_ms = match sample_line_unix_ms(&self.line)
                     .wrap_err("failed to scan sample archive line timestamp")
                 {
                     Ok(unix_ms) => unix_ms,
                     Err(err) => return Some(Err(err)),
                 };
-                if unix_ms > cutoff_ms {
+                if !self.filters.keeps(unix_ms) {
                     continue;
                 }
             }
 
-            let sample: Sample = match serde_json::from_slice(&self.line) {
+            let mut sample: Sample = match serde_json::from_slice(&self.line) {
                 Ok(sample) => sample,
                 Err(err) => {
                     return Some(Err(err).context("failed to parse sample archive line"));
                 }
             };
+            if let Some(origin) = self.filters.offset_origin_unix_ms {
+                sample.offset_ms = sample.unix_ms.saturating_sub(origin);
+            }
             return Some(Ok(sample));
         }
     }
@@ -326,7 +379,13 @@ impl SampleStore {
             writer.flush()?;
         }
 
-        Ok(SampleArchive { path: inner.path.clone(), len: inner.len, retain_until_unix_ms: None })
+        Ok(SampleArchive {
+            path: inner.path.clone(),
+            len: inner.len,
+            retain_until_unix_ms: None,
+            retain_since_unix_ms: None,
+            offset_origin_unix_ms: None,
+        })
     }
 
     /// Number of samples currently stored.
@@ -516,5 +575,38 @@ mod tests {
         assert_eq!(parsed.labels["host"], "node-1");
         assert!((parsed.value - 3.125).abs() < f64::EPSILON);
         assert_eq!(parsed.offset_ms, 500);
+    }
+    #[tokio::test]
+    async fn retain_since_and_rebase_apply_on_read_and_write() {
+        let store = SampleStore::new().unwrap();
+        let samples = (0..5u64)
+            .map(|i| Sample {
+                name: "m".to_string(),
+                labels: BTreeMap::new(),
+                value: i as f64,
+                offset_ms: i * 1_000,
+                unix_ms: 10_000 + i * 1_000,
+            })
+            .collect();
+        store.push_batch(samples).await.unwrap();
+        let mut archive = store.finish().await.unwrap();
+
+        archive.retain_since(12_000);
+        archive.retain_until(13_000);
+        archive.rebase_offsets(12_000);
+
+        let read: Vec<Sample> = archive.iter().unwrap().collect::<Result<_>>().unwrap();
+        assert_eq!(read.iter().map(|s| s.unix_ms).collect::<Vec<_>>(), vec![12_000, 13_000]);
+        assert_eq!(read.iter().map(|s| s.offset_ms).collect::<Vec<_>>(), vec![0, 1_000]);
+
+        let mut out = Vec::new();
+        let written = archive.write_ndjson_to(&mut out).unwrap();
+        assert_eq!(written, 2);
+        let lines: Vec<Sample> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.iter().map(|s| s.offset_ms).collect::<Vec<_>>(), vec![0, 1_000]);
     }
 }
