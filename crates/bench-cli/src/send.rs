@@ -20,7 +20,11 @@ use bench_core::{
     WarmupOutcome, WarmupSummary,
 };
 use eyre::{bail, Context, Result};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use txgen_tempo::TempoLateSigner;
 
 const SETUP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
@@ -221,19 +225,23 @@ async fn execute_source<S: TxSource>(
             stable_blocks = warmup_config.stable_blocks,
             stable_tolerance = warmup_config.stable_tolerance,
             pool_check = warmup_config.pool_check,
+            warmup_tps = warmup_config.warmup_rate(),
+            target_tps = warmup_config.target_tps,
+            handoff_ramp = ?warmup_config.handoff_ramp(),
             "Warm-up started"
         );
-        if args.tps == 0 {
-            tracing::info!(reason = "--tps=0 (unlimited)", "Skipped warm-up ramp");
+        if warmup_config.warmup_rate() == 0 {
+            tracing::info!(reason = "unlimited warm-up rate", "Skipped warm-up ramp");
         }
-        let mut phase = WarmupPhase::start(
-            warmup_config,
-            query_provider.clone(),
-            start_block,
-            args.tps,
-            &clock,
-        );
-        phase.apply_initial_rate(&sender).await;
+        if warmup_config.pool_check && warmup_config.is_rate_capped() {
+            tracing::info!(
+                reason = "warm-up rate is capped below the target",
+                "Skipped warm-up pool check"
+            );
+        }
+        let mut phase =
+            WarmupPhase::start(warmup_config, query_provider.clone(), start_block, &clock);
+        phase.apply_initial_rate(&mut sender).await;
         Some(phase)
     } else {
         tracing::info!(reason = "--warmup=off", "Skipped warm-up");
@@ -244,6 +252,8 @@ async fn execute_source<S: TxSource>(
         start_block,
         checkpoint: None,
         measurement_start_unix_ms: clock.start_unix_ms(),
+        // Without a warm-up the measured window starts now; a warm-up moves it.
+        measurement_started: Instant::now(),
         warmup: None,
     };
     {
@@ -256,6 +266,7 @@ async fn execute_source<S: TxSource>(
             run: &mut run,
             query_provider: &query_provider,
             clock: &clock,
+            measure_duration: args.duration,
         };
 
         if let Some(tx) = first_workload {
@@ -381,6 +392,7 @@ async fn execute_source<S: TxSource>(
         total_fees_paid,
         receipt_records,
         warmup: run.warmup.clone(),
+        started_unix_ms: Some(run.measurement_start_unix_ms),
         ..Default::default()
     };
 
@@ -582,6 +594,8 @@ struct WorkloadRun {
     checkpoint: Option<MetricsCheckpoint>,
     /// Wall-clock origin of the measured window in Unix milliseconds.
     measurement_start_unix_ms: u64,
+    /// Monotonic origin of the measured window, for `--duration`.
+    measurement_started: Instant,
     /// Warm-up summary, when a warm-up ran.
     warmup: Option<WarmupSummary>,
 }
@@ -597,6 +611,20 @@ struct WorkloadContext<'a> {
     run: &'a mut WorkloadRun,
     query_provider: &'a DynProvider<AnyNetwork>,
     clock: &'a RunClock,
+    /// `--duration`: stop taking transactions this long after the measured
+    /// window started.
+    measure_duration: Option<Duration>,
+}
+
+impl WorkloadContext<'_> {
+    /// Whether `--duration` has elapsed since the measured window started.
+    ///
+    /// Never true while a warm-up is still running: the window has not started.
+    fn measurement_deadline_reached(&self) -> bool {
+        self.warmup.is_none() &&
+            self.measure_duration
+                .is_some_and(|duration| self.run.measurement_started.elapsed() >= duration)
+    }
 }
 
 async fn send_workload_from_source<S: TxSource>(
@@ -608,6 +636,18 @@ async fn send_workload_from_source<S: TxSource>(
             bail!("setup transaction appeared after workload started");
         }
         send_workload_tx(tx, ctx).await?;
+        if ctx.measurement_deadline_reached() {
+            // Queued transactions would keep the window open for as long as
+            // they take to send at the configured rate; drop them and let the
+            // final flush only wait for requests already on the wire.
+            let dropped = ctx.sender.discard_queued();
+            tracing::info!(
+                duration = ?ctx.measure_duration.unwrap_or_default(),
+                dropped_queued = dropped,
+                "Measured window duration reached; stopping the transaction source"
+            );
+            break;
+        }
     }
     Ok(())
 }
@@ -654,10 +694,9 @@ async fn finish_warmup(ctx: &mut WorkloadContext<'_>, outcome: WarmupOutcome) ->
         return Ok(());
     };
 
-    // The ramp is over either way; the measured window runs at the full rate.
-    if ctx.config.rate_limit > 0 {
-        ctx.sender.set_rate_limit(ctx.config.rate_limit).await;
-    }
+    // Whatever the ramps reached, the measured window runs at the configured
+    // rate (0 removes the limiter again for an unlimited target).
+    ctx.sender.set_rate_limit(ctx.config.rate_limit).await;
 
     let start_block = ctx
         .query_provider
@@ -685,6 +724,7 @@ async fn finish_warmup(ctx: &mut WorkloadContext<'_>, outcome: WarmupOutcome) ->
     ctx.run.start_block = start_block;
     ctx.run.checkpoint = Some(checkpoint);
     ctx.run.measurement_start_unix_ms = ended_unix_ms;
+    ctx.run.measurement_started = Instant::now();
     ctx.run.warmup = Some(summary.clone());
 
     let start = MeasurementStart {

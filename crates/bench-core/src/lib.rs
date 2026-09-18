@@ -70,5 +70,5 @@ pub use warmup::{
     ObservedBlock, WarmupConditions, WarmupConfig, WarmupDecision, WarmupMode, WarmupOutcome,
     WarmupStatus, WarmupSummary, WarmupTracker, DEFAULT_WARMUP_MAX, DEFAULT_WARMUP_MIN,
     DEFAULT_WARMUP_PROPOSALS, DEFAULT_WARMUP_RAMP, DEFAULT_WARMUP_STABLE_BLOCKS,
-    DEFAULT_WARMUP_STABLE_TOLERANCE,
+    DEFAULT_WARMUP_STABLE_TOLERANCE, DEFAULT_WARMUP_TPS_CAP,
 };

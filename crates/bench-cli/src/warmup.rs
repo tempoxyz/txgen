@@ -1,7 +1,7 @@
 //! Warm-up orchestration for `bench send`.
 //!
 //! Polls the chain (and optionally the txpool) while the sender is running,
-//! applies the send-rate ramp, and reports when the measurement origin should
+//! applies the send-rate ramps, and reports when the measurement origin should
 //! move. The decision logic, defaults, and their derivations live in
 //! [`bench_core::warmup`].
 
@@ -11,7 +11,7 @@ use alloy_network::{primitives::BlockResponse, AnyNetwork, AnyRpcBlock};
 use alloy_provider::{ext::TxPoolApi, DynProvider, Provider};
 use bench_core::{
     block_timestamp_ms, ObservedBlock, RunClock, Sender, WarmupConfig, WarmupDecision,
-    WarmupOutcome, WarmupSummary, WarmupTracker,
+    WarmupOutcome, WarmupStatus, WarmupSummary, WarmupTracker,
 };
 use std::{
     sync::{Arc, Mutex},
@@ -40,23 +40,29 @@ pub struct WarmupPhase {
     poller: JoinHandle<()>,
     started: Instant,
     started_unix_ms: u64,
-    target_tps: u64,
     applied_rate: Option<u64>,
     next_evaluation: Instant,
     next_progress_log: Instant,
+    /// Set once readiness holds while the warm-up rate is capped: the rate is
+    /// ramping from the cap to the target before the boundary.
+    handoff: Option<(Instant, WarmupOutcome)>,
+    /// The evaluation that ended the warm-up, reported in the summary.
+    decided: Option<WarmupStatus>,
 }
 
 impl WarmupPhase {
     /// Start warming up. Blocks after `after_block` are attributed to the
-    /// warm-up; `target_tps` is the configured `--tps` (0 = unlimited).
+    /// warm-up.
     pub fn start(
         config: WarmupConfig,
         provider: DynProvider<AnyNetwork>,
         after_block: u64,
-        target_tps: u64,
         clock: &RunClock,
     ) -> Self {
-        let pool_check = config.pool_check;
+        // Pool occupancy at a capped warm-up rate says nothing about the
+        // measured window, so the tracker reports the check as not applicable
+        // and the poller does not bother asking.
+        let pool_check = config.pool_check && !config.is_rate_capped();
         let tracker = Arc::new(Mutex::new(WarmupTracker::new(config)));
         let (stop_tx, stop_rx) = watch::channel(false);
         let started = Instant::now();
@@ -75,45 +81,63 @@ impl WarmupPhase {
             poller,
             started,
             started_unix_ms: clock.unix_ms(),
-            target_tps,
             applied_rate: None,
             next_evaluation: now,
             next_progress_log: now + PROGRESS_LOG_INTERVAL,
+            handoff: None,
+            decided: None,
         }
     }
 
     /// Apply the ramp's starting rate before the first transaction is sent.
-    pub async fn apply_initial_rate(&mut self, sender: &Sender) {
+    pub async fn apply_initial_rate(&mut self, sender: &mut Sender) {
         self.apply_rate(sender, Duration::ZERO).await;
     }
 
-    async fn apply_rate(&mut self, sender: &Sender, elapsed: Duration) {
-        if self.target_tps == 0 {
+    async fn apply_rate(&mut self, sender: &mut Sender, elapsed: Duration) {
+        let (rate, warmup_rate, target) = {
+            let tracker = self.tracker.lock().expect("warm-up tracker poisoned");
+            let config = tracker.config();
+            let rate = match self.handoff {
+                Some((since, _)) => tracker.handoff_rate(since.elapsed()),
+                None => tracker.ramp_rate(elapsed),
+            };
+            (rate, config.warmup_rate(), config.target_tps)
+        };
+        if self.applied_rate == Some(rate) {
             return;
         }
-        let rate = self
-            .tracker
-            .lock()
-            .expect("warm-up tracker poisoned")
-            .ramp_rate(elapsed, self.target_tps);
-        if self.applied_rate != Some(rate) {
-            sender.set_rate_limit(rate).await;
-            if self.applied_rate.is_some_and(|previous| previous < self.target_tps) &&
-                rate == self.target_tps
-            {
-                tracing::info!(tps = rate, "Warm-up ramp reached the target rate");
-            }
-            self.applied_rate = Some(rate);
+        // An unlimited warm-up rate (no --tps and no cap) needs no limiter.
+        if rate == 0 && self.applied_rate.is_none() {
+            self.applied_rate = Some(0);
+            return;
+        }
+        sender.set_rate_limit(rate).await;
+        let previous = self.applied_rate.replace(rate);
+        if self.handoff.is_none() &&
+            rate == warmup_rate &&
+            previous.is_some_and(|previous| previous < warmup_rate)
+        {
+            tracing::info!(tps = rate, "Warm-up ramp reached the warm-up rate");
+        } else if self.handoff.is_some() && rate == target {
+            tracing::info!(tps = rate, "Hand-off ramp reached the target rate");
         }
     }
 
-    /// Advance the ramp and evaluate readiness. Call between transactions.
+    /// Advance the ramps and evaluate readiness. Call between transactions.
     ///
     /// Returns the outcome once the warm-up should end; the caller then moves
     /// the measurement origin and calls [`WarmupPhase::finish`].
-    pub async fn tick(&mut self, sender: &Sender) -> Option<WarmupOutcome> {
+    pub async fn tick(&mut self, sender: &mut Sender) -> Option<WarmupOutcome> {
         let elapsed = self.started.elapsed();
         self.apply_rate(sender, elapsed).await;
+
+        // While handing off, only the ramp advances; readiness already held.
+        if let Some((since, outcome)) = self.handoff {
+            let ramp =
+                self.tracker.lock().expect("warm-up tracker poisoned").config().handoff_ramp();
+            return (since.elapsed() >= ramp).then_some(outcome);
+        }
 
         let now = Instant::now();
         if now < self.next_evaluation {
@@ -121,35 +145,50 @@ impl WarmupPhase {
         }
         self.next_evaluation = now + EVALUATION_INTERVAL;
 
-        let status = {
+        let (status, config, blocks) = {
             let tracker = self.tracker.lock().expect("warm-up tracker poisoned");
-            tracker.evaluate(elapsed)
+            (tracker.evaluate(elapsed), tracker.config().clone(), tracker.blocks().len())
         };
-        let required = self.tracker.lock().expect("warm-up tracker poisoned").config().clone();
 
         if now >= self.next_progress_log {
             self.next_progress_log = now + PROGRESS_LOG_INTERVAL;
             tracing::info!(
                 elapsed_secs = elapsed.as_secs(),
-                blocks = self.tracker.lock().expect("warm-up tracker poisoned").blocks().len(),
-                proposers_ready = status.ready_proposers(required.proposals_per_proposer),
-                proposers_expected = required.expected_proposers,
+                blocks,
+                proposers_ready = status.ready_proposers(config.proposals_per_proposer),
+                proposers_expected = config.expected_proposers,
                 proposers_seen = status.proposals.len(),
                 full_block_threshold = status.full_block_threshold,
                 plateau = status.conditions.plateau,
                 pool_stable = ?status.conditions.pool,
                 min_elapsed = status.conditions.min_elapsed,
-                rate = self.applied_rate.unwrap_or(self.target_tps),
+                rate = self.applied_rate.unwrap_or(0),
                 "Warm-up in progress"
             );
         }
 
-        match status.decision {
-            WarmupDecision::Continue => None,
-            WarmupDecision::Ready => Some(WarmupOutcome::Ready),
-            WarmupDecision::Timeout => Some(WarmupOutcome::Timeout),
-            WarmupDecision::FixedElapsed => Some(WarmupOutcome::Fixed),
+        let outcome = match status.decision {
+            WarmupDecision::Continue => return None,
+            WarmupDecision::Ready => WarmupOutcome::Ready,
+            WarmupDecision::Timeout => WarmupOutcome::Timeout,
+            WarmupDecision::FixedElapsed => WarmupOutcome::Fixed,
+        };
+        self.decided = Some(status);
+
+        // A capped warm-up ramps to the target before the boundary so the
+        // measured window starts at full rate instead of with a rate step.
+        let handoff_ramp = config.handoff_ramp();
+        if handoff_ramp.is_zero() {
+            return Some(outcome);
         }
+        tracing::info!(
+            from_tps = config.warmup_rate(),
+            to_tps = config.target_tps,
+            ramp = ?handoff_ramp,
+            "Warm-up readiness reached; ramping to the target rate before measuring"
+        );
+        self.handoff = Some((Instant::now(), outcome));
+        None
     }
 
     /// Stop polling and summarize a warm-up that ended with `outcome` at
@@ -174,7 +213,13 @@ impl WarmupPhase {
         self.poller.abort();
         let _ = self.poller.await;
         let tracker = self.tracker.lock().expect("warm-up tracker poisoned");
-        tracker.summary(outcome, self.started_unix_ms, ended_unix_ms, elapsed)
+        tracker.summary(
+            outcome,
+            self.started_unix_ms,
+            ended_unix_ms,
+            elapsed,
+            self.decided.as_ref(),
+        )
     }
 }
 

@@ -936,14 +936,16 @@ impl Sender {
         self
     }
 
-    /// Adjust the submission rate limit while sending (used by the warm-up ramp).
-    ///
-    /// Only effective when the sender was created with a non-zero rate limit;
-    /// an unlimited sender stays unlimited. The value is clamped to at least one
-    /// transaction per second because a zero rate would stall dispatch forever.
-    pub async fn set_rate_limit(&self, tokens_per_sec: u64) {
-        if let Some(limiter) = &self.rate_limiter {
-            limiter.set_rate(tokens_per_sec.max(1)).await;
+    /// Adjust the submission rate limit while sending (used by the warm-up
+    /// ramp). `0` removes the limit; a limiter is created when none exists.
+    pub async fn set_rate_limit(&mut self, tokens_per_sec: u64) {
+        if tokens_per_sec == 0 {
+            self.rate_limiter = None;
+            return;
+        }
+        match &self.rate_limiter {
+            Some(limiter) => limiter.set_rate(tokens_per_sec).await,
+            None => self.rate_limiter = Some(Arc::new(RateLimiter::new(tokens_per_sec))),
         }
     }
 
@@ -1110,6 +1112,19 @@ impl Sender {
             !self.active_keys.is_empty() ||
             self.in_flight_setup > 0 ||
             self.in_flight_pending > 0
+    }
+
+    /// Drop transactions that were accepted by [`Sender::send`] but not yet
+    /// dispatched, returning how many were dropped. Dispatched requests are
+    /// unaffected and still complete through [`Sender::flush`].
+    ///
+    /// Used when a measured window's `--duration` ends: the buffered backlog
+    /// (up to `max_concurrent x 4` transactions) would otherwise extend the
+    /// window by however long it takes to send at the configured rate.
+    pub fn discard_queued(&mut self) -> usize {
+        let dropped = self.pending.len();
+        self.pending.clear();
+        dropped
     }
 
     /// Wait for all pending transactions to complete.

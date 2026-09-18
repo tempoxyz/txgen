@@ -53,6 +53,9 @@ pub struct FinalReport {
     pub call: Option<CallReport>,
     /// Warm-up phase summary (send mode only).
     pub warmup: Option<WarmupSummary>,
+    /// Wall-clock start of the measured window in Unix milliseconds (send
+    /// mode only). After a warm-up this is the boundary, not the process start.
+    pub started_unix_ms: Option<u64>,
 }
 
 impl FinalReport {
@@ -371,6 +374,16 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
                 "    Proposers:     {:>10} ready of {} expected ({} seen)",
                 warmup.proposers_ready, warmup.expected_proposers, warmup.proposers_seen
             )?;
+            if warmup.warmup_tps > 0 {
+                writeln!(self.writer, "    Rate:          {:>10} tx/s", warmup.warmup_tps)?;
+            }
+            if warmup.handoff_ramp_ms > 0 {
+                writeln!(
+                    self.writer,
+                    "    Hand-off ramp: {:>10.1}s",
+                    warmup.handoff_ramp_ms as f64 / 1000.0
+                )?;
+            }
             if !warmup.completed {
                 writeln!(
                     self.writer,
@@ -506,6 +519,9 @@ pub struct JsonReport {
     /// Warm-up phase summary (send mode only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warmup: Option<WarmupSummary>,
+    /// Wall-clock start of the measured window in Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_unix_ms: Option<u64>,
 }
 
 /// Latency statistics in JSON format.
@@ -678,6 +694,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             samples: Vec::new(),
             call: report.call.clone(),
             warmup: report.warmup.clone(),
+            started_unix_ms: report.started_unix_ms,
         };
 
         serde_json::to_writer_pretty(&mut self.writer, &json_report)?;

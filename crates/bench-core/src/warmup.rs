@@ -43,12 +43,24 @@ use std::{
 /// at 0.7 s pass before full pressure while connections and caches grow.
 pub const DEFAULT_WARMUP_RAMP: Duration = Duration::from_secs(10);
 
-/// Fraction of the target rate the ramp starts from.
+/// Fraction of the warm-up rate the ramp starts from.
 ///
-/// Derivation: 10% of a 50k TPS target is 5k TPS, enough to produce
-/// non-trivial blocks from the first second while staying an order of
-/// magnitude below the rate that caused the pool shock.
+/// Derivation: a tenth of the warm-up rate keeps the first blocks non-empty
+/// without a burst, and reaches the warm-up rate within the ramp.
 pub const WARMUP_RAMP_START_FRACTION: f64 = 0.10;
+
+/// Default cap on the send rate during the warm-up, in transactions per second
+/// (0 = no cap, warm up at the target rate).
+///
+/// Derivation: a cold network should not see the full target load before its
+/// connections, caches and estimators are warm. 2k TPS produces non-empty
+/// blocks from every proposer within the minimum warm-up (about 1.4k
+/// transactions per 0.7 s block) while staying more than an order of magnitude
+/// below the 50k to 100k targets that overwhelmed a cold network. When the cap
+/// is below the target, the rate ramps from the cap to the target over
+/// [`WarmupConfig::ramp`] right before the measured window starts, so the
+/// window itself runs at full rate from its first block.
+pub const DEFAULT_WARMUP_TPS_CAP: u64 = 2_000;
 
 /// Default minimum warm-up duration.
 ///
@@ -126,8 +138,14 @@ impl fmt::Display for WarmupMode {
 pub struct WarmupConfig {
     /// How the warm-up ends.
     pub mode: WarmupMode,
-    /// Ramp from [`WARMUP_RAMP_START_FRACTION`] of the target rate to the full
-    /// rate over this duration. Zero disables the ramp.
+    /// The measured window's send rate (`--tps`, 0 = unlimited).
+    pub target_tps: u64,
+    /// Cap on the warm-up send rate (0 = warm up at the target rate). See
+    /// [`DEFAULT_WARMUP_TPS_CAP`].
+    pub rate_cap: u64,
+    /// Ramp from [`WARMUP_RAMP_START_FRACTION`] of the warm-up rate to the
+    /// warm-up rate over this duration, and from the warm-up rate to the target
+    /// rate over the same duration once readiness holds. Zero disables both.
     pub ramp: Duration,
     /// Earliest time the warm-up may end in [`WarmupMode::Auto`].
     pub min_duration: Duration,
@@ -149,6 +167,8 @@ impl Default for WarmupConfig {
     fn default() -> Self {
         Self {
             mode: WarmupMode::Auto,
+            target_tps: 0,
+            rate_cap: DEFAULT_WARMUP_TPS_CAP,
             ramp: DEFAULT_WARMUP_RAMP,
             min_duration: DEFAULT_WARMUP_MIN,
             max_duration: DEFAULT_WARMUP_MAX,
@@ -165,6 +185,35 @@ impl WarmupConfig {
     /// Whether a warm-up phase runs at all.
     pub fn is_enabled(&self) -> bool {
         self.mode != WarmupMode::Off
+    }
+
+    /// Send rate held during the warm-up (0 = unlimited).
+    ///
+    /// The target rate, lowered to the cap when one is set. An unlimited
+    /// target with a cap warms up at the cap.
+    pub fn warmup_rate(&self) -> u64 {
+        match (self.target_tps, self.rate_cap) {
+            (_, 0) => self.target_tps,
+            (0, cap) => cap,
+            (target, cap) => target.min(cap),
+        }
+    }
+
+    /// Whether the warm-up runs below the target rate, so a hand-off ramp to the
+    /// target is needed before the measured window.
+    pub fn is_rate_capped(&self) -> bool {
+        self.warmup_rate() != self.target_tps
+    }
+
+    /// Duration of the ramp from the warm-up rate to the target rate that
+    /// follows readiness. Zero when the rates are equal, the target is
+    /// unlimited (nothing to ramp towards), or ramping is disabled.
+    pub fn handoff_ramp(&self) -> Duration {
+        if self.is_rate_capped() && self.target_tps > 0 {
+            self.ramp
+        } else {
+            Duration::ZERO
+        }
     }
 
     /// Validate the configuration.
@@ -309,6 +358,12 @@ pub struct WarmupSummary {
     /// Median transaction count of the last block window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_window_median_txs: Option<f64>,
+    /// Send rate held during the warm-up in transactions per second (0 =
+    /// unlimited).
+    pub warmup_tps: u64,
+    /// Duration of the ramp from the warm-up rate to the target rate that
+    /// preceded the boundary, in milliseconds (0 when the rates were equal).
+    pub handoff_ramp_ms: u64,
     /// Transactions sent before the boundary that were still awaiting a
     /// response when it happened. Their completions land in the measured
     /// window, so `success + failed` may exceed `sent` by up to this number.
@@ -396,20 +451,34 @@ impl WarmupTracker {
         self.pool_unavailable = true;
     }
 
-    /// Send rate to use `elapsed` into the warm-up for a `target_tps` target.
+    /// Send rate to use `elapsed` into the warm-up.
     ///
-    /// Linear from [`WARMUP_RAMP_START_FRACTION`] × target to the target over
-    /// the configured ramp. Returns the target when ramping is disabled or over,
-    /// and 0 (unlimited) when the target itself is 0.
-    pub fn ramp_rate(&self, elapsed: Duration, target_tps: u64) -> u64 {
-        if target_tps == 0 || self.config.ramp.is_zero() || elapsed >= self.config.ramp {
-            return target_tps;
+    /// Linear from [`WARMUP_RAMP_START_FRACTION`] × the warm-up rate to the
+    /// warm-up rate over the configured ramp. Returns the warm-up rate when
+    /// ramping is disabled or over, and 0 (unlimited) when the warm-up rate is
+    /// unlimited.
+    pub fn ramp_rate(&self, elapsed: Duration) -> u64 {
+        let warmup_rate = self.config.warmup_rate();
+        if warmup_rate == 0 || self.config.ramp.is_zero() || elapsed >= self.config.ramp {
+            return warmup_rate;
         }
-        let target = target_tps as f64;
-        let start = (target * WARMUP_RAMP_START_FRACTION).round().max(1.0);
-        let progress = elapsed.as_secs_f64() / self.config.ramp.as_secs_f64();
-        let rate = start + (target - start) * progress;
-        (rate.round() as u64).clamp(1, target_tps)
+        let start = (warmup_rate as f64 * WARMUP_RAMP_START_FRACTION).round().max(1.0);
+        linear_rate(start, warmup_rate as f64, elapsed, self.config.ramp).clamp(1, warmup_rate)
+    }
+
+    /// Send rate to use `elapsed` into the hand-off ramp that follows
+    /// readiness when the warm-up rate is capped below the target.
+    ///
+    /// Linear from the warm-up rate to the target over
+    /// [`WarmupConfig::handoff_ramp`]; returns the target once that elapsed.
+    pub fn handoff_rate(&self, elapsed: Duration) -> u64 {
+        let ramp = self.config.handoff_ramp();
+        let target = self.config.target_tps;
+        if ramp.is_zero() || elapsed >= ramp {
+            return target;
+        }
+        let warmup_rate = self.config.warmup_rate() as f64;
+        linear_rate(warmup_rate, target as f64, elapsed, ramp).clamp(1, target)
     }
 
     /// Transaction count at or above which a block counts as full.
@@ -463,10 +532,12 @@ impl WarmupTracker {
         counts
     }
 
-    /// `None` when the check is off or `txpool_status` is unavailable;
-    /// `Some(false)` until a full window of readings exists.
+    /// `None` when the check is off, `txpool_status` is unavailable, or the
+    /// warm-up rate is capped below the target (pool occupancy at the
+    /// warm-up rate says nothing about the measured window); `Some(false)`
+    /// until a full window of readings exists.
     fn pool_stable(&self, elapsed: Duration) -> Option<bool> {
-        if !self.config.pool_check || self.pool_unavailable {
+        if !self.config.pool_check || self.pool_unavailable || self.config.is_rate_capped() {
             return None;
         }
         if elapsed < WARMUP_POOL_STABLE_WINDOW {
@@ -533,14 +604,20 @@ impl WarmupTracker {
     }
 
     /// Build the summary for a warm-up that ended with `outcome`.
+    ///
+    /// `decided` is the evaluation that ended the warm-up. It is reported
+    /// instead of a fresh evaluation because blocks produced during the
+    /// hand-off ramp would otherwise change the conditions after the fact.
+    /// `None` evaluates now (fixed mode, source exhausted).
     pub fn summary(
         &self,
         outcome: WarmupOutcome,
         started_unix_ms: u64,
         ended_unix_ms: Option<u64>,
         elapsed: Duration,
+        decided: Option<&WarmupStatus>,
     ) -> WarmupSummary {
-        let status = self.evaluate(elapsed);
+        let status = decided.cloned().unwrap_or_else(|| self.evaluate(elapsed));
         let proposals_by_proposer = status
             .proposals
             .iter()
@@ -563,10 +640,18 @@ impl WarmupTracker {
             full_block_threshold: status.full_block_threshold,
             proposals_by_proposer,
             last_window_median_txs: status.last_window_median_txs,
+            warmup_tps: self.config.warmup_rate(),
+            handoff_ramp_ms: u64::try_from(self.config.handoff_ramp().as_millis())
+                .unwrap_or(u64::MAX),
             inflight_at_boundary: None,
             conditions: status.conditions,
         }
     }
+}
+
+fn linear_rate(from: f64, to: f64, elapsed: Duration, ramp: Duration) -> u64 {
+    let progress = (elapsed.as_secs_f64() / ramp.as_secs_f64()).clamp(0.0, 1.0);
+    (from + (to - from) * progress).round() as u64
 }
 
 fn median_u64(sorted: &[u64]) -> f64 {
@@ -605,7 +690,13 @@ mod tests {
     }
 
     fn config(expected_proposers: usize) -> WarmupConfig {
-        WarmupConfig { expected_proposers, pool_check: false, ..WarmupConfig::default() }
+        WarmupConfig {
+            expected_proposers,
+            pool_check: false,
+            target_tps: 50_000,
+            rate_cap: 0,
+            ..WarmupConfig::default()
+        }
     }
 
     #[test]
@@ -638,22 +729,70 @@ mod tests {
     }
 
     #[test]
-    fn ramp_is_linear_from_start_fraction_to_target() {
+    fn ramp_is_linear_from_start_fraction_to_warmup_rate() {
         let tracker = WarmupTracker::new(config(1));
-        assert_eq!(tracker.ramp_rate(Duration::ZERO, 50_000), 5_000);
-        assert_eq!(tracker.ramp_rate(Duration::from_secs(5), 50_000), 27_500);
-        assert_eq!(tracker.ramp_rate(Duration::from_secs(10), 50_000), 50_000);
-        assert_eq!(tracker.ramp_rate(Duration::from_secs(60), 50_000), 50_000);
+        assert_eq!(tracker.ramp_rate(Duration::ZERO), 5_000);
+        assert_eq!(tracker.ramp_rate(Duration::from_secs(5)), 27_500);
+        assert_eq!(tracker.ramp_rate(Duration::from_secs(10)), 50_000);
+        assert_eq!(tracker.ramp_rate(Duration::from_secs(60)), 50_000);
         // Tiny targets never ramp below one transaction per second.
-        assert_eq!(tracker.ramp_rate(Duration::ZERO, 3), 1);
-        // Unlimited stays unlimited.
-        assert_eq!(tracker.ramp_rate(Duration::ZERO, 0), 0);
+        let tiny = WarmupTracker::new(WarmupConfig { target_tps: 3, ..config(1) });
+        assert_eq!(tiny.ramp_rate(Duration::ZERO), 1);
+        // Unlimited stays unlimited without a cap.
+        let unlimited = WarmupTracker::new(WarmupConfig { target_tps: 0, ..config(1) });
+        assert_eq!(unlimited.ramp_rate(Duration::ZERO), 0);
+        assert!(!unlimited.config().is_rate_capped());
     }
 
     #[test]
-    fn ramp_disabled_returns_target() {
+    fn ramp_disabled_returns_warmup_rate() {
         let tracker = WarmupTracker::new(WarmupConfig { ramp: Duration::ZERO, ..config(1) });
-        assert_eq!(tracker.ramp_rate(Duration::ZERO, 50_000), 50_000);
+        assert_eq!(tracker.ramp_rate(Duration::ZERO), 50_000);
+    }
+
+    #[test]
+    fn rate_cap_bounds_warmup_and_hands_off_to_target() {
+        let capped = WarmupTracker::new(WarmupConfig { rate_cap: 2_000, ..config(1) });
+        assert_eq!(capped.config().warmup_rate(), 2_000);
+        assert!(capped.config().is_rate_capped());
+        assert_eq!(capped.config().handoff_ramp(), DEFAULT_WARMUP_RAMP);
+        // Initial ramp goes to the cap, not the target.
+        assert_eq!(capped.ramp_rate(Duration::ZERO), 200);
+        assert_eq!(capped.ramp_rate(Duration::from_secs(10)), 2_000);
+        // Hand-off ramps from the cap to the target.
+        assert_eq!(capped.handoff_rate(Duration::ZERO), 2_000);
+        assert_eq!(capped.handoff_rate(Duration::from_secs(5)), 26_000);
+        assert_eq!(capped.handoff_rate(Duration::from_secs(10)), 50_000);
+        assert_eq!(capped.handoff_rate(Duration::from_secs(11)), 50_000);
+
+        // A cap above the target changes nothing.
+        let loose = WarmupTracker::new(WarmupConfig { rate_cap: 80_000, ..config(1) });
+        assert_eq!(loose.config().warmup_rate(), 50_000);
+        assert!(!loose.config().is_rate_capped());
+        assert!(loose.config().handoff_ramp().is_zero());
+
+        // An unlimited target warms up at the cap and hands off with a step.
+        let unlimited =
+            WarmupTracker::new(WarmupConfig { target_tps: 0, rate_cap: 2_000, ..config(1) });
+        assert_eq!(unlimited.config().warmup_rate(), 2_000);
+        assert!(unlimited.config().is_rate_capped());
+        assert!(unlimited.config().handoff_ramp().is_zero());
+        assert_eq!(unlimited.handoff_rate(Duration::ZERO), 0);
+
+        let summary =
+            capped.summary(WarmupOutcome::Ready, 0, Some(1), Duration::from_secs(40), None);
+        assert_eq!(summary.warmup_tps, 2_000);
+        assert_eq!(summary.handoff_ramp_ms, 10_000);
+    }
+
+    #[test]
+    fn pool_check_is_not_applicable_when_rate_is_capped() {
+        let mut tracker =
+            WarmupTracker::new(WarmupConfig { pool_check: true, rate_cap: 2_000, ..config(1) });
+        for second in 0..=25u64 {
+            tracker.observe_pool_pending(Duration::from_secs(second), 1_000);
+        }
+        assert_eq!(tracker.evaluate(Duration::from_secs(25)).conditions.pool, None);
     }
 
     #[test]
@@ -731,8 +870,13 @@ mod tests {
         assert!(!status.conditions.proposers);
         let status = tracker.evaluate(Duration::from_secs(90));
         assert_eq!(status.decision, WarmupDecision::Timeout);
-        let summary =
-            tracker.summary(WarmupOutcome::Timeout, 1_000, Some(91_000), Duration::from_secs(90));
+        let summary = tracker.summary(
+            WarmupOutcome::Timeout,
+            1_000,
+            Some(91_000),
+            Duration::from_secs(90),
+            None,
+        );
         assert_eq!(summary.outcome, "timeout");
         assert!(summary.completed);
         assert!(!summary.ready);
@@ -756,7 +900,7 @@ mod tests {
             WarmupDecision::FixedElapsed
         );
         let summary =
-            tracker.summary(WarmupOutcome::Fixed, 0, Some(45_000), Duration::from_secs(45));
+            tracker.summary(WarmupOutcome::Fixed, 0, Some(45_000), Duration::from_secs(45), None);
         assert_eq!(summary.mode, "45.0s");
         assert_eq!(summary.outcome, "fixed");
         assert!(summary.completed);
@@ -764,8 +908,12 @@ mod tests {
 
     #[test]
     fn pool_check_requires_a_window_of_stable_readings() {
-        let mut tracker =
-            WarmupTracker::new(WarmupConfig { pool_check: true, ..WarmupConfig::default() });
+        let mut tracker = WarmupTracker::new(WarmupConfig {
+            pool_check: true,
+            target_tps: 50_000,
+            rate_cap: 0,
+            ..WarmupConfig::default()
+        });
         // No readings yet: the check is pending, not satisfied.
         assert_eq!(tracker.evaluate(Duration::from_secs(5)).conditions.pool, Some(false));
         assert_eq!(tracker.evaluate(Duration::from_secs(15)).conditions.pool, Some(false));
@@ -783,10 +931,41 @@ mod tests {
     }
 
     #[test]
+    fn summary_reports_the_deciding_evaluation() {
+        let mut tracker = WarmupTracker::new(WarmupConfig {
+            min_duration: Duration::from_secs(1),
+            stable_blocks: 2,
+            ..config(1)
+        });
+        for number in 1..=4 {
+            tracker.observe_block(block(number, 10_000, 1));
+        }
+        let decided = tracker.evaluate(Duration::from_secs(5));
+        assert_eq!(decided.decision, WarmupDecision::Ready);
+        // Hand-off ramp blocks grow and break the plateau after the decision.
+        tracker.observe_block(block(5, 20_000, 1));
+        tracker.observe_block(block(6, 40_000, 1));
+        let fresh = tracker.summary(WarmupOutcome::Ready, 0, Some(1), Duration::from_secs(7), None);
+        assert!(!fresh.ready);
+        let summary = tracker.summary(
+            WarmupOutcome::Ready,
+            0,
+            Some(1),
+            Duration::from_secs(7),
+            Some(&decided),
+        );
+        assert!(summary.ready);
+        assert!(summary.conditions.plateau);
+        // Block accounting still covers the whole warm-up.
+        assert_eq!(summary.blocks, 6);
+        assert_eq!(summary.last_block, Some(6));
+    }
+
+    #[test]
     fn source_exhausted_summary_is_not_completed() {
         let tracker = WarmupTracker::new(config(1));
         let summary =
-            tracker.summary(WarmupOutcome::SourceExhausted, 5, None, Duration::from_secs(3));
+            tracker.summary(WarmupOutcome::SourceExhausted, 5, None, Duration::from_secs(3), None);
         assert_eq!(summary.outcome, "source-exhausted");
         assert!(!summary.completed);
         assert_eq!(summary.blocks, 0);
@@ -797,7 +976,8 @@ mod tests {
     fn summary_round_trips_through_json() {
         let mut tracker = WarmupTracker::new(config(1));
         tracker.observe_block(block(7, 10, 1));
-        let summary = tracker.summary(WarmupOutcome::Ready, 1, Some(2), Duration::from_secs(1));
+        let summary =
+            tracker.summary(WarmupOutcome::Ready, 1, Some(2), Duration::from_secs(1), None);
         let json = serde_json::to_string(&summary).unwrap();
         let parsed: WarmupSummary = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, summary);
