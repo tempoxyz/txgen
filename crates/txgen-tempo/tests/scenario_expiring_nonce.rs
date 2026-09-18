@@ -1,6 +1,6 @@
 use alloy_consensus::{SignableTransaction, Signed};
 use alloy_eips::eip2718::{Decodable2718, Encodable2718};
-use alloy_network::{Network, TransactionBuilder};
+use alloy_network::Network;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use axum::{extract::State, routing::post, Json, Router};
 use eyre::Result;
@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     fs,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -71,9 +72,12 @@ impl RequestSignContext<TempoNetwork> for ProbeSignContext {
         <TempoNetwork as Network>::TxEnvelope:
             From<Signed<<TempoNetwork as Network>::UnsignedTx>> + Encodable2718,
     {
+        // Scenario-assigned identities encode to even `valid_after` values while
+        // ordinary generation counters encode to odd ones.
         let scenario_identity = request
-            .max_fee_per_gas()
-            .is_some_and(|fee| fee > BASE_FEE && fee.saturating_sub(BASE_FEE) % 2 == 0);
+            .valid_after
+            .map(NonZeroU64::get)
+            .is_some_and(|valid_after| valid_after % 2 == 0);
         if !scenario_identity {
             return self.0.sign_request(name, phase, request, signer, key, inclusion_keys);
         }
@@ -213,7 +217,11 @@ async fn dag_submits_distinct_expiring_nonce_transactions_concurrently() {
         assert_eq!(second.nonce_key, TEMPO_EXPIRING_NONCE_KEY);
         assert_eq!(first.nonce, 0);
         assert_eq!(second.nonce, 0);
-        assert_ne!(first.max_fee_per_gas, second.max_fee_per_gas);
+        // Uniqueness must come from `valid_after`; the fee fields decide pool
+        // priority and have to stay identical across generated transactions.
+        assert_ne!(first.valid_after, second.valid_after);
+        assert_eq!(first.max_fee_per_gas, BASE_FEE);
+        assert_eq!(second.max_fee_per_gas, BASE_FEE);
         assert_eq!(first.max_priority_fee_per_gas, 0);
         assert_eq!(second.max_priority_fee_per_gas, 0);
 
@@ -281,6 +289,7 @@ struct ExpiringTransactionFields {
     nonce: u64,
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
+    valid_after: Option<NonZeroU64>,
 }
 
 fn decode_expiring_transaction(raw: &Bytes) -> ExpiringTransactionFields {
@@ -295,6 +304,7 @@ fn decode_expiring_transaction(raw: &Bytes) -> ExpiringTransactionFields {
         nonce: transaction.nonce,
         max_fee_per_gas: transaction.max_fee_per_gas,
         max_priority_fee_per_gas: transaction.max_priority_fee_per_gas,
+        valid_after: transaction.valid_after,
     }
 }
 

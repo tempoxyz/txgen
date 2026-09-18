@@ -20,7 +20,11 @@ use alloy_signer::SignerSync;
 use eyre::{bail, Result, WrapErr};
 use rand::RngCore;
 use serde::Deserialize;
-use std::{collections::HashMap, num::NonZeroU64, sync::OnceLock};
+use std::{
+    collections::HashMap,
+    num::NonZeroU64,
+    sync::{Once, OnceLock},
+};
 use tempo_alloy::{
     provider::keychain::{authorize_key, KeyRestrictions},
     rpc::TempoTransactionRequest,
@@ -48,8 +52,8 @@ use template::{
 };
 pub use template::{TempoTemplate, TempoTxType};
 
-/// Internal nonce-tracker slot used to derive deterministic uniqueness bumps for
-/// expiring nonce transactions.
+/// Internal nonce-tracker slot used to derive the deterministic uniqueness value
+/// written into `valid_after` for expiring nonce transactions.
 const EXPIRING_UNIQUENESS_COUNTER_KEY: [u8; 20] = *b"tempo-expiring-seq!!";
 const INLINE_ACCESS_KEY_MNEMONIC: &str =
     "test test test test test test test test test test test junk";
@@ -533,7 +537,7 @@ impl NetworkAdapter for TempoAdapter {
                     req.set_valid_before(valid_before);
                 }
                 if is_expiring {
-                    apply_expiring_uniqueness_bump(&mut req, ctx)?;
+                    apply_expiring_uniqueness(&mut req, ctx)?;
                 }
 
                 self.apply_auth(
@@ -876,15 +880,35 @@ fn validate_expiring_valid_for_secs(template: &TempoTemplate) -> Result<()> {
     Ok(())
 }
 
-/// Deterministically perturb the maximum fee so expiring nonce transactions never
+/// Deterministically perturb `valid_after` so expiring nonce transactions never
 /// produce identical signed payloads within one generation run.
 ///
 /// Tempo expiring nonce replay protection is hash-based, so two otherwise
 /// identical transactions from the same sender can collide if their signed
-/// payload is identical. txgen uses a local monotonic counter to bump
-/// `max_fee_per_gas` before any signatures are produced while leaving
-/// `max_priority_fee_per_gas` exactly as configured.
-fn apply_expiring_uniqueness_bump(
+/// payload is identical. txgen derives a local monotonic uniqueness value and
+/// writes it into a signed field before any signatures are produced.
+///
+/// # Why `valid_after`
+///
+/// The uniqueness value has to be signed (otherwise it does not change the
+/// hash), but it must not leak into how the node prioritises the transaction:
+///
+/// - `max_fee_per_gas`, `max_priority_fee_per_gas` and `gas_price` feed the pool's effective tip
+///   per gas, `min(max_priority_fee_per_gas, max_fee_per_gas - base_fee)`. A monotonically
+///   increasing bump there makes every freshly generated transaction outrank the ones already
+///   queued, so the pool selects newest-first and the oldest entries starve until they expire. This
+///   is exactly what the previous `max_fee_per_gas` bump did.
+/// - `gas_limit` decides how block builders pack transactions.
+/// - Calldata length is validated strictly by some Tempo precompiles.
+///
+/// `valid_after` is signed, invisible to pool ordering and block packing, and
+/// only ever bounded from above: the pool validator checks `valid_after <= now +
+/// aa_valid_after_max_secs` (and pool-side EVM validation skips the check
+/// entirely), while execution only requires `block_timestamp >= valid_after`.
+/// Small positive values are therefore always in the past and always
+/// satisfiable. The field is `NonZeroU64`, hence the `+ 1`, and the protocol
+/// additionally requires `valid_before > valid_after`, which is checked below.
+fn apply_expiring_uniqueness(
     req: &mut TempoTransactionRequest,
     ctx: &mut BuildContext<'_>,
 ) -> Result<()> {
@@ -901,19 +925,68 @@ fn apply_expiring_uniqueness_bump(
             .ok_or_else(|| eyre::eyre!("expiring nonce uniqueness counter overflow"))?,
     };
     // Scenario-assigned identities use odd values while ordinary generation
-    // counters use even values. This keeps both domains disjoint without large
-    // gas-price changes, and retries of one scenario step remain idempotent.
-    let bump = u128::from(encoded_uniqueness) + 1;
+    // counters use even values. This keeps both domains disjoint, and retries of
+    // one scenario step stay idempotent because the step's hint - not a shared
+    // counter - decides the value.
+    let uniqueness = encoded_uniqueness
+        .checked_add(1)
+        .ok_or_else(|| eyre::eyre!("expiring nonce uniqueness value overflow"))?;
 
-    let max_fee_per_gas = req
-        .max_fee_per_gas()
-        .ok_or_else(|| eyre::eyre!("Tempo expiring transactions require max_fee_per_gas"))?
-        .checked_add(bump)
-        .ok_or_else(|| eyre::eyre!("expiring nonce max_fee_per_gas overflowed uniqueness bump"))?;
+    if req.valid_after.is_some() {
+        // The template pinned `valid_after` to a real timestamp, presumably
+        // because the workload exercises the time window itself. Overwriting it
+        // would silently change the behaviour the spec asked for, so the
+        // template value wins and uniqueness falls back to the legacy
+        // `max_fee_per_gas` bump.
+        //
+        // The fallback reintroduces the pool-priority skew described above, so
+        // it warns once per process instead of being the default.
+        warn_expiring_uniqueness_fee_fallback();
 
-    req.set_max_fee_per_gas(max_fee_per_gas);
+        let max_fee_per_gas = req
+            .max_fee_per_gas()
+            .ok_or_else(|| eyre::eyre!("Tempo expiring transactions require max_fee_per_gas"))?
+            .checked_add(u128::from(uniqueness))
+            .ok_or_else(|| {
+                eyre::eyre!("expiring nonce max_fee_per_gas overflowed uniqueness bump")
+            })?;
+        req.set_max_fee_per_gas(max_fee_per_gas);
+
+        return Ok(());
+    }
+
+    // `valid_before` is already resolved here for absolute expiry, and is still
+    // `None` for deferred relative expiry, where submission resolves it to
+    // `now + valid_for_secs`. Either way it has to stay strictly greater than
+    // `valid_after` or the node rejects the transaction outright.
+    if let Some(valid_before) = req.valid_before.map(NonZeroU64::get) &&
+        valid_before <= uniqueness
+    {
+        bail!(
+            "expiring nonce uniqueness value {uniqueness} reached `valid_before` {valid_before}; \
+             use a real unix timestamp for `valid_before` (or use `valid_for_secs`)"
+        );
+    }
+
+    let valid_after = NonZeroU64::new(uniqueness)
+        .ok_or_else(|| eyre::eyre!("expiring nonce uniqueness value must be non-zero"))?;
+    req.set_valid_after(valid_after);
 
     Ok(())
+}
+
+/// Warn once per process that a template's explicit `valid_after` forces the
+/// legacy fee-based uniqueness scheme.
+fn warn_expiring_uniqueness_fee_fallback() {
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "warning: expiring nonce template sets `valid_after` explicitly, so signed-payload \
+             uniqueness falls back to bumping `max_fee_per_gas`. That raises the effective tip of \
+             later transactions and makes the node's pool prefer newly generated ones over queued \
+             ones. Drop `valid_after` from the template to keep fees untouched."
+        );
+    });
 }
 
 /// Compute the sender scheduling key used by txgen/bench submission ordering.
@@ -1811,7 +1884,7 @@ nonce_key:
     }
 
     #[test]
-    fn test_expiring_nonce_max_fee_bumps_leave_zero_priority_fee_unchanged() {
+    fn test_expiring_nonce_uniqueness_leaves_fees_unchanged() {
         let accounts = test_accounts();
         let artifacts = ArtifactManager::empty();
         let gas = GasConfig::default();
@@ -1828,10 +1901,142 @@ nonce_key:
         let first = TempoAdapter::new().build_request(template.clone(), &mut ctx).unwrap().request;
         let second = TempoAdapter::new().build_request(template, &mut ctx).unwrap().request;
 
+        // Ordinary generation counters use even encoded values, so `valid_after`
+        // walks 1, 3, 5, ... while both fee fields stay exactly as configured.
         assert_eq!(first.max_priority_fee_per_gas(), Some(0));
-        assert_eq!(first.max_fee_per_gas(), Some(1_000_000_001));
+        assert_eq!(first.max_fee_per_gas(), Some(1_000_000_000));
+        assert_eq!(first.valid_after.map(NonZeroU64::get), Some(1));
         assert_eq!(second.max_priority_fee_per_gas(), Some(0));
+        assert_eq!(second.max_fee_per_gas(), Some(1_000_000_000));
+        assert_eq!(second.valid_after.map(NonZeroU64::get), Some(3));
+    }
+
+    #[test]
+    fn test_expiring_nonce_uniqueness_does_not_change_pool_priority() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let mut template = base_template(TempoTxType::Tempo);
+        template.expiring_nonce = true;
+        template.valid_before = Some(1_700_000_000);
+
+        let first = TempoAdapter::new().build_request(template.clone(), &mut ctx).unwrap();
+        let second = TempoAdapter::new().build_request(template.clone(), &mut ctx).unwrap();
+
+        // Everything the node's pool ranks by has to be identical, otherwise the
+        // newest transaction outranks the queued ones and the tail of the pool
+        // starves until it expires.
+        assert_eq!(first.request.max_fee_per_gas(), second.request.max_fee_per_gas());
+        assert_eq!(
+            first.request.max_priority_fee_per_gas(),
+            second.request.max_priority_fee_per_gas()
+        );
+        assert_eq!(first.request.gas_limit(), second.request.gas_limit());
+        assert_eq!(first.request.input(), second.request.input());
+        assert_ne!(first.request.valid_after, second.request.valid_after);
+
+        // ... while the signed payloads, and therefore the replay-protection
+        // hashes, still differ.
+        let first = sign_tempo_request(first, &ctx, "expiring_first");
+        let second = sign_tempo_request(second, &ctx, "expiring_second");
+        assert_ne!(first.raw, second.raw);
+        assert_ne!(keccak256(&first.raw), keccak256(&second.raw));
+    }
+
+    #[test]
+    fn test_expiring_nonce_uniqueness_keeps_explicit_valid_after() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let mut template = base_template(TempoTxType::Tempo);
+        template.expiring_nonce = true;
+        template.valid_before = Some(1_700_000_000);
+        template.valid_after = Some(1_699_000_000);
+
+        let first = TempoAdapter::new().build_request(template.clone(), &mut ctx).unwrap().request;
+        let second = TempoAdapter::new().build_request(template, &mut ctx).unwrap().request;
+
+        // A template that pins the time window keeps it, and uniqueness falls
+        // back to the legacy `max_fee_per_gas` bump.
+        assert_eq!(first.valid_after.map(NonZeroU64::get), Some(1_699_000_000));
+        assert_eq!(second.valid_after.map(NonZeroU64::get), Some(1_699_000_000));
+        assert_eq!(first.max_fee_per_gas(), Some(1_000_000_001));
         assert_eq!(second.max_fee_per_gas(), Some(1_000_000_003));
+        assert_eq!(first.max_priority_fee_per_gas(), Some(1_000_000_000));
+        assert_eq!(second.max_priority_fee_per_gas(), Some(1_000_000_000));
+    }
+
+    #[test]
+    fn test_expiring_nonce_uniqueness_rejects_unusable_valid_before() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        let mut template = base_template(TempoTxType::Tempo);
+        template.expiring_nonce = true;
+        template.valid_before = Some(1);
+
+        let error = match TempoAdapter::new().build_request(template, &mut ctx) {
+            Ok(_) => panic!("a `valid_before` below the uniqueness value must be rejected"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("`valid_before`"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn test_expiring_nonce_scenario_identities_stay_disjoint_from_counters() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut template = base_template(TempoTxType::Tempo);
+        template.expiring_nonce = true;
+        template.valid_before = Some(1_700_000_000);
+
+        let generated = {
+            let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+            TempoAdapter::new()
+                .build_request(template.clone(), &mut ctx)
+                .unwrap()
+                .request
+                .valid_after
+                .map(NonZeroU64::get)
+        };
+        let scenario = |hint: u64, nonces: &mut NonceTracker, rng: &mut StdRng| {
+            let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, nonces, rng);
+            ctx.set_unique_nonce_hint(hint);
+            TempoAdapter::new()
+                .build_request(template.clone(), &mut ctx)
+                .unwrap()
+                .request
+                .valid_after
+                .map(NonZeroU64::get)
+        };
+
+        // Generation counters land on odd values, scenario identities on even
+        // ones, so the two domains can never collide.
+        assert_eq!(generated, Some(1));
+        assert_eq!(scenario(0, &mut nonces, &mut rng), Some(2));
+        assert_eq!(scenario(3, &mut nonces, &mut rng), Some(8));
+        // A retried scenario step reproduces its identity exactly.
+        assert_eq!(scenario(3, &mut nonces, &mut rng), Some(8));
     }
 
     #[test]
@@ -1894,7 +2099,9 @@ nonce_key:
         let second =
             TempoAdapter::new().build_request(sponsored_expiring_template(), &mut ctx).unwrap();
 
-        assert_ne!(first.request.max_fee_per_gas(), second.request.max_fee_per_gas());
+        assert_ne!(first.request.valid_after, second.request.valid_after);
+        assert_eq!(first.request.max_fee_per_gas(), Some(1_000_000_000));
+        assert_eq!(second.request.max_fee_per_gas(), Some(1_000_000_000));
         assert_eq!(first.request.max_priority_fee_per_gas(), Some(1_000_000_000));
         assert_eq!(second.request.max_priority_fee_per_gas(), Some(1_000_000_000));
         assert!(first.request.fee_payer_signature.is_none());
@@ -1906,7 +2113,7 @@ nonce_key:
         assert_ne!(
             first.as_aa().unwrap().tx().fee_payer_signature,
             second.as_aa().unwrap().tx().fee_payer_signature,
-            "fee-payer signature must reflect the per-tx expiring uniqueness bump"
+            "fee-payer signature must reflect the per-tx expiring uniqueness value"
         );
     }
 
