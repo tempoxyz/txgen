@@ -26,15 +26,15 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@1d24cba4cc91d718c9dada1c397baf11dc188fc1
+        uses: tempoxyz/gh-actions/actions/secure-runner@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@1d24cba4cc91d718c9dada1c397baf11dc188fc1
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@1d24cba4cc91d718c9dada1c397baf11dc188fc1
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
       - run: cargo test --workspace
 
   decode-tx:
@@ -55,16 +55,16 @@ jobs:
             spec: tests/specs/tempo-all-types.yaml
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@1d24cba4cc91d718c9dada1c397baf11dc188fc1
+        uses: tempoxyz/gh-actions/actions/secure-runner@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
-      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@1d24cba4cc91d718c9dada1c397baf11dc188fc1
-      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@1d24cba4cc91d718c9dada1c397baf11dc188fc1
-      - uses: tempoxyz/gh-actions/actions/setup-foundry@1d24cba4cc91d718c9dada1c397baf11dc188fc1
+      - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
+      - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
+      - uses: tempoxyz/gh-actions/actions/setup-foundry@0a60d757d0f4725a34f22f7b9ebf7b91b4b00bcf
         with:
           version: nightly
       - name: Generate and decode transactions
