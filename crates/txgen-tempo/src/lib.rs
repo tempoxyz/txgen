@@ -426,9 +426,6 @@ impl NetworkAdapter for TempoAdapter {
             bail!("Tempo keychain auth is only supported for `type: tempo` templates");
         }
         let nonce_mode = resolve_nonce_mode(&template, is_tempo, ctx)?;
-        if template.randomize_expiring_nonce && !matches!(nonce_mode, TempoNonceMode::Expiring) {
-            bail!("`randomize_expiring_nonce` is only supported for expiring Tempo transactions");
-        }
         if !matches!(nonce_mode, TempoNonceMode::Expiring) &&
             let Some(valid_for_secs) = template.valid_for_secs
         {
@@ -438,10 +435,8 @@ impl NetworkAdapter for TempoAdapter {
             );
         }
         let scheduling_key = compute_scheduling_key(selected.address, nonce_mode, ctx);
-        if matches!(nonce_mode, TempoNonceMode::Expiring) && template.nonce.is_some() {
-            bail!("`nonce` must not be set for an expiring Tempo transaction");
-        }
-        let nonce = if let Some(nonce) = template.nonce {
+        let nonce = if let Some(nonce) = &template.nonce {
+            let nonce = ctx.resolve_value(nonce)?;
             if !matches!(nonce_mode, TempoNonceMode::Expiring) &&
                 self.nonce_rpc.get().is_some_and(|rpc| rpc.pending)
             {
@@ -535,12 +530,8 @@ impl NetworkAdapter for TempoAdapter {
                     })?;
                     req.set_valid_before(valid_before);
                 }
-                if is_expiring {
-                    if template.randomize_expiring_nonce {
-                        req.set_nonce(ctx.rng.next_u64());
-                    } else {
-                        apply_expiring_uniqueness_bump(&mut req, ctx)?;
-                    }
+                if is_expiring && template.nonce.is_none() {
+                    apply_expiring_uniqueness_bump(&mut req, ctx)?;
                 }
 
                 self.apply_auth(
@@ -1352,7 +1343,6 @@ mod tests {
             nonce_key: None,
             nonce: None,
             expiring_nonce: false,
-            randomize_expiring_nonce: false,
             fee_token: None,
             sponsor: None,
             valid_after: None,
@@ -1660,7 +1650,7 @@ input: "0x"
 
         let mut template = base_template(TempoTxType::Tempo);
         template.nonce_key = Some(GenValue::Literal(U256::from(42)));
-        template.nonce = Some(0);
+        template.nonce = Some(GenValue::Literal(0));
 
         let tx_req = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
 
@@ -1715,7 +1705,7 @@ nonce_key:
     }
 
     #[test]
-    fn expiring_nonce_rejects_an_explicit_nonce() {
+    fn expiring_nonce_accepts_literal_discriminators_without_fee_bumps() {
         let accounts = test_accounts();
         let artifacts = ArtifactManager::empty();
         let gas = GasConfig::default();
@@ -1725,13 +1715,13 @@ nonce_key:
         let mut template = base_template(TempoTxType::Tempo);
         template.expiring_nonce = true;
         template.valid_for_secs = Some(10);
-        template.nonce = Some(0);
-
-        let error = match TempoAdapter::new().build_request(template, &mut ctx) {
-            Ok(_) => panic!("explicit expiring nonce should be rejected"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("must not be set"));
+        for nonce in [0, 42, u64::MAX] {
+            template.nonce = Some(serde_yaml::from_str(&nonce.to_string()).unwrap());
+            let request = TempoAdapter::new().build_request(template.clone(), &mut ctx).unwrap();
+            assert_eq!(request.request.nonce(), Some(nonce));
+            assert_eq!(request.request.max_fee_per_gas(), template.max_fee_per_gas);
+            assert!(ctx.take_nonce_reservations().is_empty());
+        }
     }
 
     #[test]
@@ -1862,7 +1852,8 @@ nonce_key:
                         base_template(TempoTxType::Tempo)
                     };
                     template.expiring_nonce = true;
-                    template.randomize_expiring_nonce = true;
+                    template.nonce =
+                        Some(serde_yaml::from_str("uniform: [0, 18446744073709551615]").unwrap());
                     template.valid_after = Some(1);
                     template.valid_before = (!deferred).then_some(1_700_000_000);
                     template.valid_for_secs = deferred.then_some(25);
@@ -1918,7 +1909,7 @@ nonce_key:
     }
 
     #[test]
-    fn test_random_expiring_nonce_rejects_ordered_nonces() {
+    fn test_nonce_generators_validate_ranges_and_preserve_ordered_lane_checks() {
         let accounts = test_accounts();
         let artifacts = ArtifactManager::empty();
         let gas = GasConfig::default();
@@ -1926,11 +1917,41 @@ nonce_key:
         let mut rng = StdRng::seed_from_u64(42);
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
 
-        for tx_type in [TempoTxType::Tempo, TempoTxType::Eip1559] {
-            let mut template = base_template(tx_type);
-            template.randomize_expiring_nonce = true;
-            let error = TempoAdapter::new().build_request(template, &mut ctx).err().unwrap();
-            assert!(error.to_string().contains("only supported for expiring Tempo transactions"));
+        let mut template = base_template(TempoTxType::Tempo);
+        template.expiring_nonce = true;
+        template.valid_for_secs = Some(10);
+        for expression in ["uniform: [10, 1]", "uniform: [-1, -1]"] {
+            template.nonce = Some(serde_yaml::from_str(expression).unwrap());
+            assert!(TempoAdapter::new().build_request(template.clone(), &mut ctx).is_err());
+        }
+        assert!(serde_yaml::from_str::<GenValue<u64>>(
+            "uniform: [18446744073709551616, 18446744073709551616]"
+        )
+        .is_err());
+
+        let adapter = TempoAdapter::new();
+        let provider = ProviderBuilder::<_, _, Ethereum>::new()
+            .connect_mocked_client(Asserter::new())
+            .erased();
+        assert!(adapter.nonce_rpc.set(NonceRpc { provider, pending: true }).is_ok());
+        let sender = accounts.get_by_index("users", 0).unwrap().address();
+        template.expiring_nonce = false;
+        template.valid_for_secs = None;
+        for nonce_key in [U256::ZERO, U256::from(42)] {
+            template.nonce_key = Some(GenValue::Literal(nonce_key));
+            let key = if nonce_key.is_zero() {
+                sender.0 .0
+            } else {
+                compute_parallel_scheduling_key(sender, nonce_key)
+            };
+            ctx.nonces.reset(key, 7);
+            template.nonce = Some(serde_yaml::from_str("uniform: [7, 7]").unwrap());
+            let request = adapter.build_request(template.clone(), &mut ctx).unwrap();
+            assert_eq!(request.request.nonce(), Some(7));
+            assert_eq!(ctx.nonces.current(&key), 8);
+            template.nonce = Some(serde_yaml::from_str("choice: [6]").unwrap());
+            let error = adapter.build_request(template.clone(), &mut ctx).err().unwrap();
+            assert!(error.to_string().contains("does not match pending nonce"));
         }
     }
 
