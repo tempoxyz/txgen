@@ -479,8 +479,8 @@ pub struct JsonLatencySample {
 ///
 /// When writing to a file, samples are written to a separate gzip-compressed
 /// NDJSON (newline-delimited JSON) sibling file instead of being embedded in
-/// the report. The benchmark writes samples to a temporary uncompressed NDJSON
-/// archive, then this reporter stream-compresses that archive to the sidecar.
+/// the report. This reporter reads the compressed temporary archive and writes
+/// the sidecar, applying the report's sample cutoff if present.
 ///
 /// The samples file path is derived from the report path by replacing the
 /// extension with `.samples.ndjson.gz`:
@@ -1347,16 +1347,16 @@ mod tests {
             let report =
                 sample_report_with_samples(vec![sample("m1", 1.0, 0), sample("m2", 2.0, 100)])
                     .await;
-            let source_samples_path = report.sample_archive.as_ref().unwrap().path().to_path_buf();
+            let mut source_content = Vec::new();
+            report.sample_archive.as_ref().unwrap().write_ndjson_to(&mut source_content).unwrap();
             reporter.finalize(&report).unwrap();
 
             let samples_path = dir.join("report-test.samples.ndjson.gz");
-            let source_content = std::fs::read_to_string(&source_samples_path).unwrap();
             let file = std::fs::File::open(&samples_path).unwrap();
             let mut decoder = flate2::read::GzDecoder::new(file);
             let mut content = String::new();
             std::io::Read::read_to_string(&mut decoder, &mut content).unwrap();
-            assert_eq!(content, source_content);
+            assert_eq!(content.as_bytes(), source_content);
         }
 
         // Report JSON should not contain samples.
@@ -1397,11 +1397,22 @@ mod tests {
                 sample_report_with_samples(vec![sample("m1", 1.0, 0), sample("m2", 2.0, 100)])
                     .await;
             let source_samples_path = report.sample_archive.as_ref().unwrap().path().to_path_buf();
-            let source_content = std::fs::read_to_string(&source_samples_path).unwrap();
-            assert_eq!(source_content.lines().count(), 2);
+            let source_content = std::fs::read(&source_samples_path).unwrap();
+            assert_eq!(
+                report
+                    .sample_archive
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .unwrap()
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap()
+                    .len(),
+                2
+            );
 
             report.retain_samples_until(1000).unwrap();
-            assert_eq!(std::fs::read_to_string(&source_samples_path).unwrap(), source_content);
+            assert_eq!(std::fs::read(&source_samples_path).unwrap(), source_content);
 
             reporter.finalize(&report).unwrap();
         }
