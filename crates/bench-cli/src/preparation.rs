@@ -1,7 +1,7 @@
 //! Validator readiness gates for benchmark warm-up and cooldown.
 use bench_core::parse_prometheus_text;
 use eyre::{bail, ensure, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
 use tokio::{task::JoinSet, time::sleep};
@@ -14,10 +14,18 @@ struct Validator {
     consensus_metrics_url: String,
 }
 
-#[derive(Clone)]
 pub(crate) struct Preparation {
     validators: Vec<Validator>,
     client: reqwest::Client,
+}
+
+#[derive(Debug, Serialize)]
+struct Readiness {
+    validator: String,
+    pending: u64,
+    queued: u64,
+    head: u64,
+    finish: u64,
 }
 
 impl Preparation {
@@ -39,15 +47,14 @@ impl Preparation {
             let client = self.client.clone();
             let validator = validator.clone();
             tasks.spawn(async move {
-                let text = client
-                    .get(&validator.consensus_metrics_url)
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .text()
-                    .await?;
-                let count = metric(&text, "finalized_blocks_proposed_by_self_total", None)
-                    .wrap_err_with(|| validator.validator_name.clone())?;
+                let count = fetch_metric(
+                    &client,
+                    &validator.consensus_metrics_url,
+                    "finalized_blocks_proposed_by_self_total",
+                    None,
+                )
+                .await
+                .wrap_err_with(|| validator.validator_name.clone())?;
                 Ok::<_, eyre::Report>((validator.validator_name, count))
             });
         }
@@ -109,24 +116,29 @@ impl Preparation {
                     let pending = hex(&pool["pending"])?;
                     let queued = hex(&pool["queued"])?;
                     let head = hex(&rpc(&client, &validator.rpc_url, "eth_blockNumber").await?)?;
-                    let text = client
-                        .get(&validator.execution_metrics_url)
-                        .send()
-                        .await?
-                        .error_for_status()?
-                        .text()
-                        .await?;
-                    let finish = metric(&text, "reth_sync_checkpoint", Some(("stage", "Finish")))
-                        .wrap_err_with(|| validator.validator_name.clone())?;
-                    Ok::<_, eyre::Report>((validator.validator_name, pending, queued, head, finish))
+                    let finish = fetch_metric(
+                        &client,
+                        &validator.execution_metrics_url,
+                        "reth_sync_checkpoint",
+                        Some(("stage", "Finish")),
+                    )
+                    .await
+                    .wrap_err_with(|| validator.validator_name.clone())?;
+                    Ok::<_, eyre::Report>(Readiness {
+                        validator: validator.validator_name,
+                        pending,
+                        queued,
+                        head,
+                        finish,
+                    })
                 });
             }
             let mut rows = Vec::new();
             while let Some(result) = tasks.join_next().await {
                 rows.push(result??);
             }
-            rows.sort();
-            let empty = rows.iter().all(|r| r.1 == 0 && r.2 == 0);
+            rows.sort_by(|a, b| a.validator.cmp(&b.validator));
+            let empty = rows.iter().all(|r| r.pending == 0 && r.queued == 0);
             // Require consecutive all-node empty observations to avoid a transient gap.
             if empty {
                 empty_polls += 1;
@@ -135,23 +147,31 @@ impl Preparation {
                 target = None;
             }
             if empty_polls >= 3 && target.is_none() {
-                target = rows.iter().map(|r| r.3).max();
+                target = rows.iter().map(|r| r.head).max();
                 tracing::info!(
                     ?target,
                     "All validator pools drained; waiting for Finish checkpoints"
                 );
             }
             if let Some(height) = target &&
-                rows.iter().all(|r| r.4 >= height)
+                rows.iter().all(|r| r.finish >= height)
             {
-                return Ok(json!({"target_block": height, "validators": rows.iter().map(|r| {
-                    json!({"validator": r.0, "pending": r.1, "queued": r.2, "head": r.3, "finish": r.4})
-                }).collect::<Vec<_>>()}));
+                return Ok(json!({"target_block": height, "validators": rows}));
             }
             tracing::info!(?target, ?rows, "Waiting for empty pools and persisted warmup blocks");
             sleep(Duration::from_secs(1)).await;
         }
     }
+}
+
+async fn fetch_metric(
+    client: &reqwest::Client,
+    url: &str,
+    suffix: &str,
+    label: Option<(&str, &str)>,
+) -> Result<u64> {
+    let text = client.get(url).send().await?.error_for_status()?.text().await?;
+    metric(&text, suffix, label)
 }
 
 async fn rpc(client: &reqwest::Client, url: &str, method: &str) -> Result<Value> {
@@ -175,10 +195,11 @@ fn hex(value: &Value) -> Result<u64> {
 }
 
 fn metric(text: &str, suffix: &str, label: Option<(&str, &str)>) -> Result<u64> {
+    let qualified_suffix = format!("_{suffix}");
     let values: Vec<_> = parse_prometheus_text(text, 0, 0)
         .into_iter()
         .filter(|s| {
-            (s.name == suffix || s.name.ends_with(&format!("_{suffix}"))) &&
+            (s.name == suffix || s.name.ends_with(&qualified_suffix)) &&
                 label.is_none_or(|(key, value)| s.labels.get(key).is_some_and(|v| v == value))
         })
         .collect();

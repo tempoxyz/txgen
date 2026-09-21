@@ -164,14 +164,10 @@ async fn execute_source<S: TxSource>(
     // Keep one sender across warmup and measurement, including its pending work,
     // nonce ordering, rate limiter and HTTP connection pool.
     let warmup_metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
-    let mut sender = Sender::new_with_request_auth(
-        endpoints,
-        config.clone(),
-        warmup_metrics.clone(),
-        request_auth,
-    )
-    .with_receipt_tracker(receipt_tracker)
-    .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
+    let mut sender =
+        Sender::new_with_request_auth(endpoints, config.clone(), warmup_metrics, request_auth)
+            .with_receipt_tracker(receipt_tracker)
+            .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
     if let Some(limit) = args.pending_limit()? {
         sender = sender.with_max_pending(limit);
     }
@@ -617,20 +613,15 @@ async fn send_workload_from_source<S: TxSource>(
             source.next_tx().await?
         };
         let Some(tx) = next else {
-            ensure_input_duration(deadline)?;
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() < deadline) {
+                bail!("input ended before the requested measurement duration");
+            }
             break;
         };
         if tx.phase == TxPhase::Setup {
             bail!("setup transaction appeared after workload started");
         }
         send_workload_tx(tx, sender, metrics, config, reporters).await?;
-    }
-    Ok(())
-}
-
-fn ensure_input_duration(deadline: Option<tokio::time::Instant>) -> Result<()> {
-    if deadline.is_some_and(|deadline| tokio::time::Instant::now() < deadline) {
-        bail!("input ended before the requested measurement duration");
     }
     Ok(())
 }

@@ -351,7 +351,6 @@ Warmup requests (including their late replies) are excluded from transaction
 statistics. Metric scraping and report time start after warmup; chain statistics
 exclude blocks timestamped before that boundary. Warmup defaults to zero.
 
-
 For validator readiness gates, use `--warmup-validators validators.json --duration 90s`
 instead of `--warmup`. The JSON array contains `validator_name`, `rpc_url`,
 `consensus_metrics_url`, and `execution_metrics_url` for every validator. Warm-up

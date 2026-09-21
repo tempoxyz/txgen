@@ -386,6 +386,13 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
                     .unwrap();
             assert_eq!(evidence["target_block"], 10);
             assert_eq!(evidence["validators"].as_array().unwrap().len(), 2);
+            for (i, validator) in evidence["validators"].as_array().unwrap().iter().enumerate() {
+                assert_eq!(validator["validator"], format!("node-{i}"));
+                assert_eq!(validator["pending"], 0);
+                assert_eq!(validator["queued"], 0);
+                assert_eq!(validator["head"], 10);
+                assert_eq!(validator["finish"], 10);
+            }
             assert!(
                 report["metadata"]["cooldown_secs"].as_str().unwrap().parse::<f64>().unwrap() >=
                     4.0
