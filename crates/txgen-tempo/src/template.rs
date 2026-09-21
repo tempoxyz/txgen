@@ -64,19 +64,22 @@ pub struct TempoTemplate {
     #[serde(default)]
     pub nonce_key: Option<GenValue<U256>>,
 
-    /// Explicit transaction nonce.
+    /// Explicit transaction nonce or generator expression.
     ///
     /// When set, txgen uses this value directly instead of fetching or
     /// incrementing nonce state during ordinary generation. Online scenario
     /// execution requires it to match the lane's pending nonce and reserves it
     /// so concurrent submissions cannot reuse the same value.
+    /// For expiring transactions (T12+), this is an opaque discriminator and
+    /// supplying it disables the legacy fee bump used for uniqueness.
     #[serde(default)]
-    pub nonce: Option<u64>,
+    pub nonce: Option<GenValue<u64>>,
 
     /// Use Tempo expiring nonce mode (TIP-1009).
     ///
-    /// When enabled, txgen sets `nonce_key = U256::MAX` and `nonce = 0`
-    /// automatically, and requires either `valid_before` or `valid_for_secs`.
+    /// When enabled, txgen sets `nonce_key = U256::MAX` and requires either
+    /// `valid_before` or `valid_for_secs`. When `nonce` is omitted, it defaults
+    /// to zero and a fee bump provides transaction uniqueness for older forks.
     #[serde(default)]
     pub expiring_nonce: bool,
 

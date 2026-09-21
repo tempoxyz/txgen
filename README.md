@@ -2026,6 +2026,7 @@ templates:
     # Tempo-specific replay protection
     nonce_key: "42"              # 2D nonce lane (0 = protocol nonce)
     expiring_nonce: true         # TIP-1009 expiring nonce mode
+    nonce: { uniform: [0, 18446744073709551615] } # Optional TIP-1106 discriminator (T12+)
     valid_for_secs: 25           # Relative expiry window for standard/sponsored txs
     valid_before: 1700100000     # Absolute expiry timestamp (alternative to valid_for_secs)
     fee_token: "0x..."           # Pay gas in stablecoin
@@ -2045,14 +2046,16 @@ templates:
 
 **2D nonces:** Using different `nonce_key` values allows transactions from the same sender to be sent in parallel without nonce conflicts.
 
-**Expiring nonces:** Set `expiring_nonce: true` to generate TIP-1009 transactions. txgen will set `nonce_key = U256::MAX` and `nonce = 0` automatically. You must provide either:
+**Expiring nonces:** Set `expiring_nonce: true` to generate TIP-1009 transactions. txgen will set `nonce_key = U256::MAX` and, by default, `nonce = 0` automatically. You must provide either:
 
 - `valid_before`: an absolute Unix timestamp in seconds
 - `valid_for_secs`: a relative TTL in seconds for standard/sponsored transactions, resolved immediately before submission
 
 `valid_for_secs` must be `<= 30`, matching Tempo's expiring nonce validity window.
 
-With `--defer-signing`, relative expiry on standard or sponsored transactions emits a deferred-signing record with an empty `raw` field. `bench send --late-signing-spec workload.yaml` resolves the account references and signs each record immediately before the RPC request. The same option works for a pre-generated file and for a pipe; the workload spec supplies signing keys and is never embedded in the NDJSON output. Without `--defer-signing`, generation retains the existing signed output. Txgen still applies a deterministic per-transaction bump to `max_fee_per_gas` before the final sender and sponsor signatures, so otherwise identical expiring transactions have unique signed payloads. `max_priority_fee_per_gas` remains exactly as configured, including zero. Tempo keychain-auth records retain the existing generation-time signing path.
+For Tempo T12+ (TIP-1106), set `nonce: { uniform: [0, 18446744073709551615] }` to draw a `uint64` nonce discriminator from the seeded RNG. The `nonce` field supports literals and the existing numeric generators, including `uniform` and `choice`. Supplying it for an expiring transaction leaves both fee fields and the configured validity bounds unchanged, avoiding the fee bump described below; the caller is responsible for choosing distinct payloads. The discriminator is preserved through deferred and sponsored signing. Omit `nonce` when targeting earlier hardforks to retain the zero-nonce/fee-bump behavior. For protocol and 2D nonces, online scenarios still require the resolved value to match the lane's pending nonce.
+
+With `--defer-signing`, relative expiry on standard or sponsored transactions emits a deferred-signing record with an empty `raw` field. `bench send --late-signing-spec workload.yaml` resolves the account references and signs each record immediately before the RPC request. The same option works for a pre-generated file and for a pipe; the workload spec supplies signing keys and is never embedded in the NDJSON output. Without `--defer-signing`, generation retains the existing signed output. When `nonce` is omitted, txgen applies a deterministic per-transaction bump to `max_fee_per_gas` before the final sender and sponsor signatures, so otherwise identical expiring transactions have unique signed payloads. `max_priority_fee_per_gas` remains exactly as configured, including zero. Tempo keychain-auth records retain the existing generation-time signing path.
 
 Recommended benchmark setting: `valid_for_secs: 25`. This matches `tempo-bench`'s default behavior and stays inside Tempo's 30-second protocol limit while leaving some propagation slack.
 
