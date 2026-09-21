@@ -1,4 +1,6 @@
 //! Validator readiness gates for benchmark warm-up and cooldown.
+use alloy_network::AnyNetwork;
+use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
 use bench_core::parse_prometheus_text;
 use eyre::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -9,9 +11,17 @@ use tokio::{task::JoinSet, time::sleep};
 #[derive(Clone, Deserialize)]
 struct Validator {
     validator_name: String,
-    rpc_url: String,
+    rpc_url: reqwest::Url,
     execution_metrics_url: String,
     consensus_metrics_url: String,
+}
+
+impl Validator {
+    fn provider(&self, client: &reqwest::Client) -> DynProvider<AnyNetwork> {
+        ProviderBuilder::new_with_network::<AnyNetwork>()
+            .connect_reqwest(client.clone(), self.rpc_url.clone())
+            .erased()
+    }
 }
 
 pub(crate) struct Preparation {
@@ -95,9 +105,13 @@ impl Preparation {
             let client = self.client.clone();
             let validator = validator.clone();
             clears.spawn(async move {
-                rpc(&client, &validator.rpc_url, "debug_clearTxpool").await.wrap_err_with(|| {
-                    format!("{}: failed to clear txpool", validator.validator_name)
-                })
+                validator
+                    .provider(&client)
+                    .raw_request::<_, ()>("debug_clearTxpool".into(), ())
+                    .await
+                    .wrap_err_with(|| {
+                        format!("{}: failed to clear txpool", validator.validator_name)
+                    })
             });
         }
         while let Some(result) = clears.join_next().await {
@@ -112,10 +126,9 @@ impl Preparation {
                 let client = self.client.clone();
                 let validator = validator.clone();
                 tasks.spawn(async move {
-                    let pool = rpc(&client, &validator.rpc_url, "txpool_status").await?;
-                    let pending = hex(&pool["pending"])?;
-                    let queued = hex(&pool["queued"])?;
-                    let head = hex(&rpc(&client, &validator.rpc_url, "eth_blockNumber").await?)?;
+                    let provider = validator.provider(&client);
+                    let pool = provider.txpool_status().await?;
+                    let head = provider.get_block_number().await?;
                     let finish = fetch_metric(
                         &client,
                         &validator.execution_metrics_url,
@@ -126,8 +139,8 @@ impl Preparation {
                     .wrap_err_with(|| validator.validator_name.clone())?;
                     Ok::<_, eyre::Report>(Readiness {
                         validator: validator.validator_name,
-                        pending,
-                        queued,
+                        pending: pool.pending,
+                        queued: pool.queued,
                         head,
                         finish,
                     })
@@ -172,26 +185,6 @@ async fn fetch_metric(
 ) -> Result<u64> {
     let text = client.get(url).send().await?.error_for_status()?.text().await?;
     metric(&text, suffix, label)
-}
-
-async fn rpc(client: &reqwest::Client, url: &str, method: &str) -> Result<Value> {
-    let text = client
-        .post(url)
-        .header("content-type", "application/json")
-        .body(json!({"jsonrpc":"2.0", "id":1, "method":method, "params":[]}).to_string())
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    let response: Value = serde_json::from_str(&text)?;
-    ensure!(response.get("error").is_none(), "{url} {method}: {}", response["error"]);
-    response.get("result").cloned().ok_or_else(|| eyre::eyre!("{url} {method}: missing result"))
-}
-
-fn hex(value: &Value) -> Result<u64> {
-    let value = value.as_str().ok_or_else(|| eyre::eyre!("missing RPC quantity"))?;
-    Ok(u64::from_str_radix(value.strip_prefix("0x").unwrap_or(value), 16)?)
 }
 
 fn metric(text: &str, suffix: &str, label: Option<(&str, &str)>) -> Result<u64> {
