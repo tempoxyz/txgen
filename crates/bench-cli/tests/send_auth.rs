@@ -1,3 +1,4 @@
+use alloy_primitives::Bytes;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -363,8 +364,8 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
             .unwrap();
         let mut input = child.stdin.take().unwrap();
         let producer = thread::spawn(move || {
-            for i in 0..1000 {
-                let tx = json!({"phase":"workload", "raw":format!("0x{:04x}", i),
+            for i in 0u16..1000 {
+                let tx = json!({"phase":"workload", "raw":Bytes::copy_from_slice(&i.to_be_bytes()),
                     "sender":SENDER, "submission_keys":[SENDER], "inclusion_keys":[]});
                 if writeln!(input, "{tx}").is_err() {
                     break;
