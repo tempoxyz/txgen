@@ -75,10 +75,16 @@ pub struct TempoTemplate {
 
     /// Use Tempo expiring nonce mode (TIP-1009).
     ///
-    /// When enabled, txgen sets `nonce_key = U256::MAX` and `nonce = 0`
-    /// automatically, and requires either `valid_before` or `valid_for_secs`.
+    /// When enabled, txgen sets `nonce_key = U256::MAX` and requires either
+    /// `valid_before` or `valid_for_secs`. The nonce is zero unless
+    /// `randomize_expiring_nonce` is enabled.
     #[serde(default)]
     pub expiring_nonce: bool,
+
+    /// Use a random nonce discriminator instead of a fee bump for expiring
+    /// transactions (TIP-1106, requires Tempo T12+). Drawn from the seeded RNG.
+    #[serde(default)]
+    pub randomize_expiring_nonce: bool,
 
     /// Fee token address for paying gas in stablecoins (Tempo 0x76).
     #[serde(default)]

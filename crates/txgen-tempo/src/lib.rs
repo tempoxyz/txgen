@@ -426,6 +426,9 @@ impl NetworkAdapter for TempoAdapter {
             bail!("Tempo keychain auth is only supported for `type: tempo` templates");
         }
         let nonce_mode = resolve_nonce_mode(&template, is_tempo, ctx)?;
+        if template.randomize_expiring_nonce && !matches!(nonce_mode, TempoNonceMode::Expiring) {
+            bail!("`randomize_expiring_nonce` is only supported for expiring Tempo transactions");
+        }
         if !matches!(nonce_mode, TempoNonceMode::Expiring) &&
             let Some(valid_for_secs) = template.valid_for_secs
         {
@@ -533,7 +536,11 @@ impl NetworkAdapter for TempoAdapter {
                     req.set_valid_before(valid_before);
                 }
                 if is_expiring {
-                    apply_expiring_uniqueness_bump(&mut req, ctx)?;
+                    if template.randomize_expiring_nonce {
+                        req.set_nonce(ctx.rng.next_u64());
+                    } else {
+                        apply_expiring_uniqueness_bump(&mut req, ctx)?;
+                    }
                 }
 
                 self.apply_auth(
@@ -1345,6 +1352,7 @@ mod tests {
             nonce_key: None,
             nonce: None,
             expiring_nonce: false,
+            randomize_expiring_nonce: false,
             fee_token: None,
             sponsor: None,
             valid_after: None,
@@ -1832,6 +1840,98 @@ nonce_key:
         assert_eq!(first.max_fee_per_gas(), Some(1_000_000_001));
         assert_eq!(second.max_priority_fee_per_gas(), Some(0));
         assert_eq!(second.max_fee_per_gas(), Some(1_000_000_003));
+    }
+
+    #[test]
+    fn test_random_expiring_nonce_preserves_fees_and_survives_signing() {
+        for sponsored in [false, true] {
+            for deferred in [false, true] {
+                let generate = |seed| {
+                    let accounts = test_accounts();
+                    let artifacts = ArtifactManager::empty();
+                    let gas = GasConfig::default();
+                    let mut nonces = NonceTracker::new();
+                    let mut rng = StdRng::seed_from_u64(seed);
+                    let mut ctx =
+                        BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+                    ctx.set_defer_signing(deferred);
+
+                    let mut template = if sponsored {
+                        sponsored_expiring_template()
+                    } else {
+                        base_template(TempoTxType::Tempo)
+                    };
+                    template.expiring_nonce = true;
+                    template.randomize_expiring_nonce = true;
+                    template.valid_after = Some(1);
+                    template.valid_before = (!deferred).then_some(1_700_000_000);
+                    template.valid_for_secs = deferred.then_some(25);
+                    template.max_priority_fee_per_gas = Some(0);
+
+                    (0..4)
+                        .map(|_| {
+                            let request = TempoAdapter::new()
+                                .build_request(template.clone(), &mut ctx)
+                                .unwrap();
+                            let expected_nonce = request.request.nonce().unwrap();
+                            let raw = if deferred {
+                                let payload =
+                                    TempoExpiringPayload::from_spec(&request.late_sign.unwrap())
+                                        .unwrap();
+                                sign_tempo_expiring(&payload, &accounts).unwrap()
+                            } else {
+                                sign_tempo_request(request, &ctx, "random_expiring").raw
+                            };
+                            let envelope = TempoTxEnvelope::decode_2718(&mut raw.as_ref()).unwrap();
+                            let tx = envelope.as_aa().unwrap().tx();
+                            assert_eq!(tx.nonce, expected_nonce);
+                            assert_eq!(tx.nonce_key, TEMPO_EXPIRING_NONCE_KEY);
+                            assert_eq!(tx.max_fee_per_gas, 1_000_000_000);
+                            assert_eq!(tx.max_priority_fee_per_gas, 0);
+                            assert_eq!(tx.valid_after.map(NonZeroU64::get), Some(1));
+                            assert!(tx.valid_before.is_some());
+                            assert_eq!(tx.fee_payer_signature.is_some(), sponsored);
+                            if !deferred {
+                                assert_eq!(
+                                    tx.valid_before.map(NonZeroU64::get),
+                                    Some(1_700_000_000)
+                                );
+                            }
+                            (tx.nonce, raw)
+                        })
+                        .collect::<Vec<_>>()
+                };
+
+                let first = generate(42);
+                let replay = generate(42);
+                let other_seed = generate(43);
+                for i in 0..first.len() {
+                    assert_eq!(first[i].0, replay[i].0);
+                    assert_ne!(first[i].0, other_seed[i].0);
+                    for j in 0..i {
+                        assert_ne!(first[i].0, first[j].0);
+                        assert_ne!(first[i].1, first[j].1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_random_expiring_nonce_rejects_ordered_nonces() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+
+        for tx_type in [TempoTxType::Tempo, TempoTxType::Eip1559] {
+            let mut template = base_template(tx_type);
+            template.randomize_expiring_nonce = true;
+            let error = TempoAdapter::new().build_request(template, &mut ctx).err().unwrap();
+            assert!(error.to_string().contains("only supported for expiring Tempo transactions"));
+        }
     }
 
     #[test]
