@@ -413,3 +413,57 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
         }
     }
 }
+
+#[test]
+fn finite_input_must_cover_warmup_and_measurement() {
+    for (option, expected) in [
+        ("--warmup", "input ended during warmup"),
+        ("--duration", "input ended before the requested measurement duration"),
+    ] {
+        let submission = MockServer::start(ServerKind::Submission);
+        let query = MockServer::start(ServerKind::Query);
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("transactions.ndjson");
+        let report = temp.path().join("report.json");
+        std::fs::write(
+            &input,
+            format!(
+                "{}\n",
+                json!({
+                    "phase":"workload", "raw":"0x01", "sender":SENDER,
+                    "submission_keys":[SENDER], "inclusion_keys":[]
+                })
+            ),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_bench"))
+            .args([
+                "send",
+                "--input",
+                input.to_str().unwrap(),
+                "--rpc-url",
+                &submission.url,
+                "--query-rpc-url",
+                &query.url,
+                option,
+                "10s",
+                "--max-pending",
+                "0",
+                "--retries",
+                "0",
+                "--drain-timeout",
+                "0",
+                "--report",
+                &format!("json:{}", report.display()),
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{option} must reject early EOF");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(std::fs::read(&report).unwrap_or_default().is_empty());
+    }
+}

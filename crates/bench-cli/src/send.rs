@@ -176,59 +176,11 @@ async fn execute_source<S: TxSource>(
     }
     let mut start_block =
         query_provider.get_block_number().await.wrap_err("failed to get starting block number")?;
-    let mut preparation_metadata = HashMap::new();
-    let first_workload = if let Some(path) = &args.warmup_validators {
-        let preparation = crate::preparation::Preparation::load(path)?;
-        let baseline = preparation.proposer_counts().await?;
-        let warmup_clock = RunClock::new();
-        let mut observers = tokio::task::JoinSet::new();
-        observers.spawn(async move {
-            let evidence = preparation.wait_for_proposers(baseline).await?;
-            Ok::<_, eyre::Report>((preparation, evidence))
-        });
-        let mut next = first_workload;
-        let (preparation, evidence) = tokio::time::timeout(args.warmup_timeout, async {
-            loop {
-                if let Some(result) = observers.try_join_next() {
-                    return result?;
-                }
-                let tx = match next.take() {
-                    Some(tx) => tx,
-                    None => source
-                        .next_tx()
-                        .await?
-                        .ok_or_else(|| eyre::eyre!("input ended during warmup"))?,
-                };
-                if tx.phase == TxPhase::Setup {
-                    bail!("setup transaction appeared during warmup");
-                }
-                sender.send(tx).await?;
-            }
-        })
-        .await
-        .wrap_err("proposer warmup timed out; see waiting validators above")??;
-        preparation_metadata
-            .insert("warmup_start_unix_ms".into(), warmup_clock.start_unix_ms().to_string());
-        preparation_metadata
-            .insert("warmup_secs".into(), warmup_clock.elapsed().as_secs_f64().to_string());
-        preparation_metadata.insert("proposer_coverage".into(), evidence.to_string());
-        let cooldown_clock = RunClock::new();
-        let evidence = tokio::time::timeout(args.cooldown_timeout, async {
-            sender.flush().await?;
-            preparation.cooldown().await
-        })
-        .await
-        .wrap_err("cooldown timed out; see validator pools and checkpoints above")??;
-        preparation_metadata
-            .insert("cooldown_start_unix_ms".into(), cooldown_clock.start_unix_ms().to_string());
-        preparation_metadata
-            .insert("cooldown_secs".into(), cooldown_clock.elapsed().as_secs_f64().to_string());
-        preparation_metadata.insert("cooldown_readiness".into(), evidence.to_string());
+    let prepared =
+        crate::preparation::prepare_workload(args, source, &mut sender, first_workload).await?;
+    if args.warmup_validators.is_some() {
         start_block = query_provider.get_block_number().await?;
-        None
-    } else {
-        warm_up(source, &mut sender, first_workload, args.warmup).await?
-    };
+    }
 
     let clock = if let Some(start) = args.metrics_align {
         RunClock::new_with_start_unix_ms(start)
@@ -271,7 +223,7 @@ async fn execute_source<S: TxSource>(
         reporters.push(Box::new(ConsoleReporter::stderr(true)));
     }
 
-    if let Some(tx) = first_workload {
+    if let Some(tx) = prepared.first_workload {
         send_workload_tx(tx, &mut sender, &metrics, &config, &mut reporters).await?;
     }
 
@@ -372,7 +324,7 @@ async fn execute_source<S: TxSource>(
         ..Default::default()
     };
 
-    report.metadata.extend(preparation_metadata);
+    report.metadata.extend(prepared.metadata);
 
     if end_block > start_block {
         let block_range_start = start_block + 1;
@@ -561,35 +513,6 @@ pub(crate) fn parse_metadata(args: &[String]) -> Result<HashMap<String, String>>
         map.insert(key.to_string(), value.to_string());
     }
     Ok(map)
-}
-
-/// Consume warmup workload without flushing or replacing the sender. Requests already
-/// dispatched keep their warmup collector even if they complete during measurement.
-async fn warm_up<S: TxSource>(
-    source: &mut S,
-    sender: &mut Sender,
-    mut next: Option<GeneratedTx>,
-    duration: Duration,
-) -> Result<Option<GeneratedTx>> {
-    if duration.is_zero() {
-        return Ok(next);
-    }
-    let start = std::time::Instant::now();
-    tracing::info!(?duration, "Starting workload warmup");
-    while start.elapsed() < duration {
-        let tx = match next.take() {
-            Some(tx) => tx,
-            None => source.next_tx().await?.ok_or_else(|| {
-                eyre::eyre!("input ended during warmup; generate warmup plus measurement duration")
-            })?,
-        };
-        if tx.phase == TxPhase::Setup {
-            bail!("setup transaction appeared after workload started");
-        }
-        sender.send(tx).await?;
-    }
-    tracing::info!(elapsed = ?start.elapsed(), "Warmup complete; starting measurement");
-    Ok(None)
 }
 
 async fn send_workload_from_source<S: TxSource>(

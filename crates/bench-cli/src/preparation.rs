@@ -1,12 +1,110 @@
 //! Validator readiness gates for benchmark warm-up and cooldown.
+use crate::SendArgs;
 use alloy_network::AnyNetwork;
 use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
-use bench_core::parse_prometheus_text;
+use bench_core::{parse_prometheus_text, GeneratedTx, RunClock, Sender, TxPhase, TxSource};
 use eyre::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{path::Path, time::Duration};
+use std::{collections::HashMap, path::Path, time::Duration};
 use tokio::{task::JoinSet, time::sleep};
+
+/// Preparation preserves the sender and returns any transaction not consumed by warm-up.
+pub(crate) struct PreparedWorkload {
+    pub(crate) first_workload: Option<GeneratedTx>,
+    pub(crate) metadata: HashMap<String, String>,
+}
+
+pub(crate) async fn prepare_workload<S: TxSource>(
+    args: &SendArgs,
+    source: &mut S,
+    sender: &mut Sender,
+    first_workload: Option<GeneratedTx>,
+) -> Result<PreparedWorkload> {
+    let mut preparation_metadata = HashMap::new();
+    let first_workload = if let Some(path) = &args.warmup_validators {
+        let preparation = Preparation::load(path)?;
+        let baseline = preparation.proposer_counts().await?;
+        let warmup_clock = RunClock::new();
+        let mut observers = tokio::task::JoinSet::new();
+        observers.spawn(async move {
+            let evidence = preparation.wait_for_proposers(baseline).await?;
+            Ok::<_, eyre::Report>((preparation, evidence))
+        });
+        let mut next = first_workload;
+        let (preparation, evidence) = tokio::time::timeout(args.warmup_timeout, async {
+            loop {
+                if let Some(result) = observers.try_join_next() {
+                    return result?;
+                }
+                let tx = match next.take() {
+                    Some(tx) => tx,
+                    None => source
+                        .next_tx()
+                        .await?
+                        .ok_or_else(|| eyre::eyre!("input ended during warmup"))?,
+                };
+                if tx.phase == TxPhase::Setup {
+                    bail!("setup transaction appeared during warmup");
+                }
+                sender.send(tx).await?;
+            }
+        })
+        .await
+        .wrap_err("proposer warmup timed out; see waiting validators above")??;
+        preparation_metadata
+            .insert("warmup_start_unix_ms".into(), warmup_clock.start_unix_ms().to_string());
+        preparation_metadata
+            .insert("warmup_secs".into(), warmup_clock.elapsed().as_secs_f64().to_string());
+        preparation_metadata.insert("proposer_coverage".into(), evidence.to_string());
+        let cooldown_clock = RunClock::new();
+        let evidence = tokio::time::timeout(args.cooldown_timeout, async {
+            sender.flush().await?;
+            preparation.cooldown().await
+        })
+        .await
+        .wrap_err("cooldown timed out; see validator pools and checkpoints above")??;
+        preparation_metadata
+            .insert("cooldown_start_unix_ms".into(), cooldown_clock.start_unix_ms().to_string());
+        preparation_metadata
+            .insert("cooldown_secs".into(), cooldown_clock.elapsed().as_secs_f64().to_string());
+        preparation_metadata.insert("cooldown_readiness".into(), evidence.to_string());
+        None
+    } else {
+        warm_up(source, sender, first_workload, args.warmup).await?
+    };
+
+    Ok(PreparedWorkload { first_workload, metadata: preparation_metadata })
+}
+
+/// Consume warmup workload without flushing or replacing the sender. Requests already
+/// dispatched keep their warmup collector even if they complete during measurement.
+async fn warm_up<S: TxSource>(
+    source: &mut S,
+    sender: &mut Sender,
+    mut next: Option<GeneratedTx>,
+    duration: Duration,
+) -> Result<Option<GeneratedTx>> {
+    if duration.is_zero() {
+        return Ok(next);
+    }
+    let start = std::time::Instant::now();
+    tracing::info!(?duration, "Starting workload warmup");
+    while start.elapsed() < duration {
+        let tx = match next.take() {
+            Some(tx) => tx,
+            None => source.next_tx().await?.ok_or_else(|| {
+                eyre::eyre!("input ended during warmup; generate warmup plus measurement duration")
+            })?,
+        };
+        if tx.phase == TxPhase::Setup {
+            bail!("setup transaction appeared after workload started");
+        }
+        sender.send(tx).await?;
+    }
+    tracing::info!(elapsed = ?start.elapsed(), "Warmup complete; starting measurement");
+    Ok(None)
+}
 
 #[derive(Clone, Deserialize)]
 struct Validator {
@@ -24,7 +122,7 @@ impl Validator {
     }
 }
 
-pub(crate) struct Preparation {
+struct Preparation {
     validators: Vec<Validator>,
     client: reqwest::Client,
 }
@@ -39,7 +137,7 @@ struct Readiness {
 }
 
 impl Preparation {
-    pub(crate) fn load(path: &Path) -> Result<Self> {
+    fn load(path: &Path) -> Result<Self> {
         let validators: Vec<Validator> = serde_json::from_reader(std::fs::File::open(path)?)?;
         ensure!(!validators.is_empty(), "warmup validator list is empty");
         let names: std::collections::HashSet<_> =
@@ -51,7 +149,7 @@ impl Preparation {
         })
     }
 
-    pub(crate) async fn proposer_counts(&self) -> Result<Vec<(String, u64)>> {
+    async fn proposer_counts(&self) -> Result<Vec<(String, u64)>> {
         let mut tasks = JoinSet::new();
         for validator in &self.validators {
             let client = self.client.clone();
@@ -76,7 +174,7 @@ impl Preparation {
         Ok(counts)
     }
 
-    pub(crate) async fn wait_for_proposers(&self, baseline: Vec<(String, u64)>) -> Result<Value> {
+    async fn wait_for_proposers(&self, baseline: Vec<(String, u64)>) -> Result<Value> {
         loop {
             sleep(Duration::from_secs(1)).await;
             let counts = self.proposer_counts().await?;
@@ -99,7 +197,7 @@ impl Preparation {
 
     /// Hold the post-drain target fixed while empty blocks advance persistence.
     /// Finish is the block-data checkpoint; state masking must be disabled.
-    pub(crate) async fn cooldown(&self) -> Result<Value> {
+    async fn cooldown(&self) -> Result<Value> {
         let mut clears = JoinSet::new();
         for validator in &self.validators {
             let client = self.client.clone();
