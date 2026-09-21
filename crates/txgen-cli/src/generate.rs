@@ -847,7 +847,22 @@ where
         eprintln!("nonce prefetch completed: elapsed={:?}", nonce_prefetch_started.elapsed());
     }
 
-    generate_loop(&mut adapter, &mut ctx, output)?;
+    let stdout = output.is_none();
+    if let Err(error) = generate_loop(&mut adapter, &mut ctx, output) {
+        // A duration-limited consumer may finish before this producer.
+        let closed = stdout &&
+            error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe) ||
+                    cause.downcast_ref::<serde_json::Error>().is_some_and(|error| {
+                        error.io_error_kind() == Some(std::io::ErrorKind::BrokenPipe)
+                    })
+            });
+        if !closed {
+            return Err(error);
+        }
+    }
     eprintln!("transaction generation completed: elapsed={:?}", started.elapsed());
     Ok(())
 }

@@ -344,6 +344,29 @@ txgen-ethereum extract-big-blocks \
 
 #### `bench send`
 
+Use `--warmup 40s` to send the same workload before measurement, preserving the
+sender's connections and scheduling state. Generate **warmup + measurement** time:
+`txgen-tempo generate -s workload.yaml --duration 130s | bench send --warmup 40s`.
+Warmup requests (including their late replies) are excluded from transaction
+statistics. Metric scraping and report time start after warmup; chain statistics
+exclude blocks timestamped before that boundary. Warmup defaults to zero.
+
+For validator readiness gates, use `--warmup-validators validators.json --duration 90s`
+instead of `--warmup`. The JSON array contains `validator_name`, `rpc_url`,
+`consensus_metrics_url`, and `execution_metrics_url` for every validator. Warm-up
+ends once every finalized-self-proposal counter increases. Then outstanding work
+is flushed, every pool is cleared with `debug_clearTxpool`, and all pending/queued
+counts must stay zero while Finish checkpoints reach a fixed post-drain height.
+Requires debug RPC and state masking disabled. `--warmup-timeout` and
+`--cooldown-timeout` each default to 300s; failures abort measurement. Phase times
+and readiness evidence are included in report metadata.
+
+With `--duration`, keep the producer alive across preparation (for example,
+`generate -n 18446744073709551615`); an early EOF is an error. For expiring Tempo
+transactions, use `generate --defer-signing` and `send --late-signing-spec` so
+cooldown does not age buffered signatures. This supports standard/sponsored
+relative-expiry transactions; keychain-auth transactions are still signed early.
+
 Send pre-generated transactions from NDJSON file or stdin.
 
 After sending completes, queries the node for per-block statistics (transaction count, gas used) and includes them in the report.
