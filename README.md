@@ -362,11 +362,13 @@ Requires debug RPC and state masking disabled. `--warmup-timeout` and
 and readiness evidence are included in report metadata.
 
 After validator cooldown, workload resumes for `--measurement-delay 1s` before
-the monitoring window starts. Use `500ms` for a shorter ramp-up or `0s` to disable
-it. Ramp-up requests and blocks are excluded from measurement; the full
-`--duration` starts afterwards. The sender keeps running across this boundary,
-and ramp-up timing is included in report metadata. This delay only applies with
-`--warmup-validators`.
+the monitoring window starts. It continues for the same unmeasured interval
+after the full `--duration` window ends, then flushes and drains. Use `500ms`
+for shorter intervals or `0s` to disable both. Ramp-up and tail submissions use
+separate metrics collectors; chain statistics use the blocks observed at the
+start and end of the measured window. The sender stays in use across both
+boundaries, and ramp-up timing is included in report metadata. These intervals
+only apply with `--warmup-validators`.
 
 With `--duration`, keep the producer alive across preparation (for example,
 `generate -n 18446744073709551615`); an early EOF is an error. For expiring Tempo

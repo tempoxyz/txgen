@@ -1278,6 +1278,12 @@ impl Sender {
         self.metrics = metrics;
     }
 
+    /// Stop tracking receipts for subsequently dispatched requests.
+    /// In-flight requests retain the collector they were dispatched with.
+    pub fn clear_receipt_collector(&mut self) {
+        self.receipt_collector = None;
+    }
+
     fn dispatch(
         &mut self,
         pending: PendingTx,

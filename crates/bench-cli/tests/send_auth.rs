@@ -82,6 +82,7 @@ impl Drop for MockServer {
 }
 
 fn serve(mut stream: TcpStream, kind: ServerKind, requests: Arc<Mutex<Vec<RecordedRequest>>>) {
+    stream.set_nonblocking(false).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let (headers, body) = read_request(&mut stream);
     if let ServerKind::Readiness { stuck_proposer, stuck_finish } = kind &&
@@ -289,7 +290,7 @@ fn warmup_excludes_early_requests_from_report() {
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     let producer = thread::spawn(move || {
-        for _ in 0..5 {
+        for _ in 0..20 {
             writeln!(input, "{tx}").unwrap();
             thread::sleep(Duration::from_millis(80));
         }
@@ -299,8 +300,8 @@ fn warmup_excludes_early_requests_from_report() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let report: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
     let sent = report["sent"].as_u64().unwrap();
-    assert_eq!(submission.requests().len(), 5);
-    assert!(sent > 0 && sent < 5, "warmup must exclude only early requests: {report}");
+    assert_eq!(submission.requests().len(), 20);
+    assert!(sent > 0 && sent < 20, "warmup must exclude only early requests: {report}");
     assert_eq!(report["failed"].as_u64(), Some(sent));
     assert_eq!(report["metadata"]["warmup_secs"], "0.1");
 }
@@ -420,6 +421,12 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
                 .unwrap()
                 .parse::<u128>()
                 .unwrap();
+            let send_start = report["metadata"]["measurement_send_start_unix_ms"]
+                .as_str()
+                .unwrap()
+                .parse::<u128>()
+                .unwrap();
+            assert!(send_start >= measurement_start);
             let expected_delay = match delay {
                 None => 1000,
                 Some("500ms") => 500,
@@ -435,6 +442,32 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
             let measured = report["sent"].as_u64().unwrap();
             assert!(measured > 0);
             assert_eq!(report["failed"].as_u64(), Some(measured));
+            assert_eq!(report["elapsed_secs"].as_f64(), Some(0.3));
+            let measurement_end = if expected_delay > 0 {
+                let end = report["metadata"]["measurement_end_unix_ms"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u128>()
+                    .unwrap();
+                assert_eq!(end, send_start + 300);
+                Some(end)
+            } else {
+                None
+            };
+            let last_measured_request = requests
+                .iter()
+                .filter(|r| {
+                    r.method == "eth_sendRawTransaction" &&
+                        r.unix_ms >= send_start &&
+                        measurement_end.is_none_or(|end| r.unix_ms < end)
+                })
+                .map(|r| r.unix_ms)
+                .max()
+                .unwrap();
+            assert!(
+                last_measured_request >= send_start + 200,
+                "measured submissions must continue through the 300ms window"
+            );
             if expected_delay > 0 {
                 assert!(
                     requests.iter().any(|r| {
@@ -445,6 +478,18 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
                     "traffic must flow during ramp-up"
                 );
                 assert!(after_cooldown > measured, "ramp-up requests must not be measured");
+                let end = measurement_end.unwrap();
+                let tail_requests = requests
+                    .iter()
+                    .filter(|r| r.method == "eth_sendRawTransaction" && r.unix_ms >= end)
+                    .map(|r| r.unix_ms)
+                    .collect::<Vec<_>>();
+                assert!(!tail_requests.is_empty(), "traffic must continue after measurement");
+                assert!(
+                    tail_requests.iter().max().unwrap() - tail_requests.iter().min().unwrap() >=
+                        expected_delay.saturating_sub(150),
+                    "post-measurement traffic must continue for the configured delay"
+                );
             } else {
                 assert_eq!(after_cooldown, measured);
             }

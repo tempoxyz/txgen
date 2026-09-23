@@ -85,8 +85,8 @@ pub struct SendArgs {
     #[arg(long, default_value = "300s", value_parser = humantime::parse_duration)]
     pub cooldown_timeout: Duration,
 
-    /// Send workload after validator cooldown before starting measurement.
-    /// Use 0s to disable the ramp-up interval.
+    /// Send workload for this long before and after the measured interval.
+    /// Use 0s to disable both unmeasured intervals.
     #[arg(long, default_value = "1s", value_parser = humantime::parse_duration, requires = "warmup_validators")]
     pub measurement_delay: Duration,
 

@@ -14,8 +14,8 @@ use bench_core::{
     collect_block_stats, parse_reporters, start_scrapers, total_fees_paid,
     trim_trailing_empty_blocks, BlockReceiptCollector, ConsoleReporter, FileSource, FinalReport,
     GeneratedTx, LateSigner, MetricsCollector, ProgressState, ReceiptTracker, Reporter,
-    RequestAuthProvider, RpcEndpoint, RunClock, RunStats, SampleStore, ScraperConfig, Sender,
-    SenderConfig, SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
+    RequestAuthProvider, RpcEndpoint, RunClock, RunStats, SampleStore, ScraperConfig,
+    ScraperHandle, Sender, SenderConfig, SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -189,7 +189,6 @@ async fn execute_source<S: TxSource>(
     } else {
         RunClock::new()
     };
-    let measurement_deadline = args.duration.map(|d| tokio::time::Instant::now() + d);
     let metrics = MetricsCollector::new_with_latencies(clock.clone(), args.collect_latencies);
     sender.set_metrics(metrics.clone());
     let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
@@ -208,7 +207,7 @@ async fn execute_source<S: TxSource>(
 
     // Start background scraper + internal snapshotter after setup so setup is
     // excluded from benchmark metrics.
-    let scraper_handles = if !scraper_configs.is_empty() {
+    let mut scraper_handles = if !scraper_configs.is_empty() {
         let snap_metrics = metrics.clone();
         let callback: bench_core::SampleCallback =
             std::sync::Arc::new(move || snap_metrics.snapshot_samples());
@@ -225,19 +224,50 @@ async fn execute_source<S: TxSource>(
         reporters.push(Box::new(ConsoleReporter::stderr(true)));
     }
 
-    if let Some(tx) = prepared.first_workload {
-        send_workload_tx(tx, &mut sender, &metrics, &config, &mut reporters).await?;
-    }
-
-    send_workload_from_source(
+    let measurement_send_start_unix_ms = send_workload_from_source(
         source,
         &mut sender,
         &metrics,
         &config,
         &mut reporters,
-        measurement_deadline,
+        prepared.first_workload,
+        args.duration,
+        "measurement",
     )
     .await?;
+    let target_end_unix_ms = args.duration.map(|duration| {
+        measurement_send_start_unix_ms
+            .saturating_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+    });
+
+    // Keep the workload running briefly after measurement so the final measured
+    // blocks are observed under steady traffic. Use separate collectors and a
+    // fixed block boundary so this tail does not enter the measured report.
+    let mut measurement_end_unix_ms = None;
+    let mut measured_end_block = None;
+    if args.warmup_validators.is_some() && !args.measurement_delay.is_zero() {
+        measurement_end_unix_ms = target_end_unix_ms;
+        let tail_metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
+        sender.set_metrics(tail_metrics.clone());
+        sender.clear_receipt_collector();
+        // Capture the last measured block before tail transactions can enter
+        // the chain. Stop scrapers alongside the tail to keep traffic flowing.
+        measured_end_block = Some(query_provider.get_block_number().await?);
+        let (tail, ()) = tokio::join!(
+            send_workload_from_source(
+                source,
+                &mut sender,
+                &tail_metrics,
+                &config,
+                &mut [],
+                None,
+                Some(args.measurement_delay),
+                "post-measurement cooldown",
+            ),
+            stop_scrapers(std::mem::take(&mut scraper_handles)),
+        );
+        tail?;
+    }
 
     sender.flush().await?;
     drop(sender);
@@ -259,8 +289,12 @@ async fn execute_source<S: TxSource>(
 
     // Snapshot the range before post-processing starts. Receipt collection uses
     // one block-level request per block rather than polling each transaction.
-    let end_block =
-        query_provider.get_block_number().await.wrap_err("failed to get ending block number")?;
+    let end_block = match measured_end_block {
+        Some(end_block) => end_block,
+        None => {
+            query_provider.get_block_number().await.wrap_err("failed to get ending block number")?
+        }
+    };
     tracing::info!(end_block, "Ending block fetched");
 
     let receipt_collection = match receipt_collector {
@@ -289,19 +323,12 @@ async fn execute_source<S: TxSource>(
     let receipt_records = receipt_collection.records;
 
     // Stop the scraper before finalizing.
-    if !scraper_handles.is_empty() {
-        let scrapers = scraper_handles.len();
-        let scrapes = scraper_handles.iter().map(|h| h.scrape_count()).sum::<u64>();
-        let errors = scraper_handles.iter().map(|h| h.error_count()).sum::<u64>();
-        for handle in scraper_handles {
-            handle.stop().await;
-        }
-        tracing::info!(scrapers, scrapes, errors, "Metrics scrapers stopped");
-    } else {
-        tracing::info!(reason = "no metrics scrapers", "Skipped metrics scraper stop");
-    }
+    stop_scrapers(scraper_handles).await;
 
-    let final_metrics = metrics.finalize().await;
+    let mut final_metrics = metrics.finalize().await;
+    if let Some(duration) = args.duration {
+        final_metrics.elapsed = duration;
+    }
     tracing::info!("Metrics finalized");
 
     let time_series = metrics.time_series().await;
@@ -327,6 +354,19 @@ async fn execute_source<S: TxSource>(
     };
 
     report.metadata.extend(prepared.metadata);
+    report.metadata.insert(
+        "measurement_send_start_unix_ms".into(),
+        measurement_send_start_unix_ms.to_string(),
+    );
+    if let Some(end_ms) = measurement_end_unix_ms {
+        report.metadata.insert("measurement_end_unix_ms".into(), end_ms.to_string());
+        report.retain_samples_until(end_ms)?;
+        if let Some(ts) = report.time_series.as_mut() {
+            let end_offset_ms = end_ms.saturating_sub(clock.start_unix_ms());
+            ts.latencies.retain(|l| l.offset_ms <= end_offset_ms);
+            ts.throughput.retain(|t| t.second * 1000 <= end_offset_ms);
+        }
+    }
 
     if end_block > start_block {
         let block_range_start = start_block + 1;
@@ -341,6 +381,9 @@ async fn execute_source<S: TxSource>(
 
         if !args.warmup.is_zero() || args.warmup_validators.is_some() {
             block_stats.retain(|block| block.timestamp_ms >= clock.start_unix_ms());
+        }
+        if let Some(end_ms) = measurement_end_unix_ms {
+            block_stats.retain(|block| block.timestamp_ms <= end_ms);
         }
 
         // Trim trailing empty blocks (system-only, gas_used == 0) that
@@ -365,7 +408,10 @@ async fn execute_source<S: TxSource>(
         }
         tracing::info!(blocks = block_stats.len(), "Block reporter events emitted");
 
-        report.run_stats = Some(RunStats::from_blocks_chain_time(&block_stats));
+        report.run_stats = Some(match (measurement_end_unix_ms, args.duration) {
+            (Some(_), Some(duration)) => RunStats::from_blocks_wall_time(&block_stats, duration),
+            _ => RunStats::from_blocks_chain_time(&block_stats),
+        });
         tracing::info!("Run stats built");
         report.blocks = block_stats;
     } else {
@@ -523,8 +569,17 @@ async fn send_workload_from_source<S: TxSource>(
     metrics: &MetricsCollector,
     config: &SenderConfig,
     reporters: &mut [Box<dyn Reporter>],
-    deadline: Option<tokio::time::Instant>,
-) -> Result<()> {
+    first_workload: Option<GeneratedTx>,
+    duration: Option<Duration>,
+    phase: &str,
+) -> Result<u64> {
+    // Start the send interval only after preparation and report setup. This
+    // keeps the post-cooldown ramp-up outside the full requested duration.
+    let start_unix_ms = metrics.clock().unix_ms();
+    let deadline = duration.map(|duration| tokio::time::Instant::now() + duration);
+    if let Some(tx) = first_workload {
+        send_workload_tx(tx, sender, metrics, config, reporters).await?;
+    }
     loop {
         let next = if let Some(deadline) = deadline {
             if tokio::time::Instant::now() >= deadline {
@@ -539,16 +594,32 @@ async fn send_workload_from_source<S: TxSource>(
         };
         let Some(tx) = next else {
             if deadline.is_some_and(|deadline| tokio::time::Instant::now() < deadline) {
-                bail!("input ended before the requested measurement duration");
+                bail!("input ended before the requested {phase} duration");
             }
             break;
         };
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            break;
+        }
         if tx.phase == TxPhase::Setup {
             bail!("setup transaction appeared after workload started");
         }
         send_workload_tx(tx, sender, metrics, config, reporters).await?;
     }
-    Ok(())
+    Ok(start_unix_ms)
+}
+
+async fn stop_scrapers(scraper_handles: Vec<ScraperHandle>) {
+    if scraper_handles.is_empty() {
+        return;
+    }
+    let scrapers = scraper_handles.len();
+    let scrapes = scraper_handles.iter().map(|h| h.scrape_count()).sum::<u64>();
+    let errors = scraper_handles.iter().map(|h| h.error_count()).sum::<u64>();
+    for handle in scraper_handles {
+        handle.stop().await;
+    }
+    tracing::info!(scrapers, scrapes, errors, "Metrics scrapers stopped");
 }
 
 async fn send_workload_tx(
