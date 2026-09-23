@@ -361,6 +361,13 @@ Requires debug RPC and state masking disabled. `--warmup-timeout` and
 `--cooldown-timeout` each default to 300s; failures abort measurement. Phase times
 and readiness evidence are included in report metadata.
 
+After validator cooldown, workload resumes for `--measurement-delay 1s` before
+the monitoring window starts. Use `500ms` for a shorter ramp-up or `0s` to disable
+it. Ramp-up requests and blocks are excluded from measurement; the full
+`--duration` starts afterwards. The sender keeps running across this boundary,
+and ramp-up timing is included in report metadata. This delay only applies with
+`--warmup-validators`.
+
 With `--duration`, keep the producer alive across preparation (for example,
 `generate -n 18446744073709551615`); an early EOF is an error. For expiring Tempo
 transactions, use `generate --defer-signing` and `send --late-signing-spec` so

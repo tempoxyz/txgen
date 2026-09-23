@@ -179,6 +179,8 @@ async fn execute_source<S: TxSource>(
     let prepared =
         crate::preparation::prepare_workload(args, source, &mut sender, first_workload).await?;
     if args.warmup_validators.is_some() {
+        // Preparation includes the post-cooldown ramp-up. Exclude its blocks
+        // from both chain statistics and receipt collection.
         start_block = query_provider.get_block_number().await?;
     }
 
@@ -337,7 +339,7 @@ async fn execute_source<S: TxSource>(
             "Block stats collected"
         );
 
-        if !args.warmup.is_zero() {
+        if !args.warmup.is_zero() || args.warmup_validators.is_some() {
             block_stats.retain(|block| block.timestamp_ms >= clock.start_unix_ms());
         }
 

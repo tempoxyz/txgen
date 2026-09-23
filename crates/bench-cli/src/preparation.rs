@@ -69,6 +69,16 @@ pub(crate) async fn prepare_workload<S: TxSource>(
         preparation_metadata
             .insert("cooldown_secs".into(), cooldown_clock.elapsed().as_secs_f64().to_string());
         preparation_metadata.insert("cooldown_readiness".into(), evidence.to_string());
+        // Cooldown emptied the pools. Resume traffic before recording so the
+        // first measured block is not the initial, partially filled block.
+        let ramp_up_clock = RunClock::new();
+        warm_up(source, sender, None, args.measurement_delay)
+            .await
+            .wrap_err("post-cooldown ramp-up failed")?;
+        preparation_metadata
+            .insert("ramp_up_start_unix_ms".into(), ramp_up_clock.start_unix_ms().to_string());
+        preparation_metadata
+            .insert("ramp_up_secs".into(), ramp_up_clock.elapsed().as_secs_f64().to_string());
         None
     } else {
         warm_up(source, sender, first_workload, args.warmup).await?
