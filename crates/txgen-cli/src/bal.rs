@@ -164,3 +164,53 @@ fn merge_slot_changes(existing: &mut Vec<SlotChanges>, incoming: Vec<SlotChanges
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_eips::eip7928::{BalanceChange, CodeChange, NonceChange, StorageChange};
+    use alloy_primitives::{Address, U256};
+    use alloy_provider::ProviderBuilder;
+    use alloy_transport::mock::Asserter;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn fetch_block_access_list_accepts_current_and_legacy_json() {
+        let index = BlockAccessIndex::new(1);
+        let expected = vec![AccountChanges {
+            address: Address::ZERO,
+            storage_changes: vec![SlotChanges {
+                slot: U256::from(2),
+                changes: vec![StorageChange::new(index, U256::from(3))],
+            }],
+            storage_reads: vec![U256::from(4)],
+            balance_changes: vec![BalanceChange::new(index, U256::from(5))],
+            nonce_changes: vec![NonceChange::new(index, 6)],
+            code_changes: vec![CodeChange::new(index, Bytes::from_static(&[0x60, 0x00]))],
+        }];
+
+        for (index, storage, balance, nonce, code) in [
+            ("index", "value", "value", "value", "code"),
+            ("blockAccessIndex", "newValue", "postBalance", "newNonce", "newCode"),
+        ] {
+            // Use literal RPC fields so the fixture does not inherit Alloy's serialization.
+            let response = json!([{
+                "address": "0x0000000000000000000000000000000000000000",
+                "storageChanges": [{
+                    "key": "0x2",
+                    "changes": [{ (index): "0x1", (storage): "0x3" }]
+                }],
+                "storageReads": ["0x4"],
+                "balanceChanges": [{ (index): "0x1", (balance): "0x5" }],
+                "nonceChanges": [{ (index): "0x1", (nonce): "0x6" }],
+                "codeChanges": [{ (index): "0x1", (code): "0x6000" }]
+            }]);
+            let asserter = Asserter::new();
+            asserter.push_success(&response);
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+            let actual = fetch_block_access_list(&provider, 25_962_391).await.unwrap();
+            assert_eq!(actual, expected, "BAL JSON index field: {index}");
+        }
+    }
+}

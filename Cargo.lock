@@ -215,9 +215,9 @@ dependencies = [
 
 [[package]]
 name = "alloy-eip7928"
-version = "0.4.2"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "951e1d988b5753bc424b837c98ce0dc575031db99e7cd01833d3a5053b97951a"
+checksum = "1cb19c9d53b507960f649e5689f7098e556696023fe1b57b67f2181ed54bc5b7"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -236,7 +236,7 @@ dependencies = [
  "alloy-eip2124",
  "alloy-eip2930",
  "alloy-eip7702",
- "alloy-eip7928 0.4.2",
+ "alloy-eip7928 0.4.10",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-serde",
@@ -4662,7 +4662,7 @@ version = "12.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40eff6067185cf80932e06f6a9c8045b012ecb6f99a8d6edc618ec2792373e14"
 dependencies = [
- "alloy-eip7928 0.4.2",
+ "alloy-eip7928 0.4.10",
  "bitflags",
  "nonmax",
  "revm-bytecode 11.0.1",
