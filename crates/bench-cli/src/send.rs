@@ -230,9 +230,11 @@ async fn execute_source<S: TxSource>(
         &metrics,
         &config,
         &mut reporters,
-        prepared.first_workload,
-        args.duration,
-        "measurement",
+        SendInterval {
+            first_workload: prepared.first_workload,
+            duration: args.duration,
+            name: "measurement",
+        },
     )
     .await?;
     let target_end_unix_ms = args.duration.map(|duration| {
@@ -260,9 +262,11 @@ async fn execute_source<S: TxSource>(
                 &tail_metrics,
                 &config,
                 &mut [],
-                None,
-                Some(args.measurement_delay),
-                "post-measurement cooldown",
+                SendInterval {
+                    first_workload: None,
+                    duration: Some(args.measurement_delay),
+                    name: "post-measurement cooldown",
+                },
             ),
             stop_scrapers(std::mem::take(&mut scraper_handles)),
         );
@@ -563,21 +567,25 @@ pub(crate) fn parse_metadata(args: &[String]) -> Result<HashMap<String, String>>
     Ok(map)
 }
 
+struct SendInterval {
+    first_workload: Option<GeneratedTx>,
+    duration: Option<Duration>,
+    name: &'static str,
+}
+
 async fn send_workload_from_source<S: TxSource>(
     source: &mut S,
     sender: &mut Sender,
     metrics: &MetricsCollector,
     config: &SenderConfig,
     reporters: &mut [Box<dyn Reporter>],
-    first_workload: Option<GeneratedTx>,
-    duration: Option<Duration>,
-    phase: &str,
+    interval: SendInterval,
 ) -> Result<u64> {
     // Start the send interval only after preparation and report setup. This
     // keeps the post-cooldown ramp-up outside the full requested duration.
     let start_unix_ms = metrics.clock().unix_ms();
-    let deadline = duration.map(|duration| tokio::time::Instant::now() + duration);
-    if let Some(tx) = first_workload {
+    let deadline = interval.duration.map(|duration| tokio::time::Instant::now() + duration);
+    if let Some(tx) = interval.first_workload {
         send_workload_tx(tx, sender, metrics, config, reporters).await?;
     }
     loop {
@@ -594,7 +602,7 @@ async fn send_workload_from_source<S: TxSource>(
         };
         let Some(tx) = next else {
             if deadline.is_some_and(|deadline| tokio::time::Instant::now() < deadline) {
-                bail!("input ended before the requested {phase} duration");
+                bail!("input ended before the requested {} duration", interval.name);
             }
             break;
         };
