@@ -10,7 +10,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tempfile::TempDir;
 
@@ -22,6 +22,7 @@ const SENDER: &str = "0x1111111111111111111111111111111111111111";
 struct RecordedRequest {
     method: String,
     auth: Option<String>,
+    unix_ms: u128,
 }
 
 #[derive(Clone, Copy)]
@@ -81,6 +82,7 @@ impl Drop for MockServer {
 }
 
 fn serve(mut stream: TcpStream, kind: ServerKind, requests: Arc<Mutex<Vec<RecordedRequest>>>) {
+    stream.set_nonblocking(false).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let (headers, body) = read_request(&mut stream);
     if let ServerKind::Readiness { stuck_proposer, stuck_finish } = kind &&
@@ -103,10 +105,11 @@ fn serve(mut stream: TcpStream, kind: ServerKind, requests: Arc<Mutex<Vec<Record
     }
     let request: Value = serde_json::from_slice(&body).unwrap();
     let method = request["method"].as_str().unwrap().to_string();
-    requests
-        .lock()
-        .unwrap()
-        .push(RecordedRequest { method: method.clone(), auth: headers.get(AUTH_HEADER).cloned() });
+    requests.lock().unwrap().push(RecordedRequest {
+        method: method.clone(),
+        auth: headers.get(AUTH_HEADER).cloned(),
+        unix_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis(),
+    });
 
     let id = request["id"].clone();
     let response = match (kind, method.as_str()) {
@@ -287,7 +290,7 @@ fn warmup_excludes_early_requests_from_report() {
         .unwrap();
     let mut input = child.stdin.take().unwrap();
     let producer = thread::spawn(move || {
-        for _ in 0..5 {
+        for _ in 0..20 {
             writeln!(input, "{tx}").unwrap();
             thread::sleep(Duration::from_millis(80));
         }
@@ -297,15 +300,21 @@ fn warmup_excludes_early_requests_from_report() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let report: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
     let sent = report["sent"].as_u64().unwrap();
-    assert_eq!(submission.requests().len(), 5);
-    assert!(sent > 0 && sent < 5, "warmup must exclude only early requests: {report}");
+    assert_eq!(submission.requests().len(), 20);
+    assert!(sent > 0 && sent < 20, "warmup must exclude only early requests: {report}");
     assert_eq!(report["failed"].as_u64(), Some(sent));
     assert_eq!(report["metadata"]["warmup_secs"], "0.1");
 }
 
 #[test]
 fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
-    for (stuck_proposer, stuck_finish) in [(false, false), (true, false), (false, true)] {
+    for (stuck_proposer, stuck_finish, delay) in [
+        (false, false, None),
+        (false, false, Some("500ms")),
+        (false, false, Some("0s")),
+        (true, false, None),
+        (false, true, None),
+    ] {
         let nodes = [
             MockServer::start(ServerKind::Readiness { stuck_proposer: false, stuck_finish: false }),
             MockServer::start(ServerKind::Readiness { stuck_proposer, stuck_finish }),
@@ -329,9 +338,18 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
         )
         .unwrap();
         let report = temp.path().join("report.json");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_bench"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bench"));
+        command.arg("send");
+        if let Some(delay) = delay {
+            command.args(["--measurement-delay", delay]);
+        }
+        let reset_timeout_arg = if delay == Some("500ms") {
+            "--cooldown-timeout"
+        } else {
+            "--post-warmup-reset-timeout"
+        };
+        let mut child = command
             .args([
-                "send",
                 "--rpc-url",
                 &format!("{},{}", nodes[0].url, nodes[1].url),
                 "--query-rpc-url",
@@ -340,7 +358,7 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
                 validators.to_str().unwrap(),
                 "--warmup-timeout",
                 "3s",
-                "--cooldown-timeout",
+                reset_timeout_arg,
                 "6s",
                 "--duration",
                 "300ms",
@@ -382,9 +400,18 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
         } else {
             assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
             let report: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
-            let evidence: Value =
-                serde_json::from_str(report["metadata"]["cooldown_readiness"].as_str().unwrap())
-                    .unwrap();
+            let evidence: Value = serde_json::from_str(
+                report["metadata"]["post_warmup_reset_readiness"].as_str().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                report["metadata"]["cooldown_readiness"],
+                report["metadata"]["post_warmup_reset_readiness"]
+            );
+            assert_eq!(
+                report["metadata"]["cooldown_start_unix_ms"],
+                report["metadata"]["post_warmup_reset_start_unix_ms"]
+            );
             assert_eq!(evidence["target_block"], 10);
             assert_eq!(evidence["validators"].as_array().unwrap().len(), 2);
             for (i, validator) in evidence["validators"].as_array().unwrap().iter().enumerate() {
@@ -395,8 +422,105 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
                 assert_eq!(validator["finish"], 10);
             }
             assert!(
-                report["metadata"]["cooldown_secs"].as_str().unwrap().parse::<f64>().unwrap() >=
+                report["metadata"]["post_warmup_reset_secs"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<f64>()
+                    .unwrap() >=
                     4.0
+            );
+            assert_eq!(
+                report["metadata"]["cooldown_secs"],
+                report["metadata"]["post_warmup_reset_secs"]
+            );
+            let ramp_up_start = report["metadata"]["ramp_up_start_unix_ms"]
+                .as_str()
+                .unwrap()
+                .parse::<u128>()
+                .unwrap();
+            let measurement_start = report["metadata"]["measurement_start_unix_ms"]
+                .as_str()
+                .unwrap()
+                .parse::<u128>()
+                .unwrap();
+            let send_start = report["metadata"]["measurement_send_start_unix_ms"]
+                .as_str()
+                .unwrap()
+                .parse::<u128>()
+                .unwrap();
+            assert!(send_start >= measurement_start);
+            let expected_delay = match delay {
+                None => 1000,
+                Some("500ms") => 500,
+                Some("0s") => 0,
+                _ => unreachable!(),
+            };
+            assert!(measurement_start >= ramp_up_start + expected_delay);
+            let requests = nodes.iter().flat_map(MockServer::requests).collect::<Vec<_>>();
+            let after_reset = requests
+                .iter()
+                .filter(|r| r.method == "eth_sendRawTransaction" && r.unix_ms >= ramp_up_start)
+                .count() as u64;
+            let measured = report["sent"].as_u64().unwrap();
+            assert!(measured > 0);
+            assert_eq!(report["failed"].as_u64(), Some(measured));
+            assert_eq!(report["elapsed_secs"].as_f64(), Some(0.3));
+            let measurement_end = if expected_delay > 0 {
+                let end = report["metadata"]["measurement_end_unix_ms"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u128>()
+                    .unwrap();
+                assert_eq!(end, send_start + 300);
+                Some(end)
+            } else {
+                None
+            };
+            let last_measured_request = requests
+                .iter()
+                .filter(|r| {
+                    r.method == "eth_sendRawTransaction" &&
+                        r.unix_ms >= send_start &&
+                        measurement_end.is_none_or(|end| r.unix_ms < end)
+                })
+                .map(|r| r.unix_ms)
+                .max()
+                .unwrap();
+            assert!(
+                last_measured_request >= send_start + 200,
+                "measured submissions must continue through the 300ms window"
+            );
+            if expected_delay > 0 {
+                assert!(
+                    requests.iter().any(|r| {
+                        r.method == "eth_sendRawTransaction" &&
+                            r.unix_ms >= ramp_up_start &&
+                            r.unix_ms < measurement_start
+                    }),
+                    "traffic must flow during ramp-up"
+                );
+                assert!(after_reset > measured, "ramp-up requests must not be measured");
+                let end = measurement_end.unwrap();
+                let tail_requests = requests
+                    .iter()
+                    .filter(|r| r.method == "eth_sendRawTransaction" && r.unix_ms >= end)
+                    .map(|r| r.unix_ms)
+                    .collect::<Vec<_>>();
+                assert!(!tail_requests.is_empty(), "traffic must continue after measurement");
+                assert!(
+                    tail_requests.iter().max().unwrap() - tail_requests.iter().min().unwrap() >=
+                        expected_delay.saturating_sub(150),
+                    "post-measurement traffic must continue for the configured delay"
+                );
+            } else {
+                assert_eq!(after_reset, measured);
+            }
+            let block_queries = query.requests();
+            assert_eq!(block_queries.len(), 3);
+            assert!(block_queries[1].unix_ms >= ramp_up_start + expected_delay);
+            assert!(
+                block_queries[2].unix_ms >= measurement_start + 300,
+                "ramp-up must not shorten the measurement duration"
             );
         }
         for node in &nodes {

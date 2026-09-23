@@ -1,4 +1,4 @@
-//! Validator readiness gates for benchmark warm-up and cooldown.
+//! Validator readiness gates for warmup and the pre-measurement reset.
 use crate::SendArgs;
 use alloy_network::AnyNetwork;
 use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
@@ -57,18 +57,33 @@ pub(crate) async fn prepare_workload<S: TxSource>(
         preparation_metadata
             .insert("warmup_secs".into(), warmup_clock.elapsed().as_secs_f64().to_string());
         preparation_metadata.insert("proposer_coverage".into(), evidence.to_string());
-        let cooldown_clock = RunClock::new();
-        let evidence = tokio::time::timeout(args.cooldown_timeout, async {
+        let reset_clock = RunClock::new();
+        let evidence = tokio::time::timeout(args.post_warmup_reset_timeout, async {
             sender.flush().await?;
-            preparation.cooldown().await
+            preparation.reset_after_warmup().await
         })
         .await
-        .wrap_err("cooldown timed out; see validator pools and checkpoints above")??;
+        .wrap_err("post-warmup reset timed out; see validator pools and checkpoints above")??;
+        let reset_start = reset_clock.start_unix_ms().to_string();
+        let reset_secs = reset_clock.elapsed().as_secs_f64().to_string();
+        let reset_readiness = evidence.to_string();
+        preparation_metadata.insert("post_warmup_reset_start_unix_ms".into(), reset_start.clone());
+        preparation_metadata.insert("post_warmup_reset_secs".into(), reset_secs.clone());
+        preparation_metadata.insert("post_warmup_reset_readiness".into(), reset_readiness.clone());
+        // Preserve report fields emitted before the reset was renamed.
+        preparation_metadata.insert("cooldown_start_unix_ms".into(), reset_start);
+        preparation_metadata.insert("cooldown_secs".into(), reset_secs);
+        preparation_metadata.insert("cooldown_readiness".into(), reset_readiness);
+        // The reset emptied the pools. Resume traffic before recording so the
+        // first measured block is not the initial, partially filled block.
+        let ramp_up_clock = RunClock::new();
+        warm_up(source, sender, None, args.measurement_delay)
+            .await
+            .wrap_err("post-reset ramp-up failed")?;
         preparation_metadata
-            .insert("cooldown_start_unix_ms".into(), cooldown_clock.start_unix_ms().to_string());
+            .insert("ramp_up_start_unix_ms".into(), ramp_up_clock.start_unix_ms().to_string());
         preparation_metadata
-            .insert("cooldown_secs".into(), cooldown_clock.elapsed().as_secs_f64().to_string());
-        preparation_metadata.insert("cooldown_readiness".into(), evidence.to_string());
+            .insert("ramp_up_secs".into(), ramp_up_clock.elapsed().as_secs_f64().to_string());
         None
     } else {
         warm_up(source, sender, first_workload, args.warmup).await?
@@ -195,9 +210,9 @@ impl Preparation {
         }
     }
 
-    /// Hold the post-drain target fixed while empty blocks advance persistence.
+    /// Hold the post-reset target fixed while empty blocks advance persistence.
     /// Finish is the block-data checkpoint; state masking must be disabled.
-    async fn cooldown(&self) -> Result<Value> {
+    async fn reset_after_warmup(&self) -> Result<Value> {
         let mut clears = JoinSet::new();
         for validator in &self.validators {
             let client = self.client.clone();

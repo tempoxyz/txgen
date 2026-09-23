@@ -81,9 +81,20 @@ pub struct SendArgs {
     #[arg(long, default_value = "300s", value_parser = humantime::parse_duration)]
     pub warmup_timeout: Duration,
 
-    /// Maximum time to flush submissions, empty pools and persist warmup blocks.
-    #[arg(long, default_value = "300s", value_parser = humantime::parse_duration)]
-    pub cooldown_timeout: Duration,
+    /// Maximum time to flush warmup submissions, clear validator pools, and
+    /// wait for their Finish checkpoints before measurement.
+    #[arg(
+        long = "post-warmup-reset-timeout",
+        alias = "cooldown-timeout",
+        default_value = "300s",
+        value_parser = humantime::parse_duration
+    )]
+    pub post_warmup_reset_timeout: Duration,
+
+    /// Send workload for this long before and after the measured interval.
+    /// Use 0s to disable both unmeasured intervals.
+    #[arg(long, default_value = "1s", value_parser = humantime::parse_duration, requires = "warmup_validators")]
+    pub measurement_delay: Duration,
 
     /// Measured workload duration, starting after preparation. Input must last
     /// through this interval; outstanding submissions are flushed afterwards.
