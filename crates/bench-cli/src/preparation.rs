@@ -1,4 +1,4 @@
-//! Validator readiness gates for benchmark warm-up and cooldown.
+//! Validator readiness gates for benchmark warm-up and pool drain.
 use crate::SendArgs;
 use alloy_network::AnyNetwork;
 use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
@@ -57,24 +57,24 @@ pub(crate) async fn prepare_workload<S: TxSource>(
         preparation_metadata
             .insert("warmup_secs".into(), warmup_clock.elapsed().as_secs_f64().to_string());
         preparation_metadata.insert("proposer_coverage".into(), evidence.to_string());
-        let cooldown_clock = RunClock::new();
+        let pool_drain_clock = RunClock::new();
         let evidence = tokio::time::timeout(args.cooldown_timeout, async {
             sender.flush().await?;
-            preparation.cooldown().await
+            preparation.drain_pools().await
         })
         .await
-        .wrap_err("cooldown timed out; see validator pools and checkpoints above")??;
+        .wrap_err("validator pool drain timed out; see pools and checkpoints above")??;
         preparation_metadata
-            .insert("cooldown_start_unix_ms".into(), cooldown_clock.start_unix_ms().to_string());
+            .insert("cooldown_start_unix_ms".into(), pool_drain_clock.start_unix_ms().to_string());
         preparation_metadata
-            .insert("cooldown_secs".into(), cooldown_clock.elapsed().as_secs_f64().to_string());
+            .insert("cooldown_secs".into(), pool_drain_clock.elapsed().as_secs_f64().to_string());
         preparation_metadata.insert("cooldown_readiness".into(), evidence.to_string());
-        // Cooldown emptied the pools. Resume traffic before recording so the
+        // The drain emptied the pools. Resume traffic before recording so the
         // first measured block is not the initial, partially filled block.
         let ramp_up_clock = RunClock::new();
         warm_up(source, sender, None, args.measurement_delay)
             .await
-            .wrap_err("post-cooldown ramp-up failed")?;
+            .wrap_err("post-drain ramp-up failed")?;
         preparation_metadata
             .insert("ramp_up_start_unix_ms".into(), ramp_up_clock.start_unix_ms().to_string());
         preparation_metadata
@@ -207,7 +207,7 @@ impl Preparation {
 
     /// Hold the post-drain target fixed while empty blocks advance persistence.
     /// Finish is the block-data checkpoint; state masking must be disabled.
-    async fn cooldown(&self) -> Result<Value> {
+    async fn drain_pools(&self) -> Result<Value> {
         let mut clears = JoinSet::new();
         for validator in &self.validators {
             let client = self.client.clone();

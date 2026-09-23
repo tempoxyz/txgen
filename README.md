@@ -357,23 +357,24 @@ instead of `--warmup`. The JSON array contains `validator_name`, `rpc_url`,
 ends once every finalized-self-proposal counter increases. Then outstanding work
 is flushed, every pool is cleared with `debug_clearTxpool`, and all pending/queued
 counts must stay zero while Finish checkpoints reach a fixed post-drain height.
-Requires debug RPC and state masking disabled. `--warmup-timeout` and
-`--cooldown-timeout` each default to 300s; failures abort measurement. Phase times
-and readiness evidence are included in report metadata.
+Requires debug RPC and state masking disabled. `--warmup-timeout` limits the
+proposer wait, and `--cooldown-timeout` limits the pool drain; each defaults to
+300s. Failures abort measurement. Phase times and readiness evidence are
+included in report metadata.
 
-After validator cooldown, workload resumes for `--measurement-delay 1s` before
-the monitoring window starts. It continues for the same unmeasured interval
-after the full `--duration` window ends, then flushes and drains. Use `500ms`
-for shorter intervals or `0s` to disable both. Ramp-up and tail submissions use
-separate metrics collectors; chain statistics use the blocks observed at the
-start and end of the measured window. The sender stays in use across both
-boundaries, and ramp-up timing is included in report metadata. These intervals
-only apply with `--warmup-validators`.
+After the pool drain, the benchmark resumes sending for `--measurement-delay`
+(default `1s`) before measurement starts. It keeps sending for the same
+unmeasured interval after the full `--duration` window ends, then flushes and
+drains. Use `500ms` for shorter intervals or `0s` to disable both. Ramp-up and
+tail submissions use separate metrics collectors; chain statistics use the
+blocks observed at the start and end of the measured window. The sender stays
+in use across both boundaries, and ramp-up timing is included in report
+metadata. These intervals only apply with `--warmup-validators`.
 
 With `--duration`, keep the producer alive across preparation (for example,
 `generate -n 18446744073709551615`); an early EOF is an error. For expiring Tempo
 transactions, use `generate --defer-signing` and `send --late-signing-spec` so
-cooldown does not age buffered signatures. This supports standard/sponsored
+the pool drain does not age buffered signatures. This supports standard/sponsored
 relative-expiry transactions; keychain-auth transactions are still signed early.
 
 Send pre-generated transactions from NDJSON file or stdin.
