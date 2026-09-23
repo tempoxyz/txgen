@@ -179,7 +179,7 @@ async fn execute_source<S: TxSource>(
     let prepared =
         crate::preparation::prepare_workload(args, source, &mut sender, first_workload).await?;
     if args.warmup_validators.is_some() {
-        // Preparation includes the post-drain ramp-up. Exclude its blocks
+        // Preparation includes the post-reset ramp-up. Exclude its blocks
         // from both chain statistics and receipt collection.
         start_block = query_provider.get_block_number().await?;
     }
@@ -582,7 +582,7 @@ async fn send_workload_from_source<S: TxSource>(
     interval: SendInterval,
 ) -> Result<u64> {
     // Start the send interval only after preparation and report setup. This
-    // keeps the post-drain ramp-up outside the full requested duration.
+    // keeps the post-reset ramp-up outside the full requested duration.
     let start_unix_ms = metrics.clock().unix_ms();
     let deadline = interval.duration.map(|duration| tokio::time::Instant::now() + duration);
     if let Some(tx) = interval.first_workload {

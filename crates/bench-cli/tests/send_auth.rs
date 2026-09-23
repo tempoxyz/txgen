@@ -343,6 +343,11 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
         if let Some(delay) = delay {
             command.args(["--measurement-delay", delay]);
         }
+        let reset_timeout_arg = if delay == Some("500ms") {
+            "--cooldown-timeout"
+        } else {
+            "--post-warmup-reset-timeout"
+        };
         let mut child = command
             .args([
                 "--rpc-url",
@@ -353,7 +358,7 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
                 validators.to_str().unwrap(),
                 "--warmup-timeout",
                 "3s",
-                "--cooldown-timeout",
+                reset_timeout_arg,
                 "6s",
                 "--duration",
                 "300ms",
@@ -395,9 +400,18 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
         } else {
             assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
             let report: Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
-            let evidence: Value =
-                serde_json::from_str(report["metadata"]["cooldown_readiness"].as_str().unwrap())
-                    .unwrap();
+            let evidence: Value = serde_json::from_str(
+                report["metadata"]["post_warmup_reset_readiness"].as_str().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                report["metadata"]["cooldown_readiness"],
+                report["metadata"]["post_warmup_reset_readiness"]
+            );
+            assert_eq!(
+                report["metadata"]["cooldown_start_unix_ms"],
+                report["metadata"]["post_warmup_reset_start_unix_ms"]
+            );
             assert_eq!(evidence["target_block"], 10);
             assert_eq!(evidence["validators"].as_array().unwrap().len(), 2);
             for (i, validator) in evidence["validators"].as_array().unwrap().iter().enumerate() {
@@ -408,8 +422,16 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
                 assert_eq!(validator["finish"], 10);
             }
             assert!(
-                report["metadata"]["cooldown_secs"].as_str().unwrap().parse::<f64>().unwrap() >=
+                report["metadata"]["post_warmup_reset_secs"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<f64>()
+                    .unwrap() >=
                     4.0
+            );
+            assert_eq!(
+                report["metadata"]["cooldown_secs"],
+                report["metadata"]["post_warmup_reset_secs"]
             );
             let ramp_up_start = report["metadata"]["ramp_up_start_unix_ms"]
                 .as_str()
@@ -435,7 +457,7 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
             };
             assert!(measurement_start >= ramp_up_start + expected_delay);
             let requests = nodes.iter().flat_map(MockServer::requests).collect::<Vec<_>>();
-            let after_cooldown = requests
+            let after_reset = requests
                 .iter()
                 .filter(|r| r.method == "eth_sendRawTransaction" && r.unix_ms >= ramp_up_start)
                 .count() as u64;
@@ -477,7 +499,7 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
                     }),
                     "traffic must flow during ramp-up"
                 );
-                assert!(after_cooldown > measured, "ramp-up requests must not be measured");
+                assert!(after_reset > measured, "ramp-up requests must not be measured");
                 let end = measurement_end.unwrap();
                 let tail_requests = requests
                     .iter()
@@ -491,7 +513,7 @@ fn readiness_requires_all_proposers_empty_pools_and_persisted_target() {
                     "post-measurement traffic must continue for the configured delay"
                 );
             } else {
-                assert_eq!(after_cooldown, measured);
+                assert_eq!(after_reset, measured);
             }
             let block_queries = query.requests();
             assert_eq!(block_queries.len(), 3);
