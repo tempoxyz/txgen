@@ -19,7 +19,7 @@ jobs:
       id-token: write
     steps:
       - name: Secure runner
-        uses: tempoxyz/gh-actions/actions/secure-runner@bd66336ead0e97e3939428f526dc61fb43db0996 # 2026-09-25T20-13-44Z-bd66336e
+        uses: tempoxyz/gh-actions/actions/secure-runner@ee2960a6cc25d99bda45614135bfe1197d879bac # 2026-09-26T06-46-03Z-ee2960a6
 
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -32,17 +32,17 @@ jobs:
         run: echo "shortsha=$(echo "$GITHUB_SHA" | cut -c1-7)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: tempoxyz/gh-actions/vendor/docker/setup-buildx-action@bd66336ead0e97e3939428f526dc61fb43db0996 # 2026-09-25T20-13-44Z-bd66336e
+        uses: tempoxyz/gh-actions/vendor/docker/setup-buildx-action@ee2960a6cc25d99bda45614135bfe1197d879bac # 2026-09-26T06-46-03Z-ee2960a6
 
       - name: Log in to Container Registry
-        uses: tempoxyz/gh-actions/vendor/docker/login-action@bd66336ead0e97e3939428f526dc61fb43db0996 # 2026-09-25T20-13-44Z-bd66336e
+        uses: tempoxyz/gh-actions/vendor/docker/login-action@ee2960a6cc25d99bda45614135bfe1197d879bac # 2026-09-26T06-46-03Z-ee2960a6
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: tempoxyz/gh-actions/vendor/docker/build-push-action@bd66336ead0e97e3939428f526dc61fb43db0996 # 2026-09-25T20-13-44Z-bd66336e
+        uses: tempoxyz/gh-actions/vendor/docker/build-push-action@ee2960a6cc25d99bda45614135bfe1197d879bac # 2026-09-26T06-46-03Z-ee2960a6
         with:
           context: .
           push: true
