@@ -14,7 +14,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tempo_alloy::rpc::TempoTransactionRequest;
-use tempo_primitives::{transaction::TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS, TempoTxEnvelope};
+use tempo_primitives::TempoTxEnvelope;
 use txgen_core::{AccountManager, LateSignSpec, WorkloadSpec};
 
 /// Discriminator for relative Tempo expiring-nonce signing.
@@ -94,11 +94,8 @@ pub fn sign_tempo_expiring(
     payload: &TempoExpiringPayload,
     accounts: &AccountManager,
 ) -> Result<Bytes> {
-    if payload.valid_for_secs == 0 || payload.valid_for_secs > TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS
-    {
-        bail!(
-            "Tempo expiring transactions require `valid_for_secs` in the range 1..={TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS}"
-        );
+    if payload.valid_for_secs == 0 {
+        bail!("Tempo expiring transactions require `valid_for_secs` to be greater than zero");
     }
 
     let now = SystemTime::now()

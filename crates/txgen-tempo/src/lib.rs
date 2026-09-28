@@ -29,7 +29,7 @@ use tempo_alloy::{
 use tempo_primitives::{
     transaction::{
         Call, KeyAuthorization, KeychainSignature, PrimitiveSignature, SignatureType,
-        TEMPO_EXPIRING_NONCE_KEY, TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS,
+        TEMPO_EXPIRING_NONCE_KEY,
     },
     TempoSignature, TempoTxEnvelope,
 };
@@ -832,12 +832,6 @@ fn resolve_expiring_valid_before(template: &TempoTemplate) -> Result<u64> {
             if valid_for_secs == 0 {
                 bail!("expiring nonce templates require `valid_for_secs` to be greater than 0");
             }
-            if valid_for_secs > TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS {
-                bail!(
-                    "expiring nonce templates require `valid_for_secs` <= {} seconds",
-                    TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS
-                );
-            }
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_secs())
@@ -864,12 +858,6 @@ fn validate_expiring_valid_for_secs(template: &TempoTemplate) -> Result<()> {
         .ok_or_else(|| eyre::eyre!("expiring nonce templates require `valid_for_secs`"))?;
     if valid_for_secs == 0 {
         bail!("expiring nonce templates require `valid_for_secs` to be greater than 0");
-    }
-    if valid_for_secs > TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS {
-        bail!(
-            "expiring nonce templates require `valid_for_secs` <= {} seconds",
-            TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS
-        );
     }
     Ok(())
 }
