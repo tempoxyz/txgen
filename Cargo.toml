@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94.1"
+rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -39,8 +39,8 @@ alloy-eips = "2"
 alloy-rlp = "0.3"
 
 # tempo
-tempo-alloy = "1"
-tempo-primitives = "1"
+tempo-alloy = "1.11"
+tempo-primitives = "1.11"
 
 # crypto
 aes-gcm = "0.10"

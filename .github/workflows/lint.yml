@@ -79,4 +79,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
       - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
-      - run: cargo check --workspace --all-targets
+      - run: cargo check --workspace --all-targets --locked
+      - name: Install cargo-deny
+        uses: tempoxyz/gh-actions/actions/cargo-install@55fe3b63d9612623cc51e6c62d9d62fbcb175fb0 # 2026-09-29T01-25-15Z-55fe3b63
+        with:
+          tool: cargo-deny
+          version: "0.20.2"
+      - name: Check dependencies
+        run: cargo deny --locked check advisories sources
