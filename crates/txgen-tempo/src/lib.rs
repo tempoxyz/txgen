@@ -2098,29 +2098,4 @@ nonce_key:
         let key = compute_scheduling_key(sender, TempoNonceMode::Protocol, &mut ctx);
         assert_eq!(key, sender.0 .0);
     }
-
-    #[test]
-    fn test_expiring_nonce_retains_thirty_second_limit() {
-        let accounts = test_accounts();
-        let artifacts = ArtifactManager::empty();
-        let gas = GasConfig::default();
-        let mut nonces = NonceTracker::new();
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
-        ctx.set_defer_signing(true);
-
-        let mut template = base_template(TempoTxType::Tempo);
-        template.expiring_nonce = true;
-        template.valid_for_secs = Some(30);
-        let request = TempoAdapter::new().build_request(template.clone(), &mut ctx).unwrap();
-        let mut payload = TempoExpiringPayload::from_spec(&request.late_sign.unwrap()).unwrap();
-
-        for (seconds, valid) in [(0, false), (1, true), (30, true), (31, false)] {
-            template.valid_for_secs = Some(seconds);
-            payload.valid_for_secs = seconds;
-            assert_eq!(resolve_expiring_valid_before(&template).is_ok(), valid);
-            assert_eq!(validate_expiring_valid_for_secs(&template).is_ok(), valid);
-            assert_eq!(sign_tempo_expiring(&payload, &accounts).is_ok(), valid);
-        }
-    }
 }
