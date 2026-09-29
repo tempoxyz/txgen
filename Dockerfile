@@ -1,8 +1,8 @@
-FROM rust:1.94.1-bookworm AS builder
+FROM rust:1.95.0-bookworm AS builder
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends libfontconfig1-dev && rm -rf /var/lib/apt/lists/*
 COPY . .
-RUN cargo build --release --bin txgen-tempo --bin bench
+RUN cargo build --locked --release --bin txgen-tempo --bin bench
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 libfontconfig1 && rm -rf /var/lib/apt/lists/*
