@@ -735,18 +735,20 @@ impl fmt::Debug for RpcEndpoint {
 enum Completion {
     Release(SchedulingKeys),
     SetupFinished { id: Option<String>, success: bool },
-    PendingFinished { result: std::result::Result<(), String> },
+    PendingFinished { class: Option<PendingClass>, result: std::result::Result<(), String> },
 }
 
 /// Reports pending-slot completion once, including task cancellation.
 struct PendingCompletion {
     tx: Option<mpsc::UnboundedSender<Completion>>,
+    class: Option<PendingClass>,
 }
 
 impl PendingCompletion {
     fn finish(mut self, result: Result<()>) {
         if let Some(tx) = self.tx.take() {
             let _ = tx.send(Completion::PendingFinished {
+                class: self.class,
                 result: result.map_err(|error| error.to_string()),
             });
         }
@@ -757,6 +759,7 @@ impl Drop for PendingCompletion {
     fn drop(&mut self) {
         if let Some(tx) = self.tx.take() {
             let _ = tx.send(Completion::PendingFinished {
+                class: self.class,
                 result: Err("submission worker stopped before resolving inclusion".to_string()),
             });
         }
@@ -788,6 +791,7 @@ struct PendingTx {
     sender: Option<Address>,
     submission_keys: SchedulingKeys,
     inclusion_keys: SchedulingKeys,
+    class: Option<PendingClass>,
 }
 
 impl PendingTx {
@@ -834,6 +838,7 @@ pub struct Sender {
     /// Optional signer for deferred transactions.
     late_signer: Option<Arc<dyn LateSigner>>,
     receipt_tracker: ReceiptTracker,
+    split_pending: Option<SplitPending>,
 }
 
 impl Sender {
@@ -896,6 +901,7 @@ impl Sender {
             deferred_errors: VecDeque::new(),
             receipt_collector: None,
             late_signer: None,
+            split_pending: None,
         }
     }
 
@@ -967,6 +973,16 @@ impl Sender {
             return Err(error);
         }
 
+        let class = if let Some(split) = &self.split_pending &&
+            tx.phase == TxPhase::Workload
+        {
+            if !tx.inclusion_keys.is_empty() || !tx.depends_on.is_empty() {
+                eyre::bail!("split pending limits require independent workload transactions");
+            }
+            Some((split.classify)(&tx)?)
+        } else {
+            None
+        };
         self.wait_for_buffer_capacity().await?;
 
         let queue_id = self.next_queue_id;
@@ -1021,6 +1037,7 @@ impl Sender {
             sender,
             submission_keys,
             inclusion_keys,
+            class,
         });
         if let Err(failure) = self.pump().await {
             let current_is_pending =
@@ -1108,8 +1125,13 @@ impl Sender {
     fn handle_completion(&mut self, completion: Completion) {
         match completion {
             Completion::Release(keys) => self.release_keys(&keys),
-            Completion::PendingFinished { result } => {
+            Completion::PendingFinished { class, result } => {
                 self.in_flight_pending -= 1;
+                if let Some(class) = class {
+                    let split = self.split_pending.as_mut().expect("split tracking configured");
+                    split.in_flight[class as usize] -= 1;
+                    self.metrics.set_pending_class(class as usize, split.in_flight[class as usize]);
+                }
                 if let Err(error) = result {
                     self.pending_failure.get_or_insert(error);
                 }
@@ -1177,6 +1199,31 @@ impl Sender {
             let Some(index) = self.next_ready_index() else {
                 break;
             };
+
+            // When both budgets are full, stop pulling from the bounded input
+            // buffer instead of discarding work until a completion arrives.
+            if self.pending[index].class.is_some() &&
+                self.split_pending.as_ref().is_some_and(|split| {
+                    split
+                        .in_flight
+                        .iter()
+                        .zip(split.limits)
+                        .all(|(count, limit)| *count >= limit.get())
+                })
+            {
+                break;
+            }
+
+            // Independent expiring transactions can be omitted before submission.
+            // Keep consuming the mixed stream so a full class cannot starve the other.
+            if let Some(class) = self.pending[index].class &&
+                let Some(split) = &self.split_pending &&
+                split.in_flight[class as usize] >= split.limits[class as usize].get()
+            {
+                self.pending.remove(index);
+                self.metrics.record_pending_throttled(class as usize);
+                continue;
+            }
 
             let Ok(permit) = self.semaphore.clone().try_acquire_owned() else {
                 break;
@@ -1275,6 +1322,11 @@ impl Sender {
     /// In-flight requests retain their original collector; scheduling and connections are
     /// preserved.
     pub fn set_metrics(&mut self, metrics: Arc<MetricsCollector>) {
+        if let Some(split) = &self.split_pending {
+            for (class, count) in split.in_flight.iter().enumerate() {
+                metrics.set_pending_class(class, *count);
+            }
+        }
         self.metrics = metrics;
     }
 
@@ -1299,10 +1351,16 @@ impl Sender {
         let receipt_tracker = self.receipt_tracker.clone();
 
         let transaction_expiry = self.transaction_expiry.clone();
-        let pending_completion = self.max_pending.map(|_| {
-            self.in_flight_pending += 1;
-            PendingCompletion { tx: Some(completion_tx.clone()) }
-        });
+        let pending_completion =
+            (self.max_pending.is_some() || pending.class.is_some()).then(|| {
+                self.in_flight_pending += 1;
+                if let Some(class) = pending.class {
+                    let split = self.split_pending.as_mut().expect("split tracking configured");
+                    split.in_flight[class as usize] += 1;
+                    self.metrics.set_pending_class(class as usize, split.in_flight[class as usize]);
+                }
+                PendingCompletion { tx: Some(completion_tx.clone()), class: pending.class }
+            });
 
         let setup_completion = if pending.phase == TxPhase::Setup {
             self.in_flight_setup += 1;
@@ -1336,6 +1394,42 @@ impl Sender {
             }
         });
     }
+
+    /// Apply independent pending budgets to an expiring-nonce workload.
+    ///
+    /// The classifier must reject transactions that cannot safely be omitted.
+    /// Transactions offered to a full class are counted as throttled and are not
+    /// submitted, allowing the mixed stream to continue feeding the other class.
+    /// This replaces the shared pending limit; setup retains its existing behavior.
+    pub fn with_split_pending_limits(
+        mut self,
+        payments: NonZeroUsize,
+        general: NonZeroUsize,
+        classify: Arc<PendingClassifier>,
+    ) -> Self {
+        self.max_pending = None;
+        self.split_pending =
+            Some(SplitPending { limits: [payments, general], in_flight: [0, 0], classify });
+        self
+    }
+}
+
+/// Workload class used by independent pending limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingClass {
+    /// Transactions eligible for the payment lane.
+    Payment,
+    /// Transactions using general block space.
+    General,
+}
+
+/// Classify an independent transaction, rejecting unsupported workloads.
+pub type PendingClassifier = dyn Fn(&GeneratedTx) -> Result<PendingClass> + Send + Sync;
+
+struct SplitPending {
+    limits: [NonZeroUsize; 2],
+    in_flight: [usize; 2],
+    classify: Arc<PendingClassifier>,
 }
 
 struct DispatchPreparationError {

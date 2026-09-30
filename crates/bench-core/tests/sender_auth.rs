@@ -4,8 +4,9 @@ use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
-    LateSigner, MetricsCollector, ReceiptTracker, RequestAuthProvider, RpcEndpoint,
-    RpcRequestContext, RpcSubmitter, RunClock, Sender, SenderConfig, SenderHeaderAuthProvider,
+    sender::PendingClass, LateSigner, MetricsCollector, ReceiptTracker, RequestAuthProvider,
+    RpcEndpoint, RpcRequestContext, RpcSubmitter, RunClock, Sender, SenderConfig,
+    SenderHeaderAuthProvider,
 };
 use eyre::Result;
 use reqwest::header::HeaderMap;
@@ -1177,4 +1178,80 @@ async fn setup_batch_rejects_previously_seen_ids_before_dispatching_new_roots() 
         .requests()
         .iter()
         .any(|r| r.method == "eth_sendRawTransaction" && r.params[0] == "0x03"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_pending_limits_keep_payments_flowing_when_general_is_full() {
+    let rpc = MockRpc::start();
+    rpc.state.automine.store(false, Ordering::SeqCst);
+    let mut sender = sender(&rpc, None, 8).with_split_pending_limits(
+        3.try_into().unwrap(),
+        1.try_into().unwrap(),
+        Arc::new(|tx| {
+            Ok(if tx.raw[0] < 4 { PendingClass::General } else { PendingClass::Payment })
+        }),
+    );
+    sender.send(transaction(2, None, 2, false)).await.unwrap();
+    wait_for_pending(&rpc, 1).await;
+    // The excess general transaction must not hold up subsequent payments.
+    sender.send(transaction(3, None, 3, false)).await.unwrap();
+    sender.send(transaction(4, None, 4, false)).await.unwrap();
+    sender.send(transaction(5, None, 5, false)).await.unwrap();
+    wait_for_pending(&rpc, 3).await;
+    let mut hashes = rpc.state.chain.lock().unwrap().pending.clone();
+    hashes.sort();
+    let mut expected = vec![keccak256([2]), keccak256([4]), keccak256([5])];
+    expected.sort();
+    assert_eq!(hashes, expected);
+    let flush = tokio::spawn(async move { sender.flush().await });
+    rpc.state.mine();
+    tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_pending_limits_refill_only_the_completed_class() {
+    let rpc = MockRpc::start();
+    rpc.state.automine.store(false, Ordering::SeqCst);
+    let mut sender = sender(&rpc, None, 8).with_split_pending_limits(
+        1.try_into().unwrap(),
+        1.try_into().unwrap(),
+        Arc::new(|tx| {
+            Ok(if tx.raw[0] % 2 == 0 { PendingClass::General } else { PendingClass::Payment })
+        }),
+    );
+    sender.send(transaction(2, None, 2, false)).await.unwrap();
+    sender.send(transaction(3, None, 3, false)).await.unwrap();
+    wait_for_pending(&rpc, 2).await;
+    // Both budgets full: buffer instead of spinning through the input stream.
+    sender.send(transaction(4, None, 4, false)).await.unwrap();
+    sender.send(transaction(5, None, 5, false)).await.unwrap();
+    let flush = tokio::spawn(async move { sender.flush().await });
+    {
+        let mut chain = rpc.state.chain.lock().unwrap();
+        chain.pending.retain(|hash| *hash != keccak256([3]));
+        chain.blocks.push(vec![receipt(keccak256([3]))]);
+    }
+    wait_for_pending(&rpc, 2).await;
+    let mut hashes = rpc.state.chain.lock().unwrap().pending.clone();
+    hashes.sort();
+    let mut expected = vec![keccak256([2]), keccak256([5])];
+    expected.sort();
+    assert_eq!(hashes, expected);
+    rpc.state.mine();
+    tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap().unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn split_pending_limits_reject_inclusion_ordered_workloads() {
+    let rpc = MockRpc::start();
+    let mut sender = sender(&rpc, None, 8).with_split_pending_limits(
+        1.try_into().unwrap(),
+        1.try_into().unwrap(),
+        Arc::new(|_| Ok(PendingClass::Payment)),
+    );
+    assert_eq!(
+        sender.send(transaction(2, None, 1, true)).await.unwrap_err().to_string(),
+        "split pending limits require independent workload transactions"
+    );
+    assert!(rpc.state.requests().is_empty());
 }

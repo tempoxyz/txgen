@@ -656,6 +656,18 @@ is omitted or zero, the pending cap is disabled unless explicitly set.
 RPC requests. Logs and report metadata record the effective pending limit (zero
 when disabled).
 
+For independent Tempo expiring-nonce workloads, the experimental
+`--max-pending-payments 40000 --max-pending-general 10000` replaces the shared
+limit with two budgets, classified using Tempo's `is_payment_v2` rule. Both flags
+must be supplied with positive values and cannot be combined with `--max-pending`.
+An offer for a full class is omitted before submission so the mixed input stream
+can keep supplying the other class; when both classes are full, the bounded input
+buffer applies backpressure. Ordered nonces and inclusion-dependent workloads are
+rejected in this mode. Setup transactions are not classified or omitted.
+The `txgen_pending_transactions{class="payment|general"}` gauges expose outstanding
+slots and `txgen_pending_throttled_total{class="payment|general"}` counters expose
+omitted offers, which are not submitted or counted as failed transactions.
+
 One head poller and one `eth_getBlockByNumber` request (transaction hashes only) per
 observed block serve all pending transactions. Full block receipts are fetched only
 when a block includes a transaction with a setup or explicit receipt dependency;

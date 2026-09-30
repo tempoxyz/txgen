@@ -536,6 +536,8 @@ pub struct MetricsCollector {
     aggregation: Arc<Mutex<MetricsAggregation>>,
     aggregation_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     aggregation_handle: Mutex<Option<JoinHandle<()>>>,
+    pending_by_class: [AtomicU64; 2],
+    pending_throttled: [AtomicU64; 2],
 }
 
 impl std::fmt::Debug for MetricsCollector {
@@ -583,6 +585,8 @@ impl MetricsCollector {
             aggregation,
             aggregation_shutdown: Mutex::new(Some(aggregation_shutdown_tx)),
             aggregation_handle: Mutex::new(Some(aggregation_handle)),
+            pending_by_class: [const { AtomicU64::new(0) }; 2],
+            pending_throttled: [const { AtomicU64::new(0) }; 2],
         })
     }
 
@@ -647,7 +651,7 @@ impl MetricsCollector {
         let unix_ms = self.clock.unix_ms();
         let labels = BTreeMap::new();
 
-        vec![
+        let mut samples = vec![
             Sample {
                 name: "txgen_transactions_sent_total".to_string(),
                 labels: labels.clone(),
@@ -676,7 +680,38 @@ impl MetricsCollector {
                 offset_ms,
                 unix_ms,
             },
-        ]
+        ];
+        for (index, class) in ["payment", "general"].into_iter().enumerate() {
+            for (name, value) in [
+                (
+                    "txgen_pending_transactions",
+                    self.pending_by_class[index].load(Ordering::Relaxed),
+                ),
+                (
+                    "txgen_pending_throttled_total",
+                    self.pending_throttled[index].load(Ordering::Relaxed),
+                ),
+            ] {
+                samples.push(Sample {
+                    name: name.to_string(),
+                    labels: BTreeMap::from([("class".to_string(), class.to_string())]),
+                    value: value as f64,
+                    offset_ms,
+                    unix_ms,
+                });
+            }
+        }
+        samples
+    }
+
+    /// Publish the number of outstanding transactions in a split pending class.
+    pub(crate) fn set_pending_class(&self, class: usize, count: usize) {
+        self.pending_by_class[class].store(count as u64, Ordering::Relaxed);
+    }
+
+    /// Record an offered transaction omitted because its pending class is full.
+    pub(crate) fn record_pending_throttled(&self, class: usize) {
+        self.pending_throttled[class].fetch_add(1, Ordering::Relaxed);
     }
 
     async fn finish_aggregation(&self) {
@@ -799,8 +834,11 @@ mod tests {
         collector.record_success(Duration::from_millis(5));
         collector.record_failure();
 
+        collector.set_pending_class(0, 40);
+        collector.set_pending_class(1, 10);
+        collector.record_pending_throttled(1);
         let samples = collector.snapshot_samples();
-        assert_eq!(samples.len(), 4);
+        assert_eq!(samples.len(), 8);
 
         let by_name: std::collections::HashMap<&str, f64> =
             samples.iter().map(|s| (s.name.as_str(), s.value)).collect();
@@ -809,6 +847,18 @@ mod tests {
         assert_eq!(by_name["txgen_transactions_success_total"], 1.0);
         assert_eq!(by_name["txgen_transactions_failed_total"], 1.0);
         assert_eq!(by_name["txgen_transactions_inflight"], 1.0);
+        let pending: Vec<_> = samples
+            .iter()
+            .filter(|sample| sample.name == "txgen_pending_transactions")
+            .map(|sample| (sample.labels["class"].as_str(), sample.value))
+            .collect();
+        assert_eq!(pending, [("payment", 40.0), ("general", 10.0)]);
+        let throttled: Vec<_> = samples
+            .iter()
+            .filter(|sample| sample.name == "txgen_pending_throttled_total")
+            .map(|sample| (sample.labels["class"].as_str(), sample.value))
+            .collect();
+        assert_eq!(throttled, [("payment", 0.0), ("general", 1.0)]);
 
         // All samples share the same timestamp.
         let offset = samples[0].offset_ms;
