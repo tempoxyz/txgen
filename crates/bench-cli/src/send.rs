@@ -174,6 +174,12 @@ async fn execute_source<S: TxSource>(
     if let Some(late_signer) = late_signer {
         sender = sender.with_late_signer(late_signer);
     }
+    // Warmup transactions can land in measured blocks. Keep their input labels
+    // even though warmup blocks themselves are excluded from the report.
+    let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
+    if let Some(collector) = &receipt_collector {
+        sender = sender.with_receipt_collector(collector.handle());
+    }
     let mut start_block =
         query_provider.get_block_number().await.wrap_err("failed to get starting block number")?;
     let prepared =
@@ -191,10 +197,6 @@ async fn execute_source<S: TxSource>(
     };
     let metrics = MetricsCollector::new_with_latencies(clock.clone(), args.collect_latencies);
     sender.set_metrics(metrics.clone());
-    let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
-    if let Some(collector) = &receipt_collector {
-        sender = sender.with_receipt_collector(collector.handle());
-    }
     let mut metadata = metadata.clone();
     if !args.warmup.is_zero() {
         metadata.insert("warmup_secs".into(), args.warmup.as_secs_f64().to_string());

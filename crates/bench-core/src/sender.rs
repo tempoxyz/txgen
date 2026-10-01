@@ -1429,6 +1429,14 @@ async fn submit_tx(
     };
 
     let expected_hash = keccak256(&raw);
+    // A rejected or timed-out RPC response does not prove the transaction was
+    // absent from the chain. Deferred block collection only counts hashes that
+    // actually appear in blocks, so it can register before the RPC response.
+    let deferred_receipts =
+        receipt_collector.as_ref().is_some_and(|collector| collector.is_deferred());
+    if deferred_receipts {
+        track_workload_receipt(receipt_collector.as_ref(), &pending, expected_hash);
+    }
     let inclusion = match inclusion
         .map(|registration| {
             let expires_at = transaction_expiry.as_ref().and_then(|expiry| expiry(&raw));
@@ -1460,10 +1468,9 @@ async fn submit_tx(
         }
         Err(e) => {
             let uncertain = submission_may_have_been_accepted(&e);
-            if uncertain {
+            if uncertain && !deferred_receipts {
                 track_workload_receipt(receipt_collector.as_ref(), &pending, expected_hash);
             }
-
             if request_auth.is_some() {
                 tracing::warn!("Failed to send authenticated transaction");
             } else {
@@ -1485,8 +1492,9 @@ async fn submit_tx(
 
     drop(permit);
 
-    track_workload_receipt(receipt_collector.as_ref(), &pending, expected_hash);
-
+    if !deferred_receipts {
+        track_workload_receipt(receipt_collector.as_ref(), &pending, expected_hash);
+    }
     release_keys(&completion_tx, pending.submission_keys);
 
     let Some(inclusion) = inclusion else { return Ok(()) };
