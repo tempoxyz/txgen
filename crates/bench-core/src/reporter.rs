@@ -10,14 +10,14 @@ use crate::{
     clickhouse::ClickHouseClient,
     metrics::{BenchMetrics, BlockStats, RunStats, ThroughputSample, TimeSeriesMetrics},
     receipt_clickhouse::{insert_receipt_gas_records, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE},
-    receipt_metrics::{ReceiptGasRecord, ReceiptMetricGroup},
+    receipt_metrics::{ReceiptGasRecord, ReceiptMetricGroup, ReceiptMetricLabels},
     sample::{Sample, SampleArchive},
 };
 use alloy_primitives::U256;
 use eyre::{bail, Context, Result};
 use flate2::{write::GzEncoder, Compression};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     fs::File,
     io::{BufWriter, Write},
@@ -425,6 +425,9 @@ pub struct JsonReport {
     /// Receipt-derived gas metrics grouped by workload input labels.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub receipt_metrics: Vec<ReceiptMetricGroup>,
+    /// Included receipts grouped by input label in the measured block set only.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub measured_receipt_counts: Vec<MeasuredReceiptCount>,
     /// Exact total fees paid, encoded as a decimal base-unit string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_fees_paid: Option<String>,
@@ -434,6 +437,24 @@ pub struct JsonReport {
     /// RPC corpus replay results (call mode only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call: Option<CallReport>,
+}
+
+/// Included transaction count for one input label in measured blocks.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MeasuredReceiptCount {
+    pub labels: ReceiptMetricLabels,
+    pub count: u64,
+}
+
+fn measured_receipt_counts(report: &FinalReport) -> Vec<MeasuredReceiptCount> {
+    let measured_blocks = report.blocks.iter().map(|block| block.number).collect::<HashSet<_>>();
+    let mut counts = BTreeMap::<ReceiptMetricLabels, u64>::new();
+    for record in &report.receipt_records {
+        if record.block_number.is_some_and(|number| measured_blocks.contains(&number)) {
+            *counts.entry(record.labels.clone()).or_default() += 1;
+        }
+    }
+    counts.into_iter().map(|(labels, count)| MeasuredReceiptCount { labels, count }).collect()
 }
 
 /// Latency statistics in JSON format.
@@ -602,6 +623,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             run_stats: report.run_stats.clone(),
             metadata,
             receipt_metrics: report.receipt_metrics.clone(),
+            measured_receipt_counts: measured_receipt_counts(report),
             total_fees_paid: report.total_fees_paid.map(|fees| fees.to_string()),
             samples: Vec::new(),
             call: report.call.clone(),
@@ -1189,6 +1211,45 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert!(parsed.get("receipt_records").is_none());
+    }
+
+    #[test]
+    fn test_json_reporter_counts_receipts_only_in_measured_blocks() {
+        let mut report = sample_report();
+        report.blocks = vec![BlockStats {
+            number: 42,
+            timestamp_ms: 1_000_000,
+            tx_count: 1,
+            gas_used: 21_000,
+            gas_limit: 30_000_000,
+            block_time_ms: None,
+            new_payload_ms: None,
+            forkchoice_updated_ms: None,
+            new_payload_server_latency_us: None,
+            persistence_wait_us: None,
+            execution_cache_wait_us: None,
+            sparse_trie_wait_us: None,
+        }];
+        for block_number in [42, 43] {
+            report.receipt_records.push(ReceiptGasRecord {
+                tx_hash: TxHash::repeat_byte(block_number as u8),
+                sender: None,
+                labels: BTreeMap::from([("input".to_string(), "transfer".to_string())]),
+                scenario_instance: None,
+                success: true,
+                block_number: Some(block_number),
+                block_hash: None,
+                gas_used: U256::from(21_000),
+                effective_gas_price: None,
+            });
+        }
+
+        let mut output = Vec::new();
+        JsonReporter::new(&mut output).finalize(&report).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["measured_receipt_counts"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["measured_receipt_counts"][0]["labels"]["input"], "transfer");
+        assert_eq!(parsed["measured_receipt_counts"][0]["count"], 1);
     }
 
     #[test]

@@ -216,14 +216,20 @@ impl ReceiptRequest {
     }
 }
 
-/// Cloneable handle used by submission paths to register accepted transactions.
+/// Cloneable handle used by submission paths to register transaction labels.
 #[derive(Debug, Clone)]
 pub struct ReceiptCollectorHandle {
     requests: mpsc::UnboundedSender<ReceiptRequest>,
+    deferred: bool,
 }
 
 impl ReceiptCollectorHandle {
-    /// Register an accepted transaction for receipt collection.
+    /// Whether receipts are fetched only after sending finishes.
+    pub fn is_deferred(&self) -> bool {
+        self.deferred
+    }
+
+    /// Register a transaction for receipt collection if it appears in a block.
     ///
     /// Calls made after the collector starts finishing are ignored.
     pub fn track(&self, sender: Option<Address>, tx_hash: TxHash, labels: ReceiptMetricLabels) {
@@ -260,7 +266,7 @@ impl ReceiptCollectorHandle {
 /// Deferred receipt collector for benchmark-wide gas metrics.
 ///
 /// Unlike [`ReceiptCollector`], this collector performs no RPC work while the
-/// workload is running. It only retains the labels attached to accepted
+/// workload is running. It only retains the labels attached to generated
 /// transactions so the post-run block receipts can preserve the existing
 /// report shape. [`finish`](Self::finish) fetches all receipts in the selected
 /// block range and excludes Tempo system transactions.
@@ -273,7 +279,7 @@ impl BlockReceiptCollector {
     /// Start a collector that does not issue any requests until [`finish`](Self::finish).
     pub fn start() -> Self {
         let (requests, receiver) = mpsc::unbounded_channel();
-        Self { handle: ReceiptCollectorHandle { requests }, receiver }
+        Self { handle: ReceiptCollectorHandle { requests, deferred: true }, receiver }
     }
 
     /// Return a cloneable registration handle for submission paths.
@@ -392,7 +398,7 @@ impl ReceiptCollector {
     pub fn start(submitter: RpcSubmitter, workers: usize) -> Self {
         let (requests, receiver) = mpsc::unbounded_channel();
         let (finish, finished) = oneshot::channel();
-        let handle = ReceiptCollectorHandle { requests };
+        let handle = ReceiptCollectorHandle { requests, deferred: false };
         let task = tokio::spawn(run_collector(receiver, finished, submitter, workers.max(1)));
 
         Self { handle, finish: Some(finish), task }
@@ -555,6 +561,11 @@ fn u256_to_f64(value: U256) -> f64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn block_collector_defers_receipt_queries() {
+        assert!(BlockReceiptCollector::start().handle().is_deferred());
+    }
 
     fn labels(input: &str) -> ReceiptMetricLabels {
         BTreeMap::from([("input".to_string(), input.to_string())])
