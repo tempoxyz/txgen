@@ -192,8 +192,9 @@ pub struct SendArgs {
     /// Collect receipt-derived gas metrics for non-system transactions in the benchmark block
     /// range.
     ///
-    /// Receipts are fetched in batches after the workload completes.
-    #[arg(long)]
+    /// Enabled by default. Receipts are fetched in batches only after sending
+    /// and draining finish. Use --collect-receipt-metrics=false to disable.
+    #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", require_equals = true, action = clap::ArgAction::Set)]
     pub collect_receipt_metrics: bool,
 
     /// Skip setup-phase transactions in the input stream.
@@ -733,14 +734,14 @@ mod tests {
     }
 
     #[test]
-    fn test_send_collect_receipt_metrics_default_disabled() {
+    fn test_send_collect_receipt_metrics_default_enabled() {
         let cli = Cli::try_parse_from(["bench", "send"]).unwrap();
 
         let Command::Send(args) = cli.command else {
             panic!("expected send command");
         };
 
-        assert!(!args.collect_receipt_metrics);
+        assert!(args.collect_receipt_metrics);
     }
 
     #[test]
@@ -752,6 +753,16 @@ mod tests {
         };
 
         assert!(args.collect_receipt_metrics);
+    }
+
+    #[test]
+    fn test_send_collect_receipt_metrics_disabled_explicitly() {
+        let cli =
+            Cli::try_parse_from(["bench", "send", "--collect-receipt-metrics=false"]).unwrap();
+        let Command::Send(args) = cli.command else {
+            panic!("expected send command");
+        };
+        assert!(!args.collect_receipt_metrics);
     }
 
     #[test]

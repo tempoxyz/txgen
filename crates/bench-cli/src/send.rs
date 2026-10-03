@@ -11,10 +11,10 @@ use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
-    collect_block_stats, parse_reporters, start_scrapers, total_fees_paid,
+    block_composition, collect_block_stats, parse_reporters, start_scrapers, total_fees_paid,
     trim_trailing_empty_blocks, BlockReceiptCollector, ConsoleReporter, FileSource, FinalReport,
-    GeneratedTx, LateSigner, MetricsCollector, ProgressState, ReceiptTracker, Reporter,
-    RequestAuthProvider, RpcEndpoint, RunClock, RunStats, SampleStore, ScraperConfig,
+    GeneratedTx, LateSigner, MetricsCollector, ProgressState, ReceiptCollection, ReceiptTracker,
+    Reporter, RequestAuthProvider, RpcEndpoint, RunClock, RunStats, SampleStore, ScraperConfig,
     ScraperHandle, Sender, SenderConfig, SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
@@ -301,6 +301,9 @@ async fn execute_source<S: TxSource>(
     };
     tracing::info!(end_block, "Ending block fetched");
 
+    // Freeze the duration before receipt RPCs and aggregation add post-run latency.
+    let measured_elapsed = args.duration.unwrap_or_else(|| metrics.elapsed_since_start());
+
     let receipt_collection = match receipt_collector {
         Some(collector) => {
             let collection = collector
@@ -316,23 +319,19 @@ async fn execute_source<S: TxSource>(
         }
         None => {
             tracing::info!(
-                reason = "--collect-receipt-metrics not set",
+                reason = "--collect-receipt-metrics=false",
                 "Skipped receipt gas metrics"
             );
             Default::default()
         }
     };
-    let receipt_metrics = receipt_collection.metrics;
-    let total_fees_paid = total_fees_paid(&receipt_collection.records);
     let receipt_records = receipt_collection.records;
 
     // Stop the scraper before finalizing.
     stop_scrapers(scraper_handles).await;
 
     let mut final_metrics = metrics.finalize().await;
-    if let Some(duration) = args.duration {
-        final_metrics.elapsed = duration;
-    }
+    final_metrics.elapsed = measured_elapsed;
     tracing::info!("Metrics finalized");
 
     let time_series = metrics.time_series().await;
@@ -351,8 +350,6 @@ async fn execute_source<S: TxSource>(
         bench_metrics: Some(final_metrics),
         time_series: Some(time_series),
         sample_archive: Some(sample_archive),
-        receipt_metrics,
-        total_fees_paid,
         receipt_records,
         ..Default::default()
     };
@@ -423,6 +420,21 @@ async fn execute_source<S: TxSource>(
         tracing::info!(reason = "no block stats", "Skipped report trim");
         tracing::info!(reason = "no block stats", "Skipped block reporter events");
         tracing::info!(reason = "no block stats", "Skipped run stats build");
+    }
+
+    if args.collect_receipt_metrics {
+        let measured_blocks = report
+            .blocks
+            .iter()
+            .map(|block| block.number)
+            .collect::<std::collections::HashSet<_>>();
+        report.receipt_records.retain(|record| {
+            record.block_number.is_some_and(|number| measured_blocks.contains(&number))
+        });
+        report.block_composition =
+            Some(block_composition(&report.receipt_records, &report.blocks)?);
+        report.total_fees_paid = total_fees_paid(&report.receipt_records);
+        report.receipt_metrics = ReceiptCollection::metrics_for_records(&report.receipt_records);
     }
 
     let mut finalize_result = Ok(());

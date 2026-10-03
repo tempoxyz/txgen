@@ -433,7 +433,7 @@ txgen-tempo generate -s workload.yaml -n 1000 --defer-signing | bench send --lat
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
 | `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url` |
 | `--collect-latencies` | Collect and report aggregate latency stats plus individual request samples under `time_series.latencies` (default: disabled) |
-| `--collect-receipt-metrics` | Collect non-system transaction gas and fee metrics with block-level receipt requests after sending |
+| `--collect-receipt-metrics[=true\|false]` | Enabled by default: collect non-system transaction gas, fee, and composition metrics using block receipts only after sending and draining finish; `=false` disables collection |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 0, set >0 to enable) |
 
@@ -790,9 +790,13 @@ The bench JSON report includes:
 - `samples` — point-in-time metric snapshots (internal + node), stored as a time series
 - `blocks` — factual chain data for each block in the run (tx count, gas used, etc.)
 - `receipt_metrics` — confirmed-transaction `gas_used`, `effective_gas_price`, and `fee_paid` distributions grouped by workload input
+- `block_composition` — actual included non-system transaction composition over the same retained measured `blocks`: a run-wide `summary` and individual `blocks`, each containing exact `tx_count` and decimal-string `gas_used` totals and `kinds` with `input`, `tx_count_pct`, `gas_pct`, and `reverted_tx_count`. Percentages include reverted transactions, which consume block capacity. Input labels are generated template names or `sequence.step` names, so new presets require no classifier changes. Untracked transactions have `input: null` and remain in the denominator. System receipts with zero gas are excluded. Missing receipts or a receipt gas total that differs from the block header fail reporting rather than publish partial composition.
+
 - `total_fees_paid` — exact total paid by confirmed non-system transactions in the benchmark block range, encoded as a decimal base-unit string
 
 Receipts without `effectiveGasPrice` or legacy `gasPrice` still contribute gas usage to `receipt_metrics`, but are excluded from `total_fees_paid`.
+
+Receipt collection is entirely post-run and does not issue gas-reporting receipt requests during submission. Gas/fee distributions, composition, and ClickHouse receipt rows are restricted to the measured blocks after warmup and trailing-empty-block trimming. Run-wide percentages are weighted by total transaction count and total gas, not the unweighted mean of per-block percentages; divide a kind's run-wide `tx_count` by `block_composition.block_count` for its average transactions per measured block. Both Tempo `bench-e2e` and multi-region workflows upload these JSON reports in their existing results artifacts (`report-*.json` and phase `txgen-report.json`, respectively).
 
 ### Prometheus Reporting
 
