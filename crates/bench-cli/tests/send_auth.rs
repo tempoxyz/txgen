@@ -30,7 +30,7 @@ enum ServerKind {
     Submission,
     Query,
     Readiness { stuck_proposer: bool, stuck_finish: bool },
-    Composition,
+    Composition { receipt_delay: Duration },
 }
 
 struct MockServer {
@@ -114,11 +114,11 @@ fn serve(mut stream: TcpStream, kind: ServerKind, requests: Arc<Mutex<Vec<Record
 
     let id = request["id"].clone();
     let response = match (kind, method.as_str()) {
-        (ServerKind::Composition, "eth_sendRawTransaction") => {
+        (ServerKind::Composition { .. }, "eth_sendRawTransaction") => {
             let identity = if request["params"][0] == "0x01" { 1u8 } else { 2u8 };
             json!({"jsonrpc":"2.0", "id":id, "result":keccak256([identity])})
         }
-        (ServerKind::Composition, "eth_blockNumber") => {
+        (ServerKind::Composition { .. }, "eth_blockNumber") => {
             let sent = requests
                 .lock()
                 .unwrap()
@@ -126,7 +126,7 @@ fn serve(mut stream: TcpStream, kind: ServerKind, requests: Arc<Mutex<Vec<Record
                 .any(|request| request.method == "eth_sendRawTransaction");
             json!({"jsonrpc":"2.0", "id":id, "result":if sent { "0x1" } else { "0x0" }})
         }
-        (ServerKind::Composition, "eth_getBlockReceipts") => {
+        (ServerKind::Composition { receipt_delay }, "eth_getBlockReceipts") => {
             assert_eq!(
                 requests
                     .lock()
@@ -136,6 +136,7 @@ fn serve(mut stream: TcpStream, kind: ServerKind, requests: Arc<Mutex<Vec<Record
                     .count(),
                 2
             );
+            thread::sleep(receipt_delay);
             let receipts = [(1u8, 30, true), (2u8, 10, false), (3u8, 60, true)].into_iter().enumerate().map(|(index, (identity, gas, success))| {
                 json!({"transactionHash":keccak256([identity]), "transactionIndex":format!("0x{index:x}"),
                     "blockHash":format!("0x{}", "10".repeat(32)), "blockNumber":"0x1", "from":SENDER, "to":SENDER,
@@ -145,7 +146,7 @@ fn serve(mut stream: TcpStream, kind: ServerKind, requests: Arc<Mutex<Vec<Record
             }).collect::<Vec<_>>();
             json!({"jsonrpc":"2.0", "id":id, "result":receipts})
         }
-        (ServerKind::Composition, "eth_getBlockByNumber") => {
+        (ServerKind::Composition { .. }, "eth_getBlockByNumber") => {
             let hash = format!("0x{}", "10".repeat(32));
             json!({"jsonrpc":"2.0", "id":id, "result":{
                 "hash":hash, "parentHash":hash, "sha3Uncles":hash, "miner":SENDER,
@@ -295,9 +296,8 @@ fn query_rpc_is_separate_and_credentials_are_redacted_from_outputs() {
     assert!(query_requests.iter().all(|request| request.auth.is_none()));
 }
 
-#[test]
-fn default_collection_is_post_run_and_reports_included_composition() {
-    let server = MockServer::start(ServerKind::Composition);
+fn run_composition_fixture(receipt_delay: Duration) -> (Value, Vec<RecordedRequest>) {
+    let server = MockServer::start(ServerKind::Composition { receipt_delay });
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("transactions.ndjson");
     let report = temp.path().join("report.json");
@@ -332,6 +332,12 @@ fn default_collection_is_post_run_and_reports_included_composition() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let report: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
     assert!(!temp.path().join("report.composition.md").exists());
+    (report, server.requests())
+}
+
+#[test]
+fn default_collection_is_post_run_and_reports_included_composition() {
+    let (report, requests) = run_composition_fixture(Duration::ZERO);
     let composition = &report["block_composition"];
     assert_eq!(composition["block_count"], 1);
     assert_eq!(composition["summary"]["tx_count"], 3);
@@ -341,7 +347,6 @@ fn default_collection_is_post_run_and_reports_included_composition() {
     assert_eq!(composition["summary"]["kinds"][1]["input"], "vault_deposit");
     assert_eq!(composition["summary"]["kinds"][1]["gas_pct"], 30.0);
     assert_eq!(composition["summary"]["kinds"][2]["reverted_tx_count"], 1);
-    let requests = server.requests();
     let collection =
         requests.iter().position(|request| request.method == "eth_getBlockReceipts").unwrap();
     assert_eq!(
@@ -356,6 +361,21 @@ fn default_collection_is_post_run_and_reports_included_composition() {
         1
     );
     assert!(!requests.iter().any(|request| request.method == "eth_getTransactionReceipt"));
+}
+
+#[test]
+fn receipt_collection_latency_is_excluded_from_benchmark_duration() {
+    let (report, requests) = run_composition_fixture(Duration::from_secs(1));
+    let measurement_start =
+        report["metadata"]["measurement_start_unix_ms"].as_str().unwrap().parse::<u128>().unwrap();
+    let receipt_start =
+        requests.iter().find(|request| request.method == "eth_getBlockReceipts").unwrap().unix_ms;
+    let before_receipts = Duration::from_millis((receipt_start - measurement_start) as u64);
+    let reported_elapsed = Duration::from_secs_f64(report["elapsed_secs"].as_f64().unwrap());
+    assert!(
+        reported_elapsed <= before_receipts + Duration::from_millis(200),
+        "receipt collection must not inflate benchmark duration: {reported_elapsed:?} > {before_receipts:?}"
+    );
 }
 
 #[test]

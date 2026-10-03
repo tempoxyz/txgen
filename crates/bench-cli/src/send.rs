@@ -301,6 +301,9 @@ async fn execute_source<S: TxSource>(
     };
     tracing::info!(end_block, "Ending block fetched");
 
+    // Freeze the duration before receipt RPCs and aggregation add post-run latency.
+    let measured_elapsed = args.duration.unwrap_or_else(|| metrics.elapsed_since_start());
+
     let receipt_collection = match receipt_collector {
         Some(collector) => {
             let collection = collector
@@ -328,9 +331,7 @@ async fn execute_source<S: TxSource>(
     stop_scrapers(scraper_handles).await;
 
     let mut final_metrics = metrics.finalize().await;
-    if let Some(duration) = args.duration {
-        final_metrics.elapsed = duration;
-    }
+    final_metrics.elapsed = measured_elapsed;
     tracing::info!("Metrics finalized");
 
     let time_series = metrics.time_series().await;
