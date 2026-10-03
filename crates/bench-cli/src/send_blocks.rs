@@ -715,117 +715,6 @@ fn skip_rlp_item(buf: &mut &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy_rlp::Encodable;
-
-    fn rlp_bytes(payload: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        payload.encode(&mut out);
-        out
-    }
-
-    fn rlp_list_from_encoded(items: &[Vec<u8>]) -> Vec<u8> {
-        let payload_length = items.iter().map(Vec::len).sum();
-        let mut out = Vec::new();
-        Header { list: true, payload_length }.encode(&mut out);
-        for item in items {
-            out.extend_from_slice(item);
-        }
-        out
-    }
-
-    fn legacy_tx(id: u8) -> Vec<u8> {
-        rlp_list_from_encoded(&[rlp_bytes(&[id])])
-    }
-
-    fn typed_tx(tx_type: u8, id: u8) -> Vec<u8> {
-        rlp_bytes(&[tx_type, id])
-    }
-
-    fn block_with_transactions(transactions: &[Vec<u8>]) -> Vec<u8> {
-        let header = rlp_list_from_encoded(&[]);
-        let transactions = rlp_list_from_encoded(transactions);
-        let ommers = rlp_list_from_encoded(&[]);
-        rlp_list_from_encoded(&[header, transactions, ommers])
-    }
-
-    fn scheduler_block(number: u64) -> BlockLine {
-        BlockLine {
-            raw: Bytes::new(),
-            bal: None,
-            key: B256::ZERO,
-            number,
-            timestamp: 0,
-            gas_used: 0,
-            gas_limit: 0,
-            tx_count: 0,
-        }
-    }
-
-    fn record_action(action: ReorgAction, observed: &mut String) {
-        match action {
-            ReorgAction::Pending => {}
-            ReorgAction::Canonical(blocks) => observed.push_str(&"C".repeat(blocks.len())),
-            ReorgAction::Batch(blocks) => {
-                observed.push_str(&"S".repeat(blocks.len()));
-                observed.push_str(&"C".repeat(blocks.len()));
-            }
-        }
-    }
-
-    fn schedule(depth: usize, gap: usize, count: u64) -> String {
-        let mut state = ReorgState::new(depth, gap);
-        let mut observed = String::new();
-        for number in 1..=count {
-            record_action(state.push(scheduler_block(number)), &mut observed);
-        }
-        record_action(state.finish(), &mut observed);
-        observed
-    }
-
-    #[test]
-    fn schedules_non_overlapping_reorgs_with_canonical_gaps_and_eof_tails() {
-        assert_eq!(schedule(2, 0, 4), "SSCCSSCC");
-        assert_eq!(schedule(2, 1, 7), "SSCCCSSCCCC");
-    }
-
-    #[test]
-    fn extracts_nine_of_ten_non_blob_transactions_for_reorg_payloads() {
-        let source_transactions = (0..10).map(legacy_tx).collect::<Vec<_>>();
-        let block = block_with_transactions(&source_transactions);
-
-        let extracted = extract_tx_bytes_from_block_rlp(&block)
-            .expect("valid block RLP should extract transactions");
-
-        let expected = source_transactions
-            .into_iter()
-            .take(REORG_NON_BLOB_TX_DROP_INTERVAL - 1)
-            .map(Bytes::from)
-            .collect::<Vec<_>>();
-        assert_eq!(extracted, expected);
-    }
-
-    #[test]
-    fn blob_transactions_do_not_count_toward_reorg_payload_keep_ratio() {
-        let mut source_transactions = (0..9).map(legacy_tx).collect::<Vec<_>>();
-        source_transactions.push(typed_tx(0x03, 0));
-        source_transactions.push(legacy_tx(9));
-        let block = block_with_transactions(&source_transactions);
-
-        let extracted = extract_tx_bytes_from_block_rlp(&block)
-            .expect("valid block RLP should extract transactions");
-
-        let expected = source_transactions
-            .into_iter()
-            .take(REORG_NON_BLOB_TX_DROP_INTERVAL - 1)
-            .map(Bytes::from)
-            .collect::<Vec<_>>();
-        assert_eq!(extracted, expected);
-    }
-}
-
 async fn process_big_block(
     provider: &(impl Provider + RethApi<Ethereum>),
     big_block: &BigBlockData<ExecutionData>,
@@ -1017,5 +906,116 @@ impl MetricsCollector {
 
     fn final_snapshot(&self, clock: &RunClock) -> Vec<Sample> {
         self.counters.snapshot_samples(clock)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_rlp::Encodable;
+
+    fn rlp_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        payload.encode(&mut out);
+        out
+    }
+
+    fn rlp_list_from_encoded(items: &[Vec<u8>]) -> Vec<u8> {
+        let payload_length = items.iter().map(Vec::len).sum();
+        let mut out = Vec::new();
+        Header { list: true, payload_length }.encode(&mut out);
+        for item in items {
+            out.extend_from_slice(item);
+        }
+        out
+    }
+
+    fn legacy_tx(id: u8) -> Vec<u8> {
+        rlp_list_from_encoded(&[rlp_bytes(&[id])])
+    }
+
+    fn typed_tx(tx_type: u8, id: u8) -> Vec<u8> {
+        rlp_bytes(&[tx_type, id])
+    }
+
+    fn block_with_transactions(transactions: &[Vec<u8>]) -> Vec<u8> {
+        let header = rlp_list_from_encoded(&[]);
+        let transactions = rlp_list_from_encoded(transactions);
+        let ommers = rlp_list_from_encoded(&[]);
+        rlp_list_from_encoded(&[header, transactions, ommers])
+    }
+
+    fn scheduler_block(number: u64) -> BlockLine {
+        BlockLine {
+            raw: Bytes::new(),
+            bal: None,
+            key: B256::ZERO,
+            number,
+            timestamp: 0,
+            gas_used: 0,
+            gas_limit: 0,
+            tx_count: 0,
+        }
+    }
+
+    fn record_action(action: ReorgAction, observed: &mut String) {
+        match action {
+            ReorgAction::Pending => {}
+            ReorgAction::Canonical(blocks) => observed.push_str(&"C".repeat(blocks.len())),
+            ReorgAction::Batch(blocks) => {
+                observed.push_str(&"S".repeat(blocks.len()));
+                observed.push_str(&"C".repeat(blocks.len()));
+            }
+        }
+    }
+
+    fn schedule(depth: usize, gap: usize, count: u64) -> String {
+        let mut state = ReorgState::new(depth, gap);
+        let mut observed = String::new();
+        for number in 1..=count {
+            record_action(state.push(scheduler_block(number)), &mut observed);
+        }
+        record_action(state.finish(), &mut observed);
+        observed
+    }
+
+    #[test]
+    fn schedules_non_overlapping_reorgs_with_canonical_gaps_and_eof_tails() {
+        assert_eq!(schedule(2, 0, 4), "SSCCSSCC");
+        assert_eq!(schedule(2, 1, 7), "SSCCCSSCCCC");
+    }
+
+    #[test]
+    fn extracts_nine_of_ten_non_blob_transactions_for_reorg_payloads() {
+        let source_transactions = (0..10).map(legacy_tx).collect::<Vec<_>>();
+        let block = block_with_transactions(&source_transactions);
+
+        let extracted = extract_tx_bytes_from_block_rlp(&block)
+            .expect("valid block RLP should extract transactions");
+
+        let expected = source_transactions
+            .into_iter()
+            .take(REORG_NON_BLOB_TX_DROP_INTERVAL - 1)
+            .map(Bytes::from)
+            .collect::<Vec<_>>();
+        assert_eq!(extracted, expected);
+    }
+
+    #[test]
+    fn blob_transactions_do_not_count_toward_reorg_payload_keep_ratio() {
+        let mut source_transactions = (0..9).map(legacy_tx).collect::<Vec<_>>();
+        source_transactions.push(typed_tx(0x03, 0));
+        source_transactions.push(legacy_tx(9));
+        let block = block_with_transactions(&source_transactions);
+
+        let extracted = extract_tx_bytes_from_block_rlp(&block)
+            .expect("valid block RLP should extract transactions");
+
+        let expected = source_transactions
+            .into_iter()
+            .take(REORG_NON_BLOB_TX_DROP_INTERVAL - 1)
+            .map(Bytes::from)
+            .collect::<Vec<_>>();
+        assert_eq!(extracted, expected);
     }
 }
