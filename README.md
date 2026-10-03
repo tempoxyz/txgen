@@ -1634,6 +1634,21 @@ mix:
 
 ### Account Selection
 
+`generate --gas-weighted-mix --rpc <url>` interprets mix weights as target shares
+of submitted block gas rather than workload-item counts. It simulates one instance
+of each positive-weight item with `eth_simulateV1` before workload generation and
+every 10 seconds thereafter, selecting items proportionally to `weight / gas`.
+Sequence steps are simulated together and charged their total simulated block
+`gasUsed`, which follows the node's block-capacity accounting. Sampling clones
+the generator's nonce and RNG state and does not submit transactions. Sampling
+failures abort generation; there are no retries or fallback estimates.
+
+Confirm setup before sampling: generate setup with `--count 0 --setup-state-out
+setup.json`, submit it successfully, then generate workload with
+`--setup-state-in setup.json --gas-weighted-mix`. Setup-state reuse does not
+support `keychain_authorize_pool`. Gas shares are estimates, not guarantees for
+individual mined blocks; inspect the report's `block_composition` for actuals.
+
 Accounts are selected from signer pools using `select`. Only `accounts` pools can be used in signing positions such as `from` and `sponsor`; `address_pools` are destination-only values.
 
 ```yaml
