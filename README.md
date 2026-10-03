@@ -794,8 +794,6 @@ The bench JSON report includes:
 
 - `total_fees_paid` — exact total paid by confirmed non-system transactions in the benchmark block range, encoded as a decimal base-unit string
 
-File-based JSON reporters also write a readable sibling `*.composition.md` table with run-wide count and gas percentages. Existing benchmark workflow results uploads include this table alongside the JSON report.
-
 Receipts without `effectiveGasPrice` or legacy `gasPrice` still contribute gas usage to `receipt_metrics`, but are excluded from `total_fees_paid`.
 
 Receipt collection is entirely post-run and does not issue gas-reporting receipt requests during submission. Gas/fee distributions, composition, and ClickHouse receipt rows are restricted to the measured blocks after warmup and trailing-empty-block trimming. Run-wide percentages are weighted by total transaction count and total gas, not the unweighted mean of per-block percentages; divide a kind's run-wide `tx_count` by `block_composition.block_count` for its average transactions per measured block. Both Tempo `bench-e2e` and multi-region workflows upload these JSON reports in their existing results artifacts (`report-*.json` and phase `txgen-report.json`, respectively).

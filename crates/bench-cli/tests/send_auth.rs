@@ -331,8 +331,7 @@ fn default_collection_is_post_run_and_reports_included_composition() {
         .unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let report: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
-    let summary = std::fs::read_to_string(temp.path().join("report.composition.md")).unwrap();
-    assert!(summary.contains("| vault_deposit | 1 | 33.3333 | 30 | 30.0000 | 0 |"), "{summary}");
+    assert!(!temp.path().join("report.composition.md").exists());
     let composition = &report["block_composition"];
     assert_eq!(composition["block_count"], 1);
     assert_eq!(composition["summary"]["tx_count"], 3);

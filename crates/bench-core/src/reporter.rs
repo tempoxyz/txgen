@@ -494,18 +494,12 @@ pub struct JsonReporter<W: Write + Send = Box<dyn Write + Send>> {
     benchmark_id: Option<uuid::Uuid>,
     /// Path to the gzip-compressed NDJSON samples file (only set for file-based reporters).
     samples_path: Option<std::path::PathBuf>,
-    composition_path: Option<std::path::PathBuf>,
 }
 
 impl JsonReporter {
     /// Create a JSON reporter writing to stdout.
     pub fn stdout() -> Self {
-        Self {
-            writer: Box::new(std::io::stdout()),
-            benchmark_id: None,
-            samples_path: None,
-            composition_path: None,
-        }
+        Self { writer: Box::new(std::io::stdout()), benchmark_id: None, samples_path: None }
     }
 
     /// Create a JSON reporter writing to a file.
@@ -515,20 +509,14 @@ impl JsonReporter {
     pub fn file(path: &Path) -> Result<JsonReporter<std::io::BufWriter<std::fs::File>>> {
         let file = std::fs::File::create(path).context("failed to create output file")?;
         let samples_path = samples_path_from_report(path);
-        let composition_path = Some(path.with_extension("composition.md"));
-        Ok(JsonReporter {
-            writer: std::io::BufWriter::new(file),
-            benchmark_id: None,
-            samples_path,
-            composition_path,
-        })
+        Ok(JsonReporter { writer: std::io::BufWriter::new(file), benchmark_id: None, samples_path })
     }
 }
 
 impl<W: Write + Send> JsonReporter<W> {
     /// Create a new JSON reporter with a custom writer.
     pub fn new(writer: W) -> Self {
-        Self { writer, benchmark_id: None, samples_path: None, composition_path: None }
+        Self { writer, benchmark_id: None, samples_path: None }
     }
 
     /// Set the benchmark identifier written to the JSON report.
@@ -626,40 +614,6 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
 
         serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
         writeln!(self.writer)?;
-
-        if let Some(path) = &self.composition_path &&
-            let Some(composition) = &report.block_composition
-        {
-            let mut output =
-                BufWriter::new(File::create(path).context("failed to create composition summary")?);
-            writeln!(output, "# Measured block composition\n")?;
-            writeln!(
-                output,
-                "{} blocks, {} included non-system transactions, {} gas.\n",
-                composition.block_count, composition.summary.tx_count, composition.summary.gas_used
-            )?;
-            writeln!(output, "Shares are run-wide totals, not averages of per-block percentages. Reverted transactions are included; zero-gas system receipts are excluded. Unlabelled transactions are shown as untracked.\n")?;
-            writeln!(output, "| Input / transaction kind | Included txs | Tx count % | Gas used | Gas % | Reverted txs |")?;
-            writeln!(output, "| --- | ---: | ---: | ---: | ---: | ---: |")?;
-            for kind in &composition.summary.kinds {
-                let input = kind
-                    .input
-                    .as_deref()
-                    .unwrap_or("untracked")
-                    .replace('|', "\\|")
-                    .replace(['\n', '\r'], " ");
-                writeln!(
-                    output,
-                    "| {input} | {} | {:.4} | {} | {:.4} | {} |",
-                    kind.tx_count,
-                    kind.tx_count_pct,
-                    kind.gas_used,
-                    kind.gas_pct,
-                    kind.reverted_tx_count
-                )?;
-            }
-            output.flush()?;
-        }
 
         // Stream-compress the finalized NDJSON archive to the report sidecar.
         if let Some(samples_path) = &self.samples_path &&
