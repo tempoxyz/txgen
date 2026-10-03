@@ -786,6 +786,7 @@ impl NetworkAdapter for TempoAdapter {
     fn simulation_request(
         &self,
         tx_request: &TxRequest<TempoTransactionRequest, TempoSignContext>,
+        signer: &EcdsaSigner,
     ) -> Result<serde_json::Value> {
         let mut request = tx_request.request.clone();
         if request.inner.to.is_none() &&
@@ -795,8 +796,13 @@ impl NetworkAdapter for TempoAdapter {
             request.inner.value = Some(last_call.value);
             request.inner.input = last_call.input.into();
         }
-        if let TempoSignContext::Deferred { key_authorization, .. } = &tx_request.sign_context {
-            request.key_authorization = key_authorization.clone();
+        if let TempoSignContext::Deferred { key_authorization: Some(authorization), .. } =
+            &tx_request.sign_context
+        {
+            let signature = signer.sign_hash_sync(&authorization.signature_hash())?;
+            request.set_key_authorization(
+                authorization.clone().into_signed(PrimitiveSignature::Secp256k1(signature)),
+            );
         }
         Ok(serde_json::to_value(request)?)
     }
@@ -2131,8 +2137,12 @@ nonce_key:
                 call.value = U256::from(index);
             }
             tx_request.request.calls = calls.clone();
-            let normalized: TempoTransactionRequest =
-                serde_json::from_value(adapter.simulation_request(&tx_request).unwrap()).unwrap();
+            let normalized: TempoTransactionRequest = serde_json::from_value(
+                adapter
+                    .simulation_request(&tx_request, accounts.get_by_index("users", 0).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
             assert!(normalized.inner.to.is_some());
             assert_eq!(normalized.clone().build_aa().unwrap().calls, calls);
             assert_eq!(tx_request.request.calls, calls);

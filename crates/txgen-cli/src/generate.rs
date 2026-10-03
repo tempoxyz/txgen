@@ -837,6 +837,7 @@ pub trait NetworkAdapter: Send + Sync {
     fn simulation_request(
         &self,
         request: &TxRequest<<Self::Network as Network>::TransactionRequest, Self::SignContext>,
+        _signer: &EcdsaSigner,
     ) -> Result<serde_json::Value> {
         Ok(serde_json::to_value(&request.request)?)
     }
@@ -2330,7 +2331,7 @@ fn sample_workload_calls<A: NetworkAdapter>(
                 0,
                 &mut sample_ctx,
             )?;
-            let mut call = adapter.simulation_request(&job.tx_req)?;
+            let mut call = adapter.simulation_request(&job.tx_req, &job.signer)?;
             call["from"] = serde_json::to_value(job.signer.address())?;
             call.as_object_mut()
                 .ok_or_else(|| eyre::eyre!("simulation request must be an object"))?
