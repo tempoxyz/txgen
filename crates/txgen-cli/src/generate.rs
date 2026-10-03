@@ -832,6 +832,14 @@ pub trait NetworkAdapter: Send + Sync {
             fetch_protocol_nonces(accounts, nonces, rpc).await
         }
     }
+
+    /// Normalize adapter-specific fields for eth_simulateV1.
+    fn simulation_request(
+        &self,
+        request: &TxRequest<<Self::Network as Network>::TransactionRequest, Self::SignContext>,
+    ) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(&request.request)?)
+    }
 }
 
 pub(crate) async fn run_generate<A>(mut adapter: A, args: GenerateArgs) -> Result<()>
@@ -965,6 +973,12 @@ struct GenerationLimit {
     duration: Option<Duration>,
 }
 
+struct GenerationConfig<'a> {
+    limit: GenerationLimit,
+    signing_workers: usize,
+    gas_sample_rpc: Option<&'a str>,
+}
+
 fn generate_loop<A>(
     adapter: &mut A,
     ctx: &mut GenerateContext,
@@ -1008,12 +1022,14 @@ where
             let written = generate_txs(
                 adapter,
                 &ctx.spec,
-                ctx.limit,
-                ctx.signing_workers,
+                GenerationConfig {
+                    limit: ctx.limit,
+                    signing_workers: ctx.signing_workers,
+                    gas_sample_rpc: ctx.gas_sample_rpc.as_deref(),
+                },
                 &setup_bindings,
                 &mut build_ctx,
                 &mut writer,
-                ctx.gas_sample_rpc.as_deref(),
             )?;
             eprintln!("wrote {} workload transactions to {}", written, path.display());
         }
@@ -1032,12 +1048,14 @@ where
             generate_txs(
                 adapter,
                 &ctx.spec,
-                ctx.limit,
-                ctx.signing_workers,
+                GenerationConfig {
+                    limit: ctx.limit,
+                    signing_workers: ctx.signing_workers,
+                    gas_sample_rpc: ctx.gas_sample_rpc.as_deref(),
+                },
                 &setup_bindings,
                 &mut build_ctx,
                 &mut writer,
-                ctx.gas_sample_rpc.as_deref(),
             )?;
         }
     }
@@ -1747,12 +1765,10 @@ where
 fn generate_txs<A, W: Write>(
     adapter: &A,
     spec: &WorkloadSpec,
-    limit: GenerationLimit,
-    signing_workers: usize,
+    config: GenerationConfig<'_>,
     setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
-    gas_sample_rpc: Option<&str>,
 ) -> Result<u64>
 where
     A: NetworkAdapter + 'static,
@@ -1761,6 +1777,7 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
+    let GenerationConfig { limit, signing_workers, gas_sample_rpc } = config;
     let mut selector = WorkloadSelector::new(spec, limit.count.unwrap_or(u64::MAX))?;
     let gas_provider = gas_sample_rpc
         .map(|rpc| {
@@ -2313,7 +2330,7 @@ fn sample_workload_calls<A: NetworkAdapter>(
                 0,
                 &mut sample_ctx,
             )?;
-            let mut call = serde_json::to_value(&job.tx_req.request)?;
+            let mut call = adapter.simulation_request(&job.tx_req)?;
             call["from"] = serde_json::to_value(job.signer.address())?;
             call.as_object_mut()
                 .ok_or_else(|| eyre::eyre!("simulation request must be an object"))?
@@ -2779,6 +2796,124 @@ call:
         assert!(simulation_gas(&response, 2).is_err());
         assert!(simulation_gas(&serde_json::json!([]), 0).is_err());
         assert!(simulation_gas(&serde_json::json!([{"gasUsed": "0x0", "calls": []}]), 0).is_err());
+        Ok(())
+    }
+
+    struct SamplingAdapter;
+
+    impl NetworkAdapter for SamplingAdapter {
+        type Template = serde_yaml::Value;
+        type Network = Ethereum;
+        type SignContext = ();
+
+        fn network_name() -> &'static str {
+            "sampling-test"
+        }
+
+        fn build_request(
+            &self,
+            _template: Self::Template,
+            ctx: &mut BuildContext<'_>,
+        ) -> Result<TxRequest<TransactionRequest>> {
+            Ok(TxRequest {
+                request: TransactionRequest {
+                    nonce: Some(ctx.next_nonce([0x33; 20])),
+                    value: Some(U256::from(ctx.rng.random::<u64>())),
+                    ..Default::default()
+                },
+                signer_pool: "users".to_string(),
+                signer_index: 0,
+                key: [0x33; 20],
+                sign_context: (),
+                late_sign: None,
+            })
+        }
+    }
+
+    fn sampling_spec() -> Result<WorkloadSpec> {
+        WorkloadSpec::parse(
+            r#"
+chain_id: 1
+accounts:
+  users:
+    mnemonic: "test test test test test test test test test test test junk"
+    range: [0, 1]
+templates: {transfer: {}}
+sequences:
+  pair:
+    steps: [{template: transfer}, {template: transfer}]
+mix: [{template: transfer, weight: 1}]
+"#,
+        )
+    }
+
+    #[test]
+    fn gas_sampling_preserves_nonce_rng_and_sequence_order() -> Result<()> {
+        let spec = sampling_spec()?;
+        let accounts = AccountManager::from_spec(&spec.accounts)?;
+        let artifacts = ArtifactManager::empty();
+        let mut nonces = NonceTracker::new();
+        nonces.reset([0x33; 20], 7);
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut expected_rng = rng.clone();
+        let mut ctx = BuildContext::new(1, &spec.gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        let calls = sample_workload_calls(
+            &SamplingAdapter,
+            &spec,
+            &MixItem::Sequence("pair".to_string()),
+            &HashMap::new(),
+            &mut ctx,
+        )?;
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            assert!(call.get("nonce").is_none());
+            assert_eq!(
+                call["from"],
+                serde_json::to_value(accounts.get_by_index("users", 0)?.address())?
+            );
+            assert_eq!(
+                call["value"],
+                serde_json::to_value(U256::from(expected_rng.random::<u64>()))?
+            );
+        }
+        assert_eq!(ctx.nonces.peek(&[0x33; 20]), 7);
+        assert_eq!(ctx.rng.random::<u64>(), StdRng::seed_from_u64(42).random::<u64>());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initial_simulation_failure_aborts_before_emitting_workload() -> Result<()> {
+        let app = axum::Router::new().route("/", axum::routing::post(|axum::Json(request): axum::Json<serde_json::Value>| async move {
+            assert_eq!(request["method"], "eth_simulateV1");
+            assert_eq!(request["params"][0]["blockStateCalls"][0]["calls"].as_array().unwrap().len(), 1);
+            axum::Json(serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32000, "message": "simulation failed"}}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let rpc = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let spec = sampling_spec()?;
+        let accounts = AccountManager::from_spec(&spec.accounts)?;
+        let artifacts = ArtifactManager::empty();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut ctx = BuildContext::new(1, &spec.gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        let mut output = NdjsonWriter::new(Vec::new());
+        let result = generate_txs(
+            &SamplingAdapter,
+            &spec,
+            GenerationConfig {
+                limit: GenerationLimit { count: Some(1), duration: None },
+                signing_workers: 1,
+                gas_sample_rpc: Some(&rpc),
+            },
+            &HashMap::new(),
+            &mut ctx,
+            &mut output,
+        );
+        assert!(result.is_err());
+        assert_eq!(output.count(), 0);
+        assert!(output.into_inner().is_empty());
+        server.abort();
         Ok(())
     }
 }

@@ -1632,7 +1632,7 @@ mix:
     weight: 10
 ```
 
-### Account Selection
+### Gas-Weighted Mix
 
 `generate --gas-weighted-mix --rpc <url>` interprets mix weights as target shares
 of submitted block gas rather than workload-item counts. It simulates one instance
@@ -1648,6 +1648,8 @@ setup.json`, submit it successfully, then generate workload with
 `--setup-state-in setup.json --gas-weighted-mix`. Setup-state reuse does not
 support `keychain_authorize_pool`. Gas shares are estimates, not guarantees for
 individual mined blocks; inspect the report's `block_composition` for actuals.
+
+### Account Selection
 
 Accounts are selected from signer pools using `select`. Only `accounts` pools can be used in signing positions such as `from` and `sponsor`; `address_pools` are destination-only values.
 
