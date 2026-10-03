@@ -142,8 +142,13 @@ pub struct ReceiptCollection {
 
 impl ReceiptCollection {
     fn from_records(records: Vec<ReceiptGasRecord>) -> Self {
+        let metrics = Self::metrics_for_records(&records);
+        Self { metrics, records }
+    }
+
+    pub fn metrics_for_records(records: &[ReceiptGasRecord]) -> ReceiptMetrics {
         let mut accumulator = ReceiptMetricsAccumulator::default();
-        for record in &records {
+        for record in records {
             accumulator.record(
                 record.labels.clone(),
                 ReceiptGasSample {
@@ -153,7 +158,7 @@ impl ReceiptCollection {
             );
         }
 
-        Self { metrics: accumulator.into_metrics(), records }
+        accumulator.into_metrics()
     }
 }
 
@@ -368,7 +373,7 @@ async fn fetch_block_receipts(
         .get_block_receipts(BlockId::number(block_number))
         .await
         .wrap_err_with(|| format!("failed to fetch receipts for block {block_number}"))?
-        .unwrap_or_default();
+        .ok_or_else(|| eyre::eyre!("receipts for block {block_number} not found"))?;
 
     Ok(receipts
         .into_iter()

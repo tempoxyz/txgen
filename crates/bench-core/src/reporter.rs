@@ -8,6 +8,7 @@
 use crate::{
     call::{CallReport, MethodStats},
     clickhouse::ClickHouseClient,
+    composition::RunComposition,
     metrics::{BenchMetrics, BlockStats, RunStats, ThroughputSample, TimeSeriesMetrics},
     receipt_clickhouse::{insert_receipt_gas_records, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE},
     receipt_metrics::{ReceiptGasRecord, ReceiptMetricGroup},
@@ -48,6 +49,7 @@ pub struct FinalReport {
     pub total_fees_paid: Option<U256>,
     /// Receipt-derived gas details for ClickHouse publication.
     pub receipt_records: Vec<ReceiptGasRecord>,
+    pub block_composition: Option<RunComposition>,
     /// RPC corpus replay results (call mode only).
     pub call: Option<CallReport>,
 }
@@ -425,6 +427,8 @@ pub struct JsonReport {
     /// Receipt-derived gas metrics grouped by workload input labels.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub receipt_metrics: Vec<ReceiptMetricGroup>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub block_composition: Option<RunComposition>,
     /// Exact total fees paid, encoded as a decimal base-unit string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_fees_paid: Option<String>,
@@ -490,12 +494,18 @@ pub struct JsonReporter<W: Write + Send = Box<dyn Write + Send>> {
     benchmark_id: Option<uuid::Uuid>,
     /// Path to the gzip-compressed NDJSON samples file (only set for file-based reporters).
     samples_path: Option<std::path::PathBuf>,
+    composition_path: Option<std::path::PathBuf>,
 }
 
 impl JsonReporter {
     /// Create a JSON reporter writing to stdout.
     pub fn stdout() -> Self {
-        Self { writer: Box::new(std::io::stdout()), benchmark_id: None, samples_path: None }
+        Self {
+            writer: Box::new(std::io::stdout()),
+            benchmark_id: None,
+            samples_path: None,
+            composition_path: None,
+        }
     }
 
     /// Create a JSON reporter writing to a file.
@@ -505,14 +515,20 @@ impl JsonReporter {
     pub fn file(path: &Path) -> Result<JsonReporter<std::io::BufWriter<std::fs::File>>> {
         let file = std::fs::File::create(path).context("failed to create output file")?;
         let samples_path = samples_path_from_report(path);
-        Ok(JsonReporter { writer: std::io::BufWriter::new(file), benchmark_id: None, samples_path })
+        let composition_path = Some(path.with_extension("composition.md"));
+        Ok(JsonReporter {
+            writer: std::io::BufWriter::new(file),
+            benchmark_id: None,
+            samples_path,
+            composition_path,
+        })
     }
 }
 
 impl<W: Write + Send> JsonReporter<W> {
     /// Create a new JSON reporter with a custom writer.
     pub fn new(writer: W) -> Self {
-        Self { writer, benchmark_id: None, samples_path: None }
+        Self { writer, benchmark_id: None, samples_path: None, composition_path: None }
     }
 
     /// Set the benchmark identifier written to the JSON report.
@@ -602,6 +618,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             run_stats: report.run_stats.clone(),
             metadata,
             receipt_metrics: report.receipt_metrics.clone(),
+            block_composition: report.block_composition.clone(),
             total_fees_paid: report.total_fees_paid.map(|fees| fees.to_string()),
             samples: Vec::new(),
             call: report.call.clone(),
@@ -609,6 +626,40 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
 
         serde_json::to_writer_pretty(&mut self.writer, &json_report)?;
         writeln!(self.writer)?;
+
+        if let Some(path) = &self.composition_path &&
+            let Some(composition) = &report.block_composition
+        {
+            let mut output =
+                BufWriter::new(File::create(path).context("failed to create composition summary")?);
+            writeln!(output, "# Measured block composition\n")?;
+            writeln!(
+                output,
+                "{} blocks, {} included non-system transactions, {} gas.\n",
+                composition.block_count, composition.summary.tx_count, composition.summary.gas_used
+            )?;
+            writeln!(output, "Shares are run-wide totals, not averages of per-block percentages. Reverted transactions are included; zero-gas system receipts are excluded. Unlabelled transactions are shown as untracked.\n")?;
+            writeln!(output, "| Input / transaction kind | Included txs | Tx count % | Gas used | Gas % | Reverted txs |")?;
+            writeln!(output, "| --- | ---: | ---: | ---: | ---: | ---: |")?;
+            for kind in &composition.summary.kinds {
+                let input = kind
+                    .input
+                    .as_deref()
+                    .unwrap_or("untracked")
+                    .replace('|', "\\|")
+                    .replace(['\n', '\r'], " ");
+                writeln!(
+                    output,
+                    "| {input} | {} | {:.4} | {} | {:.4} | {} |",
+                    kind.tx_count,
+                    kind.tx_count_pct,
+                    kind.gas_used,
+                    kind.gas_pct,
+                    kind.reverted_tx_count
+                )?;
+            }
+            output.flush()?;
+        }
 
         // Stream-compress the finalized NDJSON archive to the report sidecar.
         if let Some(samples_path) = &self.samples_path &&
@@ -1168,6 +1219,35 @@ mod tests {
         assert_eq!(parsed["receipt_metrics"][0]["gas_used"]["p95"], 21_000.0);
         assert_eq!(parsed["receipt_metrics"][0]["fee_paid"]["mean"], 42_000.0);
         assert_eq!(parsed["total_fees_paid"], "42000");
+    }
+
+    #[test]
+    fn test_json_reporter_includes_block_composition() {
+        let mut report = sample_report();
+        report.block_composition = Some(RunComposition {
+            block_count: 1,
+            summary: crate::composition::TransactionComposition {
+                tx_count: 1,
+                gas_used: "21000".into(),
+                kinds: vec![crate::composition::KindComposition {
+                    input: Some("future_preset".into()),
+                    tx_count: 1,
+                    tx_count_pct: 100.0,
+                    gas_used: "21000".into(),
+                    gas_pct: 100.0,
+                    reverted_tx_count: 0,
+                }],
+            },
+            blocks: Vec::new(),
+        });
+        let mut output = Vec::new();
+        JsonReporter::new(&mut output).finalize(&report).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["block_composition"]["summary"]["kinds"][0]["input"], "future_preset");
+        assert_eq!(parsed["block_composition"]["summary"]["kinds"][0]["gas_pct"], 100.0);
+        assert_eq!(parsed["block_composition"]["summary"]["kinds"][0]["tx_count_pct"], 100.0);
+        let restored: JsonReport = serde_json::from_slice(&output).unwrap();
+        assert_eq!(restored.block_composition, report.block_composition);
     }
 
     #[test]
