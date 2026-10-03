@@ -782,6 +782,30 @@ impl NetworkAdapter for TempoAdapter {
 
         Ok(())
     }
+
+    fn simulation_request(
+        &self,
+        tx_request: &TxRequest<TempoTransactionRequest, TempoSignContext>,
+        signer: &EcdsaSigner,
+    ) -> Result<serde_json::Value> {
+        let mut request = tx_request.request.clone();
+        if request.inner.to.is_none() &&
+            let Some(last_call) = request.calls.pop()
+        {
+            request.inner.to = Some(last_call.to);
+            request.inner.value = Some(last_call.value);
+            request.inner.input = last_call.input.into();
+        }
+        if let TempoSignContext::Deferred { key_authorization: Some(authorization), .. } =
+            &tx_request.sign_context
+        {
+            let signature = signer.sign_hash_sync(&authorization.signature_hash())?;
+            request.set_key_authorization(
+                authorization.clone().into_signed(PrimitiveSignature::Secp256k1(signature)),
+            );
+        }
+        Ok(serde_json::to_value(request)?)
+    }
 }
 
 fn resolve_nonce_mode(
@@ -2094,5 +2118,34 @@ nonce_key:
         let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
         let key = compute_scheduling_key(sender, TempoNonceMode::Protocol, &mut ctx);
         assert_eq!(key, sender.0 .0);
+    }
+
+    #[test]
+    fn simulation_normalization_preserves_batch_calls_without_extra_create() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        let adapter = TempoAdapter::new();
+        let mut tx_request =
+            adapter.build_request(base_template(TempoTxType::Tempo), &mut ctx).unwrap();
+        for count in [1, 3] {
+            let mut calls = vec![tx_request.request.calls[0].clone(); count];
+            for (index, call) in calls.iter_mut().enumerate() {
+                call.value = U256::from(index);
+            }
+            tx_request.request.calls = calls.clone();
+            let normalized: TempoTransactionRequest = serde_json::from_value(
+                adapter
+                    .simulation_request(&tx_request, accounts.get_by_index("users", 0).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(normalized.inner.to.is_some());
+            assert_eq!(normalized.clone().build_aa().unwrap().calls, calls);
+            assert_eq!(tx_request.request.calls, calls);
+        }
     }
 }
