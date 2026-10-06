@@ -356,15 +356,26 @@ instead of `--warmup`. The JSON array contains `validator_name`, `rpc_url`,
 `consensus_metrics_url`, and `execution_metrics_url` for every validator. Warm-up
 ends once every finalized-self-proposal counter increases. Then outstanding work
 is flushed, every pool is cleared with `debug_clearTxpool`, and all pending/queued
-counts must stay zero while Finish checkpoints reach a fixed post-drain height.
-Requires debug RPC and state masking disabled. `--warmup-timeout` and
-`--cooldown-timeout` each default to 300s; failures abort measurement. Phase times
-and readiness evidence are included in report metadata.
+counts must stay zero while Finish checkpoints reach a fixed height. This is the
+post-warmup reset. It requires debug RPC and state masking disabled.
+`--warmup-timeout` limits the proposer wait, and `--post-warmup-reset-timeout`
+limits the reset; each defaults to 300s. Failures abort measurement. Phase times
+and readiness evidence are included in report metadata. The old
+`--cooldown-timeout` spelling remains accepted.
+
+After the reset, the benchmark resumes sending for `--measurement-delay`
+(default `1s`) before measurement starts. It keeps sending for the same
+unmeasured interval after the full `--duration` window ends, then flushes and
+drains. Use `500ms` for shorter intervals or `0s` to disable both. Ramp-up and
+tail submissions use separate metrics collectors; chain statistics use the
+blocks observed at the start and end of the measured window. The sender stays
+in use across both boundaries, and ramp-up timing is included in report
+metadata. These intervals only apply with `--warmup-validators`.
 
 With `--duration`, keep the producer alive across preparation (for example,
 `generate -n 18446744073709551615`); an early EOF is an error. For expiring Tempo
 transactions, use `generate --defer-signing` and `send --late-signing-spec` so
-cooldown does not age buffered signatures. This supports standard/sponsored
+the reset does not age buffered signatures. This supports standard/sponsored
 relative-expiry transactions; keychain-auth transactions are still signed early.
 
 Send pre-generated transactions from NDJSON file or stdin.
@@ -422,7 +433,7 @@ txgen-tempo generate -s workload.yaml -n 1000 --defer-signing | bench send --lat
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
 | `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url` |
 | `--collect-latencies` | Collect and report aggregate latency stats plus individual request samples under `time_series.latencies` (default: disabled) |
-| `--collect-receipt-metrics` | Collect non-system transaction gas and fee metrics with block-level receipt requests after sending |
+| `--collect-receipt-metrics[=true\|false]` | Enabled by default: collect non-system transaction gas, fee, and composition metrics using block receipts only after sending and draining finish; `=false` disables collection |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 0, set >0 to enable) |
 
@@ -779,9 +790,13 @@ The bench JSON report includes:
 - `samples` — point-in-time metric snapshots (internal + node), stored as a time series
 - `blocks` — factual chain data for each block in the run (tx count, gas used, etc.)
 - `receipt_metrics` — confirmed-transaction `gas_used`, `effective_gas_price`, and `fee_paid` distributions grouped by workload input
+- `block_composition` — actual included non-system transaction composition over the same retained measured `blocks`: a run-wide `summary` and individual `blocks`, each containing exact `tx_count` and decimal-string `gas_used` totals and `kinds` with `input`, `tx_count_pct`, `gas_pct`, and `reverted_tx_count`. Percentages include reverted transactions, which consume block capacity. Input labels are generated template names or `sequence.step` names, so new presets require no classifier changes. Untracked transactions have `input: null` and remain in the denominator. System receipts with zero gas are excluded. Missing receipts or a receipt gas total that differs from the block header fail reporting rather than publish partial composition.
+
 - `total_fees_paid` — exact total paid by confirmed non-system transactions in the benchmark block range, encoded as a decimal base-unit string
 
 Receipts without `effectiveGasPrice` or legacy `gasPrice` still contribute gas usage to `receipt_metrics`, but are excluded from `total_fees_paid`.
+
+Receipt collection is entirely post-run and does not issue gas-reporting receipt requests during submission. Gas/fee distributions, composition, and ClickHouse receipt rows are restricted to the measured blocks after warmup and trailing-empty-block trimming. Run-wide percentages are weighted by total transaction count and total gas, not the unweighted mean of per-block percentages; divide a kind's run-wide `tx_count` by `block_composition.block_count` for its average transactions per measured block. Both Tempo `bench-e2e` and multi-region workflows upload these JSON reports in their existing results artifacts (`report-*.json` and phase `txgen-report.json`, respectively).
 
 ### Prometheus Reporting
 
@@ -1616,6 +1631,23 @@ mix:
   - sequence: two_transfers
     weight: 10
 ```
+
+### Gas-Weighted Mix
+
+`generate --gas-weighted-mix --rpc <url>` interprets mix weights as target shares
+of submitted block gas rather than workload-item counts. It simulates one instance
+of each positive-weight item with `eth_simulateV1` before workload generation and
+every 10 seconds thereafter, selecting items proportionally to `weight / gas`.
+Sequence steps are simulated together and charged their total simulated block
+`gasUsed`, which follows the node's block-capacity accounting. Sampling clones
+the generator's nonce and RNG state and does not submit transactions. Sampling
+failures abort generation; there are no retries or fallback estimates.
+
+Confirm setup before sampling: generate setup with `--count 0 --setup-state-out
+setup.json`, submit it successfully, then generate workload with
+`--setup-state-in setup.json --gas-weighted-mix`. Setup-state reuse does not
+support `keychain_authorize_pool`. Gas shares are estimates, not guarantees for
+individual mined blocks; inspect the report's `block_composition` for actuals.
 
 ### Account Selection
 

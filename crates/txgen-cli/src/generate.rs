@@ -29,6 +29,7 @@ fn default_signing_workers() -> usize {
 }
 
 const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const GAS_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Args)]
 #[command(group(
@@ -85,6 +86,11 @@ pub struct GenerateArgs {
     /// setup again. Fetches current workload nonces using --rpc.
     #[arg(long, requires = "rpc", conflicts_with = "setup_state_out")]
     pub setup_state_in: Option<PathBuf>,
+
+    /// Interpret mix weights as gas shares, sampling each workload item every 10s.
+    /// Setup must be confirmed before workload generation starts.
+    #[arg(long, requires = "rpc")]
+    pub gas_weighted_mix: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -103,6 +109,7 @@ pub struct GenerateContext {
     defer_signing: bool,
     setup_state_in: Option<SetupState>,
     setup_state_out: Option<PathBuf>,
+    gas_sample_rpc: Option<String>,
 }
 
 impl GenerateContext {
@@ -115,6 +122,13 @@ impl GenerateContext {
             .wrap_err_with(|| format!("failed to load spec: {}", args.spec.display()))?;
         if args.setup_state_out.is_some() && args.count != Some(0) {
             bail!("--setup-state-out requires --count 0; submit setup successfully before generating workload");
+        }
+        if args.gas_weighted_mix &&
+            args.count != Some(0) &&
+            spec.setup.as_ref().is_some_and(|setup| !setup.steps.is_empty()) &&
+            args.setup_state_in.is_none()
+        {
+            bail!("gas-weighted generation requires confirmed setup via --setup-state-in");
         }
         if (args.setup_state_in.is_some() || args.setup_state_out.is_some()) &&
             spec.setup.as_ref().is_some_and(|setup| {
@@ -155,6 +169,7 @@ impl GenerateContext {
             defer_signing: args.defer_signing,
             setup_state_in,
             setup_state_out: args.setup_state_out.clone(),
+            gas_sample_rpc: args.gas_weighted_mix.then(|| args.rpc.clone()).flatten(),
         })
     }
 
@@ -817,6 +832,15 @@ pub trait NetworkAdapter: Send + Sync {
             fetch_protocol_nonces(accounts, nonces, rpc).await
         }
     }
+
+    /// Normalize adapter-specific fields for eth_simulateV1.
+    fn simulation_request(
+        &self,
+        request: &TxRequest<<Self::Network as Network>::TransactionRequest, Self::SignContext>,
+        _signer: &EcdsaSigner,
+    ) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(&request.request)?)
+    }
 }
 
 pub(crate) async fn run_generate<A>(mut adapter: A, args: GenerateArgs) -> Result<()>
@@ -950,6 +974,12 @@ struct GenerationLimit {
     duration: Option<Duration>,
 }
 
+struct GenerationConfig<'a> {
+    limit: GenerationLimit,
+    signing_workers: usize,
+    gas_sample_rpc: Option<&'a str>,
+}
+
 fn generate_loop<A>(
     adapter: &mut A,
     ctx: &mut GenerateContext,
@@ -993,8 +1023,11 @@ where
             let written = generate_txs(
                 adapter,
                 &ctx.spec,
-                ctx.limit,
-                ctx.signing_workers,
+                GenerationConfig {
+                    limit: ctx.limit,
+                    signing_workers: ctx.signing_workers,
+                    gas_sample_rpc: ctx.gas_sample_rpc.as_deref(),
+                },
                 &setup_bindings,
                 &mut build_ctx,
                 &mut writer,
@@ -1016,8 +1049,11 @@ where
             generate_txs(
                 adapter,
                 &ctx.spec,
-                ctx.limit,
-                ctx.signing_workers,
+                GenerationConfig {
+                    limit: ctx.limit,
+                    signing_workers: ctx.signing_workers,
+                    gas_sample_rpc: ctx.gas_sample_rpc.as_deref(),
+                },
                 &setup_bindings,
                 &mut build_ctx,
                 &mut writer,
@@ -1121,6 +1157,8 @@ struct WeightedWorkloadItem {
     tx_count: u64,
     weight: u64,
     cumulative_weight: u64,
+    gas_weight: f64,
+    cumulative_gas_weight: f64,
 }
 
 /// Precompute weights and validate references once. The remaining transaction
@@ -1129,11 +1167,19 @@ struct WorkloadSelector {
     entries: Vec<WeightedWorkloadItem>,
     total_weight: u64,
     max_tx_count: u64,
+    gas_weighted: bool,
+    total_gas_weight: f64,
 }
 
 impl WorkloadSelector {
     fn new(spec: &WorkloadSpec, remaining_txs: u64) -> Result<Self> {
-        let mut selector = Self { entries: Vec::new(), total_weight: 0, max_tx_count: 0 };
+        let mut selector = Self {
+            entries: Vec::new(),
+            total_weight: 0,
+            max_tx_count: 0,
+            gas_weighted: false,
+            total_gas_weight: 0.0,
+        };
         if remaining_txs == 0 {
             return Ok(selector);
         }
@@ -1150,6 +1196,8 @@ impl WorkloadSelector {
                     tx_count,
                     weight: entry.weight,
                     cumulative_weight: selector.total_weight,
+                    gas_weight: 0.0,
+                    cumulative_gas_weight: 0.0,
                 });
             }
         }
@@ -1163,18 +1211,40 @@ impl WorkloadSelector {
             self.entries.retain(|entry| entry.tx_count <= remaining_txs);
             self.total_weight = 0;
             self.max_tx_count = 0;
+            self.total_gas_weight = 0.0;
             for entry in &mut self.entries {
                 self.total_weight += entry.weight;
                 entry.cumulative_weight = self.total_weight;
+                self.total_gas_weight += entry.gas_weight;
+                entry.cumulative_gas_weight = self.total_gas_weight;
                 self.max_tx_count = self.max_tx_count.max(entry.tx_count);
             }
         }
         if self.total_weight == 0 {
             return None;
         }
+        if self.gas_weighted {
+            let roll = rng.random_range(0.0..self.total_gas_weight);
+            let index = self.entries.partition_point(|entry| entry.cumulative_gas_weight <= roll);
+            return Some(&self.entries[index].item);
+        }
         let roll = rng.random_range(0..self.total_weight);
         let index = self.entries.partition_point(|entry| entry.cumulative_weight <= roll);
         Some(&self.entries[index].item)
+    }
+
+    fn set_gas_estimates(&mut self, estimates: &[u64]) -> Result<()> {
+        if estimates.len() != self.entries.len() || estimates.contains(&0) {
+            bail!("gas sampling must return positive gas usage for each workload item");
+        }
+        self.total_gas_weight = 0.0;
+        for (entry, gas) in self.entries.iter_mut().zip(estimates) {
+            entry.gas_weight = entry.weight as f64 / *gas as f64;
+            self.total_gas_weight += entry.gas_weight;
+            entry.cumulative_gas_weight = self.total_gas_weight;
+        }
+        self.gas_weighted = true;
+        Ok(())
     }
 }
 
@@ -1696,8 +1766,7 @@ where
 fn generate_txs<A, W: Write>(
     adapter: &A,
     spec: &WorkloadSpec,
-    limit: GenerationLimit,
-    signing_workers: usize,
+    config: GenerationConfig<'_>,
     setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
@@ -1709,7 +1778,20 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
+    let GenerationConfig { limit, signing_workers, gas_sample_rpc } = config;
     let mut selector = WorkloadSelector::new(spec, limit.count.unwrap_or(u64::MAX))?;
+    let gas_provider = gas_sample_rpc
+        .map(|rpc| {
+            Ok::<_, eyre::Report>(
+                alloy_provider::ProviderBuilder::new()
+                    .connect_http(rpc.parse().wrap_err("invalid gas sampling RPC URL")?),
+            )
+        })
+        .transpose()?;
+    if let Some(provider) = &gas_provider {
+        refresh_gas_estimates(adapter, spec, setup_bindings, ctx, &mut selector, provider)?;
+    }
+    let mut last_gas_sample = Instant::now();
     let mut signing_pool = SigningPool::new(signing_workers)?;
     let mut written = 0u64;
     let mut sequence_instances = 0u64;
@@ -1724,6 +1806,12 @@ where
     while limit.count.is_none_or(|count| written < count) {
         if limit.duration.is_some_and(|duration| start.elapsed() > duration) {
             break;
+        }
+        if let Some(provider) = &gas_provider &&
+            last_gas_sample.elapsed() >= GAS_SAMPLE_INTERVAL
+        {
+            refresh_gas_estimates(adapter, spec, setup_bindings, ctx, &mut selector, provider)?;
+            last_gas_sample = Instant::now();
         }
 
         let remaining = limit.count.map(|count| count - written).unwrap_or(u64::MAX);
@@ -2189,6 +2277,136 @@ fn account_ref_value(pool: &str, index: usize) -> Result<serde_yaml::Value> {
     Ok(serde_yaml::Value::Mapping(account))
 }
 
+fn sample_workload_calls<A: NetworkAdapter>(
+    adapter: &A,
+    spec: &WorkloadSpec,
+    item: &MixItem,
+    setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
+    ctx: &mut BuildContext<'_>,
+) -> Result<Vec<serde_json::Value>> {
+    let mut nonces = ctx.nonces.clone();
+    let mut rng = ctx.rng.clone();
+    let mut sample_ctx = BuildContext::new_with_address_pools(
+        ctx.chain_id,
+        ctx.gas,
+        ctx.accounts,
+        ctx.address_pools,
+        ctx.artifacts,
+        &mut nonces,
+        &mut rng,
+    );
+    let templates = match item {
+        MixItem::Template(name) => {
+            vec![(name.clone(), substitute_vars(spec.templates[name].clone(), setup_bindings)?)]
+        }
+        MixItem::Sequence(name) => {
+            let sequence = &spec.sequences[name];
+            let bindings =
+                resolve_sequence_bindings(&sequence.bindings, &mut sample_ctx, setup_bindings)?;
+            sequence
+                .steps
+                .iter()
+                .map(|step| {
+                    let value = merge_template_overlay(
+                        spec.templates[&step.template].clone(),
+                        step.with_value.clone(),
+                    );
+                    Ok((
+                        format!("{name}.{}", step.name.as_deref().unwrap_or(&step.template)),
+                        substitute_vars(value, &bindings)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+    templates
+        .into_iter()
+        .map(|(name, value)| {
+            let job = prepare_signing_job(
+                adapter,
+                name,
+                value,
+                TxPhase::Workload,
+                &[],
+                0,
+                &mut sample_ctx,
+            )?;
+            let mut call = adapter.simulation_request(&job.tx_req, &job.signer)?;
+            call["from"] = serde_json::to_value(job.signer.address())?;
+            call.as_object_mut()
+                .ok_or_else(|| eyre::eyre!("simulation request must be an object"))?
+                .remove("nonce");
+            Ok(call)
+        })
+        .collect()
+}
+
+fn simulation_gas(response: &serde_json::Value, expected_calls: usize) -> Result<u64> {
+    let blocks = response.as_array().ok_or_else(|| eyre::eyre!("invalid simulation response"))?;
+    if blocks.len() != 1 {
+        bail!("gas sampling expected one simulated block");
+    }
+    let calls = blocks[0]["calls"]
+        .as_array()
+        .ok_or_else(|| eyre::eyre!("simulation response is missing calls"))?;
+    if calls.len() != expected_calls {
+        bail!("gas sampling returned {} calls, expected {expected_calls}", calls.len());
+    }
+    for (index, call) in calls.iter().enumerate() {
+        if call["status"] != "0x1" {
+            bail!("gas sample call {index} failed: {}", call["error"]);
+        }
+    }
+    let gas = blocks[0]["gasUsed"]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("simulation response is missing block gasUsed"))?;
+    let gas = u64::from_str_radix(
+        gas.strip_prefix("0x").ok_or_else(|| eyre::eyre!("invalid simulation gasUsed"))?,
+        16,
+    )?;
+    if gas == 0 {
+        bail!("gas sample consumed zero block gas");
+    }
+    Ok(gas)
+}
+
+fn refresh_gas_estimates<A: NetworkAdapter>(
+    adapter: &A,
+    spec: &WorkloadSpec,
+    setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
+    ctx: &mut BuildContext<'_>,
+    selector: &mut WorkloadSelector,
+    provider: &impl Provider,
+) -> Result<()> {
+    let mut estimates = Vec::with_capacity(selector.entries.len());
+    for entry in &selector.entries {
+        let calls = sample_workload_calls(adapter, spec, &entry.item, setup_bindings, ctx)?;
+        let expected_calls = calls.len();
+        let payload = serde_json::json!({
+            "blockStateCalls": [{"calls": calls}],
+            "validation": false,
+            "traceTransfers": false,
+        });
+        let response = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                provider
+                    .client()
+                    .request::<_, serde_json::Value>("eth_simulateV1", (payload, "latest"))
+                    .await
+            })
+        })
+        .wrap_err_with(|| format!("gas sampling failed for {:?}", entry.item))?;
+        let gas = simulation_gas(&response, expected_calls)
+            .wrap_err_with(|| format!("invalid gas sample for {:?}", entry.item))?;
+        eprintln!(
+            "gas sample: item={:?} block_gas={gas} target_weight={}",
+            entry.item, entry.weight
+        );
+        estimates.push(gas);
+    }
+    selector.set_gas_estimates(&estimates)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2523,5 +2741,180 @@ call:
 
         let error = sign_prepared_materialized_template(prepared).unwrap_err();
         assert!(error.to_string().contains("changed the prepared scheduling keys"));
+    }
+
+    #[test]
+    fn gas_selector_targets_gas_shares_and_refreshes() -> Result<()> {
+        let spec = WorkloadSpec::parse("chain_id: 1\ntemplates: {cheap: {}, expensive: {}}\nmix:\n- {template: cheap, weight: 80}\n- {template: expensive, weight: 20}\n")?;
+        let mut selector = WorkloadSelector::new(&spec, u64::MAX)?;
+        let mut rng = StdRng::seed_from_u64(42);
+        for estimates in [[10, 100], [100, 10]] {
+            selector.set_gas_estimates(&estimates)?;
+            let mut gas = [0u64; 2];
+            for _ in 0..100_000 {
+                let index = match selector.pick(&mut rng, u64::MAX).unwrap() {
+                    MixItem::Template(name) if name == "cheap" => 0,
+                    _ => 1,
+                };
+                gas[index] += estimates[index];
+            }
+            let share = gas[0] as f64 / (gas[0] + gas[1]) as f64;
+            assert!((share - 0.8).abs() < 0.01, "gas share was {share}");
+        }
+        assert!(selector.set_gas_estimates(&[0, 1]).is_err());
+        assert!(selector.set_gas_estimates(&[1]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn gas_selector_prunes_sequences_without_losing_gas_weights() -> Result<()> {
+        let mut spec = selector_spec();
+        spec.mix.retain(|entry| entry.weight > 0);
+        let mut selector = WorkloadSelector::new(&spec, 100)?;
+        selector.set_gas_estimates(&[10, 70, 30, 10, 10])?;
+        let mut rng = StdRng::seed_from_u64(3);
+        assert!(selector.pick(&mut rng, 1).is_some());
+        assert_eq!(selector.entries.len(), 3);
+        assert!((selector.total_gas_weight - 0.8).abs() < f64::EPSILON);
+        for _ in 0..100 {
+            assert!(matches!(selector.pick(&mut rng, 1), Some(MixItem::Template(_))));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn simulation_gas_uses_block_capacity_and_rejects_failed_samples() -> Result<()> {
+        let response = serde_json::json!([{
+            "gasUsed": "0x100", "calls": [
+                {"status": "0x1", "gasUsed": "0x100"},
+                {"status": "0x1", "gasUsed": "0x200"}
+            ]
+        }]);
+        assert_eq!(simulation_gas(&response, 2)?, 256);
+        assert!(simulation_gas(&response, 1).is_err());
+        let mut response = response;
+        response[0]["calls"][1]["status"] = serde_json::json!("0x0");
+        assert!(simulation_gas(&response, 2).is_err());
+        assert!(simulation_gas(&serde_json::json!([]), 0).is_err());
+        assert!(simulation_gas(&serde_json::json!([{"gasUsed": "0x0", "calls": []}]), 0).is_err());
+        Ok(())
+    }
+
+    struct SamplingAdapter;
+
+    impl NetworkAdapter for SamplingAdapter {
+        type Template = serde_yaml::Value;
+        type Network = Ethereum;
+        type SignContext = ();
+
+        fn network_name() -> &'static str {
+            "sampling-test"
+        }
+
+        fn build_request(
+            &self,
+            _template: Self::Template,
+            ctx: &mut BuildContext<'_>,
+        ) -> Result<TxRequest<TransactionRequest>> {
+            Ok(TxRequest {
+                request: TransactionRequest {
+                    nonce: Some(ctx.next_nonce([0x33; 20])),
+                    value: Some(U256::from(ctx.rng.random::<u64>())),
+                    ..Default::default()
+                },
+                signer_pool: "users".to_string(),
+                signer_index: 0,
+                key: [0x33; 20],
+                sign_context: (),
+                late_sign: None,
+            })
+        }
+    }
+
+    fn sampling_spec() -> Result<WorkloadSpec> {
+        WorkloadSpec::parse(
+            r#"
+chain_id: 1
+accounts:
+  users:
+    mnemonic: "test test test test test test test test test test test junk"
+    range: [0, 1]
+templates: {transfer: {}}
+sequences:
+  pair:
+    steps: [{template: transfer}, {template: transfer}]
+mix: [{template: transfer, weight: 1}]
+"#,
+        )
+    }
+
+    #[test]
+    fn gas_sampling_preserves_nonce_rng_and_sequence_order() -> Result<()> {
+        let spec = sampling_spec()?;
+        let accounts = AccountManager::from_spec(&spec.accounts)?;
+        let artifacts = ArtifactManager::empty();
+        let mut nonces = NonceTracker::new();
+        nonces.reset([0x33; 20], 7);
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut expected_rng = rng.clone();
+        let mut ctx = BuildContext::new(1, &spec.gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        let calls = sample_workload_calls(
+            &SamplingAdapter,
+            &spec,
+            &MixItem::Sequence("pair".to_string()),
+            &HashMap::new(),
+            &mut ctx,
+        )?;
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            assert!(call.get("nonce").is_none());
+            assert_eq!(
+                call["from"],
+                serde_json::to_value(accounts.get_by_index("users", 0)?.address())?
+            );
+            assert_eq!(
+                call["value"],
+                serde_json::to_value(U256::from(expected_rng.random::<u64>()))?
+            );
+        }
+        assert_eq!(ctx.nonces.peek(&[0x33; 20]), 7);
+        assert_eq!(ctx.rng.random::<u64>(), StdRng::seed_from_u64(42).random::<u64>());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initial_simulation_failure_aborts_before_emitting_workload() -> Result<()> {
+        let app = axum::Router::new().route("/", axum::routing::post(|axum::Json(request): axum::Json<serde_json::Value>| async move {
+            assert_eq!(request["method"], "eth_simulateV1");
+            assert_eq!(request["params"][0]["blockStateCalls"][0]["calls"].as_array().unwrap().len(), 1);
+            axum::Json(serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32000, "message": "simulation failed"}}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let rpc = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let spec = sampling_spec()?;
+        let accounts = AccountManager::from_spec(&spec.accounts)?;
+        let artifacts = ArtifactManager::empty();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut ctx = BuildContext::new(1, &spec.gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        let mut output = NdjsonWriter::new(Vec::new());
+        let result = generate_txs(
+            &SamplingAdapter,
+            &spec,
+            GenerationConfig {
+                limit: GenerationLimit { count: Some(1), duration: None },
+                signing_workers: 1,
+                gas_sample_rpc: Some(&rpc),
+            },
+            &HashMap::new(),
+            &mut ctx,
+            &mut output,
+        );
+        assert!(result.is_err());
+        assert_eq!(output.count(), 0);
+        assert!(output.into_inner().is_empty());
+        server.abort();
+        Ok(())
     }
 }

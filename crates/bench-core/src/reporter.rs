@@ -8,6 +8,7 @@
 use crate::{
     call::{CallReport, MethodStats},
     clickhouse::ClickHouseClient,
+    composition::RunComposition,
     metrics::{BenchMetrics, BlockStats, RunStats, ThroughputSample, TimeSeriesMetrics},
     receipt_clickhouse::{insert_receipt_gas_records, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE},
     receipt_metrics::{ReceiptGasRecord, ReceiptMetricGroup},
@@ -48,6 +49,7 @@ pub struct FinalReport {
     pub total_fees_paid: Option<U256>,
     /// Receipt-derived gas details for ClickHouse publication.
     pub receipt_records: Vec<ReceiptGasRecord>,
+    pub block_composition: Option<RunComposition>,
     /// RPC corpus replay results (call mode only).
     pub call: Option<CallReport>,
 }
@@ -425,6 +427,8 @@ pub struct JsonReport {
     /// Receipt-derived gas metrics grouped by workload input labels.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub receipt_metrics: Vec<ReceiptMetricGroup>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub block_composition: Option<RunComposition>,
     /// Exact total fees paid, encoded as a decimal base-unit string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_fees_paid: Option<String>,
@@ -602,6 +606,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             run_stats: report.run_stats.clone(),
             metadata,
             receipt_metrics: report.receipt_metrics.clone(),
+            block_composition: report.block_composition.clone(),
             total_fees_paid: report.total_fees_paid.map(|fees| fees.to_string()),
             samples: Vec::new(),
             call: report.call.clone(),
@@ -1168,6 +1173,35 @@ mod tests {
         assert_eq!(parsed["receipt_metrics"][0]["gas_used"]["p95"], 21_000.0);
         assert_eq!(parsed["receipt_metrics"][0]["fee_paid"]["mean"], 42_000.0);
         assert_eq!(parsed["total_fees_paid"], "42000");
+    }
+
+    #[test]
+    fn test_json_reporter_includes_block_composition() {
+        let mut report = sample_report();
+        report.block_composition = Some(RunComposition {
+            block_count: 1,
+            summary: crate::composition::TransactionComposition {
+                tx_count: 1,
+                gas_used: "21000".into(),
+                kinds: vec![crate::composition::KindComposition {
+                    input: Some("future_preset".into()),
+                    tx_count: 1,
+                    tx_count_pct: 100.0,
+                    gas_used: "21000".into(),
+                    gas_pct: 100.0,
+                    reverted_tx_count: 0,
+                }],
+            },
+            blocks: Vec::new(),
+        });
+        let mut output = Vec::new();
+        JsonReporter::new(&mut output).finalize(&report).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["block_composition"]["summary"]["kinds"][0]["input"], "future_preset");
+        assert_eq!(parsed["block_composition"]["summary"]["kinds"][0]["gas_pct"], 100.0);
+        assert_eq!(parsed["block_composition"]["summary"]["kinds"][0]["tx_count_pct"], 100.0);
+        let restored: JsonReport = serde_json::from_slice(&output).unwrap();
+        assert_eq!(restored.block_composition, report.block_composition);
     }
 
     #[test]
