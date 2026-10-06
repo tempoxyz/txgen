@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+test-utils = []
+
 [dependencies]
 # workspace
 txgen-core.workspace = true
@@ -40,7 +43,9 @@ prost = "0.12"
 flate2 = "1"
 
 [dev-dependencies]
+alloy-json-rpc = "2"
 alloy-rpc-client = "2"
 snap = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "test-util"] }
+tower = { version = "0.5", features = ["util"] }

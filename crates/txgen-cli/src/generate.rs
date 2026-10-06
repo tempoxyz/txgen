@@ -6,6 +6,7 @@ use alloy_network::{
 };
 use alloy_primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
 use alloy_provider::{DynProvider, Provider};
+use bench_core::pipeline_pressure::{nanos, PressureLog};
 use clap::{ArgGroup, Args};
 use eyre::{bail, Result, WrapErr};
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -1539,6 +1540,63 @@ struct SigningResult {
     result: Result<GeneratedTx>,
 }
 
+#[derive(Default, serde::Serialize)]
+struct GeneratorPressureTotals {
+    signing_workers: usize,
+    submitted_jobs: u64,
+    received_results: u64,
+    written_jobs: u64,
+    in_flight: usize,
+    completed_waiting_order: usize,
+    max_in_flight: usize,
+    recv_calls: u64,
+    recv_wait_ns: u64,
+    write_calls: u64,
+    serialization_write_ns: u64,
+    initial_calibration_ns: u64,
+    periodic_calibration_ns: u64,
+    periodic_calibrations: u64,
+    finish_start_ns: Option<u64>,
+    finish_end_ns: Option<u64>,
+    writer_flush_ns: u64,
+    completed_ok: bool,
+}
+
+impl GeneratorPressureTotals {
+    fn received_after_wait(&mut self, elapsed: Duration) {
+        self.recv_calls = self.recv_calls.saturating_add(1);
+        self.recv_wait_ns = self.recv_wait_ns.saturating_add(nanos(elapsed));
+    }
+
+    fn wrote(&mut self, elapsed: Duration, success: bool) {
+        self.write_calls = self.write_calls.saturating_add(1);
+        self.serialization_write_ns = self.serialization_write_ns.saturating_add(nanos(elapsed));
+        if success {
+            self.written_jobs = self.written_jobs.saturating_add(1);
+        }
+    }
+}
+
+struct GeneratorPressure {
+    log: PressureLog,
+    totals: GeneratorPressureTotals,
+}
+
+impl GeneratorPressure {
+    fn from_env(signing_workers: usize) -> Option<Self> {
+        Some(Self {
+            log: PressureLog::from_env("generator")?,
+            totals: GeneratorPressureTotals { signing_workers, ..Default::default() },
+        })
+    }
+}
+
+impl Drop for GeneratorPressure {
+    fn drop(&mut self) {
+        self.log.emit(&self.totals, true);
+    }
+}
+
 struct SigningPool {
     pool: ThreadPool,
     result_tx: mpsc::Sender<SigningResult>,
@@ -1548,6 +1606,7 @@ struct SigningPool {
     next_to_write: u64,
     in_flight: usize,
     max_in_flight: usize,
+    pressure: Option<GeneratorPressure>,
 }
 
 impl SigningPool {
@@ -1572,7 +1631,21 @@ impl SigningPool {
             next_to_write: 0,
             in_flight: 0,
             max_in_flight: worker_count.saturating_mul(64).max(1),
+            pressure: None,
         })
+    }
+
+    fn pressure_timer(&self) -> Option<Instant> {
+        self.pressure.as_ref().map(|_| Instant::now())
+    }
+
+    fn pressure_checkpoint(&mut self) {
+        if let Some(p) = &mut self.pressure {
+            p.totals.in_flight = self.in_flight;
+            p.totals.completed_waiting_order = self.completed.len();
+            p.totals.max_in_flight = self.max_in_flight;
+            p.log.emit(&p.totals, false);
+        }
     }
 
     fn next_sequence(&mut self) -> Result<u64> {
@@ -1603,14 +1676,30 @@ impl SigningPool {
         let result_tx = self.result_tx.clone();
         self.pool.spawn_fifo(move || submit_signing_job::<A>(job, result_tx));
         self.in_flight += 1;
+        if let Some(p) = &mut self.pressure {
+            p.totals.submitted_jobs = p.totals.submitted_jobs.saturating_add(1);
+            p.totals.in_flight = self.in_flight;
+            p.totals.completed_waiting_order = self.completed.len();
+            p.totals.max_in_flight = self.max_in_flight;
+            if p.totals.submitted_jobs.is_multiple_of(256) {
+                p.log.emit(&p.totals, false);
+            }
+        }
 
         Ok(())
     }
 
     fn finish<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
+        if let Some(p) = &mut self.pressure {
+            p.totals.finish_start_ns = Some(p.log.offset_ns());
+        }
         while self.in_flight > 0 {
             self.recv_one(writer)?;
         }
+        if let Some(p) = &mut self.pressure {
+            p.totals.finish_end_ns = Some(p.log.offset_ns());
+        }
+        self.pressure_checkpoint();
         Ok(())
     }
 
@@ -1631,9 +1720,13 @@ impl SigningPool {
     }
 
     fn recv_one<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
-        let result = self
-            .result_rx
-            .recv()
+        let wait_started = self.pressure_timer();
+        let result = self.result_rx.recv();
+        if let (Some(p), Some(start)) = (&mut self.pressure, wait_started) {
+            // Stop before handle_result, which can serialize and block on stdout.
+            p.totals.received_after_wait(start.elapsed());
+        }
+        let result = result
             .map_err(|_| eyre::eyre!("signing worker pool stopped before completing all jobs"))?;
         self.handle_result(result, writer)
     }
@@ -1643,8 +1736,15 @@ impl SigningPool {
         result: SigningResult,
         writer: &mut NdjsonWriter<W>,
     ) -> Result<()> {
+        if let Some(p) = &mut self.pressure {
+            p.totals.received_results = p.totals.received_results.saturating_add(1);
+        }
         let tx = result.result?;
-        if self.completed.insert(result.sequence, tx).is_some() {
+        let duplicate = self.completed.insert(result.sequence, tx).is_some();
+        if let Some(p) = &mut self.pressure {
+            p.totals.completed_waiting_order = self.completed.len();
+        }
+        if duplicate {
             bail!("received duplicate signing result for sequence {}", result.sequence);
         }
         self.write_ready(writer)
@@ -1652,11 +1752,22 @@ impl SigningPool {
 
     fn write_ready<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
         while let Some(tx) = self.completed.remove(&self.next_to_write) {
+            if let Some(p) = &mut self.pressure {
+                p.totals.completed_waiting_order = self.completed.len();
+            }
             if self.in_flight == 0 {
                 bail!("received unexpected signing result");
             }
-            writer.write(&tx)?;
+            let write_started = self.pressure_timer();
+            let result = writer.write(&tx);
+            if let (Some(p), Some(start)) = (&mut self.pressure, write_started) {
+                p.totals.wrote(start.elapsed(), result.is_ok());
+            }
+            result?;
             self.in_flight -= 1;
+            if let Some(p) = &mut self.pressure {
+                p.totals.in_flight = self.in_flight;
+            }
             self.next_to_write = self
                 .next_to_write
                 .checked_add(1)
@@ -1788,11 +1899,19 @@ where
             )
         })
         .transpose()?;
+    let mut pressure = GeneratorPressure::from_env(signing_workers);
     if let Some(provider) = &gas_provider {
-        refresh_gas_estimates(adapter, spec, setup_bindings, ctx, &mut selector, provider)?;
+        let sample_started = pressure.as_ref().map(|_| Instant::now());
+        let result =
+            refresh_gas_estimates(adapter, spec, setup_bindings, ctx, &mut selector, provider);
+        if let (Some(p), Some(start)) = (&mut pressure, sample_started) {
+            p.totals.initial_calibration_ns = nanos(start.elapsed());
+        }
+        result?;
     }
     let mut last_gas_sample = Instant::now();
     let mut signing_pool = SigningPool::new(signing_workers)?;
+    signing_pool.pressure = pressure;
     let mut written = 0u64;
     let mut sequence_instances = 0u64;
     let start = Instant::now();
@@ -1810,8 +1929,17 @@ where
         if let Some(provider) = &gas_provider &&
             last_gas_sample.elapsed() >= GAS_SAMPLE_INTERVAL
         {
-            refresh_gas_estimates(adapter, spec, setup_bindings, ctx, &mut selector, provider)?;
+            let sample_started = signing_pool.pressure_timer();
+            let result =
+                refresh_gas_estimates(adapter, spec, setup_bindings, ctx, &mut selector, provider);
+            if let (Some(p), Some(start)) = (&mut signing_pool.pressure, sample_started) {
+                p.totals.periodic_calibration_ns =
+                    p.totals.periodic_calibration_ns.saturating_add(nanos(start.elapsed()));
+                p.totals.periodic_calibrations = p.totals.periodic_calibrations.saturating_add(1);
+            }
+            result?;
             last_gas_sample = Instant::now();
+            signing_pool.pressure_checkpoint();
         }
 
         let remaining = limit.count.map(|count| count - written).unwrap_or(u64::MAX);
@@ -1896,7 +2024,13 @@ where
     }
 
     signing_pool.finish(writer)?;
-    writer.flush()?;
+    let flush_started = signing_pool.pressure_timer();
+    let result = writer.flush();
+    if let (Some(p), Some(start)) = (&mut signing_pool.pressure, flush_started) {
+        p.totals.writer_flush_ns = nanos(start.elapsed());
+        p.totals.completed_ok = result.is_ok();
+    }
+    result?;
     eprintln!("workload generation completed: prepared={written} elapsed={:?}", start.elapsed(),);
     Ok(written)
 }
@@ -2414,6 +2548,146 @@ mod tests {
     use alloy_rpc_types_eth::TransactionRequest;
     use std::collections::HashMap;
     use txgen_core::{derive_mnemonic_signer, GasConfig};
+
+    #[test]
+    fn pressure_recv_and_failed_write_have_distinct_accounting() {
+        let mut totals = GeneratorPressureTotals::default();
+        totals.received_after_wait(Duration::from_nanos(7));
+        totals.wrote(Duration::from_nanos(11), true);
+        totals.wrote(Duration::from_nanos(13), false);
+        assert_eq!((totals.recv_calls, totals.recv_wait_ns), (1, 7));
+        assert_eq!(
+            (totals.write_calls, totals.serialization_write_ns, totals.written_jobs),
+            (2, 24, 1)
+        );
+        totals.recv_wait_ns = u64::MAX;
+        totals.received_after_wait(Duration::from_nanos(1));
+        assert_eq!(totals.recv_wait_ns, u64::MAX);
+    }
+
+    #[derive(Default)]
+    struct FailingOutput {
+        bytes: Vec<u8>,
+        limit: Option<usize>,
+    }
+
+    impl Write for FailingOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let count = self.limit.map_or(bytes.len(), |limit| {
+                limit.saturating_sub(self.bytes.len()).min(bytes.len())
+            });
+            if count == 0 && !bytes.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "fixture output closed",
+                ));
+            }
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn pressure_output_tx(sequence: u8) -> GeneratedTx {
+        GeneratedTx {
+            depends_on: Vec::new(),
+            phase: TxPhase::Workload,
+            id: Some(format!("ordered-{sequence}")),
+            raw: Bytes::from(vec![2, sequence]),
+            late_sign: None,
+            sender: None,
+            submission_keys: vec![SchedulingKey::from([sequence; 20])],
+            inclusion_keys: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn enabled_pressure_preserves_ordered_output_and_partial_write_error() {
+        let mut expected = NdjsonWriter::new(Vec::new());
+        expected.write(&pressure_output_tx(0)).unwrap();
+        let first_line_bytes = expected.into_inner();
+        let mut expected = NdjsonWriter::new(first_line_bytes.clone());
+        expected.write(&pressure_output_tx(1)).unwrap();
+        expected.write(&pressure_output_tx(2)).unwrap();
+        let expected = expected.into_inner();
+        let failure_limit = first_line_bytes.len() + 13;
+
+        for limit in [None, Some(failure_limit)] {
+            for enabled in [false, true] {
+                let mut pool = SigningPool::new(1).unwrap();
+                // Inject already completed signing results to make out-of-order
+                // completion deterministic without depending on worker timing.
+                pool.in_flight = 3;
+                if enabled {
+                    pool.pressure = Some(GeneratorPressure {
+                        log: PressureLog::for_test("generator"),
+                        totals: GeneratorPressureTotals {
+                            signing_workers: 1,
+                            ..Default::default()
+                        },
+                    });
+                    pool.pressure_checkpoint();
+                }
+                let mut writer = NdjsonWriter::new(FailingOutput { bytes: Vec::new(), limit });
+                for sequence in [1, 2] {
+                    pool.handle_result(
+                        SigningResult {
+                            sequence: u64::from(sequence),
+                            result: Ok(pressure_output_tx(sequence)),
+                        },
+                        &mut writer,
+                    )
+                    .unwrap();
+                    assert_eq!(writer.count(), 0);
+                    if let Some(p) = &pool.pressure {
+                        assert_eq!(p.totals.completed_waiting_order, pool.completed.len());
+                        assert_eq!(p.totals.completed_waiting_order, usize::from(sequence));
+                    }
+                }
+                let result = pool.handle_result(
+                    SigningResult { sequence: 0, result: Ok(pressure_output_tx(0)) },
+                    &mut writer,
+                );
+                if limit.is_some() {
+                    assert!(result.unwrap_err().to_string().contains("fixture output closed"));
+                    assert_eq!(writer.count(), 1);
+                    assert_eq!(pool.next_to_write, 1);
+                    assert_eq!(pool.in_flight, 2);
+                    assert_eq!(pool.completed.keys().copied().collect::<Vec<_>>(), vec![2]);
+                    if let Some(p) = &pool.pressure {
+                        assert_eq!(p.totals.received_results, 3);
+                        assert_eq!(p.totals.write_calls, 2);
+                        assert_eq!(p.totals.written_jobs, 1);
+                        assert_eq!(p.totals.in_flight, 2);
+                        assert_eq!(p.totals.completed_waiting_order, 1);
+                        assert!(!p.totals.completed_ok);
+                    }
+                    assert_eq!(writer.into_inner().bytes, expected[..failure_limit]);
+                } else {
+                    result.unwrap();
+                    pool.finish(&mut writer).unwrap();
+                    assert_eq!(writer.count(), 3);
+                    assert_eq!(pool.next_to_write, 3);
+                    assert_eq!(pool.in_flight, 0);
+                    assert!(pool.completed.is_empty());
+                    if let Some(p) = &pool.pressure {
+                        assert_eq!(p.totals.received_results, 3);
+                        assert_eq!(p.totals.write_calls, 3);
+                        assert_eq!(p.totals.written_jobs, 3);
+                        assert_eq!(p.totals.in_flight, 0);
+                        assert_eq!(p.totals.completed_waiting_order, 0);
+                        assert!(p.totals.finish_start_ns.is_some());
+                        assert!(p.totals.finish_end_ns.is_some());
+                        assert!(p.totals.finish_start_ns <= p.totals.finish_end_ns);
+                    }
+                    assert_eq!(writer.into_inner().bytes, expected);
+                }
+            }
+        }
+    }
 
     struct PendingPrepareAdapter;
     struct MutatingKeyAdapter;

@@ -191,6 +191,7 @@ async fn execute_source<S: TxSource>(
     };
     let metrics = MetricsCollector::new_with_latencies(clock.clone(), args.collect_latencies);
     sender.set_metrics(metrics.clone());
+    sender.enable_pipeline_pressure(config.max_concurrent);
     let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
     if let Some(collector) = &receipt_collector {
         sender = sender.with_receipt_collector(collector.handle());
@@ -597,31 +598,46 @@ async fn send_workload_from_source<S: TxSource>(
     // keeps the post-reset ramp-up outside the full requested duration.
     let start_unix_ms = metrics.clock().unix_ms();
     let deadline = interval.duration.map(|duration| tokio::time::Instant::now() + duration);
+    sender.pressure_interval(interval.name);
     if let Some(tx) = interval.first_workload {
         send_workload_tx(tx, sender, metrics, config, reporters).await?;
     }
     loop {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            sender.pressure_source_end("deadline");
+            break;
+        }
+        let wait_started = sender.pressure_timer();
         let next = if let Some(deadline) = deadline {
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
             match tokio::time::timeout_at(deadline, source.next_tx()).await {
-                Ok(next) => next?,
-                Err(_) => break,
+                Ok(next) => next,
+                Err(_) => {
+                    sender.pressure_source_wait(wait_started, false);
+                    sender.pressure_source_end("source_timeout");
+                    break;
+                }
             }
         } else {
-            source.next_tx().await?
+            source.next_tx().await
         };
-        let Some(tx) = next else {
+        sender.pressure_source_wait(wait_started, next.as_ref().is_ok_and(|tx| tx.is_none()));
+        if next.is_err() {
+            sender.pressure_source_end("source_error");
+        }
+        let Some(tx) = next? else {
             if deadline.is_some_and(|deadline| tokio::time::Instant::now() < deadline) {
+                sender.pressure_source_end("early_eof");
                 bail!("input ended before the requested {} duration", interval.name);
             }
+            sender.pressure_source_end("eof");
             break;
         };
         if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            sender.pressure_source_end("deadline_after_read");
             break;
         }
         if tx.phase == TxPhase::Setup {
+            sender.pressure_source_end("unexpected_setup");
             bail!("setup transaction appeared after workload started");
         }
         send_workload_tx(tx, sender, metrics, config, reporters).await?;
@@ -649,7 +665,11 @@ async fn send_workload_tx(
     config: &SenderConfig,
     reporters: &mut [Box<dyn Reporter>],
 ) -> Result<()> {
-    sender.send(tx).await?;
+    let result = sender.send(tx).await;
+    if result.is_err() {
+        sender.pressure_source_end("sender_error");
+    }
+    result?;
 
     let (sent, success, failed) = metrics.counts();
     if sent.is_multiple_of(1000) {
@@ -706,5 +726,140 @@ async fn wait_for_pool_drain<P: TxPoolApi<AnyNetwork>>(
             zero_count = 0;
             tracing::debug!(pending, "Txpool still draining...");
         }
+    }
+}
+
+#[cfg(test)]
+mod pressure_tests {
+    use super::*;
+    use alloy_transport::mock::Asserter;
+    use std::future::Future;
+
+    #[derive(Clone, Copy)]
+    enum SourceBehavior {
+        Eof,
+        Error,
+        Pending,
+    }
+
+    struct TestSource {
+        behavior: SourceBehavior,
+        calls: usize,
+    }
+
+    impl TxSource for TestSource {
+        async fn next_tx(&mut self) -> Result<Option<GeneratedTx>> {
+            self.calls += 1;
+            match self.behavior {
+                SourceBehavior::Eof => Ok(None),
+                SourceBehavior::Error => bail!("fixture source failure"),
+                SourceBehavior::Pending => std::future::pending().await,
+            }
+        }
+    }
+
+    fn test_sender(config: &SenderConfig, metrics: Arc<MetricsCollector>) -> Sender {
+        let provider = ProviderBuilder::new_with_network::<AnyNetwork>()
+            .connect_mocked_client(Asserter::new())
+            .erased();
+        Sender::new(vec![provider], config.clone(), metrics)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn enabled_pressure_source_endpoints_preserve_results() {
+        for (reason, behavior, duration, expected_error, reads, eof) in [
+            ("eof", SourceBehavior::Eof, None, None, 1, true),
+            ("source_error", SourceBehavior::Error, None, Some("fixture source failure"), 1, false),
+            (
+                "early_eof",
+                SourceBehavior::Eof,
+                Some(Duration::from_secs(1)),
+                Some("input ended before the requested semantic duration"),
+                1,
+                true,
+            ),
+            ("deadline", SourceBehavior::Pending, Some(Duration::ZERO), None, 0, false),
+            (
+                "source_timeout",
+                SourceBehavior::Pending,
+                Some(Duration::from_secs(1)),
+                None,
+                1,
+                false,
+            ),
+        ] {
+            for enabled in [false, true] {
+                let metrics = MetricsCollector::new(RunClock::new());
+                let config = SenderConfig { rate_limit: 0, max_concurrent: 1 };
+                let mut sender = test_sender(&config, metrics.clone());
+                if enabled {
+                    sender.enable_pipeline_pressure_for_test(1);
+                }
+                let mut source = TestSource { behavior, calls: 0 };
+                let mut reporters = Vec::new();
+                let result = send_workload_from_source(
+                    &mut source,
+                    &mut sender,
+                    &metrics,
+                    &config,
+                    &mut reporters,
+                    SendInterval { first_workload: None, duration, name: "semantic" },
+                )
+                .await;
+                match expected_error {
+                    Some(message) => assert!(result.unwrap_err().to_string().contains(message)),
+                    None => {
+                        result.unwrap();
+                    }
+                }
+                assert_eq!(source.calls, reads);
+                assert_eq!(metrics.counts(), (0, 0, 0));
+                if enabled {
+                    let snapshot = sender.pipeline_pressure_snapshot_for_test().unwrap();
+                    let totals = &snapshot["sender"];
+                    assert_eq!(totals["interval"], "semantic");
+                    assert_eq!(totals["source_end_reason"], reason);
+                    assert!(totals["source_end_ns"].is_u64());
+                    assert_eq!(totals["source_reads"].as_u64(), Some(reads as u64));
+                    assert_eq!(totals["source_eof_ns"].is_u64(), eof);
+                    assert!(totals["flush_start_ns"].is_null());
+                    assert!(totals["flush_ok"].is_null());
+                    assert_eq!(snapshot["http"]["started"], 0);
+                    assert!(snapshot["http"]["first_begin_ns"].is_null());
+                } else {
+                    assert!(sender.pipeline_pressure_snapshot_for_test().is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_pressure_canceled_source_wait_remains_unfinished() {
+        let metrics = MetricsCollector::new(RunClock::new());
+        let config = SenderConfig { rate_limit: 0, max_concurrent: 1 };
+        let mut sender = test_sender(&config, metrics.clone());
+        sender.enable_pipeline_pressure_for_test(1);
+        let mut source = TestSource { behavior: SourceBehavior::Pending, calls: 0 };
+        let mut reporters = Vec::new();
+        let mut send = Box::pin(send_workload_from_source(
+            &mut source,
+            &mut sender,
+            &metrics,
+            &config,
+            &mut reporters,
+            SendInterval { first_workload: None, duration: None, name: "semantic" },
+        ));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(send.as_mut().poll(&mut context).is_pending());
+        drop(send);
+        assert_eq!(source.calls, 1);
+        let snapshot = sender.pipeline_pressure_snapshot_for_test().unwrap();
+        assert_eq!(snapshot["sender"]["source_reads"], 0);
+        assert_eq!(snapshot["sender"]["source_wait_ns"], 0);
+        assert_eq!(snapshot["sender"]["source_end_reason"], "unfinished");
+        assert!(snapshot["sender"]["source_end_ns"].is_null());
+        assert!(snapshot["sender"]["source_eof_ns"].is_null());
+        assert_eq!(snapshot["http"]["started"], 0);
+        assert_eq!(metrics.counts(), (0, 0, 0));
     }
 }

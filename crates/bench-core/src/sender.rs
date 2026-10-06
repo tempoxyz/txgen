@@ -6,8 +6,10 @@
 
 use crate::{
     metrics::MetricsCollector,
+    pipeline_pressure::nanos,
     receipt_metrics::{ReceiptCollectorHandle, ReceiptMetricLabels},
     receipt_tracker::Inclusion,
+    sender_pressure::{Gate, HttpPressure, SenderPressure, SenderState},
     ReceiptTracker, RequestAuthProvider, RpcRequestContext,
 };
 use alloy_network::{primitives::ReceiptResponse, AnyNetwork, AnyTransactionReceipt};
@@ -834,6 +836,7 @@ pub struct Sender {
     /// Optional signer for deferred transactions.
     late_signer: Option<Arc<dyn LateSigner>>,
     receipt_tracker: ReceiptTracker,
+    pressure: Option<SenderPressure>,
 }
 
 impl Sender {
@@ -896,6 +899,81 @@ impl Sender {
             deferred_errors: VecDeque::new(),
             receipt_collector: None,
             late_signer: None,
+            pressure: None,
+        }
+    }
+
+    /// Enable bounded diagnostics after preparation, only with the shared env opt-in.
+    pub fn enable_pipeline_pressure(&mut self, rpc_permit_capacity: usize) {
+        self.pressure = SenderPressure::from_env(rpc_permit_capacity);
+        self.pressure_checkpoint();
+    }
+
+    /// Inject enabled diagnostics in semantic tests without a process-global opt-in.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn enable_pipeline_pressure_for_test(&mut self, rpc_permit_capacity: usize) {
+        self.pressure = Some(SenderPressure::for_test(rpc_permit_capacity));
+        self.pressure_checkpoint();
+    }
+
+    /// Inspect aggregate state after the test has settled its own worker tasks.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn pipeline_pressure_snapshot_for_test(&self) -> Option<serde_json::Value> {
+        self.pressure.as_ref().map(SenderPressure::snapshot_for_test)
+    }
+
+    /// Avoid even a diagnostic clock read when the feature is disabled.
+    pub fn pressure_timer(&self) -> Option<Instant> {
+        self.pressure.as_ref().map(|_| Instant::now())
+    }
+
+    /// Label measurement/tail source intervals without changing sender state.
+    pub fn pressure_interval(&mut self, interval: &'static str) {
+        if let Some(p) = &mut self.pressure {
+            p.totals.interval = interval;
+        }
+    }
+
+    /// The source timer covers input wait and decode, not just pipe blocking.
+    pub fn pressure_source_wait(&mut self, start: Option<Instant>, eof: bool) {
+        if let (Some(p), Some(start)) = (&mut self.pressure, start) {
+            p.totals.source_wait_ns =
+                p.totals.source_wait_ns.saturating_add(nanos(start.elapsed()));
+            p.totals.source_reads = p.totals.source_reads.saturating_add(1);
+            if eof {
+                p.totals.source_eof_ns = Some(p.log.offset_ns());
+            }
+        }
+        self.pressure_checkpoint();
+    }
+
+    /// Records the observed loop endpoint separately from pending/RPC flush.
+    pub fn pressure_source_end(&mut self, reason: &'static str) {
+        if let Some(p) = &mut self.pressure {
+            p.totals.source_end_ns = Some(p.log.offset_ns());
+            p.totals.source_end_reason = reason;
+        }
+        self.pressure_checkpoint();
+    }
+
+    fn pressure_gate(&mut self, gate: Gate) {
+        if let Some(p) = &mut self.pressure {
+            p.gate(gate);
+        }
+    }
+
+    fn pressure_checkpoint(&mut self) {
+        if let Some(p) = &mut self.pressure {
+            p.totals.state = SenderState {
+                observed_ns: p.log.offset_ns(),
+                queue_len: self.pending.len(),
+                max_buffered: self.max_buffered,
+                in_flight_pending: self.in_flight_pending,
+                max_pending: self.max_pending.map(NonZeroUsize::get),
+                available_rpc_permits: self.semaphore.available_permits(),
+                active_keys: self.active_keys.len(),
+            };
+            p.emit(false);
         }
     }
 
@@ -1050,6 +1128,11 @@ impl Sender {
 
     /// Wait for all pending transactions to complete.
     pub async fn flush(&mut self) -> Result<()> {
+        if let Some(p) = &mut self.pressure {
+            p.totals.flush_start_ns = Some(p.log.offset_ns());
+            p.totals.flush_end_ns = None;
+            p.totals.flush_ok = None;
+        }
         let mut first_error = self.deferred_errors.pop_front();
         self.deferred_errors.clear();
         if first_error.is_some() {
@@ -1064,7 +1147,12 @@ impl Sender {
             self.in_flight_setup > 0 ||
             self.in_flight_pending > 0
         {
-            match self.completion_rx.recv().await {
+            let wait_started = self.pressure_timer();
+            let completion = self.completion_rx.recv().await;
+            if let (Some(p), Some(start)) = (&mut self.pressure, wait_started) {
+                p.completion_wait(start);
+            }
+            match completion {
                 Some(completion) => {
                     self.handle_completion(completion);
                     if first_error.is_none() &&
@@ -1084,6 +1172,11 @@ impl Sender {
             }
         }
 
+        if let Some(p) = &mut self.pressure {
+            p.totals.flush_end_ns = Some(p.log.offset_ns());
+            p.totals.flush_ok = Some(first_error.is_none());
+        }
+        self.pressure_checkpoint();
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -1146,7 +1239,12 @@ impl Sender {
                 break;
             }
 
-            match self.completion_rx.recv().await {
+            let wait_started = self.pressure_timer();
+            let completion = self.completion_rx.recv().await;
+            if let (Some(p), Some(start)) = (&mut self.pressure, wait_started) {
+                p.completion_wait(start);
+            }
+            match completion {
                 Some(completion) => self.handle_completion(completion),
                 None => break,
             }
@@ -1171,14 +1269,25 @@ impl Sender {
             }
 
             if self.max_pending.is_some_and(|limit| self.in_flight_pending >= limit.get()) {
+                self.pressure_gate(if self.pending.is_empty() {
+                    Gate::Empty
+                } else {
+                    Gate::Pending
+                });
                 break;
             }
 
             let Some(index) = self.next_ready_index() else {
+                self.pressure_gate(if self.pending.is_empty() {
+                    Gate::Empty
+                } else {
+                    Gate::KeysOrSetup
+                });
                 break;
             };
 
             let Ok(permit) = self.semaphore.clone().try_acquire_owned() else {
+                self.pressure_gate(Gate::RpcPermit);
                 break;
             };
 
@@ -1186,7 +1295,13 @@ impl Sender {
                 let Some(delay) = limiter.try_acquire_or_delay().await
             {
                 drop(permit);
+                self.pressure_gate(Gate::RateSleep);
+                let wait_started = self.pressure_timer();
                 tokio::time::sleep(delay).await;
+                if let (Some(p), Some(start)) = (&mut self.pressure, wait_started) {
+                    p.totals.rate_sleep_ns =
+                        p.totals.rate_sleep_ns.saturating_add(nanos(start.elapsed()));
+                }
                 continue;
             }
 
@@ -1221,9 +1336,11 @@ impl Sender {
 
             let pending = self.pending.remove(index).expect("pending index exists");
             self.activate_keys(&pending);
+            self.pressure_gate(Gate::Ready);
             self.dispatch(pending, endpoint, submission_headers, permit);
         }
 
+        self.pressure_checkpoint();
         Ok(())
     }
 
@@ -1314,6 +1431,7 @@ impl Sender {
         } else {
             None
         };
+        let pressure_http = self.pressure.as_ref().map(|p| p.http.clone());
         self.worker_tasks.spawn(async move {
             let result = submit_tx(
                 pending,
@@ -1329,6 +1447,7 @@ impl Sender {
                 permit,
                 completion_tx,
                 late_signer,
+                pressure_http,
             )
             .await;
             if let Some(completion) = pending_completion {
@@ -1384,6 +1503,7 @@ async fn submit_tx(
     permit: OwnedSemaphorePermit,
     completion_tx: mpsc::UnboundedSender<Completion>,
     late_signer: Option<Arc<dyn LateSigner>>,
+    pressure_http: Option<Arc<HttpPressure>>,
 ) -> Result<()> {
     let release_all_keys = || {
         let mut keys = pending.submission_keys.clone();
@@ -1452,13 +1572,22 @@ async fn submit_tx(
         }
     };
 
+    // Call-site clock: excludes signing/receipt preparation, but is not a wire
+    // timestamp and does not expose transport retries. Cancellation drops the guard.
+    let mut pressure_request = pressure_http.as_ref().map(|p| p.begin());
     let start = Instant::now();
     let tx_hash = match send_raw_transaction(&endpoint, &raw, submission_headers).await {
         Ok(tx_hash) => {
             metrics.record_success(start.elapsed());
+            if let Some(request) = pressure_request.take() {
+                request.finish(true);
+            }
             tx_hash
         }
         Err(e) => {
+            if let Some(request) = pressure_request.take() {
+                request.finish(false);
+            }
             let uncertain = submission_may_have_been_accepted(&e);
             if uncertain {
                 track_workload_receipt(receipt_collector.as_ref(), &pending, expected_hash);
@@ -1726,6 +1855,149 @@ mod tests {
         ProviderBuilder::new_with_network::<AnyNetwork>().connect_mocked_client(asserter).erased()
     }
 
+    fn pressure_test_tx() -> GeneratedTx {
+        GeneratedTx {
+            depends_on: Vec::new(),
+            phase: TxPhase::Workload,
+            id: None,
+            raw: Bytes::from_static(&[2]),
+            late_sign: None,
+            sender: None,
+            submission_keys: vec![SchedulingKey::from([1; 20])],
+            inclusion_keys: Vec::new(),
+        }
+    }
+
+    fn assert_pressure_http_counts(snapshot: &serde_json::Value, expected: [u64; 5]) {
+        let http = &snapshot["http"];
+        for (field, expected) in
+            ["started", "succeeded", "failed", "canceled", "active"].into_iter().zip(expected)
+        {
+            assert_eq!(http[field].as_u64(), Some(expected), "{field}");
+        }
+        assert_eq!(expected[0], expected[1] + expected[2] + expected[3] + expected[4]);
+        assert!(
+            http["first_begin_ns"].as_u64().unwrap() <= http["last_begin_ns"].as_u64().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn pressure_enabled_rpc_success_and_rejection_preserve_flush_results() {
+        for rejected in [false, true] {
+            for enabled in [false, true] {
+                let asserter = Asserter::new();
+                let tx = pressure_test_tx();
+                if rejected {
+                    asserter.push_failure_msg("transaction rejected");
+                } else {
+                    asserter.push_success(&keccak256(&tx.raw));
+                }
+                let metrics = MetricsCollector::new(RunClock::new());
+                let mut sender = Sender::new(
+                    vec![mocked_provider(asserter.clone())],
+                    SenderConfig { rate_limit: 0, max_concurrent: 1 },
+                    metrics.clone(),
+                );
+                if enabled {
+                    sender.enable_pipeline_pressure_for_test(1);
+                }
+                sender.send(tx).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(5), sender.flush())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(metrics.counts(), if rejected { (1, 0, 1) } else { (1, 1, 0) });
+                assert!(asserter.read_q().is_empty());
+                assert!(sender.pending.is_empty());
+                assert!(sender.active_keys.is_empty());
+                assert_eq!(sender.semaphore.available_permits(), 1);
+                if enabled {
+                    let snapshot = sender.pipeline_pressure_snapshot_for_test().unwrap();
+                    assert_pressure_http_counts(
+                        &snapshot,
+                        if rejected { [1, 0, 1, 0, 0] } else { [1, 1, 0, 0, 0] },
+                    );
+                    let totals = &snapshot["sender"];
+                    assert_eq!(totals["flush_ok"], true);
+                    assert!(
+                        totals["flush_start_ns"].as_u64().unwrap() <=
+                            totals["flush_end_ns"].as_u64().unwrap()
+                    );
+                    assert_eq!(totals["state"]["queue_len"], 0);
+                    assert_eq!(totals["state"]["available_rpc_permits"], 1);
+                } else {
+                    assert!(sender.pipeline_pressure_snapshot_for_test().is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pressure_canceled_second_flush_clears_success_and_rpc_guard_closes() {
+        // A pending in-memory transport exercises the actual submit_tx await and
+        // guard. No socket, process-global environment, or real-time sleep is used.
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let notify = reached.clone();
+        let transport = tower::service_fn(move |_request: alloy_json_rpc::RequestPacket| -> alloy_transport::TransportFut<'static> {
+            let notify = notify.clone();
+            Box::pin(async move {
+                notify.notify_one();
+                std::future::pending::<alloy_transport::TransportResult<alloy_json_rpc::ResponsePacket>>().await
+            })
+        });
+        let client = alloy_rpc_client::RpcClient::new(transport, true);
+        let provider =
+            ProviderBuilder::new_with_network::<AnyNetwork>().connect_client(client).erased();
+        let metrics = MetricsCollector::new(RunClock::new());
+        let mut sender = Sender::new(
+            vec![provider],
+            SenderConfig { rate_limit: 0, max_concurrent: 1 },
+            metrics.clone(),
+        );
+        sender.enable_pipeline_pressure_for_test(1);
+        sender.flush().await.unwrap();
+        let first = sender.pipeline_pressure_snapshot_for_test().unwrap();
+        assert_eq!(first["sender"]["flush_ok"], true);
+        sender.send(pressure_test_tx()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reached.notified()).await.unwrap();
+        assert_pressure_http_counts(
+            &sender.pipeline_pressure_snapshot_for_test().unwrap(),
+            [1, 0, 0, 0, 1],
+        );
+        let before_waits = sender.pipeline_pressure_snapshot_for_test().unwrap()["sender"]
+            ["completion_wait_at_last_gate_ns"]
+            .clone();
+        let mut flush = Box::pin(sender.flush());
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        drop(flush);
+        let canceled_flush = sender.pipeline_pressure_snapshot_for_test().unwrap();
+        assert!(canceled_flush["sender"]["flush_end_ns"].is_null());
+        assert!(canceled_flush["sender"]["flush_ok"].is_null());
+        assert!(
+            canceled_flush["sender"]["flush_start_ns"].as_u64().unwrap() >=
+                first["sender"]["flush_end_ns"].as_u64().unwrap()
+        );
+        assert_eq!(
+            canceled_flush["sender"]["completion_wait_at_last_gate_ns"], before_waits,
+            "an await canceled before its accounting point contributes no duration"
+        );
+
+        sender.worker_tasks.abort_all();
+        let joined = tokio::time::timeout(Duration::from_secs(5), sender.worker_tasks.join_next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(joined.unwrap_err().is_cancelled());
+        assert_pressure_http_counts(
+            &sender.pipeline_pressure_snapshot_for_test().unwrap(),
+            [1, 0, 0, 1, 0],
+        );
+        assert_eq!(sender.semaphore.available_permits(), 1);
+        assert_eq!(metrics.counts(), (1, 0, 0));
+        // Cancellation is not a successful flush. The original cancellation path
+        // need not release the active key, so do not attempt another flush here.
+    }
+
     #[tokio::test]
     async fn measurement_switch_keeps_in_flight_requests_in_warmup() {
         let asserter = Asserter::new();
@@ -1772,6 +2044,7 @@ mod tests {
         let mut sender =
             Sender::new(vec![mocked_provider(asserter)], SenderConfig::default(), metrics.clone())
                 .with_max_pending(1.try_into().unwrap());
+        sender.enable_pipeline_pressure_for_test(SenderConfig::default().max_concurrent);
         for key in 1..=2 {
             sender
                 .send(GeneratedTx {
@@ -1790,6 +2063,14 @@ mod tests {
         let error = sender.flush().await.unwrap_err();
         assert!(error.to_string().contains("timed out waiting for transaction inclusion"));
         assert_eq!(metrics.counts().0, 1, "timeout must not refill the pending window");
+        let snapshot = sender.pipeline_pressure_snapshot_for_test().unwrap();
+        assert_pressure_http_counts(&snapshot, [1, 1, 0, 0, 0]);
+        assert_eq!(snapshot["sender"]["flush_ok"], false);
+        assert!(
+            snapshot["sender"]["flush_start_ns"].as_u64().unwrap() <=
+                snapshot["sender"]["flush_end_ns"].as_u64().unwrap()
+        );
+        assert_eq!(snapshot["sender"]["state"]["in_flight_pending"], 0);
     }
 
     #[tokio::test]

@@ -44,6 +44,7 @@ hex.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "rt", "sync", "time", "test-util"] }
 
 [dev-dependencies]
+bench-core = { workspace = true, features = ["test-utils"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 # `--tracer js:<path>` reads a file, so its test needs one on disk.
 tempfile = "3"

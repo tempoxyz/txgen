@@ -45,5 +45,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+bench-core = { workspace = true, features = ["test-utils"] }
 serde_json.workspace = true
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }

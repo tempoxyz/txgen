@@ -13,6 +13,7 @@ pub mod clickhouse;
 pub mod clock;
 pub mod composition;
 pub mod metrics;
+pub mod pipeline_pressure;
 pub mod prometheus;
 pub mod prometheus_reporter;
 pub mod receipt_clickhouse;
@@ -22,6 +23,7 @@ pub mod reporter;
 pub mod sample;
 pub mod scraper;
 pub mod sender;
+mod sender_pressure;
 pub mod source;
 
 pub use auth::{RequestAuthProvider, RpcRequestContext, SenderHeaderAuthProvider};
