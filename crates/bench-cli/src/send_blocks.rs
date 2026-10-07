@@ -152,7 +152,10 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         reporters.push(Box::new(ConsoleReporter::stderr(false)));
     }
 
-    let clock = RunClock::new();
+    let clock = match args.metrics_align {
+        Some(start) => RunClock::new_with_start_unix_ms(start),
+        None => RunClock::new(),
+    };
     let store = SampleStore::with_labels(metadata.clone())?;
     let counters = Arc::new(BlockCounters::default());
     let metrics_forwarder =
