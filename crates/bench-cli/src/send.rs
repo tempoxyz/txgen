@@ -184,10 +184,12 @@ async fn execute_source<S: TxSource>(
         start_block = query_provider.get_block_number().await?;
     }
 
-    let clock = if let Some(start) = args.metrics_align {
-        RunClock::new_with_start_unix_ms(start)
-    } else {
-        RunClock::new()
+    // Block timestamps are wall-clock times, while --metrics-align shifts the
+    // run clock that stamps samples.
+    let wall_clock = RunClock::new();
+    let clock = match args.metrics_align {
+        Some(start) => RunClock::new_with_start_unix_ms(start),
+        None => wall_clock.clone(),
     };
     let metrics = MetricsCollector::new_with_latencies(clock.clone(), args.collect_latencies);
     sender.set_metrics(metrics.clone());
@@ -361,12 +363,7 @@ async fn execute_source<S: TxSource>(
     );
     if let Some(end_ms) = measurement_end_unix_ms {
         report.metadata.insert("measurement_end_unix_ms".into(), end_ms.to_string());
-        report.retain_samples_until(end_ms);
-        if let Some(ts) = report.time_series.as_mut() {
-            let end_offset_ms = end_ms.saturating_sub(clock.start_unix_ms());
-            ts.latencies.retain(|l| l.offset_ms <= end_offset_ms);
-            ts.throughput.retain(|t| t.second * 1000 <= end_offset_ms);
-        }
+        trim_report(&mut report, &clock, end_ms.saturating_sub(clock.start_unix_ms()));
     }
 
     if end_block > start_block {
@@ -381,7 +378,7 @@ async fn execute_source<S: TxSource>(
         );
 
         if !args.warmup.is_zero() || args.warmup_validators.is_some() {
-            block_stats.retain(|block| block.timestamp_ms >= clock.start_unix_ms());
+            block_stats.retain(|block| block.timestamp_ms >= wall_clock.start_unix_ms());
         }
         if let Some(end_ms) = measurement_end_unix_ms {
             block_stats.retain(|block| block.timestamp_ms <= end_ms);
@@ -392,13 +389,8 @@ async fn execute_source<S: TxSource>(
         // samples captured after the last real block.
         let cutoff_ms = trim_trailing_empty_blocks(&mut block_stats);
         if let Some(cutoff_ms) = cutoff_ms {
-            report.retain_samples_until(cutoff_ms);
-            if let Some(ts) = report.time_series.as_mut() {
-                ts.latencies
-                    .retain(|l| l.offset_ms <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
-                ts.throughput
-                    .retain(|t| t.second * 1000 <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
-            }
+            let end_offset_ms = cutoff_ms.saturating_sub(wall_clock.start_unix_ms());
+            trim_report(&mut report, &clock, end_offset_ms);
         }
         tracing::info!(cutoff_ms = ?cutoff_ms, "Report trimmed");
 
@@ -629,6 +621,15 @@ async fn send_workload_from_source<S: TxSource>(
     Ok(start_unix_ms)
 }
 
+/// Drop samples, latencies and throughput recorded after `end_offset_ms` into the run.
+fn trim_report(report: &mut FinalReport, clock: &RunClock, end_offset_ms: u64) {
+    report.retain_samples_until(clock.start_unix_ms().saturating_add(end_offset_ms));
+    if let Some(ts) = report.time_series.as_mut() {
+        ts.latencies.retain(|l| l.offset_ms <= end_offset_ms);
+        ts.throughput.retain(|t| t.second * 1000 <= end_offset_ms);
+    }
+}
+
 async fn stop_scrapers(scraper_handles: Vec<ScraperHandle>) {
     if scraper_handles.is_empty() {
         return;
@@ -706,5 +707,34 @@ async fn wait_for_pool_drain<P: TxPoolApi<AnyNetwork>>(
             zero_count = 0;
             tracing::debug!(pending, "Txpool still draining...");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bench_core::Sample;
+
+    #[tokio::test]
+    async fn trim_report_keeps_aligned_samples_up_to_the_offset() {
+        let clock = RunClock::new_with_start_unix_ms(1_000_000);
+        let store = SampleStore::new().unwrap();
+        let samples = [500, 1_500].map(|offset_ms| Sample {
+            name: "m".to_string(),
+            labels: Default::default(),
+            value: 1.0,
+            offset_ms,
+            unix_ms: clock.start_unix_ms() + offset_ms,
+        });
+        store.push_batch(samples.to_vec()).await.unwrap();
+        let mut report = FinalReport {
+            sample_archive: Some(store.finish().await.unwrap()),
+            ..Default::default()
+        };
+
+        trim_report(&mut report, &clock, 1_000);
+
+        let kept = report.sample_archive.unwrap().iter().unwrap().collect::<Result<Vec<_>>>();
+        assert_eq!(kept.unwrap().iter().map(|s| s.offset_ms).collect::<Vec<_>>(), [500]);
     }
 }
