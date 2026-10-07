@@ -362,18 +362,45 @@ impl FromGenerator for serde_yaml::Value {
     }
 }
 
+/// Owns the state borrowed by a [`ValueResolver`] in tests.
+#[cfg(test)]
+pub(crate) struct TestResolver {
+    pub(crate) accounts: AccountManager,
+    pub(crate) address_pools: AddressPoolManager,
+    pub(crate) rng: rand::rngs::StdRng,
+}
+
+#[cfg(test)]
+impl Default for TestResolver {
+    fn default() -> Self {
+        use rand::SeedableRng;
+        Self {
+            accounts: AccountManager::empty(),
+            address_pools: AddressPoolManager::empty(),
+            rng: rand::rngs::StdRng::seed_from_u64(42),
+        }
+    }
+}
+
+#[cfg(test)]
+impl TestResolver {
+    pub(crate) fn resolver(&mut self) -> ValueResolver<'_> {
+        ValueResolver {
+            accounts: &self.accounts,
+            address_pools: &self.address_pools,
+            rng: &mut self.rng,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{rngs::StdRng, SeedableRng};
 
     #[test]
     fn test_uniform_u64() {
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
 
         let generator = Generator::Uniform(UniformRange::Range([
             serde_yaml::to_value(1).unwrap(),
@@ -385,11 +412,8 @@ mod tests {
 
     #[test]
     fn test_uniform_i64_with_step() {
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
         let value = serde_yaml::from_str::<serde_yaml::Value>(
             r#"
 uniform:
@@ -409,11 +433,8 @@ uniform:
 
     #[test]
     fn test_const_address() {
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
 
         let generator = Generator::Const(serde_yaml::Value::String(
             "0x0000000000000000000000000000000000000001".to_string(),
@@ -427,11 +448,8 @@ uniform:
 
     #[test]
     fn test_random() {
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
 
         let generator = Generator::Random;
 
@@ -449,21 +467,21 @@ uniform:
 
     #[test]
     fn test_address_pool_generator() -> Result<()> {
-        let accounts = AccountManager::empty();
         let expected = Address::from([7u8; 20]);
-        let address_pools = AddressPoolManager::from_spec(&std::collections::HashMap::from([(
-            "recipients".to_string(),
-            crate::AddressPoolDef {
-                addresses: vec![expected],
-                mnemonic: None,
-                index: None,
-                range: None,
-                fast: None,
-            },
-        )]))?;
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver {
+            address_pools: AddressPoolManager::from_spec(&std::collections::HashMap::from([(
+                "recipients".to_string(),
+                crate::AddressPoolDef {
+                    addresses: vec![expected],
+                    mnemonic: None,
+                    index: None,
+                    range: None,
+                    fast: None,
+                },
+            )]))?,
+            ..Default::default()
+        };
+        let mut resolver = fixture.resolver();
 
         let generator =
             Generator::AddressPool { pool: "recipients".to_string(), select: SelectMode::Index(0) };
