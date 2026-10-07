@@ -277,6 +277,9 @@ async fn execute_source<S: TxSource>(
 
     sender.flush().await?;
     drop(sender);
+    // Freeze the duration before the drain wait, receipt RPCs and aggregation
+    // add post-run latency.
+    let measured_elapsed = args.duration.unwrap_or_else(|| metrics.elapsed_since_start());
 
     let (sent, success, failed) = metrics.counts();
     if (!args.warmup.is_zero() || args.warmup_validators.is_some()) && sent == 0 {
@@ -302,9 +305,6 @@ async fn execute_source<S: TxSource>(
         }
     };
     tracing::info!(end_block, "Ending block fetched");
-
-    // Freeze the duration before receipt RPCs and aggregation add post-run latency.
-    let measured_elapsed = args.duration.unwrap_or_else(|| metrics.elapsed_since_start());
 
     let receipt_collection = match receipt_collector {
         Some(collector) => {
