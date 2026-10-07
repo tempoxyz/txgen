@@ -165,7 +165,7 @@ async fn execute_source<S: TxSource>(
     // nonce ordering, rate limiter and HTTP connection pool.
     let warmup_metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
     let mut sender =
-        Sender::new_with_request_auth(endpoints, config.clone(), warmup_metrics, request_auth)
+        Sender::new_with_request_auth(endpoints, config.clone(), warmup_metrics, request_auth)?
             .with_receipt_tracker(receipt_tracker)
             .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
     if let Some(limit) = args.pending_limit()? {
@@ -471,7 +471,7 @@ async fn run_setup_phase<S: TxSource>(
         config.clone(),
         setup_metrics.clone(),
         request_auth,
-    )
+    )?
     .with_receipt_tracker(receipt_tracker)
     .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
     if let Some(late_signer) = late_signer {
