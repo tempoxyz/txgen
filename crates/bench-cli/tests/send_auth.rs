@@ -156,6 +156,9 @@ fn serve(mut stream: TcpStream, kind: ServerKind, requests: Arc<Mutex<Vec<Record
                 "extraData":"0x", "mixHash":hash, "nonce":"0x0000000000000000",
                 "transactions":[], "uncles":[]}})
         }
+        (ServerKind::Composition { .. }, "txpool_status") => {
+            json!({"jsonrpc":"2.0", "id":id, "result":{"pending":"0x0", "queued":"0x0"}})
+        }
         (ServerKind::Submission | ServerKind::Readiness { .. }, "eth_sendRawTransaction") => {
             json!({
                 "jsonrpc": "2.0",
@@ -296,7 +299,10 @@ fn query_rpc_is_separate_and_credentials_are_redacted_from_outputs() {
     assert!(query_requests.iter().all(|request| request.auth.is_none()));
 }
 
-fn run_composition_fixture(receipt_delay: Duration) -> (Value, Vec<RecordedRequest>) {
+fn run_composition_fixture(
+    receipt_delay: Duration,
+    drain_timeout_secs: &str,
+) -> (Value, Vec<RecordedRequest>) {
     let server = MockServer::start(ServerKind::Composition { receipt_delay });
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("transactions.ndjson");
@@ -321,7 +327,7 @@ fn run_composition_fixture(receipt_delay: Duration) -> (Value, Vec<RecordedReque
             "--max-pending",
             "0",
             "--drain-timeout",
-            "0",
+            drain_timeout_secs,
             "--retries",
             "0",
             "--report",
@@ -337,7 +343,7 @@ fn run_composition_fixture(receipt_delay: Duration) -> (Value, Vec<RecordedReque
 
 #[test]
 fn default_collection_is_post_run_and_reports_included_composition() {
-    let (report, requests) = run_composition_fixture(Duration::ZERO);
+    let (report, requests) = run_composition_fixture(Duration::ZERO, "0");
     let composition = &report["block_composition"];
     assert_eq!(composition["block_count"], 1);
     assert_eq!(composition["summary"]["tx_count"], 3);
@@ -365,7 +371,7 @@ fn default_collection_is_post_run_and_reports_included_composition() {
 
 #[test]
 fn receipt_collection_latency_is_excluded_from_benchmark_duration() {
-    let (report, requests) = run_composition_fixture(Duration::from_secs(1));
+    let (report, requests) = run_composition_fixture(Duration::from_secs(1), "0");
     let measurement_start =
         report["metadata"]["measurement_start_unix_ms"].as_str().unwrap().parse::<u128>().unwrap();
     let receipt_start =
@@ -376,6 +382,13 @@ fn receipt_collection_latency_is_excluded_from_benchmark_duration() {
         reported_elapsed <= before_receipts + Duration::from_millis(200),
         "receipt collection must not inflate benchmark duration: {reported_elapsed:?} > {before_receipts:?}"
     );
+}
+
+#[test]
+fn txpool_drain_is_excluded_from_benchmark_duration() {
+    let (report, _) = run_composition_fixture(Duration::ZERO, "10");
+    let elapsed = report["elapsed_secs"].as_f64().unwrap();
+    assert!(elapsed < 1.0, "txpool drain must not inflate benchmark duration: {elapsed}s");
 }
 
 #[test]
