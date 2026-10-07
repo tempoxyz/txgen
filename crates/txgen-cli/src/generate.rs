@@ -926,7 +926,7 @@ async fn fetch_protocol_nonces_with_state(
     let provider =
         alloy_provider::ProviderBuilder::<_, _, alloy_provider::network::Ethereum>::new()
             .connect_http(rpc_url.parse().wrap_err("invalid RPC URL")?);
-    let state = "latest";
+    let state = if pending { "pending" } else { "latest" };
 
     for (pool_name, addresses) in accounts.all_addresses() {
         let total = addresses.len();
