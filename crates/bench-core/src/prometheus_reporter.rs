@@ -482,7 +482,7 @@ fn build_write_request(samples: &[Sample]) -> WriteRequest {
     use std::collections::HashMap;
 
     // Group samples by their time series identity (name + sorted labels).
-    let mut series_map: HashMap<String, TimeSeries> = HashMap::new();
+    let mut series_map: HashMap<Vec<Label>, TimeSeries> = HashMap::new();
 
     for s in samples {
         if !is_valid_metric_name(&s.name) || !s.value.is_finite() {
@@ -501,15 +501,11 @@ fn build_write_request(samples: &[Sample]) -> WriteRequest {
         // Labels must be sorted by name per the remote write spec.
         labels.sort_by(|a, b| a.name.cmp(&b.name));
 
-        // Build a stable key for grouping.
-        let series_key: String =
-            labels.iter().map(|l| format!("{}={}", l.name, l.value)).collect::<Vec<_>>().join(",");
-
         let prom_sample = PromSample { value: s.value, timestamp: s.unix_ms as i64 };
 
         series_map
-            .entry(series_key)
-            .or_insert_with(|| TimeSeries { labels: labels.clone(), samples: Vec::new() })
+            .entry(labels)
+            .or_insert_with_key(|labels| TimeSeries { labels: labels.clone(), samples: Vec::new() })
             .samples
             .push(prom_sample);
     }
@@ -538,32 +534,12 @@ fn is_valid_metric_name(name: &str) -> bool {
 
 /// Coerce an arbitrary string into a valid Prometheus label name.
 ///
-/// Replaces invalid characters with `_`. Returns an empty string if the
-/// input is empty or starts with a digit and contains no other valid
-/// leading char (in which case a `_` prefix is added).
+/// Replaces invalid characters with `_` and prefixes a leading digit with `_`.
 fn sanitize_label_name(name: &str) -> String {
-    if name.is_empty() {
-        return String::new();
-    }
-    let mut out = String::with_capacity(name.len());
-    for (i, c) in name.chars().enumerate() {
-        let ok = if i == 0 {
-            c.is_ascii_alphabetic() || c == '_'
-        } else {
-            c.is_ascii_alphanumeric() || c == '_'
-        };
-        if ok {
-            out.push(c);
-        } else if i == 0 {
-            out.push('_');
-            if c.is_ascii_alphanumeric() {
-                out.push(c);
-            } else {
-                out.push('_');
-            }
-        } else {
-            out.push('_');
-        }
+    let mut out: String =
+        name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).collect();
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(0, '_');
     }
     out
 }
@@ -700,6 +676,16 @@ mod tests {
         assert_eq!(sanitize_label_name("123abc"), "_123abc");
         assert_eq!(sanitize_label_name(""), "");
         assert_eq!(sanitize_label_name("a.b.c"), "a_b_c");
+        assert_eq!(sanitize_label_name("-foo"), "_foo");
+    }
+
+    #[test]
+    fn label_values_with_separators_do_not_collide() {
+        let wr = build_write_request(&[
+            sample("m", 1.0, &[("a", "1,b=2")]),
+            sample("m", 2.0, &[("a", "1"), ("b", "2")]),
+        ]);
+        assert_eq!(wr.timeseries.len(), 2);
     }
 
     #[test]
