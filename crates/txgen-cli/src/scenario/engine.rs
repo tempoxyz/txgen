@@ -1288,57 +1288,60 @@ struct PreparedChain<A: NetworkAdapter> {
 
 #[derive(Default)]
 struct SubmissionLanes {
-    active: StdMutex<BTreeMap<[u8; 20], SubmissionLaneOwner>>,
-    ambiguous: StdMutex<BTreeSet<[u8; 20]>>,
-    seen_by_instance: StdMutex<BTreeMap<(u64, [u8; 20]), String>>,
+    state: StdMutex<SubmissionLaneState>,
     notify: tokio::sync::Notify,
 }
 
+#[derive(Default)]
+struct SubmissionLaneState {
+    active: BTreeMap<[u8; 20], SubmissionLaneOwner>,
+    ambiguous: BTreeSet<[u8; 20]>,
+    seen_by_instance: BTreeMap<(u64, [u8; 20]), String>,
+}
+
 impl SubmissionLanes {
+    fn state(&self) -> std::sync::MutexGuard<'_, SubmissionLaneState> {
+        self.state.lock().expect("submission lane mutex poisoned")
+    }
+
     fn try_acquire(
         self: &Arc<Self>,
         keys: BTreeSet<[u8; 20]>,
         owner: SubmissionLaneOwner,
         ordered_predecessors: &BTreeSet<String>,
     ) -> SubmissionLaneAcquire {
-        {
-            let seen =
-                self.seen_by_instance.lock().expect("submission lane history mutex poisoned");
-            if keys.iter().any(|key| {
-                seen.get(&(owner.instance, *key)).is_some_and(|previous| {
-                    previous != &owner.step && !ordered_predecessors.contains(previous)
-                })
-            }) {
-                return SubmissionLaneAcquire::UnsafeSameInstance;
-            }
+        let mut state = self.state();
+        if keys.iter().any(|key| {
+            state.seen_by_instance.get(&(owner.instance, *key)).is_some_and(|previous| {
+                previous != &owner.step && !ordered_predecessors.contains(previous)
+            })
+        }) {
+            return SubmissionLaneAcquire::UnsafeSameInstance;
         }
-        let mut active = self.active.lock().expect("submission lane mutex poisoned");
-        if active
+        if state
+            .active
             .iter()
             .any(|(key, existing)| keys.contains(key) && existing.instance == owner.instance)
         {
             return SubmissionLaneAcquire::UnsafeSameInstance;
         }
-        if keys.iter().any(|key| active.contains_key(key)) {
+        if keys.iter().any(|key| state.active.contains_key(key)) {
             return SubmissionLaneAcquire::Busy;
         }
-        active.extend(keys.iter().copied().map(|key| (key, owner.clone())));
-        self.seen_by_instance
-            .lock()
-            .expect("submission lane history mutex poisoned")
+        state.active.extend(keys.iter().copied().map(|key| (key, owner.clone())));
+        state
+            .seen_by_instance
             .extend(keys.iter().copied().map(|key| ((owner.instance, key), owner.step.clone())));
+        drop(state);
         SubmissionLaneAcquire::Acquired(SubmissionLaneGuard { lanes: self.clone(), keys, owner })
     }
 
     fn release_instance(&self, instance: u64) {
-        self.seen_by_instance
-            .lock()
-            .expect("submission lane history mutex poisoned")
-            .retain(|(seen_instance, _), _| *seen_instance != instance);
+        self.state().seen_by_instance.retain(|(seen_instance, _), _| *seen_instance != instance);
     }
 
     fn mark_ambiguous(&self, keys: &BTreeSet<[u8; 20]>) {
-        self.ambiguous.lock().expect("submission lane ambiguity mutex poisoned").extend(keys);
+        self.state().ambiguous.extend(keys);
     }
 
     fn has_ambiguous_ordered_lane(
@@ -1346,12 +1349,7 @@ impl SubmissionLanes {
         has_ordered_nonces: bool,
         keys: &BTreeSet<[u8; 20]>,
     ) -> bool {
-        has_ordered_nonces &&
-            self.ambiguous
-                .lock()
-                .expect("submission lane ambiguity mutex poisoned")
-                .iter()
-                .any(|key| keys.contains(key))
+        has_ordered_nonces && self.state().ambiguous.iter().any(|key| keys.contains(key))
     }
 }
 
@@ -1388,13 +1386,13 @@ impl Drop for InstanceSubmissionScope {
 
 impl Drop for SubmissionLaneGuard {
     fn drop(&mut self) {
-        let mut active = self.lanes.active.lock().expect("submission lane mutex poisoned");
+        let mut state = self.lanes.state();
         for key in &self.keys {
-            if active.get(key) == Some(&self.owner) {
-                active.remove(key);
+            if state.active.get(key) == Some(&self.owner) {
+                state.active.remove(key);
             }
         }
-        drop(active);
+        drop(state);
         self.lanes.notify.notify_waiters();
     }
 }
