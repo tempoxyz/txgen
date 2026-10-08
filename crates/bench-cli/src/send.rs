@@ -203,7 +203,7 @@ async fn execute_source<S: TxSource>(
     let metadata = &metadata;
     let store = SampleStore::with_labels(metadata.clone())?;
     let metrics_forwarder =
-        build_metrics_forwarder(args.metrics_forward.as_deref(), metadata, scraper_configs)?;
+        build_metrics_forwarder(args.metrics_forward.as_deref(), scraper_configs)?;
 
     // Start background scraper + internal snapshotter after setup so setup is
     // excluded from benchmark metrics.

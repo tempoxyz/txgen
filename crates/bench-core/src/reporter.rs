@@ -1023,8 +1023,7 @@ pub fn parse_reporters(
         } else if let Some(url) =
             spec.strip_prefix("prometheus:").or_else(|| spec.strip_prefix("victoriametrics:"))
         {
-            let config =
-                crate::prometheus_reporter::PrometheusConfig::from_metadata(url, metadata)?;
+            let config = crate::prometheus_reporter::PrometheusConfig::from_env(url)?;
             reporters.push(Box::new(
                 crate::prometheus_reporter::PrometheusReporter::new(config)
                     .wrap_err("failed to create Prometheus reporter")?,
