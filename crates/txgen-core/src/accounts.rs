@@ -225,6 +225,7 @@ impl FastAddressPool {
 
 /// Definition of an account pool in the workload spec.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccountPoolDef {
     /// BIP-39 mnemonic phrase (supports `${ENV_VAR}` expansion).
     pub mnemonic: String,
@@ -247,6 +248,7 @@ impl AccountPoolDef {
 
 /// Definition of a destination-only address pool in the workload spec.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddressPoolDef {
     /// Literal destination addresses.
     #[serde(default)]
@@ -269,6 +271,7 @@ pub struct AddressPoolDef {
 
 /// Definition of a fast deterministic destination-only address pool.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FastAddressPoolDef {
     /// Seed string hashed before deriving addresses.
     pub seed: String,
@@ -392,6 +395,7 @@ fn derive_fast_address(seed: B256, index: u64) -> Address {
 
 /// Reference to an account in a pool.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccountRef {
     /// Pool name.
     pub pool: String,

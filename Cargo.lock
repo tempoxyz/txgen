@@ -6038,8 +6038,6 @@ dependencies = [
 name = "txgen-ethereum"
 version = "0.1.0"
 dependencies = [
- "alloy-consensus",
- "alloy-eips",
  "alloy-network",
  "alloy-primitives",
  "alloy-rpc-types-eth",
@@ -6049,6 +6047,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "tokio",
  "txgen-cli",
  "txgen-core",
@@ -6079,6 +6078,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
+ "tempfile",
  "tempo-alloy",
  "tempo-primitives",
  "tokio",

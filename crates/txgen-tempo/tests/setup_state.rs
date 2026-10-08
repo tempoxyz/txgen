@@ -5,22 +5,13 @@ use axum::{extract::State, routing::post, Json, Router};
 use serde_json::{json, Value};
 use std::{
     fs,
-    path::PathBuf,
     process::{Command, Output},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::net::TcpListener;
-
-struct TestDir(PathBuf);
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 fn assert_success(output: &Output) {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -28,14 +19,9 @@ fn assert_success(output: &Output) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_workload_keeps_deployment_address_and_uses_current_chain_nonces() {
-    let dir = TestDir(std::env::temp_dir().join(format!(
-        "txgen-setup-state-{}-{}",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
-    )));
-    fs::create_dir_all(&dir.0).unwrap();
-    let spec_path = dir.0.join("spec.yaml");
-    let state_path = dir.0.join("setup.json");
+    let dir = tempfile::tempdir().unwrap();
+    let spec_path = dir.path().join("spec.yaml");
+    let state_path = dir.path().join("setup.json");
     fs::write(
         &spec_path,
         r#"
