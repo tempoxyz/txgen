@@ -1601,7 +1601,7 @@ pub(crate) fn expression_address(
     }
 }
 
-fn expression_hash(value: &serde_yaml::Value, context: &RuntimeContext) -> Result<B256> {
+pub(crate) fn expression_hash(value: &serde_yaml::Value, context: &RuntimeContext) -> Result<B256> {
     match eval_expression(value, context)?.coerce_dyn_sol(&DynSolType::FixedBytes(32))? {
         DynSolValue::FixedBytes(value, 32) => Ok(value),
         _ => unreachable!("bytes32 coercion returned another type"),
@@ -1623,7 +1623,7 @@ pub(crate) fn sort_logs(logs: &mut [Log]) {
     });
 }
 
-fn object<const N: usize>(values: [(&str, RuntimeValue); N]) -> RuntimeValue {
+pub(crate) fn object<const N: usize>(values: [(&str, RuntimeValue); N]) -> RuntimeValue {
     RuntimeValue::Object(values.into_iter().map(|(key, value)| (key.to_string(), value)).collect())
 }
 
