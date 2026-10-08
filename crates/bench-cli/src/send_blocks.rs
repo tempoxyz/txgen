@@ -458,10 +458,11 @@ async fn process_reorg_action(
         ReorgAction::Canonical(blocks) => (blocks, None),
         ReorgAction::Batch(blocks) => {
             let first = blocks.first().expect("reorg batch must not be empty");
-            let branch_point_hash = extract_block_header_from_block_rlp(first.raw.as_ref())
+            let branch_point_hash = split_block_rlp(&first.raw)
                 .wrap_err_with(|| {
                     format!("failed to extract parent hash from block {}", first.number)
                 })?
+                .0
                 .parent_hash;
 
             tracing::info!(
@@ -519,14 +520,12 @@ async fn process_synthetic_block(
     branch_point_hash: B256,
     wait: bool,
 ) -> Result<B256> {
-    let transactions = extract_tx_bytes_from_block_rlp(block.raw.as_ref()).wrap_err_with(|| {
+    let (header, body) = split_block_rlp(&block.raw)
+        .wrap_err_with(|| format!("failed to decode block {}", block.number))?;
+    let transactions = extract_reorg_transactions(body).wrap_err_with(|| {
         format!("failed to extract raw transaction bytes from block {}", block.number)
     })?;
-    let parent_beacon_block_root = extract_block_header_from_block_rlp(block.raw.as_ref())
-        .wrap_err_with(|| {
-            format!("failed to extract parent beacon block root from block {}", block.number)
-        })?
-        .parent_beacon_block_root;
+    let parent_beacon_block_root = header.parent_beacon_block_root;
     let payload_attributes = PayloadAttributes {
         timestamp: block.timestamp,
         prev_randao: B256::ZERO,
@@ -574,7 +573,8 @@ async fn process_synthetic_block(
     Ok(synthetic_block_hash)
 }
 
-fn extract_block_header_from_block_rlp(raw: &[u8]) -> Result<ConsensusHeader> {
+/// Split block RLP into the decoded header and the remaining body fields.
+fn split_block_rlp(raw: &[u8]) -> Result<(ConsensusHeader, &[u8])> {
     let mut block_buf = raw;
     let mut block_payload = Header::decode_bytes(&mut block_buf, true)
         .wrap_err("failed to decode outer block RLP list")?;
@@ -582,20 +582,15 @@ fn extract_block_header_from_block_rlp(raw: &[u8]) -> Result<ConsensusHeader> {
         eyre::bail!("block RLP has trailing bytes after outer list");
     }
 
-    ConsensusHeader::decode(&mut block_payload).wrap_err("failed to decode block header")
+    let header =
+        ConsensusHeader::decode(&mut block_payload).wrap_err("failed to decode block header")?;
+    Ok((header, block_payload))
 }
 
-fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<Vec<Bytes>> {
-    let mut block_buf = raw;
-    let mut block_payload = Header::decode_bytes(&mut block_buf, true)
-        .wrap_err("failed to decode outer block RLP list")?;
-    if !block_buf.is_empty() {
-        eyre::bail!("block RLP has trailing bytes after outer list");
-    }
-
-    skip_rlp_item(&mut block_payload).wrap_err("failed to skip block header")?;
-    let mut txs_payload = Header::decode_bytes(&mut block_payload, true)
-        .wrap_err("failed to decode transactions RLP list")?;
+/// Extract the transactions to rebuild a block body on a synthetic fork.
+fn extract_reorg_transactions(mut body: &[u8]) -> Result<Vec<Bytes>> {
+    let mut txs_payload =
+        Header::decode_bytes(&mut body, true).wrap_err("failed to decode transactions RLP list")?;
 
     let mut transactions = Vec::new();
     let mut skipped_blob_txs = 0usize;
@@ -646,12 +641,6 @@ fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<Vec<Bytes>> {
 
 fn should_keep_reorg_transaction(non_blob_tx_index: usize) -> bool {
     !non_blob_tx_index.is_multiple_of(REORG_NON_BLOB_TX_DROP_INTERVAL)
-}
-
-fn skip_rlp_item(buf: &mut &[u8]) -> Result<()> {
-    let header = Header::decode(buf).wrap_err("failed to decode RLP item header")?;
-    *buf = &buf[header.payload_length..];
-    Ok(())
 }
 
 async fn process_big_block(
@@ -789,7 +778,8 @@ mod tests {
     }
 
     fn block_with_transactions(transactions: &[Vec<u8>]) -> Vec<u8> {
-        let header = rlp_list_from_encoded(&[]);
+        let mut header = Vec::new();
+        ConsensusHeader::default().encode(&mut header);
         let transactions = rlp_list_from_encoded(transactions);
         let ommers = rlp_list_from_encoded(&[]);
         rlp_list_from_encoded(&[header, transactions, ommers])
@@ -840,7 +830,7 @@ mod tests {
         let source_transactions = (0..10).map(legacy_tx).collect::<Vec<_>>();
         let block = block_with_transactions(&source_transactions);
 
-        let extracted = extract_tx_bytes_from_block_rlp(&block)
+        let extracted = extract_reorg_transactions(split_block_rlp(&block).unwrap().1)
             .expect("valid block RLP should extract transactions");
 
         let expected = source_transactions
@@ -858,7 +848,7 @@ mod tests {
         source_transactions.push(legacy_tx(9));
         let block = block_with_transactions(&source_transactions);
 
-        let extracted = extract_tx_bytes_from_block_rlp(&block)
+        let extracted = extract_reorg_transactions(split_block_rlp(&block).unwrap().1)
             .expect("valid block RLP should extract transactions");
 
         let expected = source_transactions
