@@ -105,7 +105,7 @@ impl ReorgState {
 struct ProcessingState<'a> {
     collector: &'a mut MetricsCollector,
     reorg_state: Option<&'a mut ReorgState>,
-    persistence_policy: &'a WaitForPersistence,
+    persistence_policy: WaitForPersistence,
 }
 
 const REORG_NON_BLOB_TX_DROP_INTERVAL: usize = 10;
@@ -154,7 +154,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     )?;
 
     let mut collector = MetricsCollector::new(counters);
-    let mut reorg_state = args.reorg.map(|depth| ReorgState::new(depth, args.reorg_gap));
+    let mut reorg_state = args.reorg.map(|depth| ReorgState::new(depth.get(), args.reorg_gap));
     let start = Instant::now();
 
     if let Some(ref path) = args.input {
@@ -172,7 +172,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                 ProcessingState {
                     collector: &mut collector,
                     reorg_state: reorg_state.as_mut(),
-                    persistence_policy: &persistence_policy,
+                    persistence_policy,
                 },
                 args.wait_time,
                 start,
@@ -202,7 +202,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                 ProcessingState {
                     collector: &mut collector,
                     reorg_state: reorg_state.as_mut(),
-                    persistence_policy: &persistence_policy,
+                    persistence_policy,
                 },
                 args.wait_time,
                 start,
@@ -218,7 +218,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             &testing_provider,
             reorg_state,
             &mut collector,
-            &persistence_policy,
+            persistence_policy,
             args.wait_time,
             start,
             &mut reporting.reporters,
@@ -332,7 +332,7 @@ async fn process_block(
     block: &BlockLine,
     collector: &mut MetricsCollector,
     forkchoice_anchor: Option<B256>,
-    persistence_policy: &WaitForPersistence,
+    persistence_policy: WaitForPersistence,
 ) -> Result<()> {
     let input: RethNewPayloadInput<()> = match block.bal.clone() {
         Some(bal) => RethNewPayloadInput::block_rlp_with_bal(block.raw.clone(), bal),
@@ -432,7 +432,7 @@ async fn process_reorg_action(
     testing_provider: &(impl Provider + TestingApi<Ethereum>),
     state: &mut ReorgState,
     collector: &mut MetricsCollector,
-    persistence_policy: &WaitForPersistence,
+    persistence_policy: WaitForPersistence,
     wait_time: Option<Duration>,
     start: Instant,
     reporters: &mut [Box<dyn Reporter>],
@@ -672,7 +672,7 @@ async fn process_big_block(
     provider: &(impl Provider + RethApi<Ethereum>),
     big_block: &BigBlockData<ExecutionData>,
     collector: &mut MetricsCollector,
-    persistence_policy: &WaitForPersistence,
+    persistence_policy: WaitForPersistence,
 ) -> Result<()> {
     let first_payload = big_block
         .env_switches

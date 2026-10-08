@@ -1,22 +1,16 @@
 use bench_core::{
     PrometheusConfig, PrometheusForwarder, PrometheusForwarderHandle, Sample, SampleStore,
-    ScraperConfig,
 };
-use eyre::{bail, Context, Result};
+use eyre::{Context, Result};
 use std::collections::HashMap;
 
 pub(crate) fn build_metrics_forwarder(
     url: Option<&str>,
     metadata: &HashMap<String, String>,
-    scraper_configs: &[ScraperConfig],
 ) -> Result<Option<PrometheusForwarder>> {
     let Some(url) = url else {
         return Ok(None);
     };
-
-    if scraper_configs.is_empty() {
-        bail!("--metrics-forward requires at least one --metrics-url");
-    }
 
     let config = PrometheusConfig::from_metadata(url, metadata)?;
     PrometheusForwarder::spawn(config).map(Some).wrap_err("failed to create metrics forwarder")

@@ -70,7 +70,7 @@ pub struct ReportArgs {
     ///
     /// Uses `/api/v1/write` and the same PROMETHEUS_* environment variables
     /// as `--report prometheus:<url>`. Requires `--metrics-url`.
-    #[arg(long = "metrics-forward", value_name = "URL")]
+    #[arg(long = "metrics-forward", value_name = "URL", requires = "metrics_url")]
     pub metrics_forward: Option<String>,
 }
 
@@ -102,14 +102,14 @@ pub struct SendArgs {
     /// HTTP header populated from --sender-header-map for sender-scoped requests.
     ///
     /// Must be supplied together with --sender-header-map.
-    #[arg(long)]
+    #[arg(long, requires = "sender_header_map")]
     pub sender_header_name: Option<String>,
 
     /// JSON file mapping logical transaction sender addresses to secret header values.
     ///
     /// Must be supplied together with --sender-header-name. Values are loaded
     /// from this file so they do not appear in process arguments.
-    #[arg(long)]
+    #[arg(long, requires = "sender_header_name")]
     pub sender_header_map: Option<PathBuf>,
 
     /// Interval between checks for an atomically replaced sender-header map.
@@ -245,7 +245,7 @@ pub struct SendBlocksArgs {
     ///
     /// Controls whether reth_newPayload blocks until the persistence
     /// threshold is crossed. Default is never.
-    #[arg(long, default_value = "never", value_parser = parse_wait_for_persistence)]
+    #[arg(long, default_value = "never")]
     pub(crate) wait_for_persistence: WaitForPersistence,
 
     /// Minimum interval between block submissions.
@@ -264,10 +264,9 @@ pub struct SendBlocksArgs {
         long,
         value_name = "DEPTH",
         num_args = 0..=1,
-        default_missing_value = "8",
-        value_parser = parse_reorg_depth,
+        default_missing_value = "8"
     )]
-    pub reorg: Option<usize>,
+    pub reorg: Option<NonZeroUsize>,
 
     /// Additional canonical blocks between resolved synthetic side chains.
     #[arg(long, value_name = "BLOCKS", default_value_t = 0, requires = "reorg")]
@@ -318,16 +317,16 @@ pub struct CallArgs {
     ///
     /// A request that would exceed this cap is counted as dropped rather than
     /// delayed, so the offered rate stays the configured one.
-    #[arg(long, default_value_t = 256, value_parser = parse_positive_usize)]
-    pub max_concurrent: usize,
+    #[arg(long, default_value = "256")]
+    pub max_concurrent: NonZeroUsize,
 
     /// Closed-loop passes over the whole corpus (0 = skip the closed loop).
     #[arg(long, default_value_t = 20)]
     pub passes: u64,
 
     /// Closed-loop worker count.
-    #[arg(long, default_value_t = 16, value_parser = parse_positive_usize)]
-    pub concurrency: usize,
+    #[arg(long, default_value = "16")]
+    pub concurrency: NonZeroUsize,
 
     /// Seed for the open-loop record sequence.
     #[arg(long, default_value_t = 1)]
@@ -439,41 +438,6 @@ fn parse_unix_timestamp_ms(s: &str) -> Result<u64, String> {
     }
 }
 
-fn parse_positive_usize(s: &str) -> Result<usize, String> {
-    let value = s.trim().parse::<usize>().map_err(|e| format!("invalid value {s:?}: {e}"))?;
-    if value == 0 {
-        return Err(format!("{s:?} must be greater than 0"));
-    }
-    Ok(value)
-}
-
-fn parse_reorg_depth(s: &str) -> Result<usize, String> {
-    let depth = s.trim().parse::<usize>().map_err(|e| format!("invalid reorg depth: {e}"))?;
-    if depth == 0 {
-        return Err("reorg depth requires DEPTH > 0".to_string());
-    }
-    Ok(depth)
-}
-
-fn parse_wait_for_persistence(s: &str) -> Result<WaitForPersistence, String> {
-    match s {
-        "always" => Ok(WaitForPersistence::Always),
-        "never" => Ok(WaitForPersistence::Never),
-        s if s.starts_with("every:") => {
-            let n = s
-                .strip_prefix("every:")
-                .unwrap_or("0")
-                .parse::<u64>()
-                .map_err(|e| format!("invalid number in every:N: {e}"))?;
-            if n == 0 {
-                return Err("every:N requires N > 0".to_string());
-            }
-            Ok(WaitForPersistence::EveryN(n))
-        }
-        _ => Err(format!("invalid value '{s}': expected 'always', 'never', or 'every:N'")),
-    }
-}
-
 fn load_metric_names(path: Option<&PathBuf>) -> Result<Option<HashSet<String>>> {
     let Some(path) = path else {
         return Ok(None);
@@ -582,11 +546,34 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_reorg_depth() {
-        assert_eq!(parse_reorg_depth("1"), Ok(1));
-        assert_eq!(parse_reorg_depth("8"), Ok(8));
-        assert!(parse_reorg_depth("0").is_err());
-        assert!(parse_reorg_depth("abc").is_err());
+    fn test_send_blocks_reorg_depth() {
+        let parse = |reorg: &str| {
+            Cli::try_parse_from([
+                "bench",
+                "send-blocks",
+                "--engine=http://localhost:8551",
+                "--jwt-secret=/tmp/jwt.hex",
+                reorg,
+            ])
+            .map(|cli| match cli.command {
+                Command::SendBlocks(args) => args.reorg.map(NonZeroUsize::get),
+                _ => panic!("expected send-blocks command"),
+            })
+        };
+        assert_eq!(parse("--reorg").unwrap(), Some(8));
+        assert_eq!(parse("--reorg=1").unwrap(), Some(1));
+        assert!(parse("--reorg=0").is_err());
+    }
+
+    #[test]
+    fn test_paired_flags_require_each_other() {
+        for flags in [
+            ["send", "--sender-header-name", "x-auth"],
+            ["send", "--sender-header-map", "map.json"],
+            ["send", "--metrics-forward", "http://victoriametrics:8428"],
+        ] {
+            assert!(Cli::try_parse_from(["bench"].into_iter().chain(flags)).is_err(), "{flags:?}");
+        }
     }
 
     #[test]
@@ -835,9 +822,9 @@ mod tests {
         assert_eq!(args.rps, 100);
         assert_eq!(args.duration, Duration::from_secs(120));
         assert_eq!(args.requests, None);
-        assert_eq!(args.max_concurrent, 256);
+        assert_eq!(args.max_concurrent.get(), 256);
         assert_eq!(args.passes, 20);
-        assert_eq!(args.concurrency, 16);
+        assert_eq!(args.concurrency.get(), 16);
         assert_eq!(args.seed, 1);
         assert_eq!(args.timeout, Duration::from_secs(30));
         assert_eq!(args.max_fail_rate_pct, 1.0);
