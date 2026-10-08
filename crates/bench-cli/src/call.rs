@@ -54,9 +54,11 @@ pub async fn execute(args: CallArgs) -> Result<()> {
         "Starting RPC corpus replay"
     );
 
-    let metadata: HashMap<_, _> = parse_metadata(&args.metadata)?;
-    let scraper_configs =
-        metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
+    let metadata: HashMap<_, _> = parse_metadata(&args.reporting.metadata)?;
+    let scraper_configs = metrics_scraper_configs(
+        &args.reporting.metrics_url,
+        Duration::from_millis(args.reporting.scrape_interval_ms),
+    )?;
 
     let replay = Replay::new(&args, corpus.clone())?;
     let identity = replay.identity().await?;
@@ -68,19 +70,24 @@ pub async fn execute(args: CallArgs) -> Result<()> {
     );
     replay.prime(args.concurrency).await?;
 
-    let clickhouse_metric_names = load_metric_names(args.clickhouse_metrics_file.as_ref())?;
-    let mut reporters = parse_reporters(&args.reports, "call", &metadata, clickhouse_metric_names)?;
+    let clickhouse_metric_names =
+        load_metric_names(args.reporting.clickhouse_metrics_file.as_ref())?;
+    let mut reporters =
+        parse_reporters(&args.reporting.reports, "call", &metadata, clickhouse_metric_names)?;
     if reporters.is_empty() {
         reporters.push(Box::new(ConsoleReporter::stderr(false)));
     }
 
-    let clock = match args.metrics_align {
+    let clock = match args.reporting.metrics_align {
         Some(start) => RunClock::new_with_start_unix_ms(start),
         None => RunClock::new(),
     };
     let store = SampleStore::with_labels(metadata.clone())?;
-    let metrics_forwarder =
-        build_metrics_forwarder(args.metrics_forward.as_deref(), &metadata, &scraper_configs)?;
+    let metrics_forwarder = build_metrics_forwarder(
+        args.reporting.metrics_forward.as_deref(),
+        &metadata,
+        &scraper_configs,
+    )?;
     let scraper_handles = if scraper_configs.is_empty() {
         Vec::new()
     } else {
@@ -538,6 +545,7 @@ fn status_of(summary: &ResponseSummary) -> RequestStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReportArgs;
     use std::{
         collections::HashMap,
         io::{BufRead, BufReader as StdBufReader, Read},
@@ -731,13 +739,15 @@ mod tests {
             record_csv: None,
             requests_csv: None,
             max_fail_rate_pct: 100.0,
-            reports: Vec::new(),
-            metadata: Vec::new(),
-            metrics_url: Vec::new(),
-            clickhouse_metrics_file: None,
-            scrape_interval_ms: 500,
-            metrics_align: None,
-            metrics_forward: None,
+            reporting: ReportArgs {
+                reports: Vec::new(),
+                metadata: Vec::new(),
+                metrics_url: Vec::new(),
+                clickhouse_metrics_file: None,
+                scrape_interval_ms: 500,
+                metrics_align: None,
+                metrics_forward: None,
+            },
         }
     }
 

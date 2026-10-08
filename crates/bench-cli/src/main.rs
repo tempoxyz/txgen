@@ -24,6 +24,55 @@ mod send_blocks;
 mod view;
 mod wait_for_persistence;
 
+/// Report and metrics arguments shared by `send`, `send-blocks` and `call`.
+#[derive(Args)]
+pub struct ReportArgs {
+    /// Report output destinations
+    #[arg(long = "report", value_name = "FORMAT")]
+    pub reports: Vec<String>,
+
+    /// Metadata key=value pairs to include in the report.
+    ///
+    /// Can be specified multiple times. Example:
+    ///   --metadata build-sha=abcdef --metadata build-profile=perf
+    #[arg(short = 'm', long = "metadata", value_name = "KEY=VALUE")]
+    pub metadata: Vec<String>,
+
+    /// Prometheus metrics endpoint(s) to scrape during the benchmark.
+    ///
+    /// Use a single URL, comma-separated `node:URL` entries, or rich
+    /// `key=value;key=value@URL` entries. Labels are added to scraped samples.
+    #[arg(
+        long,
+        value_name = "URL|NODE:URL|LABELS@URL",
+        value_delimiter = ',',
+        value_parser = parse_metrics_url
+    )]
+    pub metrics_url: Vec<MetricsURL>,
+
+    /// File containing metric names to publish to ClickHouse, one per line.
+    #[arg(long, value_name = "PATH")]
+    pub clickhouse_metrics_file: Option<PathBuf>,
+
+    /// Scrape interval in milliseconds for the metrics scraper.
+    #[arg(long, default_value = "500")]
+    pub scrape_interval_ms: u64,
+
+    /// Align exported metric timestamps to this benchmark-start Unix timestamp.
+    ///
+    /// Accepts Unix seconds or milliseconds. Exported samples keep their
+    /// original offset within the run.
+    #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
+    pub metrics_align: Option<u64>,
+
+    /// Forward scraped samples in real time via Prometheus remote write.
+    ///
+    /// Uses `/api/v1/write` and the same PROMETHEUS_* environment variables
+    /// as `--report prometheus:<url>`. Requires `--metrics-url`.
+    #[arg(long = "metrics-forward", value_name = "URL")]
+    pub metrics_forward: Option<String>,
+}
+
 /// Arguments for the `send` subcommand.
 #[derive(Args)]
 pub struct SendArgs {
@@ -136,50 +185,8 @@ pub struct SendArgs {
     #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
     pub timeout: Duration,
 
-    /// Report output destinations
-    #[arg(long = "report", value_name = "FORMAT")]
-    pub reports: Vec<String>,
-
-    /// Metadata key=value pairs to include in the report.
-    ///
-    /// Can be specified multiple times. Example:
-    ///   --metadata build-sha=abcdef --metadata build-profile=perf
-    #[arg(short = 'm', long = "metadata", value_name = "KEY=VALUE")]
-    pub metadata: Vec<String>,
-
-    /// Prometheus metrics endpoint(s) to scrape during the benchmark.
-    ///
-    /// Use a single URL, comma-separated `node:URL` entries, or rich
-    /// `key=value;key=value@URL` entries. Labels are added to scraped samples.
-    #[arg(
-        long,
-        value_name = "URL|NODE:URL|LABELS@URL",
-        value_delimiter = ',',
-        value_parser = parse_metrics_url
-    )]
-    pub metrics_url: Vec<MetricsURL>,
-
-    /// File containing metric names to publish to ClickHouse, one per line.
-    #[arg(long, value_name = "PATH")]
-    pub clickhouse_metrics_file: Option<PathBuf>,
-
-    /// Scrape interval in milliseconds for the metrics scraper.
-    #[arg(long, default_value = "500")]
-    pub scrape_interval_ms: u64,
-
-    /// Align exported metric timestamps to this benchmark-start Unix timestamp.
-    ///
-    /// Accepts Unix seconds or milliseconds. Exported samples keep their
-    /// original offset within the run.
-    #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
-    pub metrics_align: Option<u64>,
-
-    /// Forward scraped samples in real time via Prometheus remote write.
-    ///
-    /// Uses `/api/v1/write` and the same PROMETHEUS_* environment variables
-    /// as `--report prometheus:<url>`. Requires `--metrics-url`.
-    #[arg(long = "metrics-forward", value_name = "URL")]
-    pub metrics_forward: Option<String>,
+    #[command(flatten)]
+    pub reporting: ReportArgs,
 
     /// Collect and report latency metrics.
     ///
@@ -248,47 +255,8 @@ pub struct SendBlocksArgs {
     #[arg(long, value_name = "WAIT_TIME", value_parser = parse_duration_millis_fallback)]
     pub wait_time: Option<Duration>,
 
-    /// Report output destinations
-    #[arg(long = "report", value_name = "FORMAT")]
-    pub reports: Vec<String>,
-
-    /// Metadata key=value pairs to include in the report.
-    #[arg(short = 'm', long = "metadata", value_name = "KEY=VALUE")]
-    pub metadata: Vec<String>,
-
-    /// Prometheus metrics endpoint(s) to scrape during the benchmark.
-    ///
-    /// Use a single URL, comma-separated `node:URL` entries, or rich
-    /// `key=value;key=value@URL` entries. Labels are added to scraped samples.
-    #[arg(
-        long,
-        value_name = "URL|NODE:URL|LABELS@URL",
-        value_delimiter = ',',
-        value_parser = parse_metrics_url
-    )]
-    pub metrics_url: Vec<MetricsURL>,
-
-    /// File containing metric names to publish to ClickHouse, one per line.
-    #[arg(long, value_name = "PATH")]
-    pub clickhouse_metrics_file: Option<PathBuf>,
-
-    /// Scrape interval in milliseconds for the metrics scraper.
-    #[arg(long, default_value = "500")]
-    pub scrape_interval_ms: u64,
-
-    /// Align exported metric timestamps to this benchmark-start Unix timestamp.
-    ///
-    /// Accepts Unix seconds or milliseconds. Exported samples keep their
-    /// original offset within the run.
-    #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
-    pub metrics_align: Option<u64>,
-
-    /// Forward scraped samples in real time via Prometheus remote write.
-    ///
-    /// Uses `/api/v1/write` and the same PROMETHEUS_* environment variables
-    /// as `--report prometheus:<url>`. Requires `--metrics-url`.
-    #[arg(long = "metrics-forward", value_name = "URL")]
-    pub metrics_forward: Option<String>,
+    #[command(flatten)]
+    pub reporting: ReportArgs,
 
     /// Build a synthetic side fork and alternate forkchoice updates.
     #[arg(
@@ -396,47 +364,8 @@ pub struct CallArgs {
     #[arg(long, default_value_t = 1.0, value_name = "PERCENT")]
     pub max_fail_rate_pct: f64,
 
-    /// Report output destinations
-    #[arg(long = "report", value_name = "FORMAT")]
-    pub reports: Vec<String>,
-
-    /// Metadata key=value pairs to include in the report.
-    #[arg(short = 'm', long = "metadata", value_name = "KEY=VALUE")]
-    pub metadata: Vec<String>,
-
-    /// Prometheus metrics endpoint(s) to scrape during the benchmark.
-    ///
-    /// Use a single URL, comma-separated `node:URL` entries, or rich
-    /// `key=value;key=value@URL` entries. Labels are added to scraped samples.
-    #[arg(
-        long,
-        value_name = "URL|NODE:URL|LABELS@URL",
-        value_delimiter = ',',
-        value_parser = parse_metrics_url
-    )]
-    pub metrics_url: Vec<MetricsURL>,
-
-    /// File containing metric names to publish to ClickHouse, one per line.
-    #[arg(long, value_name = "PATH")]
-    pub clickhouse_metrics_file: Option<PathBuf>,
-
-    /// Scrape interval in milliseconds for the metrics scraper.
-    #[arg(long, default_value = "500")]
-    pub scrape_interval_ms: u64,
-
-    /// Align exported metric timestamps to this benchmark-start Unix timestamp.
-    ///
-    /// Accepts Unix seconds or milliseconds. Exported samples keep their
-    /// original offset within the run.
-    #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
-    pub metrics_align: Option<u64>,
-
-    /// Forward scraped samples in real time via Prometheus remote write.
-    ///
-    /// Uses `/api/v1/write` and the same PROMETHEUS_* environment variables
-    /// as `--report prometheus:<url>`. Requires `--metrics-url`.
-    #[arg(long = "metrics-forward", value_name = "URL")]
-    pub metrics_forward: Option<String>,
+    #[command(flatten)]
+    pub reporting: ReportArgs,
 }
 
 /// Which phase of a corpus replay to run.
@@ -782,7 +711,7 @@ mod tests {
         };
 
         assert_eq!(
-            args.metrics_url,
+            args.reporting.metrics_url,
             vec![MetricsURL::Unlabeled("http://127.0.0.1:9001/metrics".to_string())]
         );
     }
@@ -801,9 +730,9 @@ mod tests {
             panic!("expected send command");
         };
 
-        assert_eq!(args.metrics_url.len(), 1);
+        assert_eq!(args.reporting.metrics_url.len(), 1);
         assert_eq!(
-            args.metrics_url[0],
+            args.reporting.metrics_url[0],
             MetricsURL::Labeled {
                 labels: std::collections::BTreeMap::from([
                     ("region".to_string(), "us-east-1".to_string()),
@@ -830,7 +759,7 @@ mod tests {
             panic!("expected send command");
         };
 
-        assert_eq!(args.metrics_forward, Some("http://victoriametrics:8428".to_string()));
+        assert_eq!(args.reporting.metrics_forward, Some("http://victoriametrics:8428".to_string()));
     }
 
     #[test]
@@ -853,7 +782,7 @@ mod tests {
             panic!("expected send-blocks command");
         };
 
-        assert_eq!(args.metrics_forward, Some("http://prometheus:9090".to_string()));
+        assert_eq!(args.reporting.metrics_forward, Some("http://prometheus:9090".to_string()));
     }
 
     #[test]
@@ -875,7 +804,7 @@ mod tests {
         };
 
         assert_eq!(
-            args.metrics_url,
+            args.reporting.metrics_url,
             vec![
                 MetricsURL::Labeled {
                     labels: std::collections::BTreeMap::from([(
