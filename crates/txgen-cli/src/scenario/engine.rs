@@ -50,7 +50,7 @@ use tokio::{
 };
 use txgen_core::{
     merge_yaml, AccountManager, AddressPoolManager, ArtifactManager, BuildContext,
-    NonceReservationKind, NonceTracker, SignerExt, TxPhase, WorkloadSpec,
+    NonceReservation, NonceReservationKind, NonceTracker, SignerExt, TxPhase, WorkloadSpec,
 };
 
 const FALLBACK_STEP_TIMEOUT: Duration = Duration::from_secs(300);
@@ -1792,10 +1792,7 @@ where
                 deadline,
             )
             .await?;
-        let has_ordered_nonces = materialized
-            .nonce_reservations
-            .iter()
-            .any(|reservation| reservation.kind == NonceReservationKind::Ordered);
+        let has_ordered_nonces = has_ordered(&materialized.nonce_reservations);
         let attempt_started_at = SystemTime::now();
         let attempt_started = Instant::now();
         let prepared_hash = (materialized.tx_hash != B256::ZERO).then_some(materialized.tx_hash);
@@ -2082,13 +2079,8 @@ where
                 )
                 .await?;
             let reservations = prepared.nonce_reservations().to_vec();
-            let has_ordered_nonces = reservations
-                .iter()
-                .any(|reservation| reservation.kind == NonceReservationKind::Ordered);
-            let keys = reservations
-                .iter()
-                .filter(|reservation| reservation.kind == NonceReservationKind::Ordered)
-                .map(|reservation| reservation.key)
+            let has_ordered_nonces = has_ordered(&reservations);
+            let keys = ordered_keys(&reservations)
                 .chain(prepared.scheduling_keys())
                 .collect::<BTreeSet<_>>();
             if keys.is_empty() {
@@ -2105,10 +2097,7 @@ where
                         "failed to restore nonce state after detecting an ambiguous nonce lane",
                     ));
                 }
-                return Err(StepError::new(
-                    "nonce_state_ambiguous",
-                    "an earlier submission on this nonce lane had an unknown acceptance outcome",
-                ));
+                return Err(nonce_state_ambiguous());
             }
 
             let notified = self.submission_lanes.notify.notified();
@@ -2150,10 +2139,7 @@ where
                             "failed to restore nonce state after detecting unsafe parallel submission",
                         ));
                     }
-                    return Err(StepError::new(
-                        "unsafe_parallel_nonce",
-                        "parallel steps in one scenario instance use the same ordered nonce lane; add an explicit dependency",
-                    ));
+                    return Err(unsafe_parallel_nonce());
                 }
                 SubmissionLaneAcquire::Busy if !has_ordered_nonces => {
                     *rng = attempt_rng;
@@ -2197,12 +2183,7 @@ where
                 ordered_predecessors,
             ) {
                 SubmissionLaneAcquire::Acquired(lanes) => return Ok(lanes),
-                SubmissionLaneAcquire::UnsafeSameInstance => {
-                    return Err(StepError::new(
-                        "unsafe_parallel_nonce",
-                        "parallel steps in one scenario instance use the same ordered nonce lane; add an explicit dependency",
-                    ));
-                }
+                SubmissionLaneAcquire::UnsafeSameInstance => return Err(unsafe_parallel_nonce()),
                 SubmissionLaneAcquire::Busy => {
                     tokio::time::timeout_at(deadline, notified)
                         .await
@@ -2217,10 +2198,7 @@ where
         transaction: MaterializedTx,
         lanes: SubmissionLaneGuard,
     ) -> Result<(MaterializedTx, SubmissionLaneGuard), StepError> {
-        let has_ordered_nonces = transaction
-            .nonce_reservations
-            .iter()
-            .any(|reservation| reservation.kind == NonceReservationKind::Ordered);
+        let has_ordered_nonces = has_ordered(&transaction.nonce_reservations);
         if !self.submission_lanes.has_ambiguous_ordered_lane(has_ordered_nonces, &lanes.keys) {
             return Ok((transaction, lanes));
         }
@@ -2231,10 +2209,7 @@ where
                 "failed to restore nonce state after the affected nonce lane was disabled",
             ));
         }
-        Err(StepError::new(
-            "nonce_state_ambiguous",
-            "an earlier submission on this nonce lane had an unknown acceptance outcome",
-        ))
+        Err(nonce_state_ambiguous())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2288,16 +2263,8 @@ where
         };
         if let Some(error) = preparation_error {
             let reservations = build_context.take_nonce_reservations();
-            let mut restored = true;
-            let mut ordered_keys = BTreeSet::new();
-            for reservation in reservations.iter().rev() {
-                if reservation.kind == NonceReservationKind::Ordered {
-                    ordered_keys.insert(reservation.key);
-                    restored &= build_context.nonces.rewind(reservation.key, reservation.nonce);
-                }
-            }
-            if !restored {
-                self.submission_lanes.mark_ambiguous(&ordered_keys);
+            if !rewind_ordered(build_context.nonces, &reservations) {
+                self.submission_lanes.mark_ambiguous(&ordered_keys(&reservations).collect());
                 return Err(StepError::new(
                     "nonce_recovery_error",
                     "failed to restore nonce state after transaction preparation failed",
@@ -2316,18 +2283,8 @@ where
         .map_err(|error| StepError::new("materialization_error", error.to_string()))
     }
 
-    async fn rollback_nonce_reservations(
-        &self,
-        reservations: &[txgen_core::NonceReservation],
-    ) -> bool {
-        let mut nonces = self.nonces.lock().await;
-        let mut restored = true;
-        for reservation in reservations.iter().rev() {
-            if reservation.kind == NonceReservationKind::Ordered {
-                restored &= nonces.rewind(reservation.key, reservation.nonce);
-            }
-        }
-        restored
+    async fn rollback_nonce_reservations(&self, reservations: &[NonceReservation]) -> bool {
+        rewind_ordered(&mut *self.nonces.lock().await, reservations)
     }
 
     async fn rollback_submitted_nonces(
@@ -2335,11 +2292,7 @@ where
         transaction: &MaterializedTx,
         deadline: TokioInstant,
     ) -> Option<bool> {
-        if !transaction
-            .nonce_reservations
-            .iter()
-            .any(|reservation| reservation.kind == NonceReservationKind::Ordered)
-        {
+        if !has_ordered(&transaction.nonce_reservations) {
             return Some(true);
         }
         // Exclude speculative materialization while proving that this accepted
@@ -2392,6 +2345,42 @@ where
             Err(StepError::timeout())
         }
     }
+}
+
+fn has_ordered(reservations: &[NonceReservation]) -> bool {
+    reservations.iter().any(|reservation| reservation.kind == NonceReservationKind::Ordered)
+}
+
+fn ordered_keys(reservations: &[NonceReservation]) -> impl Iterator<Item = [u8; 20]> + '_ {
+    reservations
+        .iter()
+        .filter(|reservation| reservation.kind == NonceReservationKind::Ordered)
+        .map(|reservation| reservation.key)
+}
+
+/// Rewind ordered reservations newest first; returns whether every lane was restored.
+fn rewind_ordered(nonces: &mut NonceTracker, reservations: &[NonceReservation]) -> bool {
+    let mut restored = true;
+    for reservation in reservations.iter().rev() {
+        if reservation.kind == NonceReservationKind::Ordered {
+            restored &= nonces.rewind(reservation.key, reservation.nonce);
+        }
+    }
+    restored
+}
+
+fn nonce_state_ambiguous() -> StepError {
+    StepError::new(
+        "nonce_state_ambiguous",
+        "an earlier submission on this nonce lane had an unknown acceptance outcome",
+    )
+}
+
+fn unsafe_parallel_nonce() -> StepError {
+    StepError::new(
+        "unsafe_parallel_nonce",
+        "parallel steps in one scenario instance use the same ordered nonce lane; add an explicit dependency",
+    )
 }
 
 async fn lock_before_deadline<T>(
