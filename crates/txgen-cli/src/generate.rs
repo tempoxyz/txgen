@@ -576,71 +576,13 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    let has_deploy = step.deploy.is_some();
-    let has_tx = step.tx.is_some();
-    let has_keychain_authorize_pool = step.keychain_authorize_pool.is_some();
-    let action_count =
-        usize::from(has_deploy) + usize::from(has_tx) + usize::from(has_keychain_authorize_pool);
-    if action_count != 1 {
-        bail!("setup step must set exactly one of `deploy`, `tx`, or `keychain_authorize_pool`");
+    for (name, value) in setup_step_templates(adapter, step, setup_bindings, ctx)? {
+        let (generated, info) =
+            materialize_setup_value_online(adapter, &name, value, ctx, output.prepare_timeout)
+                .await?;
+        bind_setup_tx(step, info, setup_bindings)?;
+        output.transactions.push((output.submit)(generated).await?);
     }
-
-    let local_bindings = resolve_sequence_bindings(&step.bindings, ctx, setup_bindings)?;
-    if let Some(keychain_authorize_pool) = &step.keychain_authorize_pool {
-        let materialized = substitute_vars(keychain_authorize_pool.clone(), &local_bindings)?;
-        let templates = adapter
-            .expand_setup_extension(&step.id, "keychain_authorize_pool", materialized, ctx)?
-            .ok_or_else(|| {
-                eyre::eyre!("adapter does not support setup step `keychain_authorize_pool`")
-            })?;
-        if templates.is_empty() {
-            bail!("setup step `keychain_authorize_pool` produced no transactions");
-        }
-        for (idx, value) in templates.into_iter().enumerate() {
-            let (generated, _) = materialize_setup_value_online(
-                adapter,
-                &format!("setup.{}[{idx}]", step.id),
-                value,
-                ctx,
-                output.prepare_timeout,
-            )
-            .await?;
-            output.transactions.push((output.submit)(generated).await?);
-        }
-        return Ok(());
-    }
-
-    let (generated, info) = if let Some(deploy) = &step.deploy {
-        let materialized = substitute_vars(deploy.clone(), &local_bindings)?;
-        let value = build_deploy_template_value(materialized, ctx)?;
-        let result = materialize_setup_value_online(
-            adapter,
-            &format!("setup.{}", step.id),
-            value,
-            ctx,
-            output.prepare_timeout,
-        )
-        .await?;
-        if result.1.created_address.is_none() {
-            bail!("deploy setup step did not produce a contract creation transaction");
-        }
-        result
-    } else {
-        let tx = step.tx.as_ref().expect("checked exactly one setup action");
-        let materialized = substitute_vars(tx.clone(), &local_bindings)?;
-        materialize_setup_value_online(
-            adapter,
-            &format!("setup.{}", step.id),
-            materialized,
-            ctx,
-            output.prepare_timeout,
-        )
-        .await?
-    };
-    output.transactions.push((output.submit)(generated).await?);
-
-    setup_bindings.insert(format!("setup.{}", step.id), ResolvedBinding::SetupTx(info));
-
     Ok(())
 }
 
@@ -1360,6 +1302,23 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
+    for (name, value) in setup_step_templates(adapter, step, setup_bindings, ctx)? {
+        let (generated, info) = materialize_setup_value(adapter, &name, value, ctx)?;
+        bind_setup_tx(step, info, setup_bindings)?;
+        transactions.push(generated);
+    }
+    Ok(())
+}
+
+/// Expand a setup step into its named transaction templates, in submission order.
+///
+/// `deploy` and `tx` steps yield one template; adapter extensions may yield several.
+fn setup_step_templates<A: NetworkAdapter>(
+    adapter: &mut A,
+    step: &SetupStep,
+    setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
+    ctx: &mut BuildContext<'_>,
+) -> Result<Vec<(String, serde_yaml::Value)>> {
     let has_deploy = step.deploy.is_some();
     let has_tx = step.tx.is_some();
     let has_keychain_authorize_pool = step.keychain_authorize_pool.is_some();
@@ -1380,31 +1339,35 @@ where
         if templates.is_empty() {
             bail!("setup step `keychain_authorize_pool` produced no transactions");
         }
-        for (idx, value) in templates.into_iter().enumerate() {
-            let (generated, _) =
-                materialize_setup_value(adapter, &format!("setup.{}[{idx}]", step.id), value, ctx)?;
-            transactions.push(generated);
-        }
-        return Ok(());
+        return Ok(templates
+            .into_iter()
+            .enumerate()
+            .map(|(idx, value)| (format!("setup.{}[{idx}]", step.id), value))
+            .collect());
     }
 
-    let (generated, info) = if let Some(deploy) = &step.deploy {
-        let materialized = substitute_vars(deploy.clone(), &local_bindings)?;
-        let value = build_deploy_template_value(materialized, ctx)?;
-        let result = materialize_setup_value(adapter, &format!("setup.{}", step.id), value, ctx)?;
-        if result.1.created_address.is_none() {
-            bail!("deploy setup step did not produce a contract creation transaction");
-        }
-        result
+    let value = if let Some(deploy) = &step.deploy {
+        build_deploy_template_value(substitute_vars(deploy.clone(), &local_bindings)?, ctx)?
     } else {
         let tx = step.tx.as_ref().expect("checked exactly one setup action");
-        let materialized = substitute_vars(tx.clone(), &local_bindings)?;
-        materialize_setup_value(adapter, &format!("setup.{}", step.id), materialized, ctx)?
+        substitute_vars(tx.clone(), &local_bindings)?
     };
-    transactions.push(generated);
+    Ok(vec![(format!("setup.{}", step.id), value)])
+}
 
+/// Expose a `deploy` or `tx` step's transaction to later steps as `setup.<id>`.
+fn bind_setup_tx(
+    step: &SetupStep,
+    info: EmittedTxInfo,
+    setup_bindings: &mut std::collections::HashMap<String, ResolvedBinding>,
+) -> Result<()> {
+    if step.keychain_authorize_pool.is_some() {
+        return Ok(());
+    }
+    if step.deploy.is_some() && info.created_address.is_none() {
+        bail!("deploy setup step did not produce a contract creation transaction");
+    }
     setup_bindings.insert(format!("setup.{}", step.id), ResolvedBinding::SetupTx(info));
-
     Ok(())
 }
 
