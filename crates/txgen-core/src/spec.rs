@@ -183,9 +183,9 @@ pub enum SequenceBinding {
     /// Resolve a bytes32 value once.
     Bytes32(GenValue<B256>),
     /// ABI packed-encode values once.
-    AbiEncodePacked(AbiEncodePackedDef),
+    AbiEncodePacked(AbiValuesDef),
     /// Resolve a Keccak-256 hash over ABI-encoded values once.
-    AbiHash(AbiHashDef),
+    AbiHash(AbiValuesDef),
     /// Resolve a U256 once.
     U256(GenValue<U256>),
     /// Resolve a u64 once.
@@ -194,19 +194,9 @@ pub enum SequenceBinding {
     String(GenValue<String>),
 }
 
-/// Values to ABI packed-encode.
+/// Typed values for the `abi_encode_packed` and `abi_hash` bindings.
 #[derive(Debug, Clone, Deserialize)]
-pub struct AbiEncodePackedDef {
-    /// Solidity ABI types, one per value.
-    pub types: Vec<String>,
-    /// Values to encode using the corresponding type.
-    #[serde(alias = "args")]
-    pub values: Vec<serde_yaml::Value>,
-}
-
-/// Values to ABI-encode and hash with Keccak-256.
-#[derive(Debug, Clone, Deserialize)]
-pub struct AbiHashDef {
+pub struct AbiValuesDef {
     /// Solidity ABI types, one per value.
     pub types: Vec<String>,
     /// Values to encode using the corresponding type.
@@ -224,8 +214,8 @@ impl<'de> Deserialize<'de> for SequenceBinding {
             account: Option<AccountRef>,
             address: Option<GenValue<Address>>,
             bytes32: Option<GenValue<B256>>,
-            abi_encode_packed: Option<AbiEncodePackedDef>,
-            abi_hash: Option<AbiHashDef>,
+            abi_encode_packed: Option<AbiValuesDef>,
+            abi_hash: Option<AbiValuesDef>,
             u256: Option<GenValue<U256>>,
             u64: Option<GenValue<u64>>,
             string: Option<GenValue<String>>,
