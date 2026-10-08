@@ -927,7 +927,6 @@ where
                 Ok(StepExecution { value: RuntimeValue::Object(output), milestones: Vec::new() })
             }
             StepAction::Submit(submit) => {
-                let submit_rng = rng.clone();
                 let ordered_predecessors = self.ordered_predecessor_ids(step_index);
                 let step_id = step.effective_id(step_index);
                 let submit_rank = self.spec.scenario.steps[..step_index]
@@ -969,7 +968,7 @@ where
                     })?;
                 let dense_unique_nonce_hint =
                     self.dense_unique_nonce_hint(chain, instance, step_index, submit)?;
-                let (value, next_rng) = chain
+                chain
                     .execute_submit(
                         instance,
                         step_name,
@@ -977,15 +976,13 @@ where
                         unique_nonce_hint,
                         dense_unique_nonce_hint,
                         &ordered_predecessors,
-                        submit.clone(),
-                        context.clone(),
-                        submit_rng,
+                        submit,
+                        context,
+                        rng,
                         deadline,
                         clock,
                     )
-                    .await?;
-                *rng = next_rng;
-                Ok(value)
+                    .await
             }
             StepAction::WaitReceipt(wait_receipt) => {
                 let hash = expression_hash(&wait_receipt.transaction_hash, context)
@@ -1766,12 +1763,12 @@ where
         unique_nonce_hint: u64,
         dense_unique_nonce_hint: Option<u64>,
         ordered_predecessors: &BTreeSet<String>,
-        submit: SubmitStep,
-        context: RuntimeContext,
-        mut rng: StdRng,
+        submit: &SubmitStep,
+        context: &RuntimeContext,
+        rng: &mut StdRng,
         deadline: TokioInstant,
         clock: &RunClock,
-    ) -> Result<(StepExecution, StdRng), StepError> {
+    ) -> Result<StepExecution, StepError> {
         let (materialized, submission_lanes) = self
             .prepare_submission(
                 instance,
@@ -1781,8 +1778,8 @@ where
                 &submit.template,
                 &submit.with_value,
                 ordered_predecessors,
-                &context,
-                &mut rng,
+                context,
+                rng,
                 deadline,
             )
             .await?;
@@ -2005,28 +2002,22 @@ where
         let mut milestones = vec![submit_milestone];
         milestones.extend(receipt_milestone);
 
-        Ok((
-            StepExecution {
-                value: object([
-                    ("chain", RuntimeValue::String(self.name.clone())),
-                    ("template", RuntimeValue::String(submit.template.clone())),
-                    ("id", RuntimeValue::String(submit.template)),
-                    ("sender", RuntimeValue::Address(materialized.sender)),
-                    ("tx_hash", RuntimeValue::Bytes32(submission.tx_hash)),
-                    (
-                        "submitted_at",
-                        RuntimeValue::Uint(U256::from(unix_ms(submission.submitted_at))),
-                    ),
-                    (
-                        "acceptance_latency",
-                        RuntimeValue::Uint(U256::from(duration_ms(submission.acceptance_latency))),
-                    ),
-                    ("receipt", receipt),
-                ]),
-                milestones,
-            },
-            rng,
-        ))
+        Ok(StepExecution {
+            value: object([
+                ("chain", RuntimeValue::String(self.name.clone())),
+                ("template", RuntimeValue::String(submit.template.clone())),
+                ("id", RuntimeValue::String(submit.template.clone())),
+                ("sender", RuntimeValue::Address(materialized.sender)),
+                ("tx_hash", RuntimeValue::Bytes32(submission.tx_hash)),
+                ("submitted_at", RuntimeValue::Uint(U256::from(unix_ms(submission.submitted_at)))),
+                (
+                    "acceptance_latency",
+                    RuntimeValue::Uint(U256::from(duration_ms(submission.acceptance_latency))),
+                ),
+                ("receipt", receipt),
+            ]),
+            milestones,
+        })
     }
 
     async fn finish_receipts(&self) -> ReceiptCollection {
