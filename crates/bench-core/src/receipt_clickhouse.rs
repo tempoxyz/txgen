@@ -34,15 +34,6 @@ pub fn insert_receipt_gas_records(
     Ok(())
 }
 
-/// Insert granular receipt gas records using [`DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE`].
-pub fn insert_receipt_gas_records_with_default_batch_size(
-    client: &ClickHouseClient,
-    run_id: uuid::Uuid,
-    records: &[ReceiptGasRecord],
-) -> Result<()> {
-    insert_receipt_gas_records(client, run_id, records, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE)
-}
-
 #[derive(Debug, Serialize)]
 struct ReceiptGasRow {
     run_id: uuid::Uuid,
