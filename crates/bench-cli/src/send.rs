@@ -511,20 +511,18 @@ async fn send_workload_from_source<S: TxSource>(
     // keeps the post-reset ramp-up outside the full requested duration.
     let start_unix_ms = metrics.clock().unix_ms();
     let deadline = interval.duration.map(|duration| tokio::time::Instant::now() + duration);
-    if let Some(tx) = interval.first_workload {
-        send_workload_tx(tx, sender, metrics, config, reporters).await?;
-    }
+    let mut pending = interval.first_workload;
     loop {
         let next = if let Some(deadline) = deadline {
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
-            match tokio::time::timeout_at(deadline, source.next_tx()).await {
+            match tokio::time::timeout_at(deadline, next_workload_tx(source, &mut pending)).await {
                 Ok(next) => next?,
                 Err(_) => break,
             }
         } else {
-            source.next_tx().await?
+            next_workload_tx(source, &mut pending).await?
         };
         let Some(tx) = next else {
             if deadline.is_some_and(|deadline| tokio::time::Instant::now() < deadline) {
@@ -534,9 +532,6 @@ async fn send_workload_from_source<S: TxSource>(
         };
         if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             break;
-        }
-        if tx.phase == TxPhase::Setup {
-            bail!("setup transaction appeared after workload started");
         }
         send_workload_tx(tx, sender, metrics, config, reporters).await?;
     }
@@ -550,6 +545,21 @@ fn trim_report(report: &mut FinalReport, clock: &RunClock, end_offset_ms: u64) {
         ts.latencies.retain(|l| l.offset_ms <= end_offset_ms);
         ts.throughput.retain(|t| t.second * 1000 <= end_offset_ms);
     }
+}
+
+/// Take `pending` or read the next transaction, rejecting setup transactions.
+pub(crate) async fn next_workload_tx<S: TxSource>(
+    source: &mut S,
+    pending: &mut Option<GeneratedTx>,
+) -> Result<Option<GeneratedTx>> {
+    let tx = match pending.take() {
+        Some(tx) => Some(tx),
+        None => source.next_tx().await?,
+    };
+    if tx.as_ref().is_some_and(|tx| tx.phase == TxPhase::Setup) {
+        bail!("setup transaction appeared after workload started");
+    }
+    Ok(tx)
 }
 
 async fn send_workload_tx(
