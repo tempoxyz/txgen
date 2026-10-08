@@ -1265,91 +1265,22 @@ fn validate_account_path(root: &str, tail: Option<&str>) -> Result<()> {
 
 fn validate_saved_path(root: &str, kind: SavedKind, tail: Option<&str>) -> Result<()> {
     let Some(tail) = tail else { return Ok(()) };
-    let valid = match kind {
-        SavedKind::Checkpoint => {
-            matches!(tail, "chain" | "block_number" | "block_hash" | "captured_at")
-        }
+    if matches!(kind, SavedKind::Submit { receipt: false }) &&
+        (tail == "receipt" || tail.starts_with("receipt."))
+    {
+        bail!("saved submit result '{root}' has no receipt because the step does not await one");
+    }
+    // Invoke outputs and decoded event arguments have no static shape.
+    let dynamic = match kind {
         SavedKind::Invoke => true,
-        SavedKind::Submit { receipt } => {
-            if (tail == "receipt" || tail.starts_with("receipt.")) && !receipt {
-                bail!("saved submit result '{root}' has no receipt because the step does not await one");
-            }
-            matches!(
-                tail,
-                "chain" |
-                    "template" |
-                    "id" |
-                    "sender" |
-                    "tx_hash" |
-                    "submitted_at" |
-                    "acceptance_latency" |
-                    "receipt" |
-                    "receipt.chain" |
-                    "receipt.transaction_hash" |
-                    "receipt.tx_hash" |
-                    "receipt.block_hash" |
-                    "receipt.block_number" |
-                    "receipt.transaction_index" |
-                    "receipt.block_timestamp_ms" |
-                    "receipt.first_observed_at" |
-                    "receipt.confirmed_at" |
-                    "receipt.confirmation_depth" |
-                    "receipt.status" |
-                    "receipt.gas_used" |
-                    "receipt.observed_at"
-            )
-        }
-        SavedKind::Receipt => {
-            matches!(
-                tail,
-                "chain" |
-                    "transaction_hash" |
-                    "tx_hash" |
-                    "block_hash" |
-                    "block_number" |
-                    "transaction_index" |
-                    "block_timestamp_ms" |
-                    "first_observed_at" |
-                    "confirmed_at" |
-                    "confirmation_depth" |
-                    "status" |
-                    "gas_used" |
-                    "observed_at"
-            )
-        }
-        SavedKind::Log { grouped } => {
-            matches!(
-                tail,
-                "chain" |
-                    "transaction_hash" |
-                    "tx_hash" |
-                    "block_hash" |
-                    "block_number" |
-                    "transaction_index" |
-                    "block_timestamp_ms" |
-                    "first_observed_at" |
-                    "observed_at" |
-                    "confirmed_at" |
-                    "confirmation_depth"
-            ) || if grouped {
-                tail == "events" ||
-                    tail.starts_with("events.") ||
-                    matches!(tail, "status" | "gas_used")
-            } else {
-                tail == "args" ||
-                    tail.starts_with("args.") ||
-                    matches!(
-                        tail,
-                        "address" | "contract_address" | "log_index" | "event" | "event_name"
-                    )
-            }
-        }
+        SavedKind::Log { grouped: true } => tail.starts_with("events."),
+        SavedKind::Log { grouped: false } => tail.starts_with("args."),
+        _ => false,
     };
-    if valid {
-        Ok(())
-    } else {
+    if !dynamic && saved_field_type(kind, tail).is_none() {
         bail!("saved step result '{root}' has no field '{tail}'");
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1511,15 +1442,22 @@ fn static_reference_type(
             _ => None,
         },
         AvailableRoot::Bytes32Binding => tail.is_empty().then_some(StaticValueType::Bytes32),
-        AvailableRoot::Saved(SavedKind::Checkpoint) => match tail {
+        AvailableRoot::Saved(kind) => saved_field_type(*kind, tail),
+    }
+}
+
+/// Static type of a saved step result field; an empty tail is the result itself.
+fn saved_field_type(kind: SavedKind, tail: &str) -> Option<StaticValueType> {
+    match kind {
+        SavedKind::Checkpoint => match tail {
             "" => Some(StaticValueType::Object),
             "chain" => Some(StaticValueType::String),
             "block_number" | "captured_at" => Some(StaticValueType::Uint),
             "block_hash" => Some(StaticValueType::Bytes32),
             _ => None,
         },
-        AvailableRoot::Saved(SavedKind::Invoke) => None,
-        AvailableRoot::Saved(SavedKind::Submit { .. }) => match tail {
+        SavedKind::Invoke => None,
+        SavedKind::Submit { .. } => match tail {
             "" | "receipt" => Some(StaticValueType::Object),
             "chain" | "template" | "id" | "receipt.chain" => Some(StaticValueType::String),
             "sender" => Some(StaticValueType::Address),
@@ -1539,7 +1477,7 @@ fn static_reference_type(
             "receipt.status" => Some(StaticValueType::Bool),
             _ => None,
         },
-        AvailableRoot::Saved(SavedKind::Receipt) => match tail {
+        SavedKind::Receipt => match tail {
             "" => Some(StaticValueType::Object),
             "chain" => Some(StaticValueType::String),
             "transaction_hash" | "tx_hash" | "block_hash" => Some(StaticValueType::Bytes32),
@@ -1550,19 +1488,19 @@ fn static_reference_type(
             "status" => Some(StaticValueType::Bool),
             _ => None,
         },
-        AvailableRoot::Saved(SavedKind::Log { grouped }) => match tail {
+        SavedKind::Log { grouped } => match tail {
             "" => Some(StaticValueType::Object),
             "chain" => Some(StaticValueType::String),
             "transaction_hash" | "tx_hash" | "block_hash" => Some(StaticValueType::Bytes32),
             "block_number" | "transaction_index" | "block_timestamp_ms" | "first_observed_at" |
             "observed_at" | "confirmed_at" | "confirmation_depth" => Some(StaticValueType::Uint),
-            "events" if *grouped => Some(StaticValueType::Object),
-            "status" if *grouped => Some(StaticValueType::Bool),
-            "gas_used" if *grouped => Some(StaticValueType::Uint),
-            "args" if !*grouped => Some(StaticValueType::Object),
-            "event" | "event_name" if !*grouped => Some(StaticValueType::String),
-            "address" | "contract_address" if !*grouped => Some(StaticValueType::Address),
-            "log_index" if !*grouped => Some(StaticValueType::Uint),
+            "events" if grouped => Some(StaticValueType::Object),
+            "status" if grouped => Some(StaticValueType::Bool),
+            "gas_used" if grouped => Some(StaticValueType::Uint),
+            "args" if !grouped => Some(StaticValueType::Object),
+            "event" | "event_name" if !grouped => Some(StaticValueType::String),
+            "address" | "contract_address" if !grouped => Some(StaticValueType::Address),
+            "log_index" if !grouped => Some(StaticValueType::Uint),
             _ => None,
         },
     }
