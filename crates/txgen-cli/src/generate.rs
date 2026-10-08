@@ -1006,58 +1006,31 @@ where
     );
     build_ctx.set_defer_signing(ctx.defer_signing);
 
-    match output {
-        Some(path) => {
-            let mut writer = txgen_core::output::file_writer(&path)?;
-            let setup_bindings = if let Some(state) = &ctx.setup_state_in {
-                state.bindings()
-            } else {
-                let bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
-                if let Some(path) = &ctx.setup_state_out {
-                    writer.flush()?;
-                    SetupState::from_bindings(ctx.spec.chain_id, &bindings).save(path)?;
-                }
-                bindings
-            };
-            let written = generate_txs(
-                adapter,
-                &ctx.spec,
-                GenerationConfig {
-                    limit: ctx.limit,
-                    signing_workers: ctx.signing_workers,
-                    gas_sample_rpc: ctx.gas_sample_rpc.as_deref(),
-                },
-                &setup_bindings,
-                &mut build_ctx,
-                &mut writer,
-            )?;
-            eprintln!("wrote {} workload transactions to {}", written, path.display());
+    let mut writer = txgen_core::output::ndjson_writer(output.as_deref())?;
+    let setup_bindings = if let Some(state) = &ctx.setup_state_in {
+        state.bindings()
+    } else {
+        let bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+        if let Some(path) = &ctx.setup_state_out {
+            writer.flush()?;
+            SetupState::from_bindings(ctx.spec.chain_id, &bindings).save(path)?;
         }
-        None => {
-            let mut writer = txgen_core::output::stdout_writer();
-            let setup_bindings = if let Some(state) = &ctx.setup_state_in {
-                state.bindings()
-            } else {
-                let bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
-                if let Some(path) = &ctx.setup_state_out {
-                    writer.flush()?;
-                    SetupState::from_bindings(ctx.spec.chain_id, &bindings).save(path)?;
-                }
-                bindings
-            };
-            generate_txs(
-                adapter,
-                &ctx.spec,
-                GenerationConfig {
-                    limit: ctx.limit,
-                    signing_workers: ctx.signing_workers,
-                    gas_sample_rpc: ctx.gas_sample_rpc.as_deref(),
-                },
-                &setup_bindings,
-                &mut build_ctx,
-                &mut writer,
-            )?;
-        }
+        bindings
+    };
+    let written = generate_txs(
+        adapter,
+        &ctx.spec,
+        GenerationConfig {
+            limit: ctx.limit,
+            signing_workers: ctx.signing_workers,
+            gas_sample_rpc: ctx.gas_sample_rpc.as_deref(),
+        },
+        &setup_bindings,
+        &mut build_ctx,
+        &mut writer,
+    )?;
+    if let Some(path) = output {
+        eprintln!("wrote {} workload transactions to {}", written, path.display());
     }
 
     Ok(())
