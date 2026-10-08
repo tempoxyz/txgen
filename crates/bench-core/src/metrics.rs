@@ -38,6 +38,9 @@ pub struct BenchMetrics {
     pub success: u64,
     /// Failed transactions (rejected by RPC or network error).
     pub failed: u64,
+    /// Accepted transactions that reverted, expired, or whose inclusion could not be confirmed.
+    #[serde(default)]
+    pub inclusion_failed: u64,
     /// Total elapsed time.
     #[serde(with = "duration_serde")]
     pub elapsed: Duration,
@@ -529,6 +532,7 @@ pub struct MetricsCollector {
     sent: AtomicU64,
     success: AtomicU64,
     failed: AtomicU64,
+    inclusion_failed: AtomicU64,
     clock: RunClock,
     collect_latencies: bool,
     latency_tx: mpsc::UnboundedSender<TimestampedLatency>,
@@ -576,6 +580,7 @@ impl MetricsCollector {
             sent: AtomicU64::new(0),
             success: AtomicU64::new(0),
             failed: AtomicU64::new(0),
+            inclusion_failed: AtomicU64::new(0),
             clock,
             collect_latencies: options.collect_latencies,
             latency_tx,
@@ -623,6 +628,11 @@ impl MetricsCollector {
         self.failed.fetch_add(1, Ordering::Relaxed);
         let offset = self.elapsed();
         let _ = self.event_tx.send(TimestampedEvent { offset, event: TxEvent::Failed });
+    }
+
+    /// Record an accepted transaction that reverted, expired, or was not confirmed included.
+    pub fn record_inclusion_failure(&self) {
+        self.inclusion_failed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get the current counts (sent, success, failed).
@@ -710,6 +720,7 @@ impl MetricsCollector {
             sent: self.sent.load(Ordering::Relaxed),
             success: self.success.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
+            inclusion_failed: self.inclusion_failed.load(Ordering::Relaxed),
             elapsed,
             latency,
         }
@@ -836,6 +847,7 @@ mod tests {
             sent: 100,
             success: 90,
             failed: 10,
+            inclusion_failed: 0,
             elapsed: Duration::from_secs(10),
             latency: None,
         };
@@ -963,6 +975,7 @@ mod tests {
             sent: 100,
             success: 90,
             failed: 10,
+            inclusion_failed: 0,
             elapsed: Duration::from_millis(1500),
             latency: Some(LatencyStats {
                 min: Duration::from_millis(5),

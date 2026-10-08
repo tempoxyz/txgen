@@ -1011,6 +1011,28 @@ async fn reverted_setup_predecessor_never_releases_next_sender() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reverted_workload_is_counted_once() {
+    let rpc = MockRpc::start();
+    rpc.state.automine.store(false, Ordering::SeqCst);
+    let metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
+    let provider = provider(&rpc.url, reqwest::Client::new());
+    let mut sender = Sender::new(vec![provider], SenderConfig::default(), metrics.clone()).unwrap();
+    sender.send(transaction(2, None, 1, true)).await.unwrap();
+    let flush = tokio::spawn(async move { sender.flush().await });
+    wait_for_pending(&rpc, 1).await;
+    {
+        let mut chain = rpc.state.chain.lock().unwrap();
+        let hash = chain.pending.pop().unwrap();
+        let mut value = receipt(hash);
+        value["status"] = json!("0x0");
+        chain.blocks.push(vec![value]);
+    }
+    tokio::time::timeout(Duration::from_secs(5), flush).await.unwrap().unwrap().unwrap();
+    assert_eq!(metrics.counts(), (1, 1, 0));
+    assert_eq!(metrics.finalize().await.inclusion_failed, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expired_setup_without_pending_cap_never_releases_next_sender() {
     let rpc = MockRpc::start();
     rpc.state.automine.store(false, Ordering::SeqCst);
