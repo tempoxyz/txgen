@@ -304,10 +304,18 @@ async fn execute_source<S: TxSource>(
     // Freeze the duration before receipt RPCs and aggregation add post-run latency.
     let measured_elapsed = args.duration.unwrap_or_else(|| metrics.elapsed_since_start());
 
+    // Fetch the same block snapshot used by the report before validating its receipts.
+    let mut block_stats = if end_block > start_block {
+        collect_block_stats(&query_provider, start_block + 1, end_block).await?
+    } else {
+        Vec::new()
+    };
+    tracing::info!(blocks = block_stats.len(), "Block stats collected");
+
     let receipt_collection = match receipt_collector {
         Some(collector) => {
             let collection = collector
-                .finish(&query_provider, start_block.saturating_add(1), end_block)
+                .finish(&query_provider, &block_stats)
                 .await
                 .wrap_err("failed to collect block receipts")?;
             tracing::info!(
@@ -341,10 +349,6 @@ async fn execute_source<S: TxSource>(
     let sample_archive = store.finish().await?;
     tracing::info!("Sample archive finalized");
 
-    // Collect per-block stats from the chain. The range starts one block after
-    // the block that was current before sending (start_block is the last
-    // existing block at that point, so start_block+1 is the first block that
-    // could contain our transactions) and ends at the current latest block.
     let mut report = FinalReport {
         metadata: metadata.clone(),
         bench_metrics: Some(final_metrics),
@@ -370,16 +374,6 @@ async fn execute_source<S: TxSource>(
     }
 
     if end_block > start_block {
-        let block_range_start = start_block + 1;
-        let mut block_stats =
-            collect_block_stats(&query_provider, block_range_start, end_block).await?;
-        tracing::info!(
-            start = block_range_start,
-            end = end_block,
-            blocks = block_stats.len(),
-            "Block stats collected"
-        );
-
         if !args.warmup.is_zero() || args.warmup_validators.is_some() {
             block_stats.retain(|block| block.timestamp_ms >= clock.start_unix_ms());
         }

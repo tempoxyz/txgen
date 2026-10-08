@@ -1,8 +1,9 @@
 //! Included non-system transaction composition for the measured benchmark blocks.
+//! Gas shares use fee-paying receipt gas, which can differ from header execution gas.
 
 use crate::{BlockStats, ReceiptGasRecord};
 use alloy_primitives::{TxHash, U256};
-use eyre::{bail, Result};
+use eyre::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
@@ -89,6 +90,8 @@ fn summarize(kinds: BTreeMap<Option<String>, KindTotals>) -> Result<TransactionC
     })
 }
 
+/// Aggregate records from validated block receipts. Completeness is checked by the collector
+/// before system receipts are filtered and receipts are expanded into labeled records.
 pub fn block_composition(
     receipts: &[ReceiptGasRecord],
     blocks: &[BlockStats],
@@ -118,19 +121,6 @@ pub fn block_composition(
             Ok(BlockComposition { block_number, composition: summarize(kinds)? })
         })
         .collect::<Result<Vec<_>>>()?;
-    let expected_gas =
-        blocks.iter().map(|block| (block.number, block.gas_used)).collect::<BTreeMap<_, _>>();
-    for composition in &compositions {
-        let gas_used = expected_gas[&composition.block_number];
-        if composition.composition.gas_used != gas_used.to_string() {
-            bail!(
-                "receipt gas total does not match measured block {}: {} != {}",
-                composition.block_number,
-                composition.composition.gas_used,
-                gas_used
-            );
-        }
-    }
     Ok(RunComposition {
         block_count: blocks.len() as u64,
         summary: summarize(summary)?,
@@ -143,11 +133,11 @@ mod tests {
     use super::*;
     use alloy_primitives::B256;
 
-    fn block(number: u64, gas_used: u64) -> BlockStats {
+    fn block(number: u64, gas_used: u64, tx_count: usize) -> BlockStats {
         BlockStats {
             number,
             timestamp_ms: 0,
-            tx_count: 0,
+            tx_count,
             gas_used,
             gas_limit: 1_000_000,
             block_time_ms: None,
@@ -190,7 +180,8 @@ mod tests {
             receipt(3, 11, Some("mpp_open_only.open"), 10, true),
             receipt(4, 11, Some("future_preset"), 50, true),
         ];
-        let composition = block_composition(&receipts, &[block(10, 40), block(11, 60)]).unwrap();
+        let composition =
+            block_composition(&receipts, &[block(10, 40, 2), block(11, 60, 2)]).unwrap();
         assert_eq!(composition.block_count, 2);
         assert_eq!(composition.summary.tx_count, 4);
         assert_eq!(composition.summary.gas_used, "100");
@@ -221,7 +212,8 @@ mod tests {
             receipt(3, 10, Some("system"), 0, true),
             receipt(4, 10, None, 30, true),
         ];
-        let composition = block_composition(&receipts, &[block(10, 40), block(11, 0)]).unwrap();
+        let composition =
+            block_composition(&receipts, &[block(10, 40, 3), block(11, 0, 0)]).unwrap();
         assert_eq!(composition.summary.tx_count, 2);
         assert_eq!(composition.summary.kinds[0].input, None);
         assert_eq!(composition.summary.kinds[0].gas_pct, 75.0);
@@ -230,7 +222,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_incomplete_receipts_instead_of_reporting_partial_composition() {
-        assert!(block_composition(&[], &[block(10, 40)]).is_err());
+    fn tip1016_composition_uses_receipt_gas_not_header_execution_gas() {
+        // Values from the failed Tempo PR #8042 benchmark: the difference is 1,715,000 state gas.
+        let receipts = [
+            receipt(1, 8, Some("transfer"), 3_000_000, true),
+            receipt(2, 8, Some("storage"), 1_967_361, false),
+        ];
+        let blocks = [block(8, 3_252_361, 2)];
+        let composition = block_composition(&receipts, &blocks).unwrap();
+        assert_eq!(composition.summary.gas_used, "4967361");
+        assert_eq!(composition.summary.tx_count, 2);
+        assert_eq!(composition.summary.kinds[0].reverted_tx_count, 1);
+        assert_eq!(composition.summary.kinds[0].gas_pct, 1_967_361.0 * 100.0 / 4_967_361.0);
+        assert_eq!(blocks[0].gas_used, 3_252_361);
+    }
+
+    #[test]
+    fn execution_floor_does_not_change_receipt_composition() {
+        // 25k execution + 245k state is 270k fee gas; the execution floor raises
+        // header gas to 50k, so adding state gas to header gas would overcount.
+        let receipts = [receipt(1, 10, Some("storage"), 270_000, true)];
+        let composition = block_composition(&receipts, &[block(10, 50_000, 1)]).unwrap();
+        assert_eq!(composition.summary.gas_used, "270000");
+        assert_eq!(composition.summary.kinds[0].gas_pct, 100.0);
     }
 }
