@@ -81,7 +81,7 @@ pub async fn execute(args: CallArgs) -> Result<()> {
     };
     let store = SampleStore::with_labels(metadata.clone())?;
     let metrics_forwarder =
-        build_metrics_forwarder(args.metrics_forward.as_deref(), &metadata, &scraper_configs)?;
+        build_metrics_forwarder(args.metrics_forward.as_deref(), &scraper_configs)?;
     let scraper_handles = if scraper_configs.is_empty() {
         Vec::new()
     } else {
