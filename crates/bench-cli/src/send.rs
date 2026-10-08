@@ -118,16 +118,15 @@ fn build_provider(
 }
 
 fn build_request_auth(args: &SendArgs) -> Result<Option<Arc<dyn RequestAuthProvider>>> {
-    match (&args.sender_header_name, &args.sender_header_map) {
-        (None, None) => Ok(None),
-        (Some(header_name), Some(path)) => Ok(Some(Arc::new(SenderHeaderAuthProvider::from_file(
-            header_name,
-            path,
-            args.sender_header_reload_interval,
-        )?))),
-        (Some(_), None) => Err(eyre::eyre!("--sender-header-name requires --sender-header-map")),
-        (None, Some(_)) => Err(eyre::eyre!("--sender-header-map requires --sender-header-name")),
-    }
+    let (Some(header_name), Some(path)) = (&args.sender_header_name, &args.sender_header_map)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(SenderHeaderAuthProvider::from_file(
+        header_name,
+        path,
+        args.sender_header_reload_interval,
+    )?)))
 }
 
 #[allow(clippy::too_many_arguments)]
