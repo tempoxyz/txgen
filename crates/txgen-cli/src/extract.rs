@@ -19,6 +19,7 @@ use eyre::{bail, Result, WrapErr};
 use futures::{stream, StreamExt};
 use std::{
     io::Write,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
 };
 use tokio::sync::mpsc;
@@ -62,7 +63,7 @@ pub struct ExtractArgs {
 
     /// Number of blocks to prefetch ahead
     #[arg(long, default_value = "20")]
-    pub buffer_size: usize,
+    pub buffer_size: NonZeroUsize,
 
     /// Include RLP-encoded block access lists from eth_getBlockAccessListByBlockNumber.
     #[arg(long, default_value_t = false)]
@@ -210,7 +211,7 @@ pub struct ExtractBigBlocksArgs {
     /// Big-block extraction currently fetches sequentially; this flag is accepted for CLI
     /// compatibility with `extract` and future pipelining.
     #[arg(long, default_value = "20")]
-    pub buffer_size: usize,
+    pub buffer_size: NonZeroUsize,
 
     /// Include and merge block access lists from eth_getBlockAccessListByBlockNumber.
     #[arg(long, default_value_t = false)]
@@ -260,7 +261,7 @@ where
     let corpus = resolve_corpus_config(&args)?;
     let provider = retrying_http_provider::<N>(&args.rpc)?;
 
-    let (tx, mut rx) = mpsc::channel::<Result<FetchedBlock>>(args.buffer_size);
+    let (tx, rx) = mpsc::channel::<Result<FetchedBlock>>(args.buffer_size.get());
 
     let from = args.from;
     let to = args.to;
@@ -277,7 +278,7 @@ where
             let file = std::fs::File::create(path)
                 .wrap_err_with(|| format!("failed to create output file: {}", path.display()))?;
             let mut writer = std::io::BufWriter::new(file);
-            let result = write_extracted_blocks(&mut rx, &mut writer, total, format, &corpus).await;
+            let result = write_extracted_blocks(rx, &mut writer, total, format, &corpus).await;
             if let Ok(item_count) = &result {
                 match format {
                     ExtractFormat::Blocks => {
@@ -297,7 +298,7 @@ where
         }
         None => {
             let mut writer = std::io::stdout();
-            write_extracted_blocks(&mut rx, &mut writer, total, format, &corpus).await.map(|_| ())
+            write_extracted_blocks(rx, &mut writer, total, format, &corpus).await.map(|_| ())
         }
     };
 
@@ -613,8 +614,10 @@ struct RecordVariant {
     label: Option<String>,
 }
 
+/// Takes the receiver by value so that an early return on a write error
+/// closes the channel and unblocks the fetch task.
 async fn write_extracted_blocks<W: Write>(
-    rx: &mut mpsc::Receiver<Result<FetchedBlock>>,
+    mut rx: mpsc::Receiver<Result<FetchedBlock>>,
     writer: &mut W,
     total: u64,
     format: ExtractFormat,
@@ -909,7 +912,7 @@ async fn fetch_blocks<N, P>(
     from: u64,
     to: u64,
     include_bal: bool,
-    buffer_size: usize,
+    buffer_size: NonZeroUsize,
     format: ExtractFormat,
     tx: mpsc::Sender<Result<FetchedBlock>>,
 ) where
@@ -918,7 +921,6 @@ async fn fetch_blocks<N, P>(
     N::Header: Decodable + 'static,
     P: Provider<N> + DebugApi<N> + Clone + 'static,
 {
-    let buffer_size = buffer_size.max(1);
     let mut block_stream = stream::iter(from..=to)
         .map(move |block_num| {
             let provider = provider.clone();
@@ -994,7 +996,7 @@ async fn fetch_blocks<N, P>(
                 })
             }
         })
-        .buffered(buffer_size);
+        .buffered(buffer_size.get());
 
     while let Some(result) = block_stream.next().await {
         let is_err = result.is_err();
@@ -1025,7 +1027,7 @@ where
     let mut first_source_block = None;
 
     // Buffered prefetch stream: keeps `buffer_size` block fetches in flight concurrently.
-    let buffer_size = args.buffer_size.max(1);
+    let buffer_size = args.buffer_size.get();
     let include_bal = args.bal;
     let provider = provider.clone();
     let mut block_stream = stream::iter(args.from..)
@@ -1321,12 +1323,12 @@ mod tests {
         format: ExtractFormat,
         corpus: CorpusConfig,
     ) -> Vec<Value> {
-        let (sender, mut receiver) = mpsc::channel(1);
+        let (sender, receiver) = mpsc::channel(1);
         sender.send(Ok(block)).await.unwrap();
         drop(sender);
 
         let mut output = Vec::new();
-        write_extracted_blocks(&mut receiver, &mut output, 1, format, &corpus).await.unwrap();
+        write_extracted_blocks(receiver, &mut output, 1, format, &corpus).await.unwrap();
         String::from_utf8(output)
             .unwrap()
             .lines()
@@ -1341,7 +1343,7 @@ mod tests {
             from: 1,
             to: 1,
             output: None,
-            buffer_size: 1,
+            buffer_size: NonZeroUsize::MIN,
             bal: false,
             format,
             methods: Vec::new(),
@@ -1414,6 +1416,56 @@ mod tests {
 
         assert_eq!(lines[0]["tx_count"], 1);
         assert_eq!(lines[0]["raw"], "0xaabb");
+    }
+
+    #[tokio::test]
+    async fn a_write_error_unblocks_the_fetch_task() {
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (sender, receiver) = mpsc::channel(1);
+        let fetch =
+            tokio::spawn(async move { while sender.send(Ok(fetched_block())).await.is_ok() {} });
+
+        let result = write_extracted_blocks(
+            receiver,
+            &mut FailingWriter,
+            1,
+            ExtractFormat::Blocks,
+            &CorpusConfig::default(),
+        )
+        .await;
+        assert!(result.is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(5), fetch).await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn a_zero_buffer_size_is_rejected() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: ExtractArgs,
+        }
+
+        let parse = |buffer_size: &str| {
+            <Cli as clap::Parser>::try_parse_from([
+                "extract",
+                "--rpc=http://localhost:8545",
+                "--from=1",
+                "--to=1",
+                "--buffer-size",
+                buffer_size,
+            ])
+        };
+        assert!(parse("0").is_err());
+        assert!(parse("1").is_ok());
     }
 
     #[test]
