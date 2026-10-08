@@ -1796,31 +1796,6 @@ where
             .nonce_reservations
             .iter()
             .any(|reservation| reservation.kind == NonceReservationKind::Ordered);
-        if self
-            .submission_lanes
-            .has_ambiguous_ordered_lane(has_ordered_nonces, &submission_lanes.keys)
-        {
-            drop(submission_lanes);
-            match self.rollback_submitted_nonces(&materialized, deadline).await {
-                Some(true) => {}
-                Some(false) => {
-                    return Err(StepError::new(
-                        "nonce_recovery_error",
-                        "failed to restore nonce state after the affected nonce lane was disabled",
-                    ));
-                }
-                None => {
-                    return Err(StepError::new(
-                        "timeout",
-                        "step timed out while aborting after the affected nonce lane was disabled",
-                    ));
-                }
-            }
-            return Err(StepError::new(
-                "nonce_state_ambiguous",
-                "an earlier submission on this nonce lane had an unknown acceptance outcome",
-            ));
-        }
         let attempt_started_at = SystemTime::now();
         let attempt_started = Instant::now();
         let prepared_hash = (materialized.tx_hash != B256::ZERO).then_some(materialized.tx_hash);
@@ -2117,9 +2092,6 @@ where
                 .chain(prepared.scheduling_keys())
                 .collect::<BTreeSet<_>>();
             if keys.is_empty() {
-                if !self.rollback_nonce_reservations(&reservations).await {
-                    self.submission_lanes.mark_ambiguous(&keys);
-                }
                 return Err(StepError::new(
                     "materialization_error",
                     "materialized transaction has no scheduling key",
@@ -2253,7 +2225,7 @@ where
             return Ok((transaction, lanes));
         }
         drop(lanes);
-        if !self.rollback_reserved_nonces(&transaction).await {
+        if !self.rollback_nonce_reservations(&transaction.nonce_reservations).await {
             return Err(StepError::new(
                 "nonce_recovery_error",
                 "failed to restore nonce state after the affected nonce lane was disabled",
@@ -2358,10 +2330,6 @@ where
         restored
     }
 
-    async fn rollback_reserved_nonces(&self, transaction: &MaterializedTx) -> bool {
-        self.rollback_nonce_reservations(&transaction.nonce_reservations).await
-    }
-
     async fn rollback_submitted_nonces(
         &self,
         transaction: &MaterializedTx,
@@ -2377,7 +2345,7 @@ where
         // Exclude speculative materialization while proving that this accepted
         // reservation is still the newest value on every affected lane.
         let _prepare_gate = lock_before_deadline(&self.submit_prepare_gate, deadline).await?;
-        Some(self.rollback_reserved_nonces(transaction).await)
+        Some(self.rollback_nonce_reservations(&transaction.nonce_reservations).await)
     }
 
     async fn checkpoint(&self) -> Result<RuntimeValue, StepError> {
