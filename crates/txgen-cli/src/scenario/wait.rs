@@ -1,5 +1,5 @@
 use super::{
-    error::StepError,
+    error::{StepError, StepErrorKind},
     log_hub::{LogInterest, LogPollHub, LogWindowSubscription},
     report::unix_ms,
     schema::{ObservationDef, ObservationMode, WaitLogStep},
@@ -118,7 +118,7 @@ impl ObservationRuntime {
                     Err(error) if behavior == SubscriptionBehavior::Require => {
                         let _ = error;
                         return Err(StepError::new(
-                            "configuration_error",
+                            StepErrorKind::Configuration,
                             "failed to connect configured observation WebSocket",
                         ));
                     }
@@ -127,7 +127,7 @@ impl ObservationRuntime {
             }
             (SubscriptionBehavior::Require, None) => {
                 return Err(StepError::new(
-                    "configuration_error",
+                    StepErrorKind::Configuration,
                     "subscription observation mode requires a websocket_url",
                 ));
             }
@@ -181,7 +181,7 @@ impl ObservationRuntime {
         let Some(provider) = &self.websocket_provider else {
             if require_subscription {
                 return Err(StepError::new(
-                    "configuration_error",
+                    StepErrorKind::Configuration,
                     "subscription observation mode has no connected WebSocket",
                 ));
             }
@@ -627,7 +627,7 @@ pub(crate) async fn wait_for_log_observed(
     let max_range = step.max_block_range.unwrap_or(DEFAULT_MAX_BLOCK_RANGE);
     if subscription == SubscriptionBehavior::Require && !observation.has_subscription() {
         return Err(StepError::new(
-            "configuration_error",
+            StepErrorKind::Configuration,
             "subscription observation mode has no connected WebSocket",
         ));
     }
