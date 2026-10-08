@@ -529,7 +529,7 @@ impl RpcSubmitter {
                 .map_err(|_| eyre::eyre!("RPC submitter semaphore closed"))?;
 
             if let Some(limiter) = &self.rate_limiter &&
-                let Some(delay) = limiter.try_acquire_or_delay().await
+                let Some(delay) = limiter.try_acquire_or_delay()
             {
                 drop(permit);
                 tokio::time::sleep(delay).await;
@@ -1183,7 +1183,7 @@ impl Sender {
             };
 
             if let Some(limiter) = &self.rate_limiter &&
-                let Some(delay) = limiter.try_acquire_or_delay().await
+                let Some(delay) = limiter.try_acquire_or_delay()
             {
                 drop(permit);
                 tokio::time::sleep(delay).await;
@@ -1642,7 +1642,7 @@ const RATE_LIMITER_MAX_BURST: Duration = Duration::from_millis(10);
 struct RateLimiter {
     rate: f64,
     burst_capacity: f64,
-    state: tokio::sync::Mutex<RateLimiterState>,
+    state: StdMutex<RateLimiterState>,
 }
 
 struct RateLimiterState {
@@ -1658,15 +1658,15 @@ impl RateLimiter {
         Self {
             rate,
             burst_capacity,
-            state: tokio::sync::Mutex::new(RateLimiterState {
+            state: StdMutex::new(RateLimiterState {
                 tokens: burst_capacity,
                 last_refill: Instant::now(),
             }),
         }
     }
 
-    async fn try_acquire_or_delay(&self) -> Option<Duration> {
-        let mut state = self.state.lock().await;
+    fn try_acquire_or_delay(&self) -> Option<Duration> {
+        let mut state = self.state.lock().expect("rate limiter mutex poisoned");
         state.refill(self.rate, self.burst_capacity);
 
         if state.tokens >= 1.0 {
@@ -2151,33 +2151,33 @@ mod tests {
         assert_eq!(limiter.burst_capacity, 100.0);
     }
 
-    #[tokio::test]
-    async fn test_rate_limiter_does_not_accumulate_unbounded_catch_up_credit() {
+    #[test]
+    fn test_rate_limiter_does_not_accumulate_unbounded_catch_up_credit() {
         let limiter = RateLimiter::new(1_000);
         assert_eq!(limiter.burst_capacity, 10.0);
 
         {
-            let mut state = limiter.state.lock().await;
+            let mut state = limiter.state.lock().unwrap();
             state.tokens = 0.0;
             state.last_refill = Instant::now() - Duration::from_secs(1);
         }
 
-        assert_eq!(limiter.try_acquire_or_delay().await, None);
+        assert_eq!(limiter.try_acquire_or_delay(), None);
 
-        let state = limiter.state.lock().await;
+        let state = limiter.state.lock().unwrap();
         assert!(state.tokens <= 9.0, "tokens: {}", state.tokens);
         assert!(state.tokens > 8.0, "tokens: {}", state.tokens);
     }
 
-    #[tokio::test]
-    async fn test_rate_limiters_have_independent_token_buckets() {
+    #[test]
+    fn test_rate_limiters_have_independent_token_buckets() {
         let first = RateLimiter::new(1);
         let second = RateLimiter::new(1);
 
-        assert_eq!(first.try_acquire_or_delay().await, None);
-        assert_eq!(second.try_acquire_or_delay().await, None);
-        assert!(first.try_acquire_or_delay().await.is_some());
-        assert!(second.try_acquire_or_delay().await.is_some());
+        assert_eq!(first.try_acquire_or_delay(), None);
+        assert_eq!(second.try_acquire_or_delay(), None);
+        assert!(first.try_acquire_or_delay().is_some());
+        assert!(second.try_acquire_or_delay().is_some());
     }
 
     #[test]
