@@ -23,10 +23,6 @@ use txgen_core::{
     NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase, WorkloadSpec,
 };
 
-fn default_signing_workers() -> usize {
-    2
-}
-
 const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const GAS_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -67,7 +63,7 @@ pub struct GenerateArgs {
     pub seed: Option<u64>,
 
     /// Number of worker threads used to sign and encode workload transactions.
-    #[arg(long, visible_alias = "workers", default_value_t = default_signing_workers())]
+    #[arg(long, visible_alias = "workers", default_value_t = 2)]
     pub signing_workers: usize,
 
     /// Emit deferred-signing envelopes instead of signed workload transactions.
@@ -170,11 +166,6 @@ impl GenerateContext {
             setup_state_out: args.setup_state_out.clone(),
             gas_sample_rpc: args.gas_weighted_mix.then(|| args.rpc.clone()).flatten(),
         })
-    }
-
-    /// Borrow accounts and nonces simultaneously for prefetching.
-    pub fn accounts_and_nonces(&mut self) -> (&AccountManager, &mut NonceTracker) {
-        (&self.accounts, &mut self.nonces)
     }
 
     /// Borrow spec, accounts, and nonces simultaneously for prefetching.
@@ -495,20 +486,6 @@ fn rollback_nonce_reservations(
     restored
 }
 
-/// Materialize a workload's setup section for direct online submission.
-pub fn materialize_setup<A: NetworkAdapter>(
-    adapter: &mut A,
-    spec: &WorkloadSpec,
-    ctx: &mut BuildContext<'_>,
-) -> Result<MaterializedSetup>
-where
-    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
-    <A::Network as Network>::TxEnvelope:
-        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
-{
-    build_setup(adapter, spec, ctx)
-}
-
 /// Materialize setup transactions after asynchronously preparing adapter state.
 ///
 /// Scenario execution uses this path because an online adapter may need to read
@@ -827,7 +804,7 @@ pub trait NetworkAdapter: Send + Sync {
         rpc: &'a str,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
         async move {
-            let (accounts, nonces) = ctx.accounts_and_nonces();
+            let (_, accounts, nonces) = ctx.prefetch_state();
             fetch_protocol_nonces(accounts, nonces, rpc).await
         }
     }
@@ -1287,7 +1264,7 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    let setup = build_setup(adapter, spec, ctx)?;
+    let setup = materialize_setup(adapter, spec, ctx)?;
     for tx in &setup.transactions {
         writer.write(tx)?;
     }
@@ -1319,7 +1296,8 @@ fn validate_setup_steps(steps: &[SetupStep], online: bool) -> Result<()> {
     Ok(())
 }
 
-fn build_setup<A: NetworkAdapter>(
+/// Materialize a workload's setup section for direct online submission.
+pub fn materialize_setup<A: NetworkAdapter>(
     adapter: &mut A,
     spec: &WorkloadSpec,
     ctx: &mut BuildContext<'_>,
@@ -1859,12 +1837,12 @@ where
 
                 for (idx, step) in sequence.steps.iter().enumerate() {
                     let label = step.name.as_deref().unwrap_or(&step.template);
-                    let base = spec
+                    let mut merged = spec
                         .templates
                         .get(&step.template)
                         .ok_or_else(|| eyre::eyre!("template '{}' not found", step.template))?
                         .clone();
-                    let merged = merge_template_overlay(base, step.with_value.clone());
+                    merge_yaml(&mut merged, step.with_value.clone());
                     let materialized = substitute_vars(merged, &bindings).wrap_err_with(|| {
                         format!("failed to materialize sequence '{name}' step {idx} ('{label}')")
                     })?;
@@ -2009,9 +1987,6 @@ fn resolve_binding_dependencies(
     ctx: &mut BuildContext<'_>,
 ) -> Result<()> {
     for dep in binding_dependency_names(binding, bindings) {
-        if resolved.contains_key(&dep) {
-            continue;
-        }
         resolve_sequence_binding(&dep, bindings, resolved, resolving, ctx)?;
     }
     Ok(())
@@ -2066,7 +2041,7 @@ fn resolve_abi_values(
     let mut values = Vec::with_capacity(raw_values.len());
     for (idx, (sol_type, value)) in types.iter().zip(raw_values).enumerate() {
         let substituted = substitute_vars(value.clone(), bindings)?;
-        let json = yaml_to_json(substituted)?;
+        let json = serde_json::to_value(substituted)?;
         let ty = DynSolType::parse(sol_type)
             .wrap_err_with(|| format!("failed to parse {context} type {idx} ('{sol_type}')"))?;
         let value = ty
@@ -2078,29 +2053,19 @@ fn resolve_abi_values(
     Ok(values)
 }
 
-fn yaml_to_json(value: serde_yaml::Value) -> Result<serde_json::Value> {
-    Ok(serde_json::to_value(value)?)
-}
-
 fn collect_var_names(
     value: &serde_yaml::Value,
     bindings: &BTreeMap<String, SequenceBinding>,
     names: &mut BTreeSet<String>,
 ) {
     match value {
-        serde_yaml::Value::Mapping(mapping) if mapping.len() == 1 => {
-            let var_key = serde_yaml::Value::String("var".to_string());
-            if let Some(serde_yaml::Value::String(path)) = mapping.get(&var_key) {
+        serde_yaml::Value::Mapping(mapping) => {
+            if let Some(path) = var_path(mapping) {
                 if let Some(name) = referenced_local_binding(path, bindings) {
                     names.insert(name);
                 }
                 return;
             }
-            for value in mapping.values() {
-                collect_var_names(value, bindings, names);
-            }
-        }
-        serde_yaml::Value::Mapping(mapping) => {
             for value in mapping.values() {
                 collect_var_names(value, bindings, names);
             }
@@ -2141,35 +2106,19 @@ fn compute_sequence_key(sequence_name: &str, sequence_instance: u64) -> Scheduli
     scheduling_key_from_hash(keccak256(data))
 }
 
-fn merge_template_overlay(
-    mut base: serde_yaml::Value,
-    overlay: serde_yaml::Value,
-) -> serde_yaml::Value {
-    merge_yaml(&mut base, overlay);
-    base
-}
-
 fn substitute_vars(
     value: serde_yaml::Value,
     bindings: &std::collections::HashMap<String, ResolvedBinding>,
 ) -> Result<serde_yaml::Value> {
     match value {
-        serde_yaml::Value::Mapping(mapping) if mapping.len() == 1 => {
-            let var_key = serde_yaml::Value::String("var".to_string());
-            if let Some(serde_yaml::Value::String(path)) = mapping.get(&var_key) {
-                // If we don't yet have a binding for this variable, leave it for later parsing.
-                if split_binding_path(path, bindings).is_none() {
-                    return Ok(serde_yaml::Value::Mapping(mapping));
-                }
-                return binding_to_value(path, bindings);
-            }
-            let substituted = mapping
-                .into_iter()
-                .map(|(key, value)| Ok((key, substitute_vars(value, bindings)?)))
-                .collect::<Result<serde_yaml::Mapping>>()?;
-            Ok(serde_yaml::Value::Mapping(substituted))
-        }
         serde_yaml::Value::Mapping(mapping) => {
+            if let Some(path) = var_path(&mapping) {
+                // If we don't yet have a binding for this variable, leave it for later parsing.
+                return match split_binding_path(path, bindings) {
+                    Some((name, field)) => binding_to_value(name, field, &bindings[name]),
+                    None => Ok(serde_yaml::Value::Mapping(mapping)),
+                };
+            }
             let substituted = mapping
                 .into_iter()
                 .map(|(key, value)| Ok((key, substitute_vars(value, bindings)?)))
@@ -2187,14 +2136,19 @@ fn substitute_vars(
     }
 }
 
-fn binding_to_value(
-    path: &str,
-    bindings: &std::collections::HashMap<String, ResolvedBinding>,
-) -> Result<serde_yaml::Value> {
-    let (name, field) = split_binding_path(path, bindings)
-        .ok_or_else(|| eyre::eyre!("unknown binding '{path}'"))?;
-    let binding = bindings.get(name).ok_or_else(|| eyre::eyre!("unknown binding '{name}'"))?;
+/// The path of a `{ var: <path> }` reference.
+fn var_path(mapping: &serde_yaml::Mapping) -> Option<&str> {
+    match mapping.get("var") {
+        Some(serde_yaml::Value::String(path)) if mapping.len() == 1 => Some(path),
+        _ => None,
+    }
+}
 
+fn binding_to_value(
+    name: &str,
+    field: Option<&str>,
+    binding: &ResolvedBinding,
+) -> Result<serde_yaml::Value> {
     match (binding, field) {
         (ResolvedBinding::Account { pool, index, .. }, Some("ref")) => {
             account_ref_value(pool, *index)
@@ -2301,10 +2255,8 @@ fn sample_workload_calls<A: NetworkAdapter>(
                 .steps
                 .iter()
                 .map(|step| {
-                    let value = merge_template_overlay(
-                        spec.templates[&step.template].clone(),
-                        step.with_value.clone(),
-                    );
+                    let mut value = spec.templates[&step.template].clone();
+                    merge_yaml(&mut value, step.with_value.clone());
                     Ok((
                         format!("{name}.{}", step.name.as_deref().unwrap_or(&step.template)),
                         substitute_vars(value, &bindings)?,
