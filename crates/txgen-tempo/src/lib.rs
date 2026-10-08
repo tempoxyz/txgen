@@ -167,6 +167,7 @@ impl RequestSignContext<TempoNetwork> for TempoSignContext {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KeychainAuthorizePoolDef {
     accounts: KeychainAccountsDef,
     access_keys: AccountPoolDef,
@@ -189,6 +190,7 @@ struct KeychainAuthorizePoolDef {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KeychainAccountsDef {
     pool: String,
 }
@@ -1705,6 +1707,19 @@ nonce_key:
             assert_eq!(request.request.nonce(), Some(nonce));
             assert_eq!(request.request.max_fee_per_gas(), template.max_fee_per_gas);
             assert!(ctx.take_nonce_reservations().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_template_rejects_unknown_fields() {
+        let base = "type: tempo\nfrom: { pool: users, select: random }\ngas_limit: 21000\n";
+        for (extra, field) in [
+            ("max_fee_pre_gas: 1", "max_fee_pre_gas"),
+            ("calls: [{ to: '0x0000000000000000000000000000000000000001', function: 'f()', vaule: 1 }]", "vaule"),
+            ("auth: { mode: keychain, acess_key: { from_setup: keys } }", "acess_key"),
+        ] {
+            let error = serde_yaml::from_str::<TempoTemplate>(&format!("{base}{extra}\n")).unwrap_err();
+            assert!(error.to_string().contains(&format!("unknown field `{field}`")), "{error}");
         }
     }
 
