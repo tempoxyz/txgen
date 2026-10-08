@@ -973,6 +973,22 @@ struct ClickHouseMetricSampleRow<'a> {
     value: f64,
 }
 
+/// Parse `key=value` metadata arguments into a map.
+pub fn parse_metadata<M: FromIterator<(String, String)>>(values: &[String]) -> Result<M> {
+    values
+        .iter()
+        .map(|value| {
+            let (key, value) = value.split_once('=').ok_or_else(|| {
+                eyre::eyre!("invalid metadata format '{value}'; expected key=value")
+            })?;
+            if key.is_empty() {
+                bail!("metadata key cannot be empty");
+            }
+            Ok((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 /// Parse reporter specifications into boxed reporters.
 ///
 /// Supported formats:
@@ -1042,6 +1058,16 @@ mod tests {
     };
     use alloy_primitives::{Address, TxHash, B256, U256};
     use std::{collections::BTreeMap, time::Duration};
+
+    #[test]
+    fn parses_metadata_and_rejects_malformed_values() {
+        let metadata: HashMap<String, String> =
+            parse_metadata(&["git-sha=abc".into(), "phase=nightly=zones".into()]).unwrap();
+        assert_eq!(metadata["git-sha"], "abc");
+        assert_eq!(metadata["phase"], "nightly=zones");
+        assert!(parse_metadata::<HashMap<_, _>>(&["missing-separator".into()]).is_err());
+        assert!(parse_metadata::<HashMap<_, _>>(&["=value".into()]).is_err());
+    }
 
     fn sample_metrics() -> BenchMetrics {
         BenchMetrics {
