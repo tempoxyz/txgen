@@ -31,10 +31,7 @@ pub struct RunClock {
 impl RunClock {
     /// Create a new clock, capturing the current time as the start.
     pub fn new() -> Self {
-        // SAFETY: `SystemTime::now()` is always after `UNIX_EPOCH`.
-        let start_unix_ms =
-            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64;
-        Self::new_with_start_unix_ms(start_unix_ms)
+        Self::new_with_start_unix_ms(unix_ms(SystemTime::now()))
     }
 
     /// Create a new clock with a specific Unix start time.
@@ -61,6 +58,11 @@ impl RunClock {
     pub fn start_unix_ms(&self) -> u64 {
         self.inner.start_unix_ms
     }
+}
+
+/// Convert a wall-clock time to Unix milliseconds, clamping pre-epoch times to 0.
+pub(crate) fn unix_ms(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |since| since.as_millis() as u64)
 }
 
 impl Default for RunClock {

@@ -8,6 +8,7 @@
 use crate::{
     call::{CallReport, MethodStats},
     clickhouse::ClickHouseClient,
+    clock::unix_ms,
     composition::RunComposition,
     metrics::{BenchMetrics, BlockStats, RunStats, ThroughputSample, TimeSeriesMetrics},
     receipt_clickhouse::{insert_receipt_gas_records, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE},
@@ -519,11 +520,7 @@ impl<W: Write + Send> JsonReporter<W> {
 /// - `output.json`            → `output.samples.ndjson.gz`
 fn samples_path_from_report(report_path: &Path) -> Option<std::path::PathBuf> {
     let stem = report_path.file_stem()?.to_str()?;
-    let filename = format!("{stem}.samples.ndjson.gz");
-    match report_path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => Some(p.join(filename)),
-        _ => Some(std::path::PathBuf::from(filename)),
-    }
+    Some(report_path.with_file_name(format!("{stem}.samples.ndjson.gz")))
 }
 
 impl<W: Write + Send> Reporter for JsonReporter<W> {
@@ -809,8 +806,8 @@ impl ClickHouseReporter {
     fn build_run_row(&self, finished_at: std::time::SystemTime) -> ClickHouseRunRow<'_> {
         ClickHouseRunRow {
             run_id: self.config.run_id,
-            started_at: system_time_to_millis(self.config.started_at),
-            finished_at: system_time_to_millis(finished_at),
+            started_at: unix_ms(self.config.started_at),
+            finished_at: unix_ms(finished_at),
             scenario_name: &self.config.scenario_name,
             platform: &self.config.platform,
             mode: &self.config.mode,
@@ -976,12 +973,6 @@ struct ClickHouseMetricSampleRow<'a> {
     value: f64,
 }
 
-/// Convert a [`SystemTime`](std::time::SystemTime) to Unix milliseconds.
-fn system_time_to_millis(t: std::time::SystemTime) -> u64 {
-    // SAFETY: SystemTime::now() is always after UNIX_EPOCH
-    t.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
-}
-
 /// Parse reporter specifications into boxed reporters.
 ///
 /// Supported formats:
@@ -1004,10 +995,6 @@ pub fn parse_reporters(
 ) -> Result<Vec<Box<dyn Reporter>>> {
     let mut reporters: Vec<Box<dyn Reporter>> = Vec::new();
     let benchmark_id = uuid::Uuid::new_v4();
-
-    if specs.is_empty() {
-        return Ok(reporters);
-    }
 
     for spec in specs {
         if spec == "console" {
