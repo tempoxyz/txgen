@@ -43,8 +43,8 @@ use txgen_core::{
 };
 
 use template::{
-    resolve_allowed_calls, token_limit, AccessKeyDef, AccessKeyDeriveMode, AccessKeyPairMode,
-    AllowedCallsDef, KeyTypeDef, TempoAuthDef, TempoAuthMode, TokenLimitDef,
+    resolve_allowed_calls, token_limit, AccessKeyDef, AllowedCallsDef, KeyTypeDef, TempoAuthDef,
+    TempoAuthMode, TokenLimitDef,
 };
 pub use template::{TempoTemplate, TempoTxType};
 
@@ -92,7 +92,6 @@ struct NonceRpc {
 #[derive(Clone)]
 struct TempoKeychainSetup {
     account_pool: String,
-    key_type: SignatureType,
     access_keys: Vec<EcdsaSigner>,
 }
 
@@ -287,7 +286,7 @@ impl TempoAdapter {
 
         self.register_keychain_setup(
             step_id,
-            TempoKeychainSetup { account_pool: def.accounts.pool, key_type, access_keys },
+            TempoKeychainSetup { account_pool: def.accounts.pool, access_keys },
         )?;
 
         Ok(templates)
@@ -309,7 +308,7 @@ impl TempoAdapter {
         let key_type = auth.key_type.unwrap_or(KeyTypeDef::Secp256k1).signature_type();
         match auth.mode {
             TempoAuthMode::Keychain => {
-                let access_signer = self.resolve_setup_access_signer(auth, selected, key_type)?;
+                let access_signer = self.resolve_setup_access_signer(auth, selected)?;
                 req.set_key_type(key_type);
                 req.set_key_id(access_signer.address());
                 *sign_context =
@@ -334,7 +333,6 @@ impl TempoAdapter {
         &self,
         auth: &TempoAuthDef,
         selected: &SelectedSigner,
-        key_type: SignatureType,
     ) -> Result<EcdsaSigner> {
         if auth.expiry.is_some() ||
             auth.limits.is_some() ||
@@ -358,9 +356,6 @@ impl TempoAdapter {
                 "`auth.mode: keychain` does not support inline access-key `mnemonic`, `index`, or `range`"
             );
         }
-        if access_key.pair.unwrap_or(AccessKeyPairMode::SameIndex) != AccessKeyPairMode::SameIndex {
-            bail!("only `access_key.pair: same_index` is supported");
-        }
         let setup_id = access_key
             .from_setup
             .as_deref()
@@ -372,9 +367,6 @@ impl TempoAdapter {
                 setup.account_pool,
                 selected.pool
             );
-        }
-        if setup.key_type != key_type {
-            bail!("keychain setup '{setup_id}' key_type does not match template auth key_type");
         }
         setup.access_keys.get(selected.index).cloned().ok_or_else(|| {
             eyre::eyre!(
@@ -543,38 +535,22 @@ impl NetworkAdapter for TempoAdapter {
                     ctx,
                 )?;
 
-                if let Some(ref sponsor_ref) = template.sponsor {
-                    let sponsor = ctx.select_signer(sponsor_ref)?;
-                    if is_late_sign {
-                        late_sign = Some(
-                            TempoExpiringPayload {
-                                signer: SignerLocator {
-                                    pool: selected.pool.clone(),
-                                    index: selected.index,
-                                },
-                                sponsor: Some(SignerLocator {
-                                    pool: sponsor.pool,
-                                    index: sponsor.index,
-                                }),
-                                valid_for_secs: template
-                                    .valid_for_secs
-                                    .expect("late signing requires valid_for_secs"),
-                                request: req.clone(),
-                            }
-                            .into_spec()?,
-                        );
-                    } else {
-                        deferred_sponsor =
-                            Some(ctx.accounts.get_by_index(&sponsor.pool, sponsor.index)?.clone());
-                    }
-                } else if is_late_sign {
+                let sponsor = template
+                    .sponsor
+                    .as_ref()
+                    .map(|sponsor| ctx.select_signer(sponsor))
+                    .transpose()?;
+                if is_late_sign {
                     late_sign = Some(
                         TempoExpiringPayload {
                             signer: SignerLocator {
                                 pool: selected.pool.clone(),
                                 index: selected.index,
                             },
-                            sponsor: None,
+                            sponsor: sponsor.map(|sponsor| SignerLocator {
+                                pool: sponsor.pool,
+                                index: sponsor.index,
+                            }),
                             valid_for_secs: template
                                 .valid_for_secs
                                 .expect("late signing requires valid_for_secs"),
@@ -582,6 +558,9 @@ impl NetworkAdapter for TempoAdapter {
                         }
                         .into_spec()?,
                     );
+                } else if let Some(sponsor) = sponsor {
+                    deferred_sponsor =
+                        Some(ctx.accounts.get_by_index(&sponsor.pool, sponsor.index)?.clone());
                 }
             }
             TempoTxType::Legacy => {
@@ -1124,9 +1103,6 @@ fn inline_access_key_source(access_key: Option<&AccessKeyDef>) -> Result<InlineA
     }
     if access_key.pair.is_some() {
         bail!("`auth.mode: key_authorization` does not support `access_key.pair`");
-    }
-    if access_key.derive.unwrap_or(AccessKeyDeriveMode::PerTx) != AccessKeyDeriveMode::PerTx {
-        bail!("only `access_key.derive: per_tx` is supported");
     }
 
     match access_key.inline_source()? {
