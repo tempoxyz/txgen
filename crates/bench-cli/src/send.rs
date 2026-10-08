@@ -41,11 +41,13 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         "Starting send"
     );
 
-    let mut metadata: HashMap<_, _> = parse_metadata(&args.metadata)?;
+    let mut metadata: HashMap<_, _> = parse_metadata(&args.reporting.metadata)?;
     metadata
         .insert("max_pending".to_string(), max_pending.map_or(0, |limit| limit.get()).to_string());
-    let scraper_configs =
-        metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
+    let scraper_configs = metrics_scraper_configs(
+        &args.reporting.metrics_url,
+        Duration::from_millis(args.reporting.scrape_interval_ms),
+    )?;
 
     // CU/s set to u64::MAX to disable the layer's built-in rate limiting
     // while keeping retry-on-429 behavior. The benchmarking tool has its own
@@ -188,7 +190,7 @@ async fn execute_source<S: TxSource>(
     // Block timestamps are wall-clock times, while --metrics-align shifts the
     // run clock that stamps samples.
     let wall_clock = RunClock::new();
-    let clock = match args.metrics_align {
+    let clock = match args.reporting.metrics_align {
         Some(start) => RunClock::new_with_start_unix_ms(start),
         None => wall_clock.clone(),
     };
@@ -205,8 +207,11 @@ async fn execute_source<S: TxSource>(
     metadata.insert("measurement_start_unix_ms".into(), clock.start_unix_ms().to_string());
     let metadata = &metadata;
     let store = SampleStore::with_labels(metadata.clone())?;
-    let metrics_forwarder =
-        build_metrics_forwarder(args.metrics_forward.as_deref(), metadata, scraper_configs)?;
+    let metrics_forwarder = build_metrics_forwarder(
+        args.reporting.metrics_forward.as_deref(),
+        metadata,
+        scraper_configs,
+    )?;
 
     // Start background scraper + internal snapshotter after setup so setup is
     // excluded from benchmark metrics.
@@ -221,8 +226,10 @@ async fn execute_source<S: TxSource>(
         Vec::new()
     };
 
-    let clickhouse_metric_names = load_metric_names(args.clickhouse_metrics_file.as_ref())?;
-    let mut reporters = parse_reporters(&args.reports, "send", metadata, clickhouse_metric_names)?;
+    let clickhouse_metric_names =
+        load_metric_names(args.reporting.clickhouse_metrics_file.as_ref())?;
+    let mut reporters =
+        parse_reporters(&args.reporting.reports, "send", metadata, clickhouse_metric_names)?;
     if reporters.is_empty() {
         reporters.push(Box::new(ConsoleReporter::stderr(true)));
     }
