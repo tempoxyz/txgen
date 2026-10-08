@@ -131,9 +131,22 @@ pub struct ReceiptMetricGroup {
 /// Deterministically ordered receipt gas metric groups.
 pub type ReceiptMetrics = Vec<ReceiptMetricGroup>;
 
+/// Totals from a complete block receipt response, including zero-gas system receipts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockReceiptTotals {
+    /// Number of receipts, checked against the block transaction count.
+    pub tx_count: usize,
+    /// Fee-paying gas from the last receipt's cumulative gas counter.
+    pub gas_used: u64,
+}
+
 /// Aggregated gas metrics and their underlying confirmed receipt records.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReceiptCollection {
+    /// Block receipt totals retained for composition completeness checks.
+    /// Empty for collections obtained by polling individual transactions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub block_totals: BTreeMap<u64, BlockReceiptTotals>,
     /// Gas distributions grouped by workload or scenario labels.
     pub metrics: ReceiptMetrics,
     /// One granular record for every collected confirmed transaction receipt.
@@ -143,7 +156,7 @@ pub struct ReceiptCollection {
 impl ReceiptCollection {
     fn from_records(records: Vec<ReceiptGasRecord>) -> Self {
         let metrics = Self::metrics_for_records(&records);
-        Self { metrics, records }
+        Self { metrics, records, block_totals: BTreeMap::new() }
     }
 
     pub fn metrics_for_records(records: &[ReceiptGasRecord]) -> ReceiptMetrics {
@@ -325,12 +338,25 @@ async fn collect_block_receipts(
     }
 
     let mut blocks = stream::iter(start_block..=end_block)
-        .map(|number| fetch_block_receipts(provider, number))
+        .map(|number| async move {
+            fetch_block_receipts(provider, number).await.map(|receipts| (number, receipts))
+        })
         .buffer_unordered(BLOCK_RECEIPT_FETCH_CONCURRENCY);
 
     let mut records = Vec::new();
+    let mut block_totals = BTreeMap::new();
     while let Some(block_receipts) = blocks.next().await {
-        for details in block_receipts? {
+        let (number, receipts) = block_receipts?;
+        block_totals.insert(
+            number,
+            BlockReceiptTotals {
+                tx_count: receipts.len(),
+                gas_used: receipts
+                    .last()
+                    .map_or(0, |details| details.receipt.cumulative_gas_used()),
+            },
+        );
+        for details in receipts {
             if details.gas_used.is_zero() {
                 continue;
             }
@@ -362,7 +388,9 @@ async fn collect_block_receipts(
         }
     }
 
-    Ok(ReceiptCollection::from_records(records))
+    let mut collection = ReceiptCollection::from_records(records);
+    collection.block_totals = block_totals;
+    Ok(collection)
 }
 
 async fn fetch_block_receipts(

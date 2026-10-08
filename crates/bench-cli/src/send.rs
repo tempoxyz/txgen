@@ -431,8 +431,11 @@ async fn execute_source<S: TxSource>(
         report.receipt_records.retain(|record| {
             record.block_number.is_some_and(|number| measured_blocks.contains(&number))
         });
-        report.block_composition =
-            Some(block_composition(&report.receipt_records, &report.blocks)?);
+        report.block_composition = Some(block_composition(
+            &report.receipt_records,
+            &report.blocks,
+            &receipt_collection.block_totals,
+        )?);
         report.total_fees_paid = total_fees_paid(&report.receipt_records);
         report.receipt_metrics = ReceiptCollection::metrics_for_records(&report.receipt_records);
     }

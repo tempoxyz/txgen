@@ -30,7 +30,7 @@ enum ServerKind {
     Submission,
     Query,
     Readiness { stuck_proposer: bool, stuck_finish: bool },
-    Composition { receipt_delay: Duration },
+    Composition { receipt_delay: Duration, block_gas: u64 },
 }
 
 struct MockServer {
@@ -126,7 +126,7 @@ fn serve(mut stream: TcpStream, kind: ServerKind, requests: Arc<Mutex<Vec<Record
                 .any(|request| request.method == "eth_sendRawTransaction");
             json!({"jsonrpc":"2.0", "id":id, "result":if sent { "0x1" } else { "0x0" }})
         }
-        (ServerKind::Composition { receipt_delay }, "eth_getBlockReceipts") => {
+        (ServerKind::Composition { receipt_delay, .. }, "eth_getBlockReceipts") => {
             assert_eq!(
                 requests
                     .lock()
@@ -137,24 +137,26 @@ fn serve(mut stream: TcpStream, kind: ServerKind, requests: Arc<Mutex<Vec<Record
                 2
             );
             thread::sleep(receipt_delay);
-            let receipts = [(1u8, 30, true), (2u8, 10, false), (3u8, 60, true)].into_iter().enumerate().map(|(index, (identity, gas, success))| {
+            let mut cumulative_gas = 0u64;
+            let receipts = [(1u8, 30, true), (2u8, 10, false), (3u8, 60, true), (4u8, 0, true)].into_iter().enumerate().map(|(index, (identity, gas, success))| {
+                cumulative_gas += gas;
                 json!({"transactionHash":keccak256([identity]), "transactionIndex":format!("0x{index:x}"),
                     "blockHash":format!("0x{}", "10".repeat(32)), "blockNumber":"0x1", "from":SENDER, "to":SENDER,
-                    "gasUsed":format!("0x{gas:x}"), "cumulativeGasUsed":"0x64", "effectiveGasPrice":"0x1",
+                    "gasUsed":format!("0x{gas:x}"), "cumulativeGasUsed":format!("0x{cumulative_gas:x}"), "effectiveGasPrice":"0x1",
                     "contractAddress":null, "logs":[], "logsBloom":format!("0x{}", "00".repeat(256)),
                     "status":if success {"0x1"} else {"0x0"}, "type":"0x2"})
             }).collect::<Vec<_>>();
             json!({"jsonrpc":"2.0", "id":id, "result":receipts})
         }
-        (ServerKind::Composition { .. }, "eth_getBlockByNumber") => {
+        (ServerKind::Composition { block_gas, .. }, "eth_getBlockByNumber") => {
             let hash = format!("0x{}", "10".repeat(32));
             json!({"jsonrpc":"2.0", "id":id, "result":{
                 "hash":hash, "parentHash":hash, "sha3Uncles":hash, "miner":SENDER,
                 "stateRoot":hash, "transactionsRoot":hash, "receiptsRoot":hash,
                 "logsBloom":format!("0x{}", "00".repeat(256)), "difficulty":"0x0",
-                "number":"0x1", "gasLimit":"0x100000", "gasUsed":"0x64", "timestamp":"0x1",
+                "number":"0x1", "gasLimit":"0x100000", "gasUsed":format!("0x{block_gas:x}"), "timestamp":"0x1",
                 "extraData":"0x", "mixHash":hash, "nonce":"0x0000000000000000",
-                "transactions":[], "uncles":[]}})
+                "transactions":[keccak256([1u8]), keccak256([2u8]), keccak256([3u8]), keccak256([4u8])], "uncles":[]}})
         }
         (ServerKind::Submission | ServerKind::Readiness { .. }, "eth_sendRawTransaction") => {
             json!({
@@ -296,8 +298,11 @@ fn query_rpc_is_separate_and_credentials_are_redacted_from_outputs() {
     assert!(query_requests.iter().all(|request| request.auth.is_none()));
 }
 
-fn run_composition_fixture(receipt_delay: Duration) -> (Value, Vec<RecordedRequest>) {
-    let server = MockServer::start(ServerKind::Composition { receipt_delay });
+fn run_composition_fixture(
+    receipt_delay: Duration,
+    block_gas: u64,
+) -> (Value, Vec<RecordedRequest>) {
+    let server = MockServer::start(ServerKind::Composition { receipt_delay, block_gas });
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("transactions.ndjson");
     let report = temp.path().join("report.json");
@@ -337,7 +342,7 @@ fn run_composition_fixture(receipt_delay: Duration) -> (Value, Vec<RecordedReque
 
 #[test]
 fn default_collection_is_post_run_and_reports_included_composition() {
-    let (report, requests) = run_composition_fixture(Duration::ZERO);
+    let (report, requests) = run_composition_fixture(Duration::ZERO, 100);
     let composition = &report["block_composition"];
     assert_eq!(composition["block_count"], 1);
     assert_eq!(composition["summary"]["tx_count"], 3);
@@ -364,8 +369,18 @@ fn default_collection_is_post_run_and_reports_included_composition() {
 }
 
 #[test]
+fn tip1016_report_keeps_header_execution_gas_and_receipt_fee_gas_separate() {
+    let (report, _) = run_composition_fixture(Duration::ZERO, 60);
+    assert_eq!(report["blocks"][0]["gas_used"], 60);
+    assert_eq!(report["blocks"][0]["tx_count"], 4);
+    assert_eq!(report["block_composition"]["summary"]["gas_used"], "100");
+    assert_eq!(report["block_composition"]["summary"]["tx_count"], 3);
+    assert_eq!(report["total_fees_paid"], "100");
+}
+
+#[test]
 fn receipt_collection_latency_is_excluded_from_benchmark_duration() {
-    let (report, requests) = run_composition_fixture(Duration::from_secs(1));
+    let (report, requests) = run_composition_fixture(Duration::from_secs(1), 100);
     let measurement_start =
         report["metadata"]["measurement_start_unix_ms"].as_str().unwrap().parse::<u128>().unwrap();
     let receipt_start =
