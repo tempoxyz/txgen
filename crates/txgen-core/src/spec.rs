@@ -46,6 +46,7 @@ pub struct WorkloadSpec {
 
 /// Default gas configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GasConfig {
     #[serde(default = "default_max_fee")]
     pub max_fee_per_gas: u128,
@@ -122,6 +123,7 @@ impl<'de> Deserialize<'de> for MixEntry {
 
 /// Deterministic setup phase.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetupDef {
     /// Ordered setup steps. All setup transactions are emitted before workload transactions.
     #[serde(default)]
@@ -130,6 +132,7 @@ pub struct SetupDef {
 
 /// One deterministic setup step.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetupStep {
     /// Setup step IDs whose transactions must all succeed before this step submits.
     #[serde(default)]
@@ -152,6 +155,7 @@ pub struct SetupStep {
 
 /// A multi-transaction workload unit.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SequenceDef {
     /// Values resolved once per sequence instance and reused by steps.
     #[serde(default)]
@@ -162,6 +166,7 @@ pub struct SequenceDef {
 
 /// A transaction step in a sequence.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SequenceStep {
     /// Optional human-readable step name for diagnostics.
     #[serde(default)]
