@@ -826,9 +826,9 @@ pub struct Sender {
     /// Monotonic identity used to remove a newly queued transaction if
     /// dispatch preparation reports an error.
     next_queue_id: u64,
-    /// Authentication failures discovered after the `send` call's own
-    /// transaction was already dispatched. These are reported by `flush`.
-    deferred_errors: VecDeque<eyre::Report>,
+    /// Authentication failure discovered after the `send` call's own
+    /// transaction was already dispatched. This is reported by `flush`.
+    deferred_error: Option<eyre::Report>,
     /// Optional receipt collector for workload gas reporting.
     receipt_collector: Option<ReceiptCollectorHandle>,
     /// Optional signer for deferred transactions.
@@ -893,7 +893,7 @@ impl Sender {
             rate_limiter,
             max_buffered,
             next_queue_id: 0,
-            deferred_errors: VecDeque::new(),
+            deferred_error: None,
             receipt_collector: None,
             late_signer: None,
         }
@@ -957,12 +957,11 @@ impl Sender {
     /// are sent sequentially, while transactions with disjoint key sets can be
     /// sent in parallel.
     pub async fn send(&mut self, tx: GeneratedTx) -> Result<()> {
-        if let Some(error) = self.deferred_errors.pop_front() {
+        if let Some(error) = self.deferred_error.take() {
             // A previous call dispatched its own transaction before discovering
             // an older authentication failure. Report that failure before
             // accepting more work, and cancel everything that has not reached
             // the wire so a missing nonce cannot be skipped implicitly.
-            self.deferred_errors.clear();
             self.pending.clear();
             return Err(error);
         }
@@ -970,10 +969,7 @@ impl Sender {
         self.wait_for_buffer_capacity().await?;
 
         let queue_id = self.next_queue_id;
-        self.next_queue_id = self
-            .next_queue_id
-            .checked_add(1)
-            .ok_or_else(|| eyre::eyre!("sender transaction queue identity overflowed"))?;
+        self.next_queue_id += 1;
         let GeneratedTx {
             phase,
             id,
@@ -987,10 +983,7 @@ impl Sender {
         if let Some(spec) = &late_sign &&
             self.late_signer.is_none()
         {
-            eyre::bail!(
-                "transaction has `late_sign` envelope (format `{}`) but sender has no late signer registered",
-                spec.format
-            );
+            return Err(missing_late_signer(spec));
         }
         let (submission_keys, inclusion_keys) =
             normalize_key_sets(submission_keys, inclusion_keys)?;
@@ -1027,7 +1020,7 @@ impl Sender {
                 self.pending.iter().any(|pending| pending.queue_id == queue_id);
             self.pending.clear();
 
-            if failure.queue_id == queue_id {
+            if failure.queue_id == Some(queue_id) {
                 return Err(failure.error);
             }
 
@@ -1042,7 +1035,7 @@ impl Sender {
             // The transaction accepted by this call is already on the wire, so
             // returning `Err` would invite an unsafe retry. Defer the unrelated
             // older failure until `flush` instead.
-            self.deferred_errors.push_back(failure.error);
+            self.deferred_error = Some(failure.error);
         }
 
         Ok(())
@@ -1050,8 +1043,7 @@ impl Sender {
 
     /// Wait for all pending transactions to complete.
     pub async fn flush(&mut self) -> Result<()> {
-        let mut first_error = self.deferred_errors.pop_front();
-        self.deferred_errors.clear();
+        let mut first_error = self.deferred_error.take();
         if first_error.is_some() {
             self.pending.clear();
         } else if let Err(failure) = self.pump().await {
@@ -1159,13 +1151,13 @@ impl Sender {
             self.drain_completions();
             if let Some(error) = &self.pending_failure {
                 return Err(DispatchPreparationError {
-                    queue_id: u64::MAX,
+                    queue_id: None,
                     error: eyre::eyre!("pending transaction tracking failed: {error}"),
                 });
             }
             if let Some(error) = &self.setup_failure {
                 return Err(DispatchPreparationError {
-                    queue_id: u64::MAX,
+                    queue_id: None,
                     error: eyre::eyre!("{error}"),
                 });
             }
@@ -1215,7 +1207,10 @@ impl Sender {
                             "setup transaction '{id}' failed authentication; cancelling queued setup"
                         ));
                     }
-                    return Err(DispatchPreparationError { queue_id: pending.queue_id, error });
+                    return Err(DispatchPreparationError {
+                        queue_id: Some(pending.queue_id),
+                        error,
+                    });
                 }
             };
 
@@ -1339,7 +1334,7 @@ impl Sender {
 }
 
 struct DispatchPreparationError {
-    queue_id: u64,
+    queue_id: Option<u64>,
     error: eyre::Report,
 }
 
@@ -1532,16 +1527,16 @@ fn resolve_raw(
     late_signer: Option<&dyn LateSigner>,
 ) -> Result<Bytes> {
     match late_sign {
-        Some(spec) => late_signer
-            .ok_or_else(|| {
-                eyre::eyre!(
-                    "transaction has `late_sign` envelope (format `{}`) but sender has no late signer registered",
-                    spec.format
-                )
-            })?
-            .sign(spec),
+        Some(spec) => late_signer.ok_or_else(|| missing_late_signer(spec))?.sign(spec),
         None => Ok(raw.clone()),
     }
+}
+
+fn missing_late_signer(spec: &LateSignSpec) -> eyre::Report {
+    eyre::eyre!(
+        "transaction has `late_sign` envelope (format `{}`) but sender has no late signer registered",
+        spec.format
+    )
 }
 
 fn track_workload_receipt(
