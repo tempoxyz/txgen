@@ -70,6 +70,10 @@ impl SenderConfig {
 
         Ok(())
     }
+
+    fn rate_limiter(&self) -> Option<Arc<RateLimiter>> {
+        (self.rate_limit > 0).then(|| Arc::new(RateLimiter::new(self.rate_limit)))
+    }
 }
 
 /// Result returned after an RPC endpoint accepts a raw transaction.
@@ -221,12 +225,7 @@ pub struct RpcSubmitter {
 impl RpcSubmitter {
     /// Create an RPC submitter backed by one or more interchangeable providers.
     pub fn new(providers: Vec<DynProvider<AnyNetwork>>, config: SenderConfig) -> Result<Self> {
-        let endpoints = providers
-            .into_iter()
-            .enumerate()
-            .map(|(index, provider)| RpcEndpoint::new(format!("rpc-{index}"), provider))
-            .collect();
-        Self::new_with_request_auth(endpoints, config, None)
+        Self::new_with_request_auth(RpcEndpoint::indexed(providers), config, None)
     }
 
     /// Create an RPC submitter with request-scoped authentication.
@@ -240,16 +239,13 @@ impl RpcSubmitter {
         }
         config.validate()?;
 
-        let rate_limiter =
-            (config.rate_limit > 0).then(|| Arc::new(RateLimiter::new(config.rate_limit)));
-
         let receipt_tracker = ReceiptTracker::new(endpoints[0].provider().clone());
         Ok(Self {
             receipt_tracker,
             endpoints: endpoints.into(),
             request_auth,
             semaphore: Arc::new(Semaphore::new(config.max_concurrent)),
-            rate_limiter,
+            rate_limiter: config.rate_limiter(),
             ordering: Arc::new(RpcOrdering::default()),
             late_signer: None,
         })
@@ -507,16 +503,7 @@ impl RpcSubmitter {
         sender: Option<Address>,
         tx_hash: Option<TxHash>,
     ) -> Result<HeaderMap> {
-        let headers = match &self.request_auth {
-            Some(auth) => auth.headers_for(&RpcRequestContext {
-                endpoint: endpoint.identity(),
-                method,
-                sender,
-                tx_hash,
-            }),
-            None => Ok(HeaderMap::new()),
-        }?;
-        Ok(mark_headers_sensitive(headers))
+        request_headers(self.request_auth.as_deref(), endpoint, method, sender, tx_hash)
     }
 
     async fn acquire_permit(&self) -> Result<OwnedSemaphorePermit> {
@@ -714,6 +701,14 @@ impl RpcEndpoint {
         Self { identity: identity.into(), provider }
     }
 
+    fn indexed(providers: Vec<DynProvider<AnyNetwork>>) -> Vec<Self> {
+        providers
+            .into_iter()
+            .enumerate()
+            .map(|(index, provider)| Self::new(format!("rpc-{index}"), provider))
+            .collect()
+    }
+
     /// Return this endpoint's authentication identity.
     pub fn identity(&self) -> &str {
         &self.identity
@@ -843,12 +838,7 @@ impl Sender {
         config: SenderConfig,
         metrics: Arc<MetricsCollector>,
     ) -> Result<Self> {
-        let endpoints = providers
-            .into_iter()
-            .enumerate()
-            .map(|(index, provider)| RpcEndpoint::new(format!("rpc-{index}"), provider))
-            .collect();
-        Self::new_with_request_auth(endpoints, config, metrics, None)
+        Self::new_with_request_auth(RpcEndpoint::indexed(providers), config, metrics, None)
     }
 
     /// Create a sender with request-scoped authentication.
@@ -863,13 +853,7 @@ impl Sender {
         }
         config.validate()?;
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
-
-        let rate_limiter = if config.rate_limit > 0 {
-            Some(Arc::new(RateLimiter::new(config.rate_limit)))
-        } else {
-            None
-        };
-
+        let rate_limiter = config.rate_limiter();
         let max_buffered = max_buffered_transactions(&config, rate_limiter.as_deref());
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
 
@@ -1204,9 +1188,14 @@ impl Sender {
                 .clone();
             let pending = self.pending.get(index).expect("pending index exists");
             let id = pending.id.as_deref().unwrap_or("<unnamed>").to_string();
-            let submission_headers = match self
-                .headers_for(&endpoint, "eth_sendRawTransaction", pending.sender, None)
-                .wrap_err_with(|| format!("failed to authenticate transaction {id}"))
+            let submission_headers = match request_headers(
+                self.request_auth.as_deref(),
+                &endpoint,
+                "eth_sendRawTransaction",
+                pending.sender,
+                None,
+            )
+            .wrap_err_with(|| format!("failed to authenticate transaction {id}"))
             {
                 Ok(headers) => headers,
                 Err(error) => {
@@ -1253,25 +1242,6 @@ impl Sender {
         for key in pending.scheduling_keys() {
             self.active_keys.insert(*key);
         }
-    }
-
-    fn headers_for(
-        &self,
-        endpoint: &RpcEndpoint,
-        method: &str,
-        sender: Option<Address>,
-        tx_hash: Option<TxHash>,
-    ) -> Result<HeaderMap> {
-        let headers = match &self.request_auth {
-            Some(auth) => auth.headers_for(&RpcRequestContext {
-                endpoint: endpoint.identity(),
-                method,
-                sender,
-                tx_hash,
-            }),
-            None => Ok(HeaderMap::new()),
-        }?;
-        Ok(mark_headers_sensitive(headers))
     }
 
     /// Use a new collector for subsequently dispatched requests.
@@ -1625,6 +1595,25 @@ fn release_keys(completion_tx: &mpsc::UnboundedSender<Completion>, keys: Schedul
     if !keys.is_empty() {
         let _ = completion_tx.send(Completion::Release(keys));
     }
+}
+
+fn request_headers(
+    request_auth: Option<&dyn RequestAuthProvider>,
+    endpoint: &RpcEndpoint,
+    method: &str,
+    sender: Option<Address>,
+    tx_hash: Option<TxHash>,
+) -> Result<HeaderMap> {
+    let headers = match request_auth {
+        Some(auth) => auth.headers_for(&RpcRequestContext {
+            endpoint: endpoint.identity(),
+            method,
+            sender,
+            tx_hash,
+        })?,
+        None => HeaderMap::new(),
+    };
+    Ok(mark_headers_sensitive(headers))
 }
 
 fn mark_headers_sensitive(mut headers: HeaderMap) -> HeaderMap {
