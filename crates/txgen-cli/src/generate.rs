@@ -1338,19 +1338,18 @@ where
     };
 
     validate_setup_steps(&setup.steps, false)?;
-    let mut encoded = Vec::new();
-    let mut writer = NdjsonWriter::new(&mut encoded);
+    let mut transactions = Vec::new();
     let mut ranges = Vec::new();
     let started = Instant::now();
     let mut last_progress = started;
     let total_steps = setup.steps.len();
     eprintln!("starting setup generation: steps={total_steps}");
     for (idx, step) in setup.steps.iter().enumerate() {
-        let start = writer.count() as usize;
-        emit_setup_step(adapter, step, &mut bindings, ctx, &mut writer)
+        let start = transactions.len();
+        emit_setup_step(adapter, step, &mut bindings, ctx, &mut transactions)
             .wrap_err_with(|| format!("failed to emit setup step '{}'", step.id))?;
 
-        ranges.push(start..writer.count() as usize);
+        ranges.push(start..transactions.len());
         if last_progress.elapsed() >= PROGRESS_LOG_INTERVAL {
             eprintln!(
                 "setup generation progress: completed_steps={} total_steps={total_steps} elapsed={:?}",
@@ -1362,12 +1361,6 @@ where
     }
     eprintln!("setup generation completed: steps={total_steps} elapsed={:?}", started.elapsed(),);
 
-    writer.flush()?;
-    let encoded = writer.into_inner();
-    let mut transactions = std::str::from_utf8(encoded)?
-        .lines()
-        .map(|line| serde_json::from_str::<bench_core::SourceTx>(line)?.into_generated_tx())
-        .collect::<Result<Vec<_>>>()?;
     let outputs: std::collections::HashMap<_, Vec<_>> = setup
         .steps
         .iter()
@@ -1393,12 +1386,12 @@ where
     Ok(MaterializedSetup { transactions, bindings })
 }
 
-fn emit_setup_step<A: NetworkAdapter, W: Write>(
+fn emit_setup_step<A: NetworkAdapter>(
     adapter: &mut A,
     step: &SetupStep,
     setup_bindings: &mut std::collections::HashMap<String, ResolvedBinding>,
     ctx: &mut BuildContext<'_>,
-    writer: &mut NdjsonWriter<W>,
+    transactions: &mut Vec<GeneratedTx>,
 ) -> Result<()>
 where
     A::SignContext: RequestSignContext<A::Network>,
@@ -1434,7 +1427,7 @@ where
                 TxPhase::Setup,
                 &[],
                 ctx,
-                writer,
+                transactions,
             )?;
         }
         return Ok(());
@@ -1450,7 +1443,7 @@ where
             TxPhase::Setup,
             &[],
             ctx,
-            writer,
+            transactions,
         )?
         .expect("setup emissions request tx info");
         if info.created_address.is_none() {
@@ -1467,7 +1460,7 @@ where
             TxPhase::Setup,
             &[],
             ctx,
-            writer,
+            transactions,
         )?
         .expect("setup emissions request tx info")
     };
@@ -1901,14 +1894,14 @@ where
     Ok(written)
 }
 
-fn emit_template_value<A: NetworkAdapter, W: Write>(
+fn emit_template_value<A: NetworkAdapter>(
     adapter: &A,
     name: &str,
     value: serde_yaml::Value,
     phase: TxPhase,
     inclusion_keys: &[SchedulingKey],
     ctx: &mut BuildContext<'_>,
-    writer: &mut NdjsonWriter<W>,
+    transactions: &mut Vec<GeneratedTx>,
 ) -> Result<Option<EmittedTxInfo>>
 where
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
@@ -1931,7 +1924,7 @@ where
         None
     };
 
-    writer.write(&materialized.generated)?;
+    transactions.push(materialized.generated);
     Ok(info)
 }
 
