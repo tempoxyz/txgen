@@ -260,6 +260,7 @@ where
 
     let corpus = resolve_corpus_config(&args)?;
     let provider = retrying_http_provider::<N>(&args.rpc)?;
+    let mut writer = open_output(args.output.as_deref())?;
 
     let (tx, rx) = mpsc::channel::<Result<FetchedBlock>>(args.buffer_size.get());
 
@@ -273,37 +274,33 @@ where
     });
 
     let total = to - from + 1;
-    let write_result = match args.output {
-        Some(ref path) => {
-            let file = std::fs::File::create(path)
-                .wrap_err_with(|| format!("failed to create output file: {}", path.display()))?;
-            let mut writer = std::io::BufWriter::new(file);
-            let result = write_extracted_blocks(rx, &mut writer, total, format, &corpus).await;
-            if let Ok(item_count) = &result {
-                match format {
-                    ExtractFormat::Blocks => {
-                        eprintln!("wrote {item_count} blocks to {}", path.display())
-                    }
-                    ExtractFormat::Transactions => eprintln!(
-                        "wrote {item_count} transactions from {total} blocks to {}",
-                        path.display()
-                    ),
-                    ExtractFormat::Calls | ExtractFormat::Traces => eprintln!(
-                        "wrote {item_count} records from {total} blocks to {}",
-                        path.display()
-                    ),
-                }
-            }
-            result.map(|_| ())
-        }
-        None => {
-            let mut writer = std::io::stdout();
-            write_extracted_blocks(rx, &mut writer, total, format, &corpus).await.map(|_| ())
-        }
-    };
-
+    let write_result = write_extracted_blocks(rx, &mut writer, total, format, &corpus).await;
     fetch_handle.await?;
-    write_result
+    let item_count = write_result?;
+    if let Some(path) = &args.output {
+        match format {
+            ExtractFormat::Blocks => eprintln!("wrote {item_count} blocks to {}", path.display()),
+            ExtractFormat::Transactions => eprintln!(
+                "wrote {item_count} transactions from {total} blocks to {}",
+                path.display()
+            ),
+            ExtractFormat::Calls | ExtractFormat::Traces => {
+                eprintln!("wrote {item_count} records from {total} blocks to {}", path.display())
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Open `--output` for writing, or stdout when it is omitted.
+fn open_output(path: Option<&Path>) -> Result<Box<dyn Write>> {
+    Ok(match path {
+        Some(path) => Box::new(std::io::BufWriter::new(
+            std::fs::File::create(path)
+                .wrap_err_with(|| format!("failed to create output file: {}", path.display()))?,
+        )),
+        None => Box::new(std::io::stdout()),
+    })
 }
 
 /// Resolve everything that decides which corpus records a block contributes.
@@ -443,30 +440,20 @@ where
     }
 
     let provider = retrying_http_provider::<N>(&args.rpc)?;
-
-    match args.output {
-        Some(ref path) => {
-            let file = std::fs::File::create(path)
-                .wrap_err_with(|| format!("failed to create output file: {}", path.display()))?;
-            let mut writer = std::io::BufWriter::new(file);
-            write_big_blocks::<N, _, _>(&provider, &mut writer, &args).await?;
-            eprintln!("wrote {} big blocks to {}", args.count, path.display());
-        }
-        None => {
-            let mut writer = std::io::stdout();
-            write_big_blocks::<N, _, _>(&provider, &mut writer, &args).await?;
-        }
+    let mut writer = open_output(args.output.as_deref())?;
+    write_big_blocks::<N, _, _>(&provider, &mut writer, &args).await?;
+    if let Some(path) = &args.output {
+        eprintln!("wrote {} big blocks to {}", args.count, path.display());
     }
-
     Ok(())
 }
 
 #[derive(serde::Serialize)]
 struct BlockOutputLine<'a> {
-    raw: &'a str,
+    raw: &'a Bytes,
     #[serde(skip_serializing_if = "Option::is_none")]
-    bal: Option<&'a str>,
-    key: &'a str,
+    bal: Option<&'a Bytes>,
+    key: B256,
     number: u64,
     timestamp: u64,
     gas_used: u64,
@@ -478,7 +465,7 @@ struct BlockOutputLine<'a> {
 struct TransactionOutputLine<'a> {
     phase: &'static str,
     id: String,
-    raw: String,
+    raw: &'a Bytes,
     sender: &'a Address,
     submission_keys: [&'a Address; 1],
     inclusion_keys: [Address; 0],
@@ -638,13 +625,10 @@ async fn write_extracted_blocks<W: Write>(
 
         match format {
             ExtractFormat::Blocks => {
-                let raw_hex = format!("0x{}", hex::encode(&block.rlp_bytes));
-                let bal_hex = block.bal_rlp.as_ref().map(|bal| format!("0x{}", hex::encode(bal)));
-                let key_hex = format!("{}", block.hash);
                 let line = BlockOutputLine {
-                    raw: &raw_hex,
-                    bal: bal_hex.as_deref(),
-                    key: &key_hex,
+                    raw: &block.rlp_bytes,
+                    bal: block.bal_rlp.as_ref(),
+                    key: block.hash,
                     number: block.number,
                     timestamp: block.timestamp,
                     gas_used: block.gas_used,
@@ -660,7 +644,7 @@ async fn write_extracted_blocks<W: Write>(
                     let line = TransactionOutputLine {
                         phase: "workload",
                         id: format!("block:{}:tx:{index}", block.number),
-                        raw: format!("0x{}", hex::encode(&transaction.raw)),
+                        raw: &transaction.raw,
                         sender: &transaction.signer,
                         submission_keys: [&transaction.signer],
                         inclusion_keys: [],
@@ -861,8 +845,8 @@ fn block_params(method: CallMethod, number: u64, corpus: &CorpusConfig) -> Vec<R
             .collect(),
         CallMethod::TraceBlock => vec![RecordVariant { params: vec![number], label: None }],
         CallMethod::TraceReplayBlockTransactions => vec![RecordVariant {
-            params: vec![number, serde_json::json!(["trace", "stateDiff"])],
-            label: Some(parity_label(&["trace", "stateDiff"])),
+            params: vec![number, serde_json::json!(PARITY_TRACE_STATE_DIFF)],
+            label: Some(parity_label(&PARITY_TRACE_STATE_DIFF)),
         }],
         _ => Vec::new(),
     }
@@ -930,20 +914,12 @@ async fn fetch_blocks<N, P>(
         .map(move |block_num| {
             let provider = provider.clone();
             async move {
-                let rlp_bytes: Bytes = provider
-                    .debug_get_raw_block(BlockNumberOrTag::Number(block_num).into())
-                    .await
-                    .wrap_err_with(|| format!("failed to fetch raw block {block_num}"))?;
-
                 let bal_rlp = if include_bal {
                     Some(fetch_encoded_block_access_list(&provider, block_num).await?)
                 } else {
                     None
                 };
-
-                let sealed: Sealed<alloy_consensus::Block<N::TxEnvelope, N::Header>> =
-                    alloy_consensus::Block::decode_sealed(&mut rlp_bytes.as_ref())
-                        .map_err(|e| eyre::eyre!("failed to decode block {block_num}: {e}"))?;
+                let (rlp_bytes, sealed) = fetch_sealed_block::<N, _>(&provider, block_num).await?;
 
                 let hash = sealed.hash();
                 let block = sealed.inner();
@@ -1107,23 +1083,35 @@ where
     N::Header: Decodable + BlockHeader + Sealable,
     P: Provider<N> + DebugApi<N>,
 {
-    let rlp_bytes: Bytes = provider
-        .debug_get_raw_block(BlockNumberOrTag::Number(block_num).into())
-        .await
-        .wrap_err_with(|| format!("failed to fetch raw block {block_num}"))?;
-
     let block_access_list =
         if include_bal { Some(fetch_block_access_list(provider, block_num).await?) } else { None };
-
-    let sealed: Sealed<alloy_consensus::Block<N::TxEnvelope, N::Header>> =
-        alloy_consensus::Block::decode_sealed(&mut rlp_bytes.as_ref())
-            .map_err(|e| eyre::eyre!("failed to decode block {block_num}: {e}"))?;
+    let (_, sealed) = fetch_sealed_block::<N, _>(provider, block_num).await?;
     let (block, _) = sealed.split();
     let (payload, sidecar) = ExecutionPayload::from_block_slow(&block);
     Ok(FetchedExecutionData {
         execution_data: ExecutionData { payload, sidecar },
         block_access_list,
     })
+}
+
+/// Fetch a raw block with `debug_getRawBlock` and decode it.
+async fn fetch_sealed_block<N, P>(
+    provider: &P,
+    block_num: u64,
+) -> Result<(Bytes, Sealed<alloy_consensus::Block<N::TxEnvelope, N::Header>>)>
+where
+    N: Network,
+    N::TxEnvelope: Decodable,
+    N::Header: Decodable,
+    P: DebugApi<N>,
+{
+    let rlp_bytes: Bytes = provider
+        .debug_get_raw_block(BlockNumberOrTag::Number(block_num).into())
+        .await
+        .wrap_err_with(|| format!("failed to fetch raw block {block_num}"))?;
+    let sealed = alloy_consensus::Block::decode_sealed(&mut rlp_bytes.as_ref())
+        .map_err(|e| eyre::eyre!("failed to decode block {block_num}: {e}"))?;
+    Ok((rlp_bytes, sealed))
 }
 
 fn retrying_http_provider<N>(rpc: &str) -> Result<RootProvider<N>>
