@@ -306,20 +306,28 @@ fn open_output(path: Option<&Path>) -> Result<Box<dyn Write>> {
 /// Resolve everything that decides which corpus records a block contributes.
 fn resolve_corpus_config(args: &ExtractArgs) -> Result<CorpusConfig> {
     let format = args.format;
+    if args.block_param != BlockParam::Latest && format != ExtractFormat::Calls {
+        bail!("--block-param parent only applies to --format calls");
+    }
     if !format.is_corpus() {
         for (flag, given) in [
+            ("--methods", !args.methods.is_empty()),
+            ("--top-gas", args.top_gas.is_some()),
             ("--tracer", !args.tracer.is_empty()),
             ("--tracer-config", args.tracer_config.is_some()),
             ("--trace-options", args.trace_options.is_some()),
-            ("--block-param", args.block_param != BlockParam::Latest),
         ] {
             if given {
                 bail!("{flag} only applies to --format calls and --format traces");
             }
         }
+        return Ok(CorpusConfig::default());
+    }
+    if args.top_gas == Some(0) {
+        bail!("--top-gas must be greater than zero");
     }
 
-    let tracers = resolve_tracers(format, &args.tracer)?;
+    let tracers = resolve_tracers(&args.tracer)?;
     let tracer_config = parse_options_object("--tracer-config", args.tracer_config.as_deref())?;
     if tracer_config.is_some() &&
         let Some(spec) = tracers.iter().find(|spec| spec.tracer.is_none())
@@ -340,27 +348,16 @@ fn resolve_corpus_config(args: &ExtractArgs) -> Result<CorpusConfig> {
 
     Ok(CorpusConfig {
         methods: resolve_methods(format, &args.methods)?,
-        top_gas: resolve_top_gas(format, args.top_gas)?,
+        top_gas: args.top_gas,
         tracers,
         tracer_config: tracer_config.map(serde_json::Value::Object),
         options,
-        block_param: resolve_block_param(format, args.block_param)?,
+        block_param: args.block_param,
     })
 }
 
-/// `--block-param parent` only makes sense for records that carry a block parameter.
-fn resolve_block_param(format: ExtractFormat, block_param: BlockParam) -> Result<BlockParam> {
-    if block_param != BlockParam::Latest && format != ExtractFormat::Calls {
-        bail!("--block-param {block_param:?} only applies to --format calls");
-    }
-    Ok(block_param)
-}
-
 /// Resolve the `--tracer` specs, defaulting to `callTracer`.
-fn resolve_tracers(format: ExtractFormat, requested: &[String]) -> Result<Vec<TracerSpec>> {
-    if !format.is_corpus() {
-        return Ok(Vec::new());
-    }
+fn resolve_tracers(requested: &[String]) -> Result<Vec<TracerSpec>> {
     if requested.is_empty() {
         return Ok(vec![TracerSpec::builtin(DEFAULT_TRACER)]);
     }
@@ -381,27 +378,8 @@ fn parse_options_object(flag: &str, value: Option<&str>) -> Result<Option<TraceO
     }
 }
 
-/// Validate `--top-gas` against the format.
-fn resolve_top_gas(format: ExtractFormat, top_gas: Option<usize>) -> Result<Option<usize>> {
-    match top_gas {
-        None => Ok(None),
-        Some(_) if !format.is_corpus() => {
-            Err(eyre::eyre!("--top-gas applies to --format calls and --format traces only"))
-        }
-        Some(0) => Err(eyre::eyre!("--top-gas must be greater than zero")),
-        Some(limit) => Ok(Some(limit)),
-    }
-}
-
 /// Resolve `--methods` against the methods the format can emit.
 fn resolve_methods(format: ExtractFormat, requested: &[String]) -> Result<Vec<CallMethod>> {
-    if !format.is_corpus() {
-        if !requested.is_empty() {
-            bail!("--methods only applies to --format calls and --format traces");
-        }
-        return Ok(Vec::new());
-    }
-
     if requested.is_empty() {
         return Ok(format.default_methods().to_vec());
     }
@@ -1359,11 +1337,16 @@ mod tests {
 
     #[test]
     fn top_gas_is_validated_against_the_format() {
-        assert_eq!(resolve_top_gas(ExtractFormat::Traces, Some(3)).unwrap(), Some(3));
-        assert_eq!(resolve_top_gas(ExtractFormat::Blocks, None).unwrap(), None);
-        assert!(resolve_top_gas(ExtractFormat::Blocks, Some(3)).is_err());
-        assert!(resolve_top_gas(ExtractFormat::Transactions, Some(3)).is_err());
-        assert!(resolve_top_gas(ExtractFormat::Calls, Some(0)).is_err());
+        let resolve = |format, top_gas| {
+            let mut args = extract_args(format);
+            args.top_gas = top_gas;
+            resolve_corpus_config(&args).map(|corpus| corpus.top_gas)
+        };
+        assert_eq!(resolve(ExtractFormat::Traces, Some(3)).unwrap(), Some(3));
+        assert_eq!(resolve(ExtractFormat::Blocks, None).unwrap(), None);
+        assert!(resolve(ExtractFormat::Blocks, Some(3)).is_err());
+        assert!(resolve(ExtractFormat::Transactions, Some(3)).is_err());
+        assert!(resolve(ExtractFormat::Calls, Some(0)).is_err());
     }
 
     #[tokio::test]
@@ -1519,11 +1502,16 @@ mod tests {
 
     #[test]
     fn block_param_parent_is_rejected_outside_the_calls_format() {
-        assert!(resolve_block_param(ExtractFormat::Traces, BlockParam::Parent).is_err());
-        assert_eq!(
-            resolve_block_param(ExtractFormat::Calls, BlockParam::Parent).unwrap(),
-            BlockParam::Parent
-        );
+        let resolve = |format| {
+            let mut args = extract_args(format);
+            args.block_param = BlockParam::Parent;
+            resolve_corpus_config(&args).map(|corpus| corpus.block_param)
+        };
+        for format in [ExtractFormat::Blocks, ExtractFormat::Transactions, ExtractFormat::Traces] {
+            let error = resolve(format).unwrap_err().to_string();
+            assert!(error.contains("--block-param parent"), "{format:?}: {error}");
+        }
+        assert_eq!(resolve(ExtractFormat::Calls).unwrap(), BlockParam::Parent);
     }
 
     #[tokio::test]
@@ -1629,8 +1617,7 @@ mod tests {
     async fn a_named_tracer_is_passed_through_verbatim() {
         let corpus = CorpusConfig {
             methods: vec![CallMethod::DebugTraceTransaction],
-            tracers: resolve_tracers(ExtractFormat::Traces, &["flatCallTracer".to_string()])
-                .unwrap(),
+            tracers: resolve_tracers(&["flatCallTracer".to_string()]).unwrap(),
             ..Default::default()
         };
         let lines =
@@ -1646,7 +1633,7 @@ mod tests {
     async fn structlog_leaves_the_tracer_field_out() {
         let corpus = CorpusConfig {
             methods: vec![CallMethod::DebugTraceTransaction, CallMethod::DebugTraceBlockByNumber],
-            tracers: resolve_tracers(ExtractFormat::Traces, &["structlog".to_string()]).unwrap(),
+            tracers: resolve_tracers(&["structlog".to_string()]).unwrap(),
             ..Default::default()
         };
         let lines =
@@ -1669,8 +1656,7 @@ mod tests {
 
         let corpus = CorpusConfig {
             methods: vec![CallMethod::DebugTraceCall],
-            tracers: resolve_tracers(ExtractFormat::Calls, &[format!("js:{}", script.display())])
-                .unwrap(),
+            tracers: resolve_tracers(&[format!("js:{}", script.display())]).unwrap(),
             ..Default::default()
         };
         let lines =
