@@ -204,16 +204,7 @@ impl FromGenerator for U256 {
                 let val: u128 = sample_uniform_i128(range, resolver)?.try_into()?;
                 Ok(U256::from(val))
             }
-            Generator::Const(v) => {
-                // Handle both numeric and string representations
-                if let Some(n) = v.as_u64() {
-                    Ok(U256::from(n))
-                } else if let Some(s) = v.as_str() {
-                    Ok(s.parse()?)
-                } else {
-                    bail!("cannot parse U256 from {:?}", v);
-                }
-            }
+            Generator::Const(v) => Ok(serde_yaml::from_value(v.clone())?),
             Generator::Choice(choices) => choose(choices, resolver),
             Generator::Random => Ok(resolver.rng.random()),
             _ => {
@@ -315,19 +306,10 @@ impl FromGenerator for serde_yaml::Value {
                 let value = choose_yaml_value(choices, resolver)?.clone();
                 resolver.resolve_yaml(&value)
             }
-            Generator::Pool { pool, select } => {
-                let signer = match select {
-                    SelectMode::Random => resolver.accounts.get_random(pool, resolver.rng)?,
-                    SelectMode::Index(idx) => resolver.accounts.get_by_index(pool, *idx)?,
-                };
-                Ok(serde_yaml::Value::String(signer.address().to_string()))
-            }
-            Generator::AddressPool { pool, select } => {
-                let address = match select {
-                    SelectMode::Random => resolver.address_pools.get_random(pool, resolver.rng)?,
-                    SelectMode::Index(idx) => resolver.address_pools.get_by_index(pool, *idx)?,
-                };
-                Ok(serde_yaml::Value::String(address.to_string()))
+            Generator::Pool { .. } | Generator::AddressPool { .. } => {
+                Ok(serde_yaml::Value::String(
+                    Address::from_generator(generator, resolver)?.to_string(),
+                ))
             }
             Generator::RandomBytes(len) => {
                 let mut bytes = vec![0u8; *len];
