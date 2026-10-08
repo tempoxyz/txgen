@@ -1,9 +1,9 @@
 //! Included non-system transaction composition for the measured benchmark blocks.
 //! Gas shares use fee-paying receipt gas, which can differ from header execution gas.
 
-use crate::{BlockReceiptTotals, BlockStats, ReceiptGasRecord};
+use crate::{BlockStats, ReceiptGasRecord};
 use alloy_primitives::{TxHash, U256};
-use eyre::{bail, Result};
+use eyre::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
@@ -90,10 +90,11 @@ fn summarize(kinds: BTreeMap<Option<String>, KindTotals>) -> Result<TransactionC
     })
 }
 
+/// Aggregate records from validated block receipts. Completeness is checked by the collector
+/// before system receipts are filtered and receipts are expanded into labeled records.
 pub fn block_composition(
     receipts: &[ReceiptGasRecord],
     blocks: &[BlockStats],
-    receipt_totals: &BTreeMap<u64, BlockReceiptTotals>,
 ) -> Result<RunComposition> {
     let mut per_block = blocks
         .iter()
@@ -120,32 +121,6 @@ pub fn block_composition(
             Ok(BlockComposition { block_number, composition: summarize(kinds)? })
         })
         .collect::<Result<Vec<_>>>()?;
-    for block in blocks {
-        let totals = receipt_totals.get(&block.number).ok_or_else(|| {
-            eyre::eyre!("missing receipt totals for measured block {}", block.number)
-        })?;
-        if totals.tx_count != block.tx_count {
-            bail!(
-                "receipt count does not match measured block {}: {} != {}",
-                block.number,
-                totals.tx_count,
-                block.tx_count
-            );
-        }
-    }
-    // TIP-1016 headers count execution gas, while receipts retain fee-paying gas,
-    // including state gas. Check composition against cumulative receipt gas instead.
-    for composition in &compositions {
-        let gas_used = receipt_totals[&composition.block_number].gas_used;
-        if composition.composition.gas_used != gas_used.to_string() {
-            bail!(
-                "receipt gas total does not match cumulative receipt gas for block {}: {} != {}",
-                composition.block_number,
-                composition.composition.gas_used,
-                gas_used
-            );
-        }
-    }
     Ok(RunComposition {
         block_count: blocks.len() as u64,
         summary: summarize(summary)?,
@@ -205,15 +180,8 @@ mod tests {
             receipt(3, 11, Some("mpp_open_only.open"), 10, true),
             receipt(4, 11, Some("future_preset"), 50, true),
         ];
-        let composition = block_composition(
-            &receipts,
-            &[block(10, 40, 2), block(11, 60, 2)],
-            &BTreeMap::from([
-                (10, BlockReceiptTotals { tx_count: 2, gas_used: 40 }),
-                (11, BlockReceiptTotals { tx_count: 2, gas_used: 60 }),
-            ]),
-        )
-        .unwrap();
+        let composition =
+            block_composition(&receipts, &[block(10, 40, 2), block(11, 60, 2)]).unwrap();
         assert_eq!(composition.block_count, 2);
         assert_eq!(composition.summary.tx_count, 4);
         assert_eq!(composition.summary.gas_used, "100");
@@ -244,26 +212,13 @@ mod tests {
             receipt(3, 10, Some("system"), 0, true),
             receipt(4, 10, None, 30, true),
         ];
-        let composition = block_composition(
-            &receipts,
-            &[block(10, 40, 3), block(11, 0, 0)],
-            &BTreeMap::from([
-                (10, BlockReceiptTotals { tx_count: 3, gas_used: 40 }),
-                (11, BlockReceiptTotals { tx_count: 0, gas_used: 0 }),
-            ]),
-        )
-        .unwrap();
+        let composition =
+            block_composition(&receipts, &[block(10, 40, 3), block(11, 0, 0)]).unwrap();
         assert_eq!(composition.summary.tx_count, 2);
         assert_eq!(composition.summary.kinds[0].input, None);
         assert_eq!(composition.summary.kinds[0].gas_pct, 75.0);
         assert_eq!(composition.blocks[1].composition.tx_count, 0);
         assert_eq!(composition.blocks[1].composition.gas_used, "0");
-    }
-
-    #[test]
-    fn rejects_incomplete_receipts_instead_of_reporting_partial_composition() {
-        let totals = BTreeMap::from([(10, BlockReceiptTotals { tx_count: 1, gas_used: 40 })]);
-        assert!(block_composition(&[], &[block(10, 40, 1)], &totals).is_err());
     }
 
     #[test]
@@ -274,8 +229,7 @@ mod tests {
             receipt(2, 8, Some("storage"), 1_967_361, false),
         ];
         let blocks = [block(8, 3_252_361, 2)];
-        let totals = BTreeMap::from([(8, BlockReceiptTotals { tx_count: 2, gas_used: 4_967_361 })]);
-        let composition = block_composition(&receipts, &blocks, &totals).unwrap();
+        let composition = block_composition(&receipts, &blocks).unwrap();
         assert_eq!(composition.summary.gas_used, "4967361");
         assert_eq!(composition.summary.tx_count, 2);
         assert_eq!(composition.summary.kinds[0].reverted_tx_count, 1);
@@ -288,34 +242,8 @@ mod tests {
         // 25k execution + 245k state is 270k fee gas; the execution floor raises
         // header gas to 50k, so adding state gas to header gas would overcount.
         let receipts = [receipt(1, 10, Some("storage"), 270_000, true)];
-        let totals = BTreeMap::from([(10, BlockReceiptTotals { tx_count: 1, gas_used: 270_000 })]);
-        let composition = block_composition(&receipts, &[block(10, 50_000, 1)], &totals).unwrap();
+        let composition = block_composition(&receipts, &[block(10, 50_000, 1)]).unwrap();
         assert_eq!(composition.summary.gas_used, "270000");
         assert_eq!(composition.summary.kinds[0].gas_pct, 100.0);
-    }
-
-    #[test]
-    fn rejects_truncated_receipt_response_even_when_its_gas_sums_match() {
-        let receipts = [receipt(1, 10, None, 40, true)];
-        let totals = BTreeMap::from([(10, BlockReceiptTotals { tx_count: 1, gas_used: 40 })]);
-        let error = block_composition(&receipts, &[block(10, 40, 2)], &totals).unwrap_err();
-        assert_eq!(error.to_string(), "receipt count does not match measured block 10: 1 != 2");
-    }
-
-    #[test]
-    fn rejects_missing_block_receipt_totals() {
-        let error = block_composition(&[], &[block(10, 40, 1)], &BTreeMap::new()).unwrap_err();
-        assert_eq!(error.to_string(), "missing receipt totals for measured block 10");
-    }
-
-    #[test]
-    fn rejects_mismatched_cumulative_receipt_gas() {
-        let receipts = [receipt(1, 10, None, 30, true)];
-        let totals = BTreeMap::from([(10, BlockReceiptTotals { tx_count: 1, gas_used: 40 })]);
-        let error = block_composition(&receipts, &[block(10, 30, 1)], &totals).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "receipt gas total does not match cumulative receipt gas for block 10: 30 != 40"
-        );
     }
 }

@@ -1,11 +1,14 @@
 //! Receipt-based transaction gas metric collection and aggregation.
 
-use crate::sender::{RpcReceiptDetails, RpcSubmitter};
+use crate::{
+    sender::{RpcReceiptDetails, RpcSubmitter},
+    BlockStats,
+};
 use alloy_eips::BlockId;
 use alloy_network::{primitives::ReceiptResponse, AnyNetwork};
 use alloy_primitives::{Address, TxHash, B256, U256};
 use alloy_provider::{DynProvider, Provider};
-use eyre::{Context, Result};
+use eyre::{ensure, Context, Result};
 use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -131,22 +134,9 @@ pub struct ReceiptMetricGroup {
 /// Deterministically ordered receipt gas metric groups.
 pub type ReceiptMetrics = Vec<ReceiptMetricGroup>;
 
-/// Totals from a complete block receipt response, including zero-gas system receipts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlockReceiptTotals {
-    /// Number of receipts, checked against the block transaction count.
-    pub tx_count: usize,
-    /// Fee-paying gas from the last receipt's cumulative gas counter.
-    pub gas_used: u64,
-}
-
 /// Aggregated gas metrics and their underlying confirmed receipt records.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReceiptCollection {
-    /// Block receipt totals retained for composition completeness checks.
-    /// Empty for collections obtained by polling individual transactions.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub block_totals: BTreeMap<u64, BlockReceiptTotals>,
     /// Gas distributions grouped by workload or scenario labels.
     pub metrics: ReceiptMetrics,
     /// One granular record for every collected confirmed transaction receipt.
@@ -156,7 +146,7 @@ pub struct ReceiptCollection {
 impl ReceiptCollection {
     fn from_records(records: Vec<ReceiptGasRecord>) -> Self {
         let metrics = Self::metrics_for_records(&records);
-        Self { metrics, records, block_totals: BTreeMap::new() }
+        Self { metrics, records }
     }
 
     pub fn metrics_for_records(records: &[ReceiptGasRecord]) -> ReceiptMetrics {
@@ -299,12 +289,11 @@ impl BlockReceiptCollector {
         self.handle.clone()
     }
 
-    /// Fetch and aggregate receipts for the block range after submission ends.
+    /// Fetch, validate, and aggregate receipts for the supplied blocks after submission ends.
     pub async fn finish(
         self,
         provider: &DynProvider<AnyNetwork>,
-        start_block: u64,
-        end_block: u64,
+        blocks: &[BlockStats],
     ) -> Result<ReceiptCollection> {
         let Self { handle, mut receiver } = self;
         drop(handle);
@@ -317,11 +306,11 @@ impl BlockReceiptCollector {
             }
         }
 
-        collect_block_receipts(provider, start_block, end_block, tracked).await
+        collect_block_receipts(provider, blocks, tracked).await
     }
 }
 
-/// Fetch all block receipts in a range and aggregate non-system transactions.
+/// Validate all receipts for the supplied blocks and aggregate non-system transactions.
 ///
 /// The block range is assumed to contain only the benchmark workload and
 /// protocol system transactions. No transaction-hash filter is applied. Tempo
@@ -329,34 +318,16 @@ impl BlockReceiptCollector {
 /// `gasUsed` receipt.
 async fn collect_block_receipts(
     provider: &DynProvider<AnyNetwork>,
-    start_block: u64,
-    end_block: u64,
+    blocks: &[BlockStats],
     mut tracked: BTreeMap<TxHash, Vec<ReceiptRequest>>,
 ) -> Result<ReceiptCollection> {
-    if start_block > end_block {
-        return Ok(ReceiptCollection::default());
-    }
-
-    let mut blocks = stream::iter(start_block..=end_block)
-        .map(|number| async move {
-            fetch_block_receipts(provider, number).await.map(|receipts| (number, receipts))
-        })
+    let mut pending = stream::iter(blocks)
+        .map(|block| fetch_block_receipts(provider, block))
         .buffer_unordered(BLOCK_RECEIPT_FETCH_CONCURRENCY);
 
     let mut records = Vec::new();
-    let mut block_totals = BTreeMap::new();
-    while let Some(block_receipts) = blocks.next().await {
-        let (number, receipts) = block_receipts?;
-        block_totals.insert(
-            number,
-            BlockReceiptTotals {
-                tx_count: receipts.len(),
-                gas_used: receipts
-                    .last()
-                    .map_or(0, |details| details.receipt.cumulative_gas_used()),
-            },
-        );
-        for details in receipts {
+    while let Some(receipts) = pending.next().await {
+        for details in receipts? {
             if details.gas_used.is_zero() {
                 continue;
             }
@@ -388,20 +359,21 @@ async fn collect_block_receipts(
         }
     }
 
-    let mut collection = ReceiptCollection::from_records(records);
-    collection.block_totals = block_totals;
-    Ok(collection)
+    Ok(ReceiptCollection::from_records(records))
 }
 
 async fn fetch_block_receipts(
     provider: &DynProvider<AnyNetwork>,
-    block_number: u64,
+    block: &BlockStats,
 ) -> Result<Vec<RpcReceiptDetails>> {
+    let block_number = block.number;
     let receipts = provider
         .get_block_receipts(BlockId::number(block_number))
         .await
         .wrap_err_with(|| format!("failed to fetch receipts for block {block_number}"))?
         .ok_or_else(|| eyre::eyre!("receipts for block {block_number} not found"))?;
+
+    validate_block_receipts(block_number, block.tx_count, &receipts)?;
 
     Ok(receipts
         .into_iter()
@@ -411,6 +383,45 @@ async fn fetch_block_receipts(
             receipt,
         })
         .collect())
+}
+
+/// Validate raw receipts before zero-gas filtering or expansion into labeled records.
+fn validate_block_receipts(
+    block_number: u64,
+    tx_count: usize,
+    receipts: &[impl ReceiptResponse],
+) -> Result<()> {
+    ensure!(
+        receipts.len() == tx_count,
+        "receipt count does not match block {block_number}: {} != {tx_count}",
+        receipts.len()
+    );
+    let mut seen = BTreeSet::new();
+    let mut cumulative_gas = 0u64;
+    for (index, receipt) in receipts.iter().enumerate() {
+        ensure!(
+            seen.insert(receipt.transaction_hash()),
+            "duplicate receipt in block {block_number}: {}",
+            receipt.transaction_hash()
+        );
+        ensure!(
+            receipt.block_number() == Some(block_number),
+            "receipt block number does not match block {block_number}"
+        );
+        ensure!(
+            receipt.transaction_index() == Some(index as u64),
+            "receipt transaction index does not match block {block_number} position {index}"
+        );
+        cumulative_gas = cumulative_gas
+            .checked_add(receipt.gas_used())
+            .ok_or_else(|| eyre::eyre!("receipt gas total overflow in block {block_number}"))?;
+        // TIP-1016 headers count execution gas; receipts include fee-paying state gas.
+        // Check the receipt counter directly, without comparing it to header gas.
+        ensure!(cumulative_gas == receipt.cumulative_gas_used(),
+            "receipt gas total does not match cumulative gas in block {block_number} at index {index}: {cumulative_gas} != {}",
+            receipt.cumulative_gas_used());
+    }
+    Ok(())
 }
 
 /// Background collector for confirmed transaction receipt gas fields.
@@ -587,7 +598,103 @@ fn u256_to_f64(value: U256) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_network::AnyTransactionReceipt;
     use serde_json::json;
+
+    fn block_receipt(identity: u8, index: u64, gas: u64, cumulative: u64) -> AnyTransactionReceipt {
+        serde_json::from_value(json!({
+            "transactionHash": TxHash::repeat_byte(identity),
+            "transactionIndex": format!("0x{index:x}"),
+            "blockHash": B256::repeat_byte(0x33), "blockNumber": "0x2a",
+            "from": Address::repeat_byte(0x11), "to": Address::repeat_byte(0x22),
+            "gasUsed": format!("0x{gas:x}"), "cumulativeGasUsed": format!("0x{cumulative:x}"),
+            "effectiveGasPrice": "0x1", "contractAddress": null, "logs": [],
+            "logsBloom": format!("0x{}", "00".repeat(256)), "status": "0x1", "type": "0x2"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn validates_complete_receipts_including_zero_gas_system_transactions() {
+        let receipts =
+            [block_receipt(1, 0, 30, 30), block_receipt(2, 1, 10, 40), block_receipt(3, 2, 0, 40)];
+        validate_block_receipts(42, 3, &receipts).unwrap();
+        validate_block_receipts(42, 0, &[] as &[AnyTransactionReceipt]).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_receipts_hiding_a_missing_transaction() {
+        let first = block_receipt(1, 0, 30, 30);
+        let error = validate_block_receipts(42, 2, &[first.clone(), first]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("duplicate receipt in block 42: {}", TxHash::repeat_byte(1))
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_hash_even_with_distinct_indices() {
+        let receipts = [block_receipt(1, 0, 30, 30), block_receipt(1, 1, 10, 40)];
+        let error = validate_block_receipts(42, 2, &receipts).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("duplicate receipt in block 42: {}", TxHash::repeat_byte(1))
+        );
+    }
+
+    #[test]
+    fn rejects_missing_receipts_including_a_missing_system_receipt() {
+        let receipts = [block_receipt(1, 0, 30, 30)];
+        let error = validate_block_receipts(42, 2, &receipts).unwrap_err();
+        assert_eq!(error.to_string(), "receipt count does not match block 42: 1 != 2");
+        let error = validate_block_receipts(42, 1, &[] as &[AnyTransactionReceipt]).unwrap_err();
+        assert_eq!(error.to_string(), "receipt count does not match block 42: 0 != 1");
+    }
+
+    #[test]
+    fn rejects_receipts_from_another_block() {
+        let error = validate_block_receipts(43, 1, &[block_receipt(1, 0, 30, 30)]).unwrap_err();
+        assert_eq!(error.to_string(), "receipt block number does not match block 43");
+    }
+
+    #[test]
+    fn rejects_invalid_receipt_indices() {
+        for index in [0, 2] {
+            let receipts = [block_receipt(1, 0, 30, 30), block_receipt(2, index, 10, 40)];
+            let error = validate_block_receipts(42, 2, &receipts).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "receipt transaction index does not match block 42 position 1"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_inconsistent_cumulative_gas_before_the_last_receipt() {
+        let receipts = [block_receipt(1, 0, 30, 99), block_receipt(2, 1, 10, 40)];
+        let error = validate_block_receipts(42, 2, &receipts).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "receipt gas total does not match cumulative gas in block 42 at index 0: 30 != 99"
+        );
+    }
+
+    #[test]
+    fn validates_system_receipt_gas_before_filtering() {
+        let receipts = [block_receipt(1, 0, 30, 30), block_receipt(2, 1, 0, 99)];
+        let error = validate_block_receipts(42, 2, &receipts).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "receipt gas total does not match cumulative gas in block 42 at index 1: 30 != 99"
+        );
+    }
+
+    #[test]
+    fn rejects_cumulative_gas_overflow() {
+        let receipts = [block_receipt(1, 0, u64::MAX, u64::MAX), block_receipt(2, 1, 1, 0)];
+        let error = validate_block_receipts(42, 2, &receipts).unwrap_err();
+        assert_eq!(error.to_string(), "receipt gas total overflow in block 42");
+    }
 
     fn labels(input: &str) -> ReceiptMetricLabels {
         BTreeMap::from([("input".to_string(), input.to_string())])
