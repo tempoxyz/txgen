@@ -262,20 +262,8 @@ impl ScenarioReportDestinations {
 }
 
 fn canonical_clickhouse_url(value: &str) -> Result<String> {
-    let mut url = url::Url::parse(value).wrap_err("invalid scenario ClickHouse report URL")?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        bail!("scenario ClickHouse report URL must use HTTP or HTTPS");
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        bail!(
-            "scenario ClickHouse report URL must not contain credentials; use CLICKHOUSE_USER and CLICKHOUSE_PASSWORD"
-        );
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        bail!("scenario ClickHouse report URL must not contain a query string or fragment");
-    }
-    let path = url.path().trim_end_matches('/').to_string();
-    url.set_path(if path.is_empty() { "/" } else { &path });
+    let url = bench_core::clickhouse::parse_endpoint(value)
+        .wrap_err("invalid scenario ClickHouse report URL")?;
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
