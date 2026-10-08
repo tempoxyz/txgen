@@ -6,13 +6,7 @@
 //! (as `BlockRlp`) and `reth_forkchoiceUpdated`,
 //! collecting per-block timing and engine status from [`alloy_reth::RethPayloadStatus`].
 
-use crate::{
-    load_metric_names,
-    metrics_forwarder::{build_metrics_forwarder, finish_metrics_forwarder, push_samples},
-    metrics_url::metrics_scraper_configs,
-    wait_for_persistence::WaitForPersistence,
-    SendBlocksArgs,
-};
+use crate::{reporting::Reporting, wait_for_persistence::WaitForPersistence, SendBlocksArgs};
 use alloy_consensus::Header as ConsensusHeader;
 use alloy_network::Ethereum;
 use alloy_primitives::{Address, Bytes, B256};
@@ -24,8 +18,7 @@ use alloy_rpc_types_engine::{
 };
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    parse_metadata, parse_reporters, start_scrapers, BlockStats, ConsoleReporter, FinalReport,
-    ProgressState, Reporter, RunClock, RunStats, Sample, SampleStore,
+    parse_metadata, BlockStats, FinalReport, ProgressState, Reporter, RunClock, RunStats, Sample,
 };
 use eyre::{Context, Result};
 use std::{
@@ -124,10 +117,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         JwtSecret::from_hex(jwt_secret_hex.trim()).wrap_err("invalid JWT secret hex")?;
 
     let metadata: HashMap<_, _> = parse_metadata(&args.reporting.metadata)?;
-    let scraper_configs = metrics_scraper_configs(
-        &args.reporting.metrics_url,
-        Duration::from_millis(args.reporting.scrape_interval_ms),
-    )?;
+    let scraper_configs = args.reporting.scraper_configs()?;
     let persistence_policy = args.wait_for_persistence;
     tracing::info!(
         engine = %args.engine,
@@ -146,42 +136,22 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let testing_provider =
         RootProvider::<Ethereum>::new_http(args.rpc.parse().wrap_err("invalid RPC URL")?);
 
-    let clickhouse_metric_names =
-        load_metric_names(args.reporting.clickhouse_metrics_file.as_ref())?;
-    let mut reporters = parse_reporters(
-        &args.reporting.reports,
-        "send-blocks",
-        &metadata,
-        clickhouse_metric_names,
-    )?;
-    if reporters.is_empty() {
-        reporters.push(Box::new(ConsoleReporter::stderr(false)));
-    }
-
     let clock = match args.reporting.metrics_align {
         Some(start) => RunClock::new_with_start_unix_ms(start),
         None => RunClock::new(),
     };
-    let store = SampleStore::with_labels(metadata.clone())?;
     let counters = Arc::new(BlockCounters::default());
-    let metrics_forwarder = build_metrics_forwarder(
-        args.reporting.metrics_forward.as_deref(),
+    let snap_counters = counters.clone();
+    let snap_clock = clock.clone();
+    let mut reporting = Reporting::start(
+        &args.reporting,
+        "send-blocks",
         &metadata,
         &scraper_configs,
+        &clock,
+        Arc::new(move || snap_counters.snapshot_samples(&snap_clock)),
+        false,
     )?;
-
-    // Start background scraper if metrics URL is configured.
-    let scraper_handles = if !scraper_configs.is_empty() {
-        let snap_counters = counters.clone();
-        let snap_clock = clock.clone();
-        let callback: bench_core::SampleCallback =
-            Arc::new(move || snap_counters.snapshot_samples(&snap_clock));
-        let forwarder_handle = metrics_forwarder.as_ref().map(|f| f.handle());
-
-        start_scrapers(&scraper_configs, clock.clone(), store.clone(), callback, forwarder_handle)
-    } else {
-        Vec::new()
-    };
 
     let mut collector = MetricsCollector::new(counters);
     let mut reorg_state = args.reorg.map(|depth| ReorgState::new(depth, args.reorg_gap));
@@ -206,7 +176,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                 },
                 args.wait_time,
                 start,
-                &mut reporters,
+                &mut reporting.reporters,
             )
             .await?;
         }
@@ -236,7 +206,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                 },
                 args.wait_time,
                 start,
-                &mut reporters,
+                &mut reporting.reporters,
             )
             .await?;
         }
@@ -251,41 +221,24 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             &persistence_policy,
             args.wait_time,
             start,
-            &mut reporters,
+            &mut reporting.reporters,
             None,
         )
         .await?;
     }
 
-    // Stop the scraper before finalizing.
-    if !scraper_handles.is_empty() {
-        tracing::info!(
-            scrapers = scraper_handles.len(),
-            scrapes = scraper_handles.iter().map(|h| h.scrape_count()).sum::<u64>(),
-            errors = scraper_handles.iter().map(|h| h.error_count()).sum::<u64>(),
-            "Stopping metrics scrapers"
-        );
-        for handle in scraper_handles {
-            handle.stop().await;
-        }
-    }
+    reporting.stop_scrapers().await;
 
     // Push a final snapshot so counter totals are captured even if the
     // last scraper tick fired before the final block was submitted.
-    let final_samples = collector.final_snapshot(&clock);
-    let forwarder_handle = metrics_forwarder.as_ref().map(|f| f.handle());
-    push_samples(&store, forwarder_handle.as_ref(), final_samples).await?;
+    reporting.push_samples(collector.final_snapshot(&clock)).await?;
 
-    let sample_archive = store.finish().await?;
+    let sample_archive = reporting.store.finish().await?;
 
     let blocks = std::mem::take(&mut collector.blocks);
     let run_stats = RunStats::from_blocks_wall_time(&blocks, start.elapsed());
 
-    for block in &blocks {
-        for reporter in reporters.iter_mut() {
-            reporter.on_block(block)?;
-        }
-    }
+    reporting.on_blocks(&blocks)?;
 
     let report = FinalReport {
         metadata: metadata.clone(),
@@ -295,19 +248,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         ..Default::default()
     };
 
-    let mut finalize_result = Ok(());
-    for reporter in reporters.iter_mut() {
-        if let Err(err) = reporter.finalize(&report) {
-            finalize_result = Err(err);
-            break;
-        }
-    }
-
-    let forwarder_result = finish_metrics_forwarder(metrics_forwarder).await;
-
-    finalize_result?;
-    forwarder_result?;
-    Ok(())
+    reporting.finish(&report).await
 }
 
 fn parse_input_line(line: &str) -> Result<InputLine> {
