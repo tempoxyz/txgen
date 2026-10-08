@@ -148,11 +148,6 @@ impl Corpus {
         self.records.is_empty()
     }
 
-    /// Retained record count per reporting key.
-    pub fn counts_per_method(&self) -> &BTreeMap<Arc<str>, usize> {
-        &self.counts
-    }
-
     /// Record count per reporting key dropped by the `--methods` filter.
     pub fn skipped_per_method(&self) -> &BTreeMap<Arc<str>, usize> {
         &self.skipped
@@ -199,10 +194,8 @@ impl CorpusRecord {
     }
 
     /// Parse the request parameters back out of the stored body.
-    ///
-    /// Re-parses on every call; intended for diagnostics and tests, not for
-    /// the replay path, which sends [`body`](Self::body) as is.
-    pub fn params(&self) -> Result<serde_json::Value> {
+    #[cfg(test)]
+    fn params(&self) -> Result<serde_json::Value> {
         let request: serde_json::Value = serde_json::from_str(&self.body)?;
         Ok(request["params"].clone())
     }
@@ -497,7 +490,8 @@ impl ResponseScanner {
     /// Bounded regardless of response size: a `result` member is hashed as it
     /// arrives and never accumulated, and a captured `error` member stops at
     /// [`MAX_ERROR_CAPTURE`].
-    pub fn retained_bytes(&self) -> usize {
+    #[cfg(test)]
+    fn retained_bytes(&self) -> usize {
         self.key.capacity() + self.error.as_ref().map_or(0, Vec::capacity)
     }
 
