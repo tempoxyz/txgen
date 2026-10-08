@@ -52,11 +52,6 @@ impl NonceTracker {
         self.nonces.get(key).copied().unwrap_or(0)
     }
 
-    /// Peek the next nonce without consuming it.
-    pub fn peek(&self, key: &[u8; 20]) -> u64 {
-        self.current(key)
-    }
-
     /// Reset the nonce for a key to a specific value.
     pub fn reset(&mut self, key: [u8; 20], nonce: u64) {
         self.nonces.insert(key, nonce);
@@ -76,21 +71,6 @@ impl NonceTracker {
         }
         self.reset(key, nonce);
         true
-    }
-
-    /// Clear all tracked nonces.
-    pub fn clear(&mut self) {
-        self.nonces.clear();
-    }
-
-    /// Get the number of tracked keys.
-    pub fn len(&self) -> usize {
-        self.nonces.len()
-    }
-
-    /// Check if no keys are tracked.
-    pub fn is_empty(&self) -> bool {
-        self.nonces.is_empty()
     }
 
     /// Check if a key has been initialized.
