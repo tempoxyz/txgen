@@ -385,36 +385,10 @@ pub(crate) fn prepare_materialized_template<A: NetworkAdapter>(
     inclusion_keys: &[SchedulingKey],
     ctx: &mut BuildContext<'_>,
 ) -> Result<PreparedMaterializedTx<A>> {
-    let result = (|| -> Result<_> {
-        let template: A::Template = serde_yaml::from_value(value)
-            .wrap_err_with(|| format!("failed to parse template '{name}'"))?;
-        let tx_req = adapter
-            .build_request(template, ctx)
-            .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
-        let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?.clone();
-        let sender = signer.address();
-        let nonce = tx_req.request.nonce();
-        let created_address = match (tx_req.request.kind(), nonce) {
-            (Some(TxKind::Create), Some(nonce)) => Some(sender.create(nonce)),
-            _ => None,
-        };
-        Ok((tx_req, signer, sender, nonce, created_address))
-    })();
-
-    match result {
-        Ok((tx_req, signer, sender, nonce, created_address)) => {
-            let nonce_reservations = ctx.take_nonce_reservations();
-            Ok(PreparedMaterializedTx {
-                name: name.to_string(),
-                phase,
-                tx_req,
-                signer,
-                inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),
-                sender,
-                nonce,
-                nonce_reservations,
-                created_address,
-            })
+    match build_prepared_template(adapter, name, value, phase, inclusion_keys, ctx) {
+        Ok(mut prepared) => {
+            prepared.nonce_reservations = ctx.take_nonce_reservations();
+            Ok(prepared)
         }
         Err(error) => {
             if !ctx.rollback_nonce_reservations() {
@@ -423,6 +397,39 @@ pub(crate) fn prepare_materialized_template<A: NetworkAdapter>(
             Err(error)
         }
     }
+}
+
+fn build_prepared_template<A: NetworkAdapter>(
+    adapter: &A,
+    name: &str,
+    value: serde_yaml::Value,
+    phase: TxPhase,
+    inclusion_keys: &[SchedulingKey],
+    ctx: &mut BuildContext<'_>,
+) -> Result<PreparedMaterializedTx<A>> {
+    let template: A::Template = serde_yaml::from_value(value)
+        .wrap_err_with(|| format!("failed to parse template '{name}'"))?;
+    let tx_req = adapter
+        .build_request(template, ctx)
+        .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
+    let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?.clone();
+    let sender = signer.address();
+    let nonce = tx_req.request.nonce();
+    let created_address = match (tx_req.request.kind(), nonce) {
+        (Some(TxKind::Create), Some(nonce)) => Some(sender.create(nonce)),
+        _ => None,
+    };
+    Ok(PreparedMaterializedTx {
+        name: name.to_string(),
+        phase,
+        tx_req,
+        signer,
+        inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),
+        sender,
+        nonce,
+        nonce_reservations: Vec::new(),
+        created_address,
+    })
 }
 
 /// Sign and encode a previously prepared adapter request.
@@ -877,10 +884,7 @@ where
             error.chain().any(|cause| {
                 cause
                     .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe) ||
-                    cause.downcast_ref::<serde_json::Error>().is_some_and(|error| {
-                        error.io_error_kind() == Some(std::io::ErrorKind::BrokenPipe)
-                    })
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
             });
         if !closed {
             return Err(error);
@@ -1524,15 +1528,6 @@ fn build_deploy_template_value(
 type NetworkRequest<A> = <<A as NetworkAdapter>::Network as Network>::TransactionRequest;
 type AdapterTxRequest<A> = TxRequest<NetworkRequest<A>, <A as NetworkAdapter>::SignContext>;
 
-struct SigningJob<A: NetworkAdapter> {
-    sequence: u64,
-    name: String,
-    phase: TxPhase,
-    tx_req: AdapterTxRequest<A>,
-    signer: EcdsaSigner,
-    inclusion_keys: Vec<SchedulingKey>,
-}
-
 struct SigningResult {
     sequence: u64,
     result: Result<GeneratedTx>,
@@ -1551,10 +1546,6 @@ struct SigningPool {
 
 impl SigningPool {
     fn new(worker_count: usize) -> Result<Self> {
-        if worker_count == 0 {
-            bail!("signing worker count must be at least 1");
-        }
-
         let (result_tx, result_rx) = mpsc::channel();
         let pool = ThreadPoolBuilder::new()
             .num_threads(worker_count)
@@ -1570,22 +1561,13 @@ impl SigningPool {
             next_sequence: 0,
             next_to_write: 0,
             in_flight: 0,
-            max_in_flight: worker_count.saturating_mul(64).max(1),
+            max_in_flight: worker_count.saturating_mul(64),
         })
-    }
-
-    fn next_sequence(&mut self) -> Result<u64> {
-        let sequence = self.next_sequence;
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .ok_or_else(|| eyre::eyre!("signing job sequence counter overflowed u64"))?;
-        Ok(sequence)
     }
 
     fn submit<A: NetworkAdapter + 'static, W: Write>(
         &mut self,
-        job: SigningJob<A>,
+        prepared: PreparedMaterializedTx<A>,
         writer: &mut NdjsonWriter<W>,
     ) -> Result<()>
     where
@@ -1599,8 +1581,10 @@ impl SigningPool {
             self.recv_one(writer)?;
         }
 
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
         let result_tx = self.result_tx.clone();
-        self.pool.spawn_fifo(move || submit_signing_job::<A>(job, result_tx));
+        self.pool.spawn_fifo(move || submit_signing_job::<A>(sequence, prepared, result_tx));
         self.in_flight += 1;
 
         Ok(())
@@ -1614,26 +1598,14 @@ impl SigningPool {
     }
 
     fn drain_available<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
-        loop {
-            match self.result_rx.try_recv() {
-                Ok(result) => self.handle_result(result, writer)?,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    if self.in_flight > 0 {
-                        bail!("signing worker pool stopped before completing all jobs");
-                    }
-                    break;
-                }
-            }
+        while let Ok(result) = self.result_rx.try_recv() {
+            self.handle_result(result, writer)?;
         }
         Ok(())
     }
 
     fn recv_one<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
-        let result = self
-            .result_rx
-            .recv()
-            .map_err(|_| eyre::eyre!("signing worker pool stopped before completing all jobs"))?;
+        let result = self.result_rx.recv().expect("the pool holds a result sender");
         self.handle_result(result, writer)
     }
 
@@ -1642,41 +1614,33 @@ impl SigningPool {
         result: SigningResult,
         writer: &mut NdjsonWriter<W>,
     ) -> Result<()> {
-        let tx = result.result?;
-        if self.completed.insert(result.sequence, tx).is_some() {
-            bail!("received duplicate signing result for sequence {}", result.sequence);
-        }
+        self.completed.insert(result.sequence, result.result?);
         self.write_ready(writer)
     }
 
     fn write_ready<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
         while let Some(tx) = self.completed.remove(&self.next_to_write) {
-            if self.in_flight == 0 {
-                bail!("received unexpected signing result");
-            }
             writer.write(&tx)?;
             self.in_flight -= 1;
-            self.next_to_write = self
-                .next_to_write
-                .checked_add(1)
-                .ok_or_else(|| eyre::eyre!("written signing result counter overflowed u64"))?;
+            self.next_to_write += 1;
         }
         Ok(())
     }
 }
 
-fn submit_signing_job<A: NetworkAdapter>(job: SigningJob<A>, result_tx: mpsc::Sender<SigningResult>)
-where
+fn submit_signing_job<A: NetworkAdapter>(
+    sequence: u64,
+    prepared: PreparedMaterializedTx<A>,
+    result_tx: mpsc::Sender<SigningResult>,
+) where
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    let sequence = job.sequence;
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sign_workload_job::<A>(job)))
-            .unwrap_or_else(|panic| {
-                Err(eyre::eyre!("signing worker panicked: {}", panic_msg(&panic)))
-            });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sign_prepared_materialized_template(prepared).map(|materialized| materialized.generated)
+    }))
+    .unwrap_or_else(|panic| Err(eyre::eyre!("signing worker panicked: {}", panic_msg(&panic))));
     let _ = result_tx.send(SigningResult { sequence, result });
 }
 
@@ -1687,78 +1651,6 @@ fn panic_msg(panic: &(dyn std::any::Any + Send)) -> &str {
         message.as_str()
     } else {
         "unknown panic payload"
-    }
-}
-
-fn prepare_signing_job<A: NetworkAdapter>(
-    adapter: &A,
-    name: String,
-    value: serde_yaml::Value,
-    phase: TxPhase,
-    inclusion_keys: &[SchedulingKey],
-    sequence: u64,
-    ctx: &mut BuildContext<'_>,
-) -> Result<SigningJob<A>> {
-    let template: A::Template = serde_yaml::from_value(value)
-        .wrap_err_with(|| format!("failed to parse template '{name}'"))?;
-
-    let tx_req = match adapter
-        .build_request(template, ctx)
-        .wrap_err_with(|| format!("failed to build request from template '{name}'"))
-    {
-        Ok(tx_req) => tx_req,
-        Err(error) => {
-            let _ = ctx.rollback_nonce_reservations();
-            return Err(error);
-        }
-    };
-
-    let signer = match ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index) {
-        Ok(signer) => signer.clone(),
-        Err(error) => {
-            let _ = ctx.rollback_nonce_reservations();
-            return Err(error);
-        }
-    };
-    let _ = ctx.take_nonce_reservations();
-
-    Ok(SigningJob {
-        sequence,
-        name,
-        phase,
-        tx_req,
-        signer,
-        inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),
-    })
-}
-
-fn sign_workload_job<A: NetworkAdapter>(job: SigningJob<A>) -> Result<GeneratedTx>
-where
-    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
-    <A::Network as Network>::TxEnvelope:
-        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
-{
-    let SigningJob { sequence: _, name, phase, tx_req, signer, inclusion_keys } = job;
-    let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context, late_sign } =
-        tx_req;
-
-    match late_sign {
-        Some(late_sign) => {
-            if phase == TxPhase::Setup {
-                bail!("deferred signing is not supported for setup transactions");
-            }
-            Ok(GeneratedTx {
-                depends_on: Vec::new(),
-                phase,
-                id: Some(name),
-                raw: Bytes::new(),
-                late_sign: Some(late_sign),
-                sender: Some(signer.address()),
-                submission_keys: vec![SchedulingKey::from(key)],
-                inclusion_keys,
-            })
-        }
-        None => sign_context.sign_request(name, phase, request, signer, key, inclusion_keys),
     }
 }
 
@@ -1827,17 +1719,15 @@ where
                     .clone();
                 let materialized = substitute_vars(value, setup_bindings)
                     .wrap_err_with(|| format!("failed to materialize template '{name}'"))?;
-                let sequence = signing_pool.next_sequence()?;
-                let job = prepare_signing_job(
+                let prepared = prepare_materialized_template(
                     adapter,
-                    name,
+                    &name,
                     materialized,
                     TxPhase::Workload,
                     &[],
-                    sequence,
                     ctx,
                 )?;
-                signing_pool.submit(job, writer)?;
+                signing_pool.submit(prepared, writer)?;
                 written += 1;
             }
             MixItem::Sequence(name) => {
@@ -1845,11 +1735,8 @@ where
                     .sequences
                     .get(&name)
                     .ok_or_else(|| eyre::eyre!("sequence '{}' not found", name))?;
-                let sequence_instance = sequence_instances;
-                sequence_instances = sequence_instances
-                    .checked_add(1)
-                    .ok_or_else(|| eyre::eyre!("sequence instance counter overflowed u64"))?;
-                let sequence_key = compute_sequence_key(&name, sequence_instance);
+                let sequence_key = compute_sequence_key(&name, sequence_instances);
+                sequence_instances += 1;
                 // A single step has no dependent transaction to wait for its inclusion.
                 let inclusion_keys = (sequence.steps.len() > 1).then_some(sequence_key);
                 let bindings = resolve_sequence_bindings(&sequence.bindings, ctx, setup_bindings)
@@ -1868,17 +1755,15 @@ where
                     let materialized = substitute_vars(merged, &bindings).wrap_err_with(|| {
                         format!("failed to materialize sequence '{name}' step {idx} ('{label}')")
                     })?;
-                    let sequence = signing_pool.next_sequence()?;
-                    let job = prepare_signing_job(
+                    let prepared = prepare_materialized_template(
                         adapter,
-                        format!("{name}.{label}"),
+                        &format!("{name}.{label}"),
                         materialized,
                         TxPhase::Workload,
                         inclusion_keys.as_slice(),
-                        sequence,
                         ctx,
                     )?;
-                    signing_pool.submit(job, writer)?;
+                    signing_pool.submit(prepared, writer)?;
                     written += 1;
                 }
             }
@@ -2316,17 +2201,16 @@ fn sample_workload_calls<A: NetworkAdapter>(
     templates
         .into_iter()
         .map(|(name, value)| {
-            let job = prepare_signing_job(
+            let prepared = prepare_materialized_template(
                 adapter,
-                name,
+                &name,
                 value,
                 TxPhase::Workload,
                 &[],
-                0,
                 &mut sample_ctx,
             )?;
-            let mut call = adapter.simulation_request(&job.tx_req, &job.signer)?;
-            call["from"] = serde_json::to_value(job.signer.address())?;
+            let mut call = adapter.simulation_request(&prepared.tx_req, &prepared.signer)?;
+            call["from"] = serde_json::to_value(prepared.sender)?;
             call.as_object_mut()
                 .ok_or_else(|| eyre::eyre!("simulation request must be an object"))?
                 .remove("nonce");
