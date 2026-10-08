@@ -99,7 +99,7 @@ impl ArtifactManager {
 
         let mut encoded_args = Vec::with_capacity(args.len());
         for (arg, param) in args.iter().zip(inputs) {
-            encoded_args.push(yaml_to_sol_value(arg, &param.ty.to_string(), resolver)?);
+            encoded_args.push(yaml_to_param_value(arg, param, resolver)?);
         }
         initcode.extend_from_slice(&DynSolValue::Tuple(encoded_args).abi_encode_params());
 
@@ -703,6 +703,44 @@ mod tests {
             Bytes::from_static(&[0x60, 0x00])
         );
         std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_encode_constructor_tuple_arg() -> Result<()> {
+        let abi: JsonAbi = serde_json::from_value(serde_json::json!([{
+            "type": "constructor",
+            "stateMutability": "nonpayable",
+            "inputs": [{
+                "name": "config",
+                "type": "tuple",
+                "components": [
+                    { "name": "owner", "type": "address" },
+                    { "name": "limit", "type": "uint64" }
+                ]
+            }]
+        }]))?;
+        let manager = ArtifactManager {
+            artifacts: HashMap::from([(
+                "contract".to_string(),
+                Artifact { abi, bytecode: Some(Bytes::from_static(&[0x60, 0x00])) },
+            )]),
+        };
+        let owner = Address::repeat_byte(1);
+        let args = [serde_yaml::from_str(&format!("{{ owner: \"{owner}\", limit: 7 }}"))?];
+        let mut fixture = TestResolver::default();
+
+        let initcode = manager.encode_constructor("contract", &args, &mut fixture.resolver())?;
+
+        let mut expected = vec![0x60, 0x00];
+        expected.extend(
+            DynSolValue::Tuple(vec![DynSolValue::Tuple(vec![
+                DynSolValue::Address(owner),
+                DynSolValue::Uint(U256::from(7), 64),
+            ])])
+            .abi_encode_params(),
+        );
+        assert_eq!(initcode, Bytes::from(expected));
         Ok(())
     }
 
