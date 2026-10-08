@@ -1,6 +1,6 @@
 use super::schema::StepProvenance;
 use alloy_primitives::B256;
-use bench_core::{compute_latency_stats, percentile, ReceiptGasRecord, ReceiptMetricGroup};
+use bench_core::{percentile, ReceiptGasRecord, ReceiptMetricGroup};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -112,41 +112,6 @@ pub struct LatencyDistribution {
     pub p50_ms: f64,
     pub p95_ms: f64,
     pub p99_ms: f64,
-}
-
-impl LatencyDistribution {
-    pub fn from_samples(samples: &[Duration]) -> Self {
-        if samples.is_empty() {
-            return Self::default();
-        }
-        let stats = compute_latency_stats(samples);
-        Self {
-            samples: samples.len(),
-            min_ms: duration_ms_f64(stats.min),
-            max_ms: duration_ms_f64(stats.max),
-            mean_ms: duration_ms_f64(stats.mean),
-            p50_ms: duration_ms_f64(stats.p50),
-            p95_ms: duration_ms_f64(stats.p95),
-            p99_ms: duration_ms_f64(stats.p99),
-        }
-    }
-
-    pub fn from_millisecond_samples(samples: &[f64]) -> Self {
-        if samples.is_empty() {
-            return Self::default();
-        }
-        let mut sorted = samples.to_vec();
-        sorted.sort_by(f64::total_cmp);
-        Self {
-            samples: sorted.len(),
-            min_ms: sorted[0],
-            max_ms: sorted[sorted.len() - 1],
-            mean_ms: sorted.iter().sum::<f64>() / sorted.len() as f64,
-            p50_ms: percentile(&sorted, 50),
-            p95_ms: percentile(&sorted, 95),
-            p99_ms: percentile(&sorted, 99),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -275,56 +240,13 @@ const MAX_LATENCY_SAMPLES: usize = 65_536;
 #[derive(Default)]
 struct LatencyAccumulator {
     observed: usize,
-    minimum: Option<Duration>,
-    maximum: Option<Duration>,
-    total_ms: f64,
-    reservoir: Vec<Duration>,
-}
-
-impl LatencyAccumulator {
-    fn record(&mut self, value: Duration) {
-        self.observed = self.observed.saturating_add(1);
-        self.minimum = Some(self.minimum.map_or(value, |current| current.min(value)));
-        self.maximum = Some(self.maximum.map_or(value, |current| current.max(value)));
-        self.total_ms += duration_ms_f64(value);
-
-        if self.reservoir.len() < MAX_LATENCY_SAMPLES {
-            self.reservoir.push(value);
-            return;
-        }
-        let slot = reservoir_hash(self.observed as u64) % self.observed as u64;
-        if slot < MAX_LATENCY_SAMPLES as u64 {
-            self.reservoir[slot as usize] = value;
-        }
-    }
-
-    fn distribution(&self) -> LatencyDistribution {
-        if self.observed == 0 {
-            return LatencyDistribution::default();
-        }
-        let sampled = compute_latency_stats(&self.reservoir);
-        LatencyDistribution {
-            samples: self.observed,
-            min_ms: duration_ms_f64(self.minimum.expect("observed latency has a minimum")),
-            max_ms: duration_ms_f64(self.maximum.expect("observed latency has a maximum")),
-            mean_ms: self.total_ms / self.observed as f64,
-            p50_ms: duration_ms_f64(sampled.p50),
-            p95_ms: duration_ms_f64(sampled.p95),
-            p99_ms: duration_ms_f64(sampled.p99),
-        }
-    }
-}
-
-#[derive(Default)]
-struct MillisecondAccumulator {
-    observed: usize,
     minimum: Option<f64>,
     maximum: Option<f64>,
     total: f64,
     reservoir: Vec<f64>,
 }
 
-impl MillisecondAccumulator {
+impl LatencyAccumulator {
     fn record(&mut self, value: f64) {
         if !value.is_finite() {
             return;
@@ -347,15 +269,16 @@ impl MillisecondAccumulator {
         if self.observed == 0 {
             return LatencyDistribution::default();
         }
-        let sampled = LatencyDistribution::from_millisecond_samples(&self.reservoir);
+        let mut sorted = self.reservoir.clone();
+        sorted.sort_by(f64::total_cmp);
         LatencyDistribution {
             samples: self.observed,
             min_ms: self.minimum.expect("observed value has a minimum"),
             max_ms: self.maximum.expect("observed value has a maximum"),
             mean_ms: self.total / self.observed as f64,
-            p50_ms: sampled.p50_ms,
-            p95_ms: sampled.p95_ms,
-            p99_ms: sampled.p99_ms,
+            p50_ms: percentile(&sorted, 50),
+            p95_ms: percentile(&sorted, 95),
+            p99_ms: percentile(&sorted, 99),
         }
     }
 }
@@ -371,9 +294,9 @@ struct CausalEdgeKey {
 
 #[derive(Default)]
 struct CausalEdgeAccumulator {
-    observed_latency: MillisecondAccumulator,
-    chain_timestamp_delta: MillisecondAccumulator,
-    destination_observation_lag: MillisecondAccumulator,
+    observed_latency: LatencyAccumulator,
+    chain_timestamp_delta: LatencyAccumulator,
+    destination_observation_lag: LatencyAccumulator,
 }
 
 fn reservoir_hash(mut value: u64) -> u64 {
@@ -394,7 +317,7 @@ pub(crate) struct ScenarioAccumulator {
     step_success: Vec<u64>,
     step_failed: Vec<u64>,
     total_scenario_latency: LatencyAccumulator,
-    critical_path_latency: MillisecondAccumulator,
+    critical_path_latency: LatencyAccumulator,
     causal_edges: BTreeMap<CausalEdgeKey, CausalEdgeAccumulator>,
     failure_counts: BTreeMap<FailureKey, FailureAggregate>,
     sampled_instances: BTreeMap<u64, InstanceLifecycle>,
@@ -411,7 +334,7 @@ impl ScenarioAccumulator {
             step_success: vec![0; step_count],
             step_failed: vec![0; step_count],
             total_scenario_latency: LatencyAccumulator::default(),
-            critical_path_latency: MillisecondAccumulator::default(),
+            critical_path_latency: LatencyAccumulator::default(),
             causal_edges: BTreeMap::new(),
             failure_counts: BTreeMap::new(),
             sampled_instances: BTreeMap::new(),
@@ -422,7 +345,7 @@ impl ScenarioAccumulator {
     pub(crate) fn record(&mut self, outcome: InstanceOutcome) {
         if outcome.failure.is_none() {
             self.completed = self.completed.saturating_add(1);
-            self.total_scenario_latency.record(outcome.elapsed);
+            self.total_scenario_latency.record(duration_ms_f64(outcome.elapsed));
             let (_, critical_path_latency_ms) = observed_critical_path(&outcome.steps);
             self.critical_path_latency.record(critical_path_latency_ms);
             record_causal_edges(&mut self.causal_edges, &outcome.steps);
@@ -435,7 +358,7 @@ impl ScenarioAccumulator {
 
         for step in &outcome.steps {
             if let Some(samples) = self.step_samples.get_mut(step.index) {
-                samples.record(step.latency);
+                samples.record(duration_ms_f64(step.latency));
                 if step.success {
                     self.step_success[step.index] = self.step_success[step.index].saturating_add(1);
                 } else {
@@ -734,18 +657,21 @@ impl ScenarioReport {
         let steps = step_definitions
             .iter()
             .enumerate()
-            .map(|(index, (id, name, chain, kind, depends_on, provenance))| StepReport {
-                index,
-                id: id.clone(),
-                name: name.clone(),
-                chain: chain.clone(),
-                kind: kind.clone(),
-                depends_on: depends_on.clone(),
-                provenance: provenance.clone(),
-                success: step_success[index],
-                failed: step_failed[index],
-                latency: step_samples[index].distribution(),
-                command_latency: step_samples[index].distribution(),
+            .map(|(index, (id, name, chain, kind, depends_on, provenance))| {
+                let latency = step_samples[index].distribution();
+                StepReport {
+                    index,
+                    id: id.clone(),
+                    name: name.clone(),
+                    chain: chain.clone(),
+                    kind: kind.clone(),
+                    depends_on: depends_on.clone(),
+                    provenance: provenance.clone(),
+                    success: step_success[index],
+                    failed: step_failed[index],
+                    command_latency: latency.clone(),
+                    latency,
+                }
             })
             .collect();
         let failures = failure_counts
@@ -1441,7 +1367,7 @@ scenario:
     fn latency_aggregation_bounds_reservoir_memory() {
         let mut accumulator = LatencyAccumulator::default();
         for index in 0..(MAX_LATENCY_SAMPLES + 100) {
-            accumulator.record(Duration::from_nanos(index as u64 + 1));
+            accumulator.record(duration_ms_f64(Duration::from_nanos(index as u64 + 1)));
         }
         let distribution = accumulator.distribution();
         assert_eq!(distribution.samples, MAX_LATENCY_SAMPLES + 100);
