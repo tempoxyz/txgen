@@ -37,7 +37,7 @@ impl RuntimeContext {
     /// Construct a context from a complete set of immutable roots.
     pub fn new(roots: BTreeMap<String, RuntimeValue>) -> Result<Self> {
         for name in roots.keys() {
-            validate_root_name(name)?;
+            validate_component(name, "runtime root")?;
         }
         Ok(Self { roots: Arc::new(roots) })
     }
@@ -386,13 +386,7 @@ pub fn collect_variable_paths(value: &serde_yaml::Value) -> Result<BTreeSet<Stri
 
 /// Validate dotted runtime-variable path syntax without consulting a context.
 pub fn validate_variable_path(path: &str) -> Result<()> {
-    if path.is_empty() {
-        bail!("runtime variable path must not be empty");
-    }
-    if path.split('.').any(str::is_empty) {
-        bail!("runtime variable path '{path}' contains an empty component");
-    }
-    Ok(())
+    validate_path(path, "runtime variable")
 }
 
 fn collect_variable_paths_inner(
@@ -683,12 +677,25 @@ fn recognized_operator(value: &str) -> Option<&'static str> {
     }
 }
 
-fn validate_root_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        bail!("runtime root name must not be empty");
+pub(crate) fn validate_name(name: &str, context: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("{context} name must not be empty");
     }
+    Ok(())
+}
+
+pub(crate) fn validate_component(name: &str, context: &str) -> Result<()> {
+    validate_name(name, context)?;
     if name.contains('.') {
-        bail!("runtime root name '{name}' must not contain '.'");
+        bail!("{context} '{name}' must be one name component and cannot contain '.'");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_path(path: &str, context: &str) -> Result<()> {
+    validate_name(path, context)?;
+    if path.split('.').any(str::is_empty) {
+        bail!("{context} '{path}' contains an empty path component");
     }
     Ok(())
 }
