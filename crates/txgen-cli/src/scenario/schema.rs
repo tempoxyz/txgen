@@ -1,6 +1,8 @@
 use super::{
     composition,
-    value::{collect_variable_paths, RuntimeValue},
+    value::{
+        collect_variable_paths, validate_component, validate_name, validate_path, RuntimeValue,
+    },
 };
 use alloy_dyn_abi::DynSolType;
 use alloy_primitives::{Address, B256, I256, U256};
@@ -586,7 +588,7 @@ impl ScenarioSpec {
         }
 
         for (name, binding) in &self.scenario.bindings {
-            validate_runtime_root(name, "binding")?;
+            validate_component(name, "binding")?;
             match binding {
                 BindingDef::Account(account) if account.pool.trim().is_empty() => {
                     bail!("account binding '{name}' has an empty pool");
@@ -680,7 +682,7 @@ impl ScenarioSpec {
                 }
                 continue;
             };
-            validate_step_id(id).wrap_err_with(|| {
+            validate_path(id, "step ID").wrap_err_with(|| {
                 format!("{} has an invalid step ID", step.diagnostic_label(index))
             })?;
             if let Some(previous) = ids.insert(id.clone(), index) {
@@ -702,7 +704,7 @@ impl ScenarioSpec {
         for (index, step) in self.scenario.steps.iter().enumerate() {
             let mut seen = BTreeSet::new();
             for dependency in &step.depends_on {
-                validate_step_id(dependency).wrap_err_with(|| {
+                validate_path(dependency, "step ID").wrap_err_with(|| {
                     format!("{} has an invalid dependency ID", step.diagnostic_label(index))
                 })?;
                 if !seen.insert(dependency) {
@@ -761,7 +763,7 @@ impl ScenarioSpec {
         let mut saves = BTreeMap::new();
         for (index, step) in self.scenario.steps.iter().enumerate() {
             let Some(save) = &step.save else { continue };
-            validate_save_path(save)?;
+            validate_path(save, "save")?;
             let root = save.split('.').next().expect("validated save path");
             if self.scenario.bindings.contains_key(root) {
                 bail!(
@@ -969,7 +971,7 @@ impl ScenarioSpec {
                         );
                     }
                     for (event_id, event) in &wait.events {
-                        validate_runtime_root(event_id, "receipt event ID")
+                        validate_component(event_id, "receipt event ID")
                             .wrap_err_with(|| format!("{label} has an invalid event ID"))?;
                         if event.abi.trim().is_empty() {
                             bail!("{label} event '{event_id}' has an empty ABI name");
@@ -1578,37 +1580,6 @@ fn validate_optional_nonzero(value: Option<u64>, label: &str, field: &str) -> Re
 fn validate_optional_duration(value: Option<Duration>, label: &str, field: &str) -> Result<()> {
     if value == Some(Duration::ZERO) {
         bail!("{label} {field} must be greater than zero");
-    }
-    Ok(())
-}
-
-fn validate_name(name: &str, context: &str) -> Result<()> {
-    if name.trim().is_empty() {
-        bail!("{context} name must not be empty");
-    }
-    Ok(())
-}
-
-fn validate_runtime_root(name: &str, context: &str) -> Result<()> {
-    validate_name(name, context)?;
-    if name.contains('.') {
-        bail!("{context} name '{name}' must not contain '.'");
-    }
-    Ok(())
-}
-
-fn validate_save_path(path: &str) -> Result<()> {
-    validate_name(path, "save")?;
-    if path.split('.').any(str::is_empty) {
-        bail!("save path '{path}' contains an empty component");
-    }
-    Ok(())
-}
-
-fn validate_step_id(id: &str) -> Result<()> {
-    validate_name(id, "step ID")?;
-    if id.split('.').any(str::is_empty) {
-        bail!("step ID '{id}' contains an empty component");
     }
     Ok(())
 }
