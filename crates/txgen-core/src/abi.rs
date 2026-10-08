@@ -320,7 +320,10 @@ impl CallDef {
             let args = self.args.resolve(resolver)?;
             encode_function_call(abi, &self.function, &args, resolver)?
         } else {
-            // Raw function selector (4 bytes) - assume function is the hex selector
+            ensure!(
+                matches!(&self.args, CallArgs::List(args) if args.is_empty()),
+                "call args require an `abi`; without one, `function` is raw hex calldata"
+            );
             self.function.parse()?
         };
 
@@ -724,6 +727,23 @@ mod tests {
         let sol_value = yaml_to_sol_value(&value, "uint256", &mut resolver).unwrap();
 
         assert_eq!(sol_value, DynSolValue::Uint(U256::from(16), 256));
+    }
+
+    #[test]
+    fn test_raw_call_rejects_args() -> Result<()> {
+        let call: CallDef = serde_yaml::from_str(
+            r#"
+to: "0x0000000000000000000000000000000000000001"
+function: "0x12345678"
+args: [1]
+"#,
+        )?;
+        let mut fixture = TestResolver::default();
+
+        let err = call.encode(&ArtifactManager::empty(), &mut fixture.resolver()).unwrap_err();
+
+        assert!(err.to_string().contains("call args require an `abi`"));
+        Ok(())
     }
 
     #[test]
