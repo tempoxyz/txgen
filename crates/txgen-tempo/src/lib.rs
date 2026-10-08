@@ -1,17 +1,15 @@
 pub mod auth_token_map;
-pub mod late_sign;
+mod late_sign;
 mod nonce;
 mod template;
 mod zone;
 pub mod zone_auth;
 
-pub use late_sign::{
-    sign_tempo_expiring, SignerLocator, TempoExpiringPayload, TempoLateSigner,
-    FORMAT_TEMPO_EXPIRING_RELATIVE,
+pub use late_sign::TempoLateSigner;
+use late_sign::{
+    valid_before_from_now, validate_valid_for_secs, SignerLocator, TempoExpiringPayload,
 };
-use late_sign::{valid_before_from_now, validate_valid_for_secs};
-pub use nonce::{prefetch_parallel_nonces, NONCE_PRECOMPILE};
-pub use txgen_cli::fetch_protocol_nonces;
+use nonce::prefetch_parallel_nonces;
 
 use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_network::TransactionBuilder;
@@ -242,7 +240,7 @@ impl TempoAdapter {
                     &nonce_rpc.provider,
                     address,
                     nonce_key,
-                    nonce_rpc.pending,
+                    false,
                 ))
             })?;
             ctx.nonces.reset(scheduling_key, n);
@@ -1242,6 +1240,7 @@ fn account_ref_value(pool: &str, index: usize) -> Result<serde_yaml::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::late_sign::sign_tempo_expiring;
     use alloy_consensus::SignableTransaction;
     use alloy_eips::eip2718::{Decodable2718, Encodable2718};
     use alloy_network::{NetworkTransactionBuilder, TxSignerSync};
