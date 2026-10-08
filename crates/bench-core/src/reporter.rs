@@ -96,11 +96,10 @@ impl FinalReport {
     }
 
     /// Retain only samples at or before the given Unix millisecond timestamp.
-    pub fn retain_samples_until(&mut self, cutoff_ms: u64) -> Result<()> {
+    pub fn retain_samples_until(&mut self, cutoff_ms: u64) {
         if let Some(archive) = self.sample_archive.as_mut() {
             archive.retain_until(cutoff_ms);
         }
-        Ok(())
     }
 }
 
@@ -162,11 +161,6 @@ pub struct ConsoleReporter<W: Write + Send = Box<dyn Write + Send>> {
 }
 
 impl ConsoleReporter {
-    /// Create a new console reporter writing to stdout.
-    pub fn stdout(show_progress: bool) -> Self {
-        Self { writer: Box::new(std::io::stdout()), show_progress }
-    }
-
     /// Create a new console reporter writing to stderr.
     pub fn stderr(show_progress: bool) -> Self {
         Self { writer: Box::new(std::io::stderr()), show_progress }
@@ -432,9 +426,6 @@ pub struct JsonReport {
     /// Exact total fees paid, encoded as a decimal base-unit string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_fees_paid: Option<String>,
-    /// Unified time-series samples (internal + node metrics).
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub samples: Vec<Sample>,
     /// RPC corpus replay results (call mode only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call: Option<CallReport>,
@@ -497,11 +488,6 @@ pub struct JsonReporter<W: Write + Send = Box<dyn Write + Send>> {
 }
 
 impl JsonReporter {
-    /// Create a JSON reporter writing to stdout.
-    pub fn stdout() -> Self {
-        Self { writer: Box::new(std::io::stdout()), benchmark_id: None, samples_path: None }
-    }
-
     /// Create a JSON reporter writing to a file.
     ///
     /// Samples are written to a sibling gzip-compressed NDJSON file derived
@@ -608,7 +594,6 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             receipt_metrics: report.receipt_metrics.clone(),
             block_composition: report.block_composition.clone(),
             total_fees_paid: report.total_fees_paid.map(|fees| fees.to_string()),
-            samples: Vec::new(),
             call: report.call.clone(),
         };
 
@@ -1434,7 +1419,7 @@ mod tests {
             let source_content = std::fs::read_to_string(&source_samples_path).unwrap();
             assert_eq!(source_content.lines().count(), 2);
 
-            report.retain_samples_until(1000).unwrap();
+            report.retain_samples_until(1000);
             assert_eq!(std::fs::read_to_string(&source_samples_path).unwrap(), source_content);
 
             reporter.finalize(&report).unwrap();
