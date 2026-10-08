@@ -1010,7 +1010,6 @@ where
                     sender,
                     hash,
                     wait_receipt.confirmations.unwrap_or(0),
-                    observation.subscription_behavior(),
                 )
                 .await?;
                 let milestone = observation_milestone(
@@ -1028,7 +1027,6 @@ where
             }
             StepAction::WaitLog(wait_log) => {
                 let observation = chain.observation.for_step(wait_log.poll_interval);
-                let behavior = observation.subscription_behavior();
                 let (result, event_names) = if wait_log.events.is_empty() {
                     let abi = chain
                         .artifacts
@@ -1042,7 +1040,6 @@ where
                             abi,
                             wait_log,
                             context,
-                            behavior,
                         )
                         .await?,
                         vec![wait_log.event.clone()],
@@ -1091,7 +1088,6 @@ where
                             hash,
                             &prepared,
                             wait_log.confirmations.unwrap_or(0),
-                            behavior,
                         )
                         .await?,
                         names,
@@ -1979,7 +1975,6 @@ where
                     Some(materialized.sender),
                     submission.tx_hash,
                     0,
-                    self.observation.subscription_behavior(),
                 ),
             )
             .await
@@ -2874,7 +2869,7 @@ fn observation_milestone(
         block_hash: Some(observation.block_hash),
         transaction_index: observation.transaction_index,
         log_index: (observation.log_indices.len() == 1).then(|| observation.log_indices[0]),
-        canonical_block_timestamp_ms: observation.block_timestamp_ms,
+        canonical_block_timestamp_ms: Some(observation.block_timestamp_ms),
         confirmation_depth: observation.confirmation_depth,
         event_names,
         log_indices: observation.log_indices.clone(),

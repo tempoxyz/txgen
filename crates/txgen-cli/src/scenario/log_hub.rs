@@ -265,16 +265,7 @@ impl LogPollHub {
     }
 
     async fn subscribe_wake(&self) -> Result<Option<WakeStream>, String> {
-        if self.subscription_behavior == SubscriptionBehavior::Disabled {
-            return Ok(None);
-        }
-        let Some(provider) = &self.websocket_provider else {
-            return if self.subscription_behavior == SubscriptionBehavior::Require {
-                Err("subscription observation mode has no connected WebSocket".to_string())
-            } else {
-                Ok(None)
-            };
-        };
+        let Some(provider) = &self.websocket_provider else { return Ok(None) };
         match provider.subscribe_blocks().await {
             Ok(subscription) => {
                 Ok(Some(Box::pin(subscription.into_stream().map(|_| ())) as WakeStream))
