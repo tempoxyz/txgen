@@ -46,10 +46,7 @@ pub use prometheus_reporter::{
     PrometheusConfig, PrometheusForwarder, PrometheusForwarderHandle, PrometheusForwarderSummary,
     PrometheusReporter,
 };
-pub use receipt_clickhouse::{
-    insert_receipt_gas_records, insert_receipt_gas_records_with_default_batch_size,
-    DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE,
-};
+pub use receipt_clickhouse::{insert_receipt_gas_records, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE};
 pub use receipt_metrics::{
     total_fees_paid, BlockReceiptCollector, ReceiptCollection, ReceiptCollector,
     ReceiptCollectorHandle, ReceiptGasRecord, ReceiptGasSample, ReceiptMetricDistribution,
