@@ -11,11 +11,12 @@ use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
-    block_composition, collect_block_stats, parse_reporters, start_scrapers, total_fees_paid,
-    trim_trailing_empty_blocks, BlockReceiptCollector, ConsoleReporter, FileSource, FinalReport,
-    GeneratedTx, LateSigner, MetricsCollector, ProgressState, ReceiptCollection, ReceiptTracker,
-    Reporter, RequestAuthProvider, RpcEndpoint, RunClock, RunStats, SampleStore, ScraperConfig,
-    ScraperHandle, Sender, SenderConfig, SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
+    block_composition, collect_block_stats, parse_metadata, parse_reporters, start_scrapers,
+    total_fees_paid, trim_trailing_empty_blocks, BlockReceiptCollector, ConsoleReporter,
+    FileSource, FinalReport, GeneratedTx, LateSigner, MetricsCollector, ProgressState,
+    ReceiptCollection, ReceiptTracker, Reporter, RequestAuthProvider, RpcEndpoint, RunClock,
+    RunStats, SampleStore, ScraperConfig, ScraperHandle, Sender, SenderConfig,
+    SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -40,7 +41,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         "Starting send"
     );
 
-    let mut metadata = parse_metadata(&args.metadata)?;
+    let mut metadata: HashMap<_, _> = parse_metadata(&args.metadata)?;
     metadata
         .insert("max_pending".to_string(), max_pending.map_or(0, |limit| limit.get()).to_string());
     let scraper_configs =
@@ -277,6 +278,9 @@ async fn execute_source<S: TxSource>(
 
     sender.flush().await?;
     drop(sender);
+    // Freeze the duration before the drain wait, receipt RPCs and aggregation
+    // add post-run latency.
+    let measured_elapsed = args.duration.unwrap_or_else(|| metrics.elapsed_since_start());
 
     let (sent, success, failed) = metrics.counts();
     if (!args.warmup.is_zero() || args.warmup_validators.is_some()) && sent == 0 {
@@ -302,9 +306,6 @@ async fn execute_source<S: TxSource>(
         }
     };
     tracing::info!(end_block, "Ending block fetched");
-
-    // Freeze the duration before receipt RPCs and aggregation add post-run latency.
-    let measured_elapsed = args.duration.unwrap_or_else(|| metrics.elapsed_since_start());
 
     let receipt_collection = match receipt_collector {
         Some(collector) => {
@@ -555,20 +556,6 @@ async fn finish_setup_phase(
     }
 
     Ok(())
-}
-
-/// Parse `key=value` metadata strings into a HashMap.
-pub(crate) fn parse_metadata(args: &[String]) -> Result<HashMap<String, String>> {
-    let mut map = HashMap::new();
-    for arg in args {
-        let (key, value) =
-            arg.split_once('=').ok_or_else(|| eyre::eyre!("invalid metadata format: {arg}"))?;
-        if key.is_empty() {
-            bail!("metadata key cannot be empty: {arg}");
-        }
-        map.insert(key.to_string(), value.to_string());
-    }
-    Ok(map)
 }
 
 struct SendInterval {

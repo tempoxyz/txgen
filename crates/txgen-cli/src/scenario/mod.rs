@@ -190,7 +190,7 @@ where
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
     let destinations = ScenarioReportDestinations::parse(&args.reports)?;
-    let metadata = parse_metadata(&args.metadata)?;
+    let metadata: BTreeMap<_, _> = bench_core::parse_metadata(&args.metadata)?;
     let spec = ScenarioSpec::load(&args.scenario)?;
     let clickhouse_reporters = destinations
         .clickhouse_urls
@@ -265,20 +265,6 @@ fn canonical_clickhouse_url(value: &str) -> Result<String> {
     let url = bench_core::clickhouse::parse_endpoint(value)
         .wrap_err("invalid scenario ClickHouse report URL")?;
     Ok(url.as_str().trim_end_matches('/').to_string())
-}
-
-fn parse_metadata(values: &[String]) -> Result<BTreeMap<String, String>> {
-    let mut metadata = BTreeMap::new();
-    for value in values {
-        let (key, value) = value
-            .split_once('=')
-            .ok_or_else(|| eyre::eyre!("invalid metadata format '{value}'; expected key=value"))?;
-        if key.is_empty() {
-            bail!("metadata key cannot be empty");
-        }
-        metadata.insert(key.to_string(), value.to_string());
-    }
-    Ok(metadata)
 }
 
 fn finalize_scenario_reports(
@@ -517,16 +503,6 @@ mod tests {
             "clickhouse:https://clickhouse.example/".into(),
         ])
         .is_err());
-    }
-
-    #[test]
-    fn parses_metadata_and_rejects_malformed_values() {
-        let metadata =
-            parse_metadata(&["git-sha=abc".into(), "phase=nightly=zones".into()]).unwrap();
-        assert_eq!(metadata["git-sha"], "abc");
-        assert_eq!(metadata["phase"], "nightly=zones");
-        assert!(parse_metadata(&["missing-separator".into()]).is_err());
-        assert!(parse_metadata(&["=value".into()]).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]
