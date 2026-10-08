@@ -127,6 +127,13 @@ fn choose_yaml_value<'a>(
     Ok(&choices[idx])
 }
 
+fn choose<T: DeserializeOwned>(
+    choices: &[serde_yaml::Value],
+    resolver: &mut ValueResolver<'_>,
+) -> Result<T> {
+    Ok(serde_yaml::from_value(choose_yaml_value(choices, resolver)?.clone())?)
+}
+
 fn yaml_i128(value: &serde_yaml::Value, context: &str) -> Result<i128> {
     serde_yaml::from_value(value.clone())
         .map_err(|err| eyre::eyre!("{context} must be an integer: {err}"))
@@ -167,10 +174,7 @@ impl FromGenerator for u64 {
         match generator {
             Generator::Uniform(range) => Ok(sample_uniform_i128(range, resolver)?.try_into()?),
             Generator::Const(v) => Ok(serde_yaml::from_value(v.clone())?),
-            Generator::Choice(choices) => {
-                let idx = resolver.rng.random_range(0..choices.len());
-                Ok(serde_yaml::from_value(choices[idx].clone())?)
-            }
+            Generator::Choice(choices) => choose(choices, resolver),
             Generator::Random => Ok(resolver.rng.random()),
             _ => {
                 bail!("cannot generate u64 from {:?}", generator);
@@ -184,10 +188,7 @@ impl FromGenerator for u128 {
         match generator {
             Generator::Uniform(range) => Ok(sample_uniform_i128(range, resolver)?.try_into()?),
             Generator::Const(v) => Ok(serde_yaml::from_value(v.clone())?),
-            Generator::Choice(choices) => {
-                let idx = resolver.rng.random_range(0..choices.len());
-                Ok(serde_yaml::from_value(choices[idx].clone())?)
-            }
+            Generator::Choice(choices) => choose(choices, resolver),
             Generator::Random => Ok(resolver.rng.random()),
             _ => {
                 bail!("cannot generate u128 from {:?}", generator);
@@ -203,27 +204,8 @@ impl FromGenerator for U256 {
                 let val: u128 = sample_uniform_i128(range, resolver)?.try_into()?;
                 Ok(U256::from(val))
             }
-            Generator::Const(v) => {
-                // Handle both numeric and string representations
-                if let Some(n) = v.as_u64() {
-                    Ok(U256::from(n))
-                } else if let Some(s) = v.as_str() {
-                    Ok(s.parse()?)
-                } else {
-                    bail!("cannot parse U256 from {:?}", v);
-                }
-            }
-            Generator::Choice(choices) => {
-                let idx = resolver.rng.random_range(0..choices.len());
-                let v = &choices[idx];
-                if let Some(n) = v.as_u64() {
-                    Ok(U256::from(n))
-                } else if let Some(s) = v.as_str() {
-                    Ok(s.parse()?)
-                } else {
-                    bail!("cannot parse U256 from {:?}", v);
-                }
-            }
+            Generator::Const(v) => Ok(serde_yaml::from_value(v.clone())?),
+            Generator::Choice(choices) => choose(choices, resolver),
             Generator::Random => Ok(resolver.rng.random()),
             _ => {
                 bail!("cannot generate U256 from {:?}", generator);
@@ -250,11 +232,7 @@ impl FromGenerator for Address {
                 let s: String = serde_yaml::from_value(v.clone())?;
                 Ok(s.parse()?)
             }
-            Generator::Choice(choices) => {
-                let idx = resolver.rng.random_range(0..choices.len());
-                let s: String = serde_yaml::from_value(choices[idx].clone())?;
-                Ok(s.parse()?)
-            }
+            Generator::Choice(choices) => choose(choices, resolver),
             Generator::Random => Ok(resolver.rng.random()),
             _ => {
                 bail!("cannot generate Address from {:?}", generator);
@@ -297,11 +275,7 @@ impl FromGenerator for B256 {
                 let s: String = serde_yaml::from_value(v.clone())?;
                 Ok(s.parse()?)
             }
-            Generator::Choice(choices) => {
-                let idx = resolver.rng.random_range(0..choices.len());
-                let s: String = serde_yaml::from_value(choices[idx].clone())?;
-                Ok(s.parse()?)
-            }
+            Generator::Choice(choices) => choose(choices, resolver),
             Generator::Random => Ok(resolver.rng.random()),
             _ => {
                 bail!("cannot generate B256 from {:?}", generator);
@@ -314,10 +288,7 @@ impl FromGenerator for String {
     fn from_generator(generator: &Generator, resolver: &mut ValueResolver<'_>) -> Result<Self> {
         match generator {
             Generator::Const(v) => Ok(serde_yaml::from_value(v.clone())?),
-            Generator::Choice(choices) => {
-                let idx = resolver.rng.random_range(0..choices.len());
-                Ok(serde_yaml::from_value(choices[idx].clone())?)
-            }
+            Generator::Choice(choices) => choose(choices, resolver),
             _ => {
                 bail!("cannot generate String from {:?}", generator);
             }
@@ -335,19 +306,10 @@ impl FromGenerator for serde_yaml::Value {
                 let value = choose_yaml_value(choices, resolver)?.clone();
                 resolver.resolve_yaml(&value)
             }
-            Generator::Pool { pool, select } => {
-                let signer = match select {
-                    SelectMode::Random => resolver.accounts.get_random(pool, resolver.rng)?,
-                    SelectMode::Index(idx) => resolver.accounts.get_by_index(pool, *idx)?,
-                };
-                Ok(serde_yaml::Value::String(signer.address().to_string()))
-            }
-            Generator::AddressPool { pool, select } => {
-                let address = match select {
-                    SelectMode::Random => resolver.address_pools.get_random(pool, resolver.rng)?,
-                    SelectMode::Index(idx) => resolver.address_pools.get_by_index(pool, *idx)?,
-                };
-                Ok(serde_yaml::Value::String(address.to_string()))
+            Generator::Pool { .. } | Generator::AddressPool { .. } => {
+                Ok(serde_yaml::Value::String(
+                    Address::from_generator(generator, resolver)?.to_string(),
+                ))
             }
             Generator::RandomBytes(len) => {
                 let mut bytes = vec![0u8; *len];
@@ -362,18 +324,45 @@ impl FromGenerator for serde_yaml::Value {
     }
 }
 
+/// Owns the state borrowed by a [`ValueResolver`] in tests.
+#[cfg(test)]
+pub(crate) struct TestResolver {
+    pub(crate) accounts: AccountManager,
+    pub(crate) address_pools: AddressPoolManager,
+    pub(crate) rng: rand::rngs::StdRng,
+}
+
+#[cfg(test)]
+impl Default for TestResolver {
+    fn default() -> Self {
+        use rand::SeedableRng;
+        Self {
+            accounts: AccountManager::empty(),
+            address_pools: AddressPoolManager::empty(),
+            rng: rand::rngs::StdRng::seed_from_u64(42),
+        }
+    }
+}
+
+#[cfg(test)]
+impl TestResolver {
+    pub(crate) fn resolver(&mut self) -> ValueResolver<'_> {
+        ValueResolver {
+            accounts: &self.accounts,
+            address_pools: &self.address_pools,
+            rng: &mut self.rng,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{rngs::StdRng, SeedableRng};
 
     #[test]
     fn test_uniform_u64() {
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
 
         let generator = Generator::Uniform(UniformRange::Range([
             serde_yaml::to_value(1).unwrap(),
@@ -385,11 +374,8 @@ mod tests {
 
     #[test]
     fn test_uniform_i64_with_step() {
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
         let value = serde_yaml::from_str::<serde_yaml::Value>(
             r#"
 uniform:
@@ -409,11 +395,8 @@ uniform:
 
     #[test]
     fn test_const_address() {
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
 
         let generator = Generator::Const(serde_yaml::Value::String(
             "0x0000000000000000000000000000000000000001".to_string(),
@@ -427,11 +410,8 @@ uniform:
 
     #[test]
     fn test_random() {
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
 
         let generator = Generator::Random;
 
@@ -449,21 +429,21 @@ uniform:
 
     #[test]
     fn test_address_pool_generator() -> Result<()> {
-        let accounts = AccountManager::empty();
         let expected = Address::from([7u8; 20]);
-        let address_pools = AddressPoolManager::from_spec(&std::collections::HashMap::from([(
-            "recipients".to_string(),
-            crate::AddressPoolDef {
-                addresses: vec![expected],
-                mnemonic: None,
-                index: None,
-                range: None,
-                fast: None,
-            },
-        )]))?;
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver {
+            address_pools: AddressPoolManager::from_spec(&std::collections::HashMap::from([(
+                "recipients".to_string(),
+                crate::AddressPoolDef {
+                    addresses: vec![expected],
+                    mnemonic: None,
+                    index: None,
+                    range: None,
+                    fast: None,
+                },
+            )]))?,
+            ..Default::default()
+        };
+        let mut resolver = fixture.resolver();
 
         let generator =
             Generator::AddressPool { pool: "recipients".to_string(), select: SelectMode::Index(0) };
@@ -471,5 +451,19 @@ uniform:
 
         assert_eq!(address, expected);
         Ok(())
+    }
+
+    #[test]
+    fn test_empty_choice_fails() {
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
+        let generator = Generator::Choice(Vec::new());
+
+        assert!(u64::from_generator(&generator, &mut resolver).is_err());
+        assert!(u128::from_generator(&generator, &mut resolver).is_err());
+        assert!(U256::from_generator(&generator, &mut resolver).is_err());
+        assert!(Address::from_generator(&generator, &mut resolver).is_err());
+        assert!(B256::from_generator(&generator, &mut resolver).is_err());
+        assert!(String::from_generator(&generator, &mut resolver).is_err());
     }
 }
