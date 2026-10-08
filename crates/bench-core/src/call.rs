@@ -33,10 +33,16 @@ use std::{
 const MAX_ERROR_CAPTURE: usize = 64 * 1024;
 
 /// The shape a `meta.label` must have, as documented in errors.
-const LABEL_PATTERN: &str = "^[A-Za-z0-9._+:-]{1,48}$";
+pub const LABEL_PATTERN: &str = "^[A-Za-z0-9._+:-]{1,48}$";
 
 /// Maximum length of a `meta.label`.
 const MAX_LABEL_LEN: usize = 48;
+
+/// Whether `label` matches [`LABEL_PATTERN`].
+pub fn is_valid_label(label: &str) -> bool {
+    (1..=MAX_LABEL_LEN).contains(&label.len()) &&
+        label.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._+:-".contains(&byte))
+}
 
 /// Maximum length of a member key tracked while scanning a response.
 const MAX_KEY_LEN: usize = 32;
@@ -1346,9 +1352,7 @@ fn reporting_key(line: usize, method: CallMethod, label: Option<&str>) -> Result
         return Ok(Arc::from(method.as_str()));
     };
 
-    let valid = (1..=MAX_LABEL_LEN).contains(&label.len()) &&
-        label.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._+:-".contains(&byte));
-    if !valid {
+    if !is_valid_label(label) {
         bail!("corpus line {line}: `meta.label` must match {LABEL_PATTERN}");
     }
 
