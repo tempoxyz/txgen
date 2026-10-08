@@ -54,6 +54,9 @@ const INLINE_ACCESS_KEY_MNEMONIC: &str =
     "test test test test test test test test test test test junk";
 const INLINE_ACCESS_KEY_START_INDEX: u32 = 1_000_000;
 
+/// Keep generated transactions compatible with pre-T11 networks, which cap expiry at 30 seconds.
+const TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS: u64 = 30;
+
 /// Extract the signed validity deadline for bench's shared pending tracker.
 /// Unknown/non-Tempo envelopes retain the generic inclusion timeout.
 pub fn transaction_expiry(raw: &Bytes) -> Option<u64> {

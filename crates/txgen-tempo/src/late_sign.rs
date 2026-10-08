@@ -13,8 +13,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tempo_alloy::rpc::TempoTransactionRequest;
-use tempo_primitives::{transaction::TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS, TempoTxEnvelope};
+use tempo_primitives::TempoTxEnvelope;
 use txgen_core::{AccountManager, LateSignSpec, WorkloadSpec};
+
+use crate::TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS;
 
 /// Discriminator for relative Tempo expiring-nonce signing.
 pub const FORMAT_TEMPO_EXPIRING_RELATIVE: &str = "tempo_expiring_relative";
