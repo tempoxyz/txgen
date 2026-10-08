@@ -303,19 +303,6 @@ pub(crate) async fn wait_for_receipt_observed(
     }
 }
 
-#[cfg(test)]
-async fn receipt_is_canonical_on_query(
-    provider: &DynProvider<AnyNetwork>,
-    receipt: &AnyTransactionReceipt,
-) -> Result<bool, StepError> {
-    let (Some(block_number), Some(receipt_block_hash)) =
-        (receipt.block_number(), receipt.block_hash())
-    else {
-        return Ok(false);
-    };
-    Ok(canonical_block(provider, block_number, receipt_block_hash).await?.is_some())
-}
-
 #[derive(Debug, Clone, Copy)]
 struct CanonicalBlock {
     timestamp_ms: u64,
@@ -491,24 +478,6 @@ pub(crate) async fn wait_for_wake(wake: &mut Option<WakeStream>, poll_interval: 
             }
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) async fn wait_for_log(
-    query_provider: &DynProvider<AnyNetwork>,
-    submitter: &RpcSubmitter,
-    chain: &str,
-    abi: &JsonAbi,
-    step: &WaitLogStep,
-    context: &RuntimeContext,
-) -> Result<RuntimeValue, StepError> {
-    let observation = ObservationRuntime::polling(
-        query_provider.clone(),
-        step.poll_interval.unwrap_or(DEFAULT_POLL_INTERVAL),
-    );
-    wait_for_log_observed(&observation, submitter, chain, abi, step, context)
-        .await
-        .map(|result| result.value)
 }
 
 pub(crate) struct LogResult {
@@ -1560,6 +1529,35 @@ mod tests {
 
     fn mock_submitter(provider: &DynProvider<AnyNetwork>) -> RpcSubmitter {
         RpcSubmitter::new(vec![provider.clone()], SenderConfig::default()).unwrap()
+    }
+
+    async fn wait_for_log(
+        query_provider: &DynProvider<AnyNetwork>,
+        submitter: &RpcSubmitter,
+        chain: &str,
+        abi: &JsonAbi,
+        step: &WaitLogStep,
+        context: &RuntimeContext,
+    ) -> Result<RuntimeValue, StepError> {
+        let observation = ObservationRuntime::polling(
+            query_provider.clone(),
+            step.poll_interval.unwrap_or(DEFAULT_POLL_INTERVAL),
+        );
+        wait_for_log_observed(&observation, submitter, chain, abi, step, context)
+            .await
+            .map(|result| result.value)
+    }
+
+    async fn receipt_is_canonical_on_query(
+        provider: &DynProvider<AnyNetwork>,
+        receipt: &AnyTransactionReceipt,
+    ) -> Result<bool, StepError> {
+        let (Some(block_number), Some(receipt_block_hash)) =
+            (receipt.block_number(), receipt.block_hash())
+        else {
+            return Ok(false);
+        };
+        Ok(canonical_block(provider, block_number, receipt_block_hash).await?.is_some())
     }
 
     /// Stateful JSON-RPC chain mock. Unlike the FIFO [`Asserter`], responses
