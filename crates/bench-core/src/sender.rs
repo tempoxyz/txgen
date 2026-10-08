@@ -206,7 +206,7 @@ impl std::error::Error for RpcSubmitError {}
 /// clients have independent rate limits, allowing scenario-instance start rate
 /// limiting to remain separate from transaction submission rate limiting.
 /// Generated transactions are ordered using the same submission and inclusion
-/// key semantics as [`Sender`]. Raw submissions bypass key ordering.
+/// key semantics as [`Sender`].
 #[derive(Clone)]
 pub struct RpcSubmitter {
     endpoints: Arc<[RpcEndpoint]>,
@@ -304,50 +304,32 @@ impl RpcSubmitter {
             .clone()
             .enqueue(tx.submission_keys.clone(), tx.inclusion_keys.clone())
             .map_err(RpcSubmitError::before_send)?;
-        let mut order = match deadline {
-            Some(deadline) => {
-                tokio::time::timeout_at(deadline, order.acquire()).await.map_err(|_| {
-                    RpcSubmitError::deadline(
-                        RpcSubmitFailureKind::BeforeSend,
-                        "submission deadline elapsed before dispatch",
-                        None,
-                    )
-                })?
-            }
-            None => order.acquire().await,
+        let before_dispatch = |_| {
+            RpcSubmitError::deadline(
+                RpcSubmitFailureKind::BeforeSend,
+                "submission deadline elapsed before dispatch",
+                None,
+            )
         };
-        let permit = match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, self.acquire_permit())
-                .await
-                .map_err(|_| {
-                    RpcSubmitError::deadline(
-                        RpcSubmitFailureKind::BeforeSend,
-                        "submission deadline elapsed before dispatch",
-                        None,
-                    )
-                })?
-                .map_err(RpcSubmitError::before_send)?,
-            None => self.acquire_permit().await.map_err(RpcSubmitError::before_send)?,
-        };
+        let mut order = with_deadline(deadline, order.acquire()).await.map_err(before_dispatch)?;
+        let permit = with_deadline(deadline, self.acquire_permit())
+            .await
+            .map_err(before_dispatch)?
+            .map_err(RpcSubmitError::before_send)?;
 
         let inclusion = if tx.inclusion_keys.is_empty() {
             None
         } else {
-            let registration = self.receipt_tracker.prepare();
-
-            let waiter = match deadline {
-                Some(deadline) => {
-                    tokio::time::timeout_at(deadline, registration).await.map_err(|_| {
-                        RpcSubmitError::deadline(
-                            RpcSubmitFailureKind::BeforeSend,
-                            "submission deadline elapsed starting inclusion observation",
-                            None,
-                        )
-                    })?
-                }
-                None => registration.await,
-            }
-            .map_err(RpcSubmitError::before_send)?;
+            let waiter = with_deadline(deadline, self.receipt_tracker.prepare())
+                .await
+                .map_err(|_| {
+                    RpcSubmitError::deadline(
+                        RpcSubmitFailureKind::BeforeSend,
+                        "submission deadline elapsed starting inclusion observation",
+                        None,
+                    )
+                })?
+                .map_err(RpcSubmitError::before_send)?;
 
             Some(waiter)
         };
@@ -366,23 +348,16 @@ impl RpcSubmitter {
             .map_err(RpcSubmitError::before_send)?;
 
         let redact = self.request_auth.is_some();
-        let submission = match deadline {
-            Some(deadline) => {
-                tokio::time::timeout_at(deadline, submit_raw_rpc(&endpoint, &raw, headers))
-                    .await
-                    .map_err(|_| {
-                        RpcSubmitError::deadline(
-                            RpcSubmitFailureKind::Ambiguous,
-                            "submission deadline elapsed after RPC dispatch; acceptance is unknown",
-                            Some(expected_hash),
-                        )
-                    })?
-                    .map_err(|error| RpcSubmitError::from_transport(error, redact, expected_hash))?
-            }
-            None => submit_raw_rpc(&endpoint, &raw, headers)
-                .await
-                .map_err(|error| RpcSubmitError::from_transport(error, redact, expected_hash))?,
-        };
+        let submission = with_deadline(deadline, submit_raw_rpc(&endpoint, &raw, headers))
+            .await
+            .map_err(|_| {
+                RpcSubmitError::deadline(
+                    RpcSubmitFailureKind::Ambiguous,
+                    "submission deadline elapsed after RPC dispatch; acceptance is unknown",
+                    Some(expected_hash),
+                )
+            })?
+            .map_err(|error| RpcSubmitError::from_transport(error, redact, expected_hash))?;
 
         drop(permit);
 
@@ -401,17 +376,6 @@ impl RpcSubmitter {
         }
 
         Ok(submission)
-    }
-
-    /// Submit raw EIP-2718 transaction bytes and wait for RPC acceptance.
-    pub async fn submit_raw(&self, raw: &Bytes) -> Result<RpcSubmission> {
-        let _permit = self.acquire_permit().await?;
-
-        let endpoint = self.endpoint_for_hash(keccak256(raw));
-        let headers = self.headers_for(&endpoint, "eth_sendRawTransaction", None, None)?;
-        submit_raw_rpc(&endpoint, raw, headers)
-            .await
-            .map_err(|error| rpc_request_error(error, self.request_auth.is_some(), "submission"))
     }
 
     /// Fetch a transaction receipt through a sender-authenticated endpoint.
@@ -1526,6 +1490,16 @@ async fn submit_tx(
     result
 }
 
+async fn with_deadline<T>(
+    deadline: Option<tokio::time::Instant>,
+    future: impl Future<Output = T>,
+) -> std::result::Result<T, tokio::time::error::Elapsed> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, future).await,
+        None => Ok(future.await),
+    }
+}
+
 fn resolve_raw(
     raw: &Bytes,
     late_sign: Option<&LateSignSpec>,
@@ -1988,8 +1962,19 @@ mod tests {
         )
         .unwrap();
 
-        let submission =
-            submitter.submit_raw(&Bytes::from_static(&[0x02, 0xf8, 0x70])).await.unwrap();
+        let submission = submitter
+            .submit(&GeneratedTx {
+                depends_on: Vec::new(),
+                phase: TxPhase::Workload,
+                id: None,
+                sender: None,
+                raw: Bytes::from_static(&[0x02, 0xf8, 0x70]),
+                late_sign: None,
+                submission_keys: vec![SchedulingKey::from([0x11; 20])],
+                inclusion_keys: Vec::new(),
+            })
+            .await
+            .unwrap();
 
         assert_eq!(submission.tx_hash, tx_hash);
         assert!(submission.submitted_at.duration_since(std::time::UNIX_EPOCH).is_ok());

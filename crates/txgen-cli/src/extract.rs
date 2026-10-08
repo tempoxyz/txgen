@@ -10,7 +10,10 @@ use alloy_rlp::Decodable;
 use alloy_rpc_client::RpcClient;
 use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload};
 use alloy_transport::layers::RetryBackoffLayer;
-use bench_core::CallMethod;
+use bench_core::{
+    call::{is_valid_label, LABEL_PATTERN},
+    CallMethod,
+};
 use clap::{Args, ValueEnum};
 use eyre::{bail, Result, WrapErr};
 use futures::{stream, StreamExt};
@@ -38,12 +41,6 @@ const PARITY_TRACE: [&str; 1] = ["trace"];
 
 /// The trace types of the state-diff parity-style variant.
 const PARITY_TRACE_STATE_DIFF: [&str; 2] = ["trace", "stateDiff"];
-
-/// The shape `bench call` requires of a `meta.label`.
-const LABEL_PATTERN: &str = "^[A-Za-z0-9._+:-]{1,48}$";
-
-/// Maximum length of a `meta.label`.
-const MAX_LABEL_LEN: usize = 48;
 
 #[derive(Args)]
 pub struct ExtractArgs {
@@ -585,12 +582,7 @@ impl TracerSpec {
 
         // A label the replay would reject turns a long extraction into a
         // corpus that cannot be loaded, so it fails here instead.
-        let valid = (1..=MAX_LABEL_LEN).contains(&resolved.label.len()) &&
-            resolved
-                .label
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"._+:-".contains(&byte));
-        if !valid {
+        if !is_valid_label(&resolved.label) {
             bail!(
                 "--tracer {spec:?} yields the label `{}`, which must match {LABEL_PATTERN}",
                 resolved.label

@@ -39,7 +39,6 @@ pub struct BenchMetrics {
     /// Failed transactions (rejected by RPC or network error).
     pub failed: u64,
     /// Total elapsed time.
-    #[serde(with = "duration_serde")]
     pub elapsed: Duration,
     /// Latency statistics, when latency collection is enabled.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -70,22 +69,16 @@ impl BenchMetrics {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LatencyStats {
     /// Minimum latency observed.
-    #[serde(with = "duration_serde")]
     pub min: Duration,
     /// Maximum latency observed.
-    #[serde(with = "duration_serde")]
     pub max: Duration,
     /// Mean latency.
-    #[serde(with = "duration_serde")]
     pub mean: Duration,
     /// P50 latency.
-    #[serde(with = "duration_serde")]
     pub p50: Duration,
     /// P95 latency.
-    #[serde(with = "duration_serde")]
     pub p95: Duration,
     /// P99 latency.
-    #[serde(with = "duration_serde")]
     pub p99: Duration,
 }
 
@@ -141,7 +134,6 @@ pub struct LatencySample {
     /// Offset from benchmark start in milliseconds.
     pub offset_ms: u64,
     /// Latency of this request.
-    #[serde(with = "duration_serde")]
     pub latency: Duration,
 }
 
@@ -206,7 +198,7 @@ pub struct BlockStats {
 }
 
 /// Run summary statistics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunStats {
     /// Starting block number.
     pub start_block: u64,
@@ -250,20 +242,7 @@ impl RunStats {
 
     fn from_blocks_with_duration_ms(blocks: &[BlockStats], duration_ms: u64) -> Self {
         if blocks.is_empty() {
-            return Self {
-                start_block: 0,
-                end_block: 0,
-                total_blocks: 0,
-                total_txs: 0,
-                total_gas: 0,
-                duration_ms: 0,
-                avg_blocks_per_second: 0.0,
-                avg_tps: 0.0,
-                avg_gas_per_second: 0.0,
-                block_time_p50_ms: 0,
-                block_time_p95_ms: 0,
-                block_time_p99_ms: 0,
-            };
+            return Self::default();
         }
 
         let start_block = blocks.first().map(|b| b.number).unwrap_or(0);
@@ -434,20 +413,6 @@ struct ThroughputCounts {
     failed: u64,
 }
 
-/// Options controlling metrics collection behavior.
-#[derive(Debug, Clone, Copy)]
-pub struct MetricsCollectorOptions {
-    /// Whether to retain per-transaction latency samples for aggregate latency
-    /// stats and `time_series.latencies` reporting.
-    pub collect_latencies: bool,
-}
-
-impl Default for MetricsCollectorOptions {
-    fn default() -> Self {
-        Self { collect_latencies: true }
-    }
-}
-
 #[derive(Debug)]
 struct MetricsAggregation {
     throughput: BTreeMap<u64, ThroughputCounts>,
@@ -545,16 +510,14 @@ impl std::fmt::Debug for MetricsCollector {
 impl MetricsCollector {
     /// Create a new metrics collector with a shared [`RunClock`].
     pub fn new(clock: RunClock) -> Arc<Self> {
-        Self::new_with_options(clock, MetricsCollectorOptions::default())
+        Self::new_with_latencies(clock, true)
     }
 
     /// Create a new metrics collector with explicit latency collection behavior.
+    ///
+    /// `collect_latencies` controls whether per-transaction latency samples are
+    /// retained for aggregate latency stats and `time_series.latencies`.
     pub fn new_with_latencies(clock: RunClock, collect_latencies: bool) -> Arc<Self> {
-        Self::new_with_options(clock, MetricsCollectorOptions { collect_latencies })
-    }
-
-    /// Create a new metrics collector with explicit options.
-    pub fn new_with_options(clock: RunClock, options: MetricsCollectorOptions) -> Arc<Self> {
         let (latency_tx, latency_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (aggregation_shutdown_tx, aggregation_shutdown_rx) = oneshot::channel();
@@ -571,7 +534,7 @@ impl MetricsCollector {
             success: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             clock,
-            collect_latencies: options.collect_latencies,
+            collect_latencies,
             latency_tx,
             event_tx,
             aggregation,
@@ -590,22 +553,17 @@ impl MetricsCollector {
         self.clock.elapsed()
     }
 
-    /// Get the elapsed time since start.
-    fn elapsed(&self) -> Duration {
-        self.clock.elapsed()
-    }
-
     /// Record a sent transaction.
     pub fn record_sent(&self) {
         self.sent.fetch_add(1, Ordering::Relaxed);
-        let offset = self.elapsed();
+        let offset = self.clock.elapsed();
         let _ = self.event_tx.send(TimestampedEvent { offset, event: TxEvent::Sent });
     }
 
     /// Record a successful transaction with its latency.
     pub fn record_success(&self, latency: Duration) {
         self.success.fetch_add(1, Ordering::Relaxed);
-        let offset = self.elapsed();
+        let offset = self.clock.elapsed();
         if self.collect_latencies {
             let _ = self.latency_tx.send(TimestampedLatency { offset, latency });
         }
@@ -615,7 +573,7 @@ impl MetricsCollector {
     /// Record a failed transaction.
     pub fn record_failure(&self) {
         self.failed.fetch_add(1, Ordering::Relaxed);
-        let offset = self.elapsed();
+        let offset = self.clock.elapsed();
         let _ = self.event_tx.send(TimestampedEvent { offset, event: TxEvent::Failed });
     }
 
@@ -734,33 +692,6 @@ impl MetricsCollector {
             .collect();
 
         TimeSeriesMetrics { throughput, latencies: latency_samples }
-    }
-}
-
-mod duration_serde {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::time::Duration;
-
-    #[derive(Serialize, Deserialize)]
-    struct DurationRepr {
-        secs: u64,
-        nanos: u32,
-    }
-
-    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        DurationRepr { secs: duration.as_secs(), nanos: duration.subsec_nanos() }
-            .serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let repr = DurationRepr::deserialize(deserializer)?;
-        Ok(Duration::new(repr.secs, repr.nanos))
     }
 }
 

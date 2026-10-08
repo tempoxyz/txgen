@@ -38,18 +38,15 @@ pub use composition::{
 };
 pub use metrics::{
     collect_block_stats, compute_latency_stats, percentile, trim_trailing_empty_blocks,
-    BenchMetrics, BlockStats, LatencySample, LatencyStats, MetricsCollector,
-    MetricsCollectorOptions, RunStats, ThroughputSample, TimeSeriesMetrics,
+    BenchMetrics, BlockStats, LatencySample, LatencyStats, MetricsCollector, RunStats,
+    ThroughputSample, TimeSeriesMetrics,
 };
 pub use prometheus::parse_prometheus_text;
 pub use prometheus_reporter::{
     PrometheusConfig, PrometheusForwarder, PrometheusForwarderHandle, PrometheusForwarderSummary,
     PrometheusReporter,
 };
-pub use receipt_clickhouse::{
-    insert_receipt_gas_records, insert_receipt_gas_records_with_default_batch_size,
-    DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE,
-};
+pub use receipt_clickhouse::{insert_receipt_gas_records, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE};
 pub use receipt_metrics::{
     total_fees_paid, BlockReceiptCollector, ReceiptCollection, ReceiptCollector,
     ReceiptCollectorHandle, ReceiptGasRecord, ReceiptGasSample, ReceiptMetricDistribution,
@@ -69,3 +66,34 @@ pub use sender::{
 };
 pub use source::{FileSource, SourceTx, StdinSource, TxSource};
 pub use txgen_core::{GeneratedTx, TxPhase};
+
+/// Drive `future` to completion from synchronous code running on a
+/// multi-threaded Tokio runtime, without blocking a runtime worker.
+///
+/// Errors instead of panicking when called outside such a runtime.
+pub(crate) fn block_on<F: std::future::Future>(future: F) -> eyre::Result<F::Output> {
+    let rt = tokio::runtime::Handle::try_current()
+        .map_err(|_| eyre::eyre!("blocking call requires a Tokio runtime"))?;
+    if !matches!(rt.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread) {
+        eyre::bail!("blocking call requires a multi-threaded Tokio runtime");
+    }
+    Ok(tokio::task::block_in_place(|| rt.block_on(future)))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn block_on_requires_runtime() {
+        assert!(super::block_on(async {}).is_err());
+    }
+
+    #[tokio::test]
+    async fn block_on_rejects_current_thread_runtime() {
+        assert!(super::block_on(async {}).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn block_on_runs_on_multi_thread_runtime() {
+        assert_eq!(super::block_on(async { 7 }).unwrap(), 7);
+    }
+}
