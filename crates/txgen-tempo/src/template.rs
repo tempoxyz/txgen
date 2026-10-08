@@ -2,6 +2,7 @@ use alloy_primitives::{Address, Bytes, Selector, B256, U256};
 use serde::{Deserialize, Deserializer};
 use tempo_primitives::transaction::{CallScope, SelectorRule};
 use txgen_core::{AccountRef, CallDef, GenValue};
+use txgen_ethereum::EthTxType;
 
 /// Tempo transaction type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -11,6 +12,18 @@ pub enum TempoTxType {
     Eip2930,
     Eip1559,
     Tempo,
+}
+
+impl TempoTxType {
+    /// The equivalent Ethereum transaction type, or `None` for `tempo`.
+    pub(crate) fn evm_type(self) -> Option<EthTxType> {
+        match self {
+            Self::Legacy => Some(EthTxType::Legacy),
+            Self::Eip2930 => Some(EthTxType::Eip2930),
+            Self::Eip1559 => Some(EthTxType::Eip1559),
+            Self::Tempo => None,
+        }
+    }
 }
 
 /// Template for Tempo transactions.
