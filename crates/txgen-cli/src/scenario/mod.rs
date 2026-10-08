@@ -29,8 +29,8 @@ pub use report::{
 };
 pub use schema::*;
 pub use value::{
-    coerce_event_filter, collect_variable_paths, eval_expression, event_value_matches,
-    materialize_yaml, RuntimeContext, RuntimeValue,
+    coerce_event_filter, collect_variable_paths, eval_expression, materialize_yaml, RuntimeContext,
+    RuntimeValue,
 };
 
 /// Nested `scenario` command.
