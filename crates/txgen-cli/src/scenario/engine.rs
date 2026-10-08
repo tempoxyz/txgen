@@ -1,5 +1,5 @@
 use super::{
-    error::StepError,
+    error::{StepError, StepErrorKind},
     report::{
         duration_ms, unix_ms, ChainReportConfig, InstanceFailure, InstanceOutcome,
         ProtocolMilestone, ScenarioAccumulator, ScenarioReport, ScenarioReportConfig, StepOutcome,
@@ -556,7 +556,7 @@ where
                         step_index: 0,
                         step_name: "bindings".to_string(),
                         failure_provenance: None,
-                        classification: error.classification.to_string(),
+                        classification: error.classification.as_str().to_string(),
                         timed_out: false,
                         detail,
                     }),
@@ -617,7 +617,7 @@ where
                                     step_outcomes,
                                     index,
                                     step,
-                                    StepError::new("context_error", error.to_string()),
+                                    StepError::new(StepErrorKind::Context, error.to_string()),
                                 );
                             }
                         }
@@ -720,7 +720,7 @@ where
                                 failures.push((
                                     index,
                                     step,
-                                    StepError::new("context_error", error.to_string()),
+                                    StepError::new(StepErrorKind::Context, error.to_string()),
                                 ));
                                 continue;
                             }
@@ -846,7 +846,7 @@ where
         lease_requests.sort_by_key(|(address, _, _, _)| *address);
         if lease_requests.windows(2).any(|pair| pair[0].0 == pair[1].0) {
             return Err(StepError::new(
-                "binding_error",
+                StepErrorKind::Binding,
                 "two lease bindings selected the same account address",
             ));
         }
@@ -868,7 +868,7 @@ where
             }
         }
         let context = RuntimeContext::new(roots)
-            .map_err(|error| StepError::new("binding_error", error.to_string()))?;
+            .map_err(|error| StepError::new(StepErrorKind::Binding, error.to_string()))?;
         Ok((context, leases))
     }
 
@@ -887,7 +887,7 @@ where
         let chain = self
             .chains
             .get(step.action.chain())
-            .ok_or_else(|| StepError::new("configuration_error", "unknown chain"))?;
+            .ok_or_else(|| StepError::new(StepErrorKind::Configuration, "unknown chain"))?;
         match &step.action {
             StepAction::Checkpoint(_) => chain
                 .checkpoint()
@@ -910,12 +910,12 @@ where
                         },
                     )
                     .await
-                    .map_err(|error| StepError::new("invoke_error", error.to_string()))?;
+                    .map_err(|error| StepError::new(StepErrorKind::Invoke, error.to_string()))?;
                 let RuntimeValue::Object(mut output) = RuntimeValue::from_yaml(&output)
-                    .map_err(|error| StepError::new("invoke_error", error.to_string()))?
+                    .map_err(|error| StepError::new(StepErrorKind::Invoke, error.to_string()))?
                 else {
                     return Err(StepError::new(
-                        "invoke_error",
+                        StepErrorKind::Invoke,
                         "scenario action returned a non-object value",
                     ));
                 };
@@ -950,17 +950,18 @@ where
                         )
                     })
                     .count();
-                let submit_rank = u64::try_from(submit_rank)
-                    .map_err(|_| StepError::new("configuration_error", "submit rank overflow"))?;
+                let submit_rank = u64::try_from(submit_rank).map_err(|_| {
+                    StepError::new(StepErrorKind::Configuration, "submit rank overflow")
+                })?;
                 let submits_per_instance = u64::try_from(submits_per_instance).map_err(|_| {
-                    StepError::new("configuration_error", "too many scenario submit steps")
+                    StepError::new(StepErrorKind::Configuration, "too many scenario submit steps")
                 })?;
                 let unique_nonce_hint = instance
                     .checked_mul(submits_per_instance)
                     .and_then(|base| base.checked_add(submit_rank))
                     .ok_or_else(|| {
                         StepError::new(
-                            "configuration_error",
+                            StepErrorKind::Configuration,
                             "scenario transaction identity overflow",
                         )
                     })?;
@@ -1011,8 +1012,11 @@ where
                     clock,
                 );
                 if !receipt.status && !wait_receipt.allow_revert {
-                    return Err(StepError::new("reverted_receipt", "transaction receipt reverted")
-                        .with_milestones(vec![milestone]));
+                    return Err(StepError::new(
+                        StepErrorKind::RevertedReceipt,
+                        "transaction receipt reverted",
+                    )
+                    .with_milestones(vec![milestone]));
                 }
                 Ok(StepExecution { value: receipt.value, milestones: vec![milestone] })
             }
@@ -1146,7 +1150,7 @@ where
         let group = chain
             .adapter
             .scenario_unique_nonce_group(template, &submit.with_value)
-            .map_err(|error| StepError::new("configuration_error", error.to_string()))?;
+            .map_err(|error| StepError::new(StepErrorKind::Configuration, error.to_string()))?;
         let Some(group) = group else { return Ok(None) };
 
         let mut groups = Vec::new();
@@ -1163,7 +1167,7 @@ where
             let candidate_group = chain
                 .adapter
                 .scenario_unique_nonce_group(template, &candidate.with_value)
-                .map_err(|error| StepError::new("configuration_error", error.to_string()))?;
+                .map_err(|error| StepError::new(StepErrorKind::Configuration, error.to_string()))?;
             groups.push((index, candidate_group));
         }
         dense_unique_nonce_identity(instance, step_index, &group, &groups)
@@ -1184,14 +1188,12 @@ fn dense_unique_nonce_identity(
     let count = matching.len();
     debug_assert!(count > 0, "the current step belongs to the requested uniqueness group");
     let rank = u64::try_from(rank)
-        .map_err(|_| StepError::new("configuration_error", "unique nonce rank overflow"))?;
+        .map_err(|_| StepError::new(StepErrorKind::Configuration, "unique nonce rank overflow"))?;
     let count = u64::try_from(count)
-        .map_err(|_| StepError::new("configuration_error", "too many unique nonce steps"))?;
-    instance
-        .checked_mul(count)
-        .and_then(|base| base.checked_add(rank))
-        .map(Some)
-        .ok_or_else(|| StepError::new("configuration_error", "dense scenario identity overflow"))
+        .map_err(|_| StepError::new(StepErrorKind::Configuration, "too many unique nonce steps"))?;
+    instance.checked_mul(count).and_then(|base| base.checked_add(rank)).map(Some).ok_or_else(|| {
+        StepError::new(StepErrorKind::Configuration, "dense scenario identity overflow")
+    })
 }
 
 fn failed_outcome(
@@ -1214,8 +1216,8 @@ fn failed_outcome(
             step_index,
             step_name: step_name(step_index, step),
             failure_provenance: step.provenance.clone(),
-            classification: error.classification.to_string(),
-            timed_out: error.classification == "timeout",
+            classification: error.classification.as_str().to_string(),
+            timed_out: error.classification == StepErrorKind::Timeout,
             detail,
         }),
     }
@@ -1806,7 +1808,10 @@ where
                     RpcSubmitFailureKind::BeforeSend => None,
                     RpcSubmitFailureKind::Rejected | RpcSubmitFailureKind::Ambiguous => {
                         let Some(transaction_hash) = transaction_hash else {
-                            return Err(StepError::new("submission_ambiguous", error.to_string()));
+                            return Err(StepError::new(
+                                StepErrorKind::SubmissionAmbiguous,
+                                error.to_string(),
+                            ));
                         };
                         let lookup = tokio::time::timeout_at(
                             deadline,
@@ -1826,7 +1831,7 @@ where
                                     ""
                                 };
                                 return Err(StepError::new(
-                                    "timeout",
+                                    StepErrorKind::Timeout,
                                     format!(
                                         "step timed out while checking an uncertain transaction submission{suffix}"
                                     ),
@@ -1850,25 +1855,28 @@ where
                         Some(false) => {
                             self.submission_lanes.mark_ambiguous(&submission_lanes.keys);
                             return Err(StepError::new(
-                                "nonce_recovery_error",
+                                StepErrorKind::NonceRecovery,
                                 "failed to restore nonce state after an RPC rejection",
                             ));
                         }
                         None => {
                             self.submission_lanes.mark_ambiguous(&submission_lanes.keys);
                             return Err(StepError::new(
-                                "timeout",
+                                StepErrorKind::Timeout,
                                 "step timed out before nonce recovery could be proven safe; further ordered submissions on affected nonce lanes are disabled",
                             ));
                         }
                     }
                     if error.is_timeout() {
                         return Err(StepError::new(
-                            "timeout",
+                            StepErrorKind::Timeout,
                             "step timed out before transaction dispatch",
                         ));
                     }
-                    return Err(StepError::new("submission_rejected", error.to_string()));
+                    return Err(StepError::new(
+                        StepErrorKind::SubmissionRejected,
+                        error.to_string(),
+                    ));
                 } else {
                     // A JSON-RPC rejection is not proof that its nonce is reusable:
                     // `already known`, `nonce too low`, and replacement errors can
@@ -1880,9 +1888,9 @@ where
                         lookup.as_ref().is_some_and(|result| {
                             result.as_ref().is_ok_and(|transaction| !*transaction)
                         }) {
-                        "submission_rejected"
+                        StepErrorKind::SubmissionRejected
                     } else {
-                        "submission_ambiguous"
+                        StepErrorKind::SubmissionAmbiguous
                     };
                     return Err(StepError::new(classification, error.to_string()));
                 }
@@ -1900,7 +1908,7 @@ where
                 self.submission_lanes.mark_ambiguous(&submission_lanes.keys);
             }
             return Err(StepError::new(
-                "rpc_hash_mismatch",
+                StepErrorKind::RpcHashMismatch,
                 "RPC returned a transaction hash different from the signed payload",
             ));
         }
@@ -1958,8 +1966,11 @@ where
                 clock,
             );
             if !receipt.status {
-                return Err(StepError::new("reverted_receipt", "submitted transaction reverted")
-                    .with_milestones(vec![submit_milestone.clone(), milestone]));
+                return Err(StepError::new(
+                    StepErrorKind::RevertedReceipt,
+                    "submitted transaction reverted",
+                )
+                .with_milestones(vec![submit_milestone.clone(), milestone]));
             }
             (receipt.value, Some(milestone))
         } else {
@@ -2068,7 +2079,7 @@ where
                 .collect::<BTreeSet<_>>();
             if keys.is_empty() {
                 return Err(StepError::new(
-                    "materialization_error",
+                    StepErrorKind::Materialization,
                     "materialized transaction has no scheduling key",
                 ));
             }
@@ -2076,7 +2087,7 @@ where
                 if !self.rollback_nonce_reservations(&reservations).await {
                     self.submission_lanes.mark_ambiguous(&keys);
                     return Err(StepError::new(
-                        "nonce_recovery_error",
+                        StepErrorKind::NonceRecovery,
                         "failed to restore nonce state after detecting an ambiguous nonce lane",
                     ));
                 }
@@ -2101,7 +2112,7 @@ where
                                 if !self.rollback_nonce_reservations(&reservations).await {
                                     self.submission_lanes.mark_ambiguous(&lanes.keys);
                                     return Err(StepError::new(
-                                        "nonce_recovery_error",
+                                        StepErrorKind::NonceRecovery,
                                         "failed to restore nonce state after transaction signing failed",
                                     ));
                                 }
@@ -2118,7 +2129,7 @@ where
                     if !self.rollback_nonce_reservations(&reservations).await {
                         self.submission_lanes.mark_ambiguous(&keys);
                         return Err(StepError::new(
-                            "nonce_recovery_error",
+                            StepErrorKind::NonceRecovery,
                             "failed to restore nonce state after detecting unsafe parallel submission",
                         ));
                     }
@@ -2140,7 +2151,7 @@ where
             if !self.rollback_nonce_reservations(&reservations).await {
                 self.submission_lanes.mark_ambiguous(&keys);
                 return Err(StepError::new(
-                    "nonce_recovery_error",
+                    StepErrorKind::NonceRecovery,
                     "failed to restore nonce state while waiting for an active submission lane",
                 ));
             }
@@ -2188,7 +2199,7 @@ where
         drop(lanes);
         if !self.rollback_nonce_reservations(&transaction.nonce_reservations).await {
             return Err(StepError::new(
-                "nonce_recovery_error",
+                StepErrorKind::NonceRecovery,
                 "failed to restore nonce state after the affected nonce lane was disabled",
             ));
         }
@@ -2211,13 +2222,13 @@ where
             .templates
             .get(template)
             .cloned()
-            .ok_or_else(|| StepError::new("template_error", "template not found"))?;
+            .ok_or_else(|| StepError::new(StepErrorKind::Template, "template not found"))?;
         let overlay = materialize_yaml(overlay, context).map_err(StepError::expression)?;
         merge_yaml(&mut value, overlay);
         let value = self
             .setup
             .resolve_template(value)
-            .map_err(|error| StepError::new("materialization_error", error.to_string()))?;
+            .map_err(|error| StepError::new(StepErrorKind::Materialization, error.to_string()))?;
         let mut nonces =
             lock_before_deadline(&self.nonces, deadline).await.ok_or_else(StepError::timeout)?;
         let mut build_context = BuildContext::new_with_address_pools(
@@ -2241,7 +2252,9 @@ where
         .await;
         let preparation_error = match preparation {
             Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(StepError::new("materialization_error", error.to_string())),
+            Ok(Err(error)) => {
+                Some(StepError::new(StepErrorKind::Materialization, error.to_string()))
+            }
             Err(_) => Some(StepError::timeout()),
         };
         if let Some(error) = preparation_error {
@@ -2249,7 +2262,7 @@ where
             if !rewind_ordered(build_context.nonces, &reservations) {
                 self.submission_lanes.mark_ambiguous(&ordered_keys(&reservations).collect());
                 return Err(StepError::new(
-                    "nonce_recovery_error",
+                    StepErrorKind::NonceRecovery,
                     "failed to restore nonce state after transaction preparation failed",
                 ));
             }
@@ -2263,7 +2276,7 @@ where
             &[],
             &mut build_context,
         )
-        .map_err(|error| StepError::new("materialization_error", error.to_string()))
+        .map_err(|error| StepError::new(StepErrorKind::Materialization, error.to_string()))
     }
 
     async fn rollback_nonce_reservations(&self, reservations: &[NonceReservation]) -> bool {
@@ -2316,9 +2329,11 @@ where
         tokio::task::spawn_blocking(move || sign_prepared_materialized_template(prepared));
     match tokio::time::timeout_at(deadline, &mut signing).await {
         Ok(Ok(Ok(transaction))) => Ok(transaction),
-        Ok(Ok(Err(error))) => Err(StepError::new("materialization_error", error.to_string())),
+        Ok(Ok(Err(error))) => {
+            Err(StepError::new(StepErrorKind::Materialization, error.to_string()))
+        }
         Ok(Err(error)) => Err(StepError::new(
-            "materialization_error",
+            StepErrorKind::Materialization,
             format!("transaction signing task failed: {error}"),
         )),
         Err(_) => {
@@ -2354,14 +2369,14 @@ fn rewind_ordered(nonces: &mut NonceTracker, reservations: &[NonceReservation]) 
 
 fn nonce_state_ambiguous() -> StepError {
     StepError::new(
-        "nonce_state_ambiguous",
+        StepErrorKind::NonceStateAmbiguous,
         "an earlier submission on this nonce lane had an unknown acceptance outcome",
     )
 }
 
 fn unsafe_parallel_nonce() -> StepError {
     StepError::new(
-        "unsafe_parallel_nonce",
+        StepErrorKind::UnsafeParallelNonce,
         "parallel steps in one scenario instance use the same ordered nonce lane; add an explicit dependency",
     )
 }
@@ -2474,7 +2489,7 @@ impl LeasePool {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| StepError::new("binding_error", "account lease pool closed"))
+            .map_err(|_| StepError::new(StepErrorKind::Binding, "account lease pool closed"))
     }
 }
 
