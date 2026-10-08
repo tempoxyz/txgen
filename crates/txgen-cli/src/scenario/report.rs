@@ -1,6 +1,6 @@
 use super::schema::StepProvenance;
 use alloy_primitives::B256;
-use bench_core::{compute_latency_stats, ReceiptGasRecord, ReceiptMetricGroup};
+use bench_core::{compute_latency_stats, percentile, ReceiptGasRecord, ReceiptMetricGroup};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -137,18 +137,14 @@ impl LatencyDistribution {
         }
         let mut sorted = samples.to_vec();
         sorted.sort_by(f64::total_cmp);
-        let percentile = |percent: usize| {
-            let index = (sorted.len() * percent / 100).min(sorted.len() - 1);
-            sorted[index]
-        };
         Self {
             samples: sorted.len(),
             min_ms: sorted[0],
             max_ms: sorted[sorted.len() - 1],
             mean_ms: sorted.iter().sum::<f64>() / sorted.len() as f64,
-            p50_ms: percentile(50),
-            p95_ms: percentile(95),
-            p99_ms: percentile(99),
+            p50_ms: percentile(&sorted, 50),
+            p95_ms: percentile(&sorted, 95),
+            p99_ms: percentile(&sorted, 99),
         }
     }
 }
@@ -860,7 +856,7 @@ pub(crate) fn unix_ms(time: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-fn duration_ms(duration: Duration) -> u64 {
+pub(crate) fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 

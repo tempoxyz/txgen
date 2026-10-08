@@ -1,9 +1,6 @@
 //! Generate and refresh Tempo Zone private-RPC authorization-token maps.
 
-use crate::zone_auth::{
-    build_token_fields, encode_token_hex, parse_token_fields, sign_token, verify_token,
-    MAX_TOKEN_VALIDITY_SECS, SIGNATURE_LEN,
-};
+use crate::zone_auth::{build_token_fields, encode_token_hex, sign_token, MAX_TOKEN_VALIDITY_SECS};
 use clap::Args;
 use eyre::{bail, eyre, Result, WrapErr};
 use serde::Serialize;
@@ -66,55 +63,30 @@ pub struct AuthTokenMapArgs {
     pub output: PathBuf,
 }
 
-struct Config {
-    spec: PathBuf,
-    pool: String,
-    zone_id: u32,
-    chain_id: u64,
-    ttl_secs: u64,
-    refresh_before_secs: u64,
-    watch: bool,
-    force: bool,
-    output: PathBuf,
-}
-
-impl TryFrom<AuthTokenMapArgs> for Config {
-    type Error = eyre::Report;
-
-    fn try_from(args: AuthTokenMapArgs) -> Result<Self> {
-        if args.zone_id == 0 {
+impl AuthTokenMapArgs {
+    fn validate(&self) -> Result<()> {
+        if self.zone_id == 0 {
             bail!("--zone-id must be nonzero");
         }
-        if args.ttl_secs == 0 || args.ttl_secs > MAX_TOKEN_VALIDITY_SECS {
+        if self.ttl_secs == 0 || self.ttl_secs > MAX_TOKEN_VALIDITY_SECS {
             bail!("--ttl-secs must be between 1 and {MAX_TOKEN_VALIDITY_SECS}");
         }
-        if args.refresh_before_secs >= args.ttl_secs {
+        if self.refresh_before_secs >= self.ttl_secs {
             bail!("--refresh-before-secs must be less than --ttl-secs");
         }
-        if args.pool.is_empty() {
+        if self.pool.is_empty() {
             bail!("--pool must not be empty");
         }
-        if args.output.file_name().is_none() {
+        if self.output.file_name().is_none() {
             bail!("--output must name a file");
         }
-
-        Ok(Self {
-            spec: args.spec,
-            pool: args.pool,
-            zone_id: args.zone_id,
-            chain_id: args.chain_id,
-            ttl_secs: args.ttl_secs,
-            refresh_before_secs: args.refresh_before_secs,
-            watch: args.watch,
-            force: args.force,
-            output: args.output,
-        })
+        Ok(())
     }
 }
 
 /// Run the Tempo-specific `auth-token-map` command.
-pub async fn run_auth_token_map(args: AuthTokenMapArgs) -> Result<()> {
-    let config = Config::try_from(args)?;
+pub async fn run_auth_token_map(config: AuthTokenMapArgs) -> Result<()> {
+    config.validate()?;
     let clock = SystemClock;
 
     if config.watch {
@@ -140,6 +112,7 @@ fn load_pool_signers(spec_path: &Path, pool_name: &str) -> Result<Vec<EcdsaSigne
         .ok_or_else(|| eyre!("account pool '{pool_name}' not found"))?;
     let signers = pool
         .derive_signers()
+        // Drop the cause: derivation errors can echo the mnemonic.
         .map_err(|_| eyre!("failed to derive signers for pool '{pool_name}'"))?;
 
     if signers.is_empty() {
@@ -196,19 +169,11 @@ fn generate_map(
     let expires_at =
         issued_at.checked_add(ttl_secs).ok_or_else(|| eyre!("token expiry timestamp overflow"))?;
     let fields = build_token_fields(zone_id, chain_id, issued_at, expires_at);
-    let expected_fields = parse_token_fields(&fields)?;
     let mut entries = BTreeMap::new();
 
     for signer in signers {
         let address = signer.address();
         let token = Zeroizing::new(sign_token(signer, &fields)?);
-        verify_token(&*token, address)?;
-
-        let parsed = parse_token_fields(&token[SIGNATURE_LEN..])?;
-        if parsed != expected_fields {
-            bail!("generated Zone authorization-token fields failed local verification");
-        }
-
         let key = format!("0x{}", hex::encode(address.as_slice()));
         let token_hex = SecretToken(encode_token_hex(&token));
         if entries.insert(key, token_hex).is_some() {
@@ -216,15 +181,11 @@ fn generate_map(
         }
     }
 
-    if entries.len() != signers.len() {
-        bail!("generated token-map entry count does not match the selected account pool");
-    }
-
     Ok(GeneratedMap { entries, issued_at, expires_at })
 }
 
 fn generate_and_write<C: Clock>(
-    config: &Config,
+    config: &AuthTokenMapArgs,
     signers: &[EcdsaSigner],
     clock: &C,
     replace_existing: bool,
@@ -256,7 +217,7 @@ fn validate_publish_time<C: Clock>(clock: &C, issued_at: u64, expires_at: u64) -
 }
 
 async fn run_watch<C: Clock>(
-    config: &Config,
+    config: &AuthTokenMapArgs,
     signers: &[EcdsaSigner],
     clock: &C,
     mut shutdown: ShutdownFuture,
@@ -315,7 +276,11 @@ async fn run_watch<C: Clock>(
     }
 }
 
-fn print_summary(config: &Config, generated: &GeneratedMap, watching: bool) -> Result<()> {
+fn print_summary(
+    config: &AuthTokenMapArgs,
+    generated: &GeneratedMap,
+    watching: bool,
+) -> Result<()> {
     let mode = if watching { " (watching)" } else { "" };
     println!(
         "wrote {} Zone authorization tokens for zone {} chain {} issued_at={} expires_at={} to {}{}",
@@ -560,7 +525,9 @@ fn warn_if_unsafe_directory(_path: &Path, _metadata: &fs::Metadata) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zone_auth::{recover_signer, TOKEN_HEX_LEN, TOKEN_LEN};
+    use crate::zone_auth::{
+        parse_token_fields, recover_signer, SIGNATURE_LEN, TOKEN_HEX_LEN, TOKEN_LEN,
+    };
     use std::{
         collections::BTreeSet,
         sync::{
@@ -632,8 +599,10 @@ mod tests {
         }
     }
 
-    fn test_config(output: PathBuf) -> Config {
-        Config::try_from(test_args(output)).unwrap()
+    fn test_config(output: PathBuf) -> AuthTokenMapArgs {
+        let args = test_args(output);
+        args.validate().unwrap();
+        args
     }
 
     fn test_signers(start: u32, end: u32) -> Vec<EcdsaSigner> {
@@ -657,44 +626,44 @@ mod tests {
         let mut args = test_args(directory.join("tokens.json"));
         args.zone_id = 0;
         assert_eq!(
-            Config::try_from(args).err().expect("zero zone ID must fail").to_string(),
+            args.validate().expect_err("zero zone ID must fail").to_string(),
             "--zone-id must be nonzero"
         );
 
         let mut args = test_args(directory.join("tokens.json"));
         args.ttl_secs = 0;
-        assert!(Config::try_from(args)
-            .err()
-            .expect("zero TTL must fail")
+        assert!(args
+            .validate()
+            .expect_err("zero TTL must fail")
             .to_string()
             .contains("--ttl-secs"));
 
         let mut args = test_args(directory.join("tokens.json"));
         args.ttl_secs = MAX_TOKEN_VALIDITY_SECS + 1;
-        assert!(Config::try_from(args)
-            .err()
-            .expect("oversized TTL must fail")
+        assert!(args
+            .validate()
+            .expect_err("oversized TTL must fail")
             .to_string()
             .contains("--ttl-secs"));
 
         let mut args = test_args(directory.join("tokens.json"));
         args.refresh_before_secs = args.ttl_secs;
-        assert!(Config::try_from(args)
-            .err()
-            .expect("invalid refresh lead time must fail")
+        assert!(args
+            .validate()
+            .expect_err("invalid refresh lead time must fail")
             .to_string()
             .contains("--refresh-before-secs"));
 
         let mut args = test_args(directory.join("tokens.json"));
         args.pool.clear();
         assert_eq!(
-            Config::try_from(args).err().expect("empty pool name must fail").to_string(),
+            args.validate().expect_err("empty pool name must fail").to_string(),
             "--pool must not be empty"
         );
 
         let args = test_args(PathBuf::from("/"));
         assert_eq!(
-            Config::try_from(args).err().expect("directory output must fail").to_string(),
+            args.validate().expect_err("directory output must fail").to_string(),
             "--output must name a file"
         );
     }

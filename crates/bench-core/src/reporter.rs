@@ -10,7 +10,9 @@ use crate::{
     clickhouse::ClickHouseClient,
     clock::unix_ms,
     composition::RunComposition,
-    metrics::{BenchMetrics, BlockStats, RunStats, ThroughputSample, TimeSeriesMetrics},
+    metrics::{
+        BenchMetrics, BlockStats, LatencyStats, RunStats, ThroughputSample, TimeSeriesMetrics,
+    },
     receipt_clickhouse::{insert_receipt_gas_records, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE},
     receipt_metrics::{ReceiptGasRecord, ReceiptMetricGroup},
     sample::{Sample, SampleArchive},
@@ -24,6 +26,7 @@ use std::{
     fs::File,
     io::{BufWriter, Write},
     path::Path,
+    time::Duration,
 };
 
 /// Unified final report passed to reporters at finalization.
@@ -452,6 +455,35 @@ pub struct JsonLatency {
     pub p99_ms: f64,
 }
 
+impl From<&LatencyStats> for JsonLatency {
+    fn from(stats: &LatencyStats) -> Self {
+        let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        Self {
+            min_ms: ms(stats.min),
+            max_ms: ms(stats.max),
+            mean_ms: ms(stats.mean),
+            p50_ms: ms(stats.p50),
+            p90_ms: None,
+            p95_ms: ms(stats.p95),
+            p99_ms: ms(stats.p99),
+        }
+    }
+}
+
+impl From<&JsonLatency> for LatencyStats {
+    fn from(latency: &JsonLatency) -> Self {
+        let duration = |ms: f64| Duration::from_secs_f64(ms / 1000.0);
+        Self {
+            min: duration(latency.min_ms),
+            max: duration(latency.max_ms),
+            mean: duration(latency.mean_ms),
+            p50: duration(latency.p50_ms),
+            p95: duration(latency.p95_ms),
+            p99: duration(latency.p99_ms),
+        }
+    }
+}
+
 /// Time-series data in JSON format.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct JsonTimeSeries {
@@ -555,15 +587,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
                     Some(metrics.elapsed.as_secs_f64()),
                     Some(metrics.tps()),
                     Some(metrics.success_rate()),
-                    metrics.latency.as_ref().map(|latency| JsonLatency {
-                        min_ms: latency.min.as_secs_f64() * 1000.0,
-                        max_ms: latency.max.as_secs_f64() * 1000.0,
-                        mean_ms: latency.mean.as_secs_f64() * 1000.0,
-                        p50_ms: latency.p50.as_secs_f64() * 1000.0,
-                        p90_ms: None,
-                        p95_ms: latency.p95.as_secs_f64() * 1000.0,
-                        p99_ms: latency.p99.as_secs_f64() * 1000.0,
-                    }),
+                    metrics.latency.as_ref().map(JsonLatency::from),
                     ts,
                 )
             } else {
@@ -638,14 +662,9 @@ fn copy_and_gzip_samples_ndjson(report: &FinalReport, path: &Path) -> Result<usi
 /// ClickHouse reporter configuration.
 #[derive(Clone)]
 pub struct ClickHouseConfig {
-    /// ClickHouse HTTP endpoint (e.g. `https://host:8443`).
+    /// ClickHouse HTTP endpoint (e.g. `https://host:8443`). The database and
+    /// credentials are read by [`ClickHouseClient::from_env`].
     pub url: String,
-    /// Database name (from `CLICKHOUSE_DATABASE`, default: `default`).
-    pub database: String,
-    /// ClickHouse user (from `CLICKHOUSE_USER`).
-    pub user: Option<String>,
-    /// ClickHouse password (from `CLICKHOUSE_PASSWORD`).
-    pub password: Option<String>,
     /// Run identifier.
     pub run_id: uuid::Uuid,
     /// Benchmark start time.
@@ -678,9 +697,6 @@ impl fmt::Debug for ClickHouseConfig {
         formatter
             .debug_struct("ClickHouseConfig")
             .field("url", &url)
-            .field("database", &self.database)
-            .field("user", &self.user)
-            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
             .field("run_id", &self.run_id)
             .field("started_at", &self.started_at)
             .field("scenario_name", &self.scenario_name)
@@ -723,10 +739,6 @@ impl ClickHouseConfig {
             );
         }
 
-        let database =
-            std::env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "default".to_string());
-        let user = std::env::var("CLICKHOUSE_USER").ok();
-        let password = std::env::var("CLICKHOUSE_PASSWORD").ok();
         let sample_batch_size = std::env::var("CLICKHOUSE_SAMPLE_BATCH_SIZE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -748,9 +760,6 @@ impl ClickHouseConfig {
 
         Ok(Self {
             url: url.to_string(),
-            database,
-            user,
-            password,
             run_id,
             started_at: std::time::SystemTime::now(),
             scenario_name: metadata["scenario"].clone(),
@@ -781,20 +790,14 @@ pub struct ClickHouseReporter {
 impl ClickHouseReporter {
     /// Create a new ClickHouse reporter.
     pub fn new(config: ClickHouseConfig) -> Result<Self> {
-        let client = ClickHouseClient::new(
-            config.url.clone(),
-            config.database.clone(),
-            config.user.clone(),
-            config.password.clone(),
-        )?;
+        let client = ClickHouseClient::from_env(&config.url)?;
 
         tracing::info!(
             run_id = %config.run_id,
             scenario = %config.scenario_name,
             platform = %config.platform,
             mode = %config.mode,
-            url = %client.endpoint_origin(),
-            database = %config.database,
+            ?client,
             sample_batch_size = config.sample_batch_size,
             "ClickHouse reporter initialized"
         );

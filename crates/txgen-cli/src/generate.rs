@@ -18,10 +18,9 @@ use std::{
     time::{Duration, Instant},
 };
 use txgen_core::{
-    dedup_scheduling_keys, merge_yaml, AbiEncodePackedDef, AbiHashDef, AccountManager,
-    AddressPoolManager, ArtifactManager, BuildContext, EcdsaSigner, GeneratedTx, LateSignSpec,
-    MixItem, NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase,
-    WorkloadSpec,
+    dedup_scheduling_keys, merge_yaml, AbiValuesDef, AccountManager, AddressPoolManager,
+    ArtifactManager, BuildContext, EcdsaSigner, GeneratedTx, LateSignSpec, MixItem, NdjsonWriter,
+    NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase, WorkloadSpec,
 };
 
 fn default_signing_workers() -> usize {
@@ -926,7 +925,7 @@ async fn fetch_protocol_nonces_with_state(
     let provider =
         alloy_provider::ProviderBuilder::<_, _, alloy_provider::network::Ethereum>::new()
             .connect_http(rpc_url.parse().wrap_err("invalid RPC URL")?);
-    let state = "latest";
+    let state = if pending { "pending" } else { "latest" };
 
     for (pool_name, addresses) in accounts.all_addresses() {
         let total = addresses.len();
@@ -1007,58 +1006,31 @@ where
     );
     build_ctx.set_defer_signing(ctx.defer_signing);
 
-    match output {
-        Some(path) => {
-            let mut writer = txgen_core::output::file_writer(&path)?;
-            let setup_bindings = if let Some(state) = &ctx.setup_state_in {
-                state.bindings()
-            } else {
-                let bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
-                if let Some(path) = &ctx.setup_state_out {
-                    writer.flush()?;
-                    SetupState::from_bindings(ctx.spec.chain_id, &bindings).save(path)?;
-                }
-                bindings
-            };
-            let written = generate_txs(
-                adapter,
-                &ctx.spec,
-                GenerationConfig {
-                    limit: ctx.limit,
-                    signing_workers: ctx.signing_workers,
-                    gas_sample_rpc: ctx.gas_sample_rpc.as_deref(),
-                },
-                &setup_bindings,
-                &mut build_ctx,
-                &mut writer,
-            )?;
-            eprintln!("wrote {} workload transactions to {}", written, path.display());
+    let mut writer = txgen_core::output::ndjson_writer(output.as_deref())?;
+    let setup_bindings = if let Some(state) = &ctx.setup_state_in {
+        state.bindings()
+    } else {
+        let bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+        if let Some(path) = &ctx.setup_state_out {
+            writer.flush()?;
+            SetupState::from_bindings(ctx.spec.chain_id, &bindings).save(path)?;
         }
-        None => {
-            let mut writer = txgen_core::output::stdout_writer();
-            let setup_bindings = if let Some(state) = &ctx.setup_state_in {
-                state.bindings()
-            } else {
-                let bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
-                if let Some(path) = &ctx.setup_state_out {
-                    writer.flush()?;
-                    SetupState::from_bindings(ctx.spec.chain_id, &bindings).save(path)?;
-                }
-                bindings
-            };
-            generate_txs(
-                adapter,
-                &ctx.spec,
-                GenerationConfig {
-                    limit: ctx.limit,
-                    signing_workers: ctx.signing_workers,
-                    gas_sample_rpc: ctx.gas_sample_rpc.as_deref(),
-                },
-                &setup_bindings,
-                &mut build_ctx,
-                &mut writer,
-            )?;
-        }
+        bindings
+    };
+    let written = generate_txs(
+        adapter,
+        &ctx.spec,
+        GenerationConfig {
+            limit: ctx.limit,
+            signing_workers: ctx.signing_workers,
+            gas_sample_rpc: ctx.gas_sample_rpc.as_deref(),
+        },
+        &setup_bindings,
+        &mut build_ctx,
+        &mut writer,
+    )?;
+    if let Some(path) = output {
+        eprintln!("wrote {} workload transactions to {}", written, path.display());
     }
 
     Ok(())
@@ -1936,7 +1908,7 @@ where
 }
 
 fn resolve_sequence_bindings(
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
+    bindings: &BTreeMap<String, SequenceBinding>,
     ctx: &mut BuildContext<'_>,
     globals: &std::collections::HashMap<String, ResolvedBinding>,
 ) -> Result<std::collections::HashMap<String, ResolvedBinding>> {
@@ -1958,7 +1930,7 @@ fn resolve_sequence_bindings(
 
 fn resolve_sequence_binding(
     name: &str,
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
+    bindings: &BTreeMap<String, SequenceBinding>,
     resolved: &mut std::collections::HashMap<String, ResolvedBinding>,
     resolving: &mut HashSet<String>,
     ctx: &mut BuildContext<'_>,
@@ -2004,7 +1976,7 @@ fn resolve_sequence_binding(
 
 fn resolve_binding_dependencies(
     binding: &SequenceBinding,
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
+    bindings: &BTreeMap<String, SequenceBinding>,
     resolved: &mut std::collections::HashMap<String, ResolvedBinding>,
     resolving: &mut HashSet<String>,
     ctx: &mut BuildContext<'_>,
@@ -2020,16 +1992,11 @@ fn resolve_binding_dependencies(
 
 fn binding_dependency_names(
     binding: &SequenceBinding,
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
-) -> HashSet<String> {
-    let mut deps = HashSet::new();
+    bindings: &BTreeMap<String, SequenceBinding>,
+) -> BTreeSet<String> {
+    let mut deps = BTreeSet::new();
     match binding {
-        SequenceBinding::AbiEncodePacked(def) => {
-            for value in &def.values {
-                collect_var_names(value, bindings, &mut deps);
-            }
-        }
-        SequenceBinding::AbiHash(def) => {
+        SequenceBinding::AbiEncodePacked(def) | SequenceBinding::AbiHash(def) => {
             for value in &def.values {
                 collect_var_names(value, bindings, &mut deps);
             }
@@ -2040,7 +2007,7 @@ fn binding_dependency_names(
 }
 
 fn resolve_abi_encode_packed(
-    def: &AbiEncodePackedDef,
+    def: &AbiValuesDef,
     bindings: &std::collections::HashMap<String, ResolvedBinding>,
 ) -> Result<Bytes> {
     let values = resolve_abi_values(&def.types, &def.values, bindings, "abi_encode_packed")?;
@@ -2048,7 +2015,7 @@ fn resolve_abi_encode_packed(
 }
 
 fn resolve_abi_hash(
-    def: &AbiHashDef,
+    def: &AbiValuesDef,
     bindings: &std::collections::HashMap<String, ResolvedBinding>,
 ) -> Result<B256> {
     let values = resolve_abi_values(&def.types, &def.values, bindings, "abi_hash")?;
@@ -2090,8 +2057,8 @@ fn yaml_to_json(value: serde_yaml::Value) -> Result<serde_json::Value> {
 
 fn collect_var_names(
     value: &serde_yaml::Value,
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
-    names: &mut HashSet<String>,
+    bindings: &BTreeMap<String, SequenceBinding>,
+    names: &mut BTreeSet<String>,
 ) {
     match value {
         serde_yaml::Value::Mapping(mapping) if mapping.len() == 1 => {
@@ -2122,7 +2089,7 @@ fn collect_var_names(
 
 fn referenced_local_binding(
     path: &str,
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
+    bindings: &BTreeMap<String, SequenceBinding>,
 ) -> Option<String> {
     let first = path.split('.').next().unwrap_or(path);
     if bindings.contains_key(first) {
@@ -2686,6 +2653,50 @@ call:
         assert_eq!(values[2], var("is_bid"));
         assert_eq!(values[3], var("tick"));
         assert_eq!(yaml_get(yaml_get(&values[4], "if"), "cond"), &var("is_bid"));
+        Ok(())
+    }
+
+    #[test]
+    fn seeded_sequence_bindings_resolve_deterministically() -> Result<()> {
+        let yaml = r#"
+chain_id: 1
+templates: {t: {}}
+sequences:
+  s:
+    bindings:
+      digest:
+        abi_hash: { types: [bytes32, bytes32, bytes32], values: [{ var: x6 }, { var: x4 }, { var: x2 }] }
+      x1: { bytes32: { random_bytes: 32 } }
+      x2: { bytes32: { random_bytes: 32 } }
+      x3: { bytes32: { random_bytes: 32 } }
+      x4: { bytes32: { random_bytes: 32 } }
+      x5: { bytes32: { random_bytes: 32 } }
+      x6: { bytes32: { random_bytes: 32 } }
+    steps: [{template: t}]
+mix: [{sequence: s, weight: 1}]
+"#;
+        let names = ["digest", "x1", "x2", "x3", "x4", "x5", "x6"];
+
+        let resolve = || -> Result<Vec<String>> {
+            let spec = WorkloadSpec::parse(yaml)?;
+            let accounts = AccountManager::empty();
+            let artifacts = ArtifactManager::empty();
+            let gas = GasConfig::default();
+            let mut nonces = NonceTracker::new();
+            let mut rng = StdRng::seed_from_u64(7);
+            let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+            let resolved = resolve_sequence_bindings(
+                &spec.sequences["s"].bindings,
+                &mut ctx,
+                &HashMap::new(),
+            )?;
+            Ok(names.iter().map(|name| format!("{:?}", resolved[*name])).collect())
+        };
+
+        let expected = resolve()?;
+        for _ in 0..8 {
+            assert_eq!(resolve()?, expected);
+        }
         Ok(())
     }
 

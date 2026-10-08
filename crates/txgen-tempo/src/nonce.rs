@@ -20,7 +20,7 @@ pub const NONCE_PRECOMPILE: Address = Address::new([
 ///
 /// Scans the spec templates for literal `nonce_key` values and fetches the current
 /// nonce from the nonce precompile for each (sender, nonce_key) combination.
-/// Protocol nonces (key=0) are skipped — use [`txgen_ethereum::fetch_protocol_nonces`]
+/// Protocol nonces (key=0) are skipped — use [`txgen_cli::fetch_protocol_nonces`]
 /// for those.
 pub async fn prefetch_parallel_nonces<P: Provider<Ethereum> + Clone + Send + Sync>(
     provider: &P,
