@@ -62,18 +62,17 @@ impl ScraperConfig {
     }
 }
 
-/// Handle returned by [`start_scraper`]. Stops the scraper on drop.
+/// Handle to a single scraper task returned by [`start_scrapers`].
 pub struct ScraperHandle {
     stop_tx: watch::Sender<bool>,
     handle: tokio::task::JoinHandle<()>,
-    scrape_count: Arc<AtomicU64>,
-    error_count: Arc<AtomicU64>,
+    counters: Arc<ScraperCounters>,
 }
 
-#[derive(Clone)]
+#[derive(Default)]
 struct ScraperCounters {
-    scrape_count: Arc<AtomicU64>,
-    error_count: Arc<AtomicU64>,
+    scrape_count: AtomicU64,
+    error_count: AtomicU64,
 }
 
 impl ScraperHandle {
@@ -85,12 +84,12 @@ impl ScraperHandle {
 
     /// Number of successful scrapes so far.
     pub fn scrape_count(&self) -> u64 {
-        self.scrape_count.load(Ordering::Relaxed)
+        self.counters.scrape_count.load(Ordering::Relaxed)
     }
 
     /// Number of failed scrapes so far.
     pub fn error_count(&self) -> u64 {
-        self.error_count.load(Ordering::Relaxed)
+        self.counters.error_count.load(Ordering::Relaxed)
     }
 }
 
@@ -110,33 +109,23 @@ pub fn start_scrapers(
     callback: SampleCallback,
     forwarder: Option<PrometheusForwarderHandle>,
 ) -> Vec<ScraperHandle> {
-    let (stop_tx, stop_rx) = watch::channel(false);
-    let counters = ScraperCounters {
-        scrape_count: Arc::new(AtomicU64::new(0)),
-        error_count: Arc::new(AtomicU64::new(0)),
-    };
-
     configs
         .iter()
         .enumerate()
         .map(|(idx, config)| {
-            let counters = counters.clone();
+            let (stop_tx, stop_rx) = watch::channel(false);
+            let counters = Arc::new(ScraperCounters::default());
             let handle = tokio::spawn(scraper_loop(
                 config.clone(),
                 clock.clone(),
                 store.clone(),
                 (idx == 0).then(|| callback.clone()),
                 forwarder.clone(),
-                stop_rx.clone(),
+                stop_rx,
                 counters.clone(),
             ));
 
-            ScraperHandle {
-                stop_tx: stop_tx.clone(),
-                handle,
-                scrape_count: counters.scrape_count.clone(),
-                error_count: counters.error_count.clone(),
-            }
+            ScraperHandle { stop_tx, handle, counters }
         })
         .collect()
 }
@@ -148,7 +137,7 @@ async fn scraper_loop(
     extra_samples: Option<SampleCallback>,
     forwarder: Option<PrometheusForwarderHandle>,
     mut stop_rx: watch::Receiver<bool>,
-    counters: ScraperCounters,
+    counters: Arc<ScraperCounters>,
 ) {
     let client = reqwest::Client::builder().timeout(config.timeout).build().unwrap_or_default();
 
@@ -291,5 +280,35 @@ mod tests {
 
         assert_eq!(samples[0].labels["validator"], "v0");
         assert_eq!(samples[0].labels["region"], "us-east-1");
+    }
+
+    #[tokio::test]
+    async fn scraper_handles_have_independent_counters_and_stop() {
+        let unreachable = "http://127.0.0.1:1/metrics";
+        let configs = [
+            ScraperConfig::new(unreachable).with_interval(Duration::from_millis(5)),
+            ScraperConfig::new(unreachable).with_interval(Duration::from_secs(3600)),
+        ];
+        let mut handles = start_scrapers(
+            &configs,
+            RunClock::new(),
+            SampleStore::new().unwrap(),
+            Arc::new(Vec::new),
+            None,
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while handles[0].error_count() < 3 || handles[1].error_count() < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(handles[1].error_count(), 1);
+
+        let slow = handles.pop().unwrap();
+        handles.pop().unwrap().stop().await;
+        assert!(!slow.handle.is_finished());
+        slow.stop().await;
     }
 }
