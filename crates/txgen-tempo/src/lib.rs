@@ -28,7 +28,7 @@ use tempo_alloy::{
 };
 use tempo_primitives::{
     transaction::{
-        Call, KeyAuthorization, KeychainSignature, PrimitiveSignature, SignatureType,
+        Call, KeyAuthorization, KeychainSignature, PrimitiveSignature, SignatureType, TokenLimit,
         TEMPO_EXPIRING_NONCE_KEY, TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS,
     },
     TempoSignature, TempoTxEnvelope,
@@ -43,8 +43,8 @@ use txgen_core::{
 };
 
 use template::{
-    resolve_allowed_calls, token_limit, AccessKeyDef, AllowedCallsDef, KeyTypeDef, TempoAuthDef,
-    TempoAuthMode, TokenLimitDef,
+    resolve_allowed_calls, AccessKeyDef, AllowedCallsDef, KeyTypeDef, TempoAuthDef, TempoAuthMode,
+    TokenLimitDef,
 };
 pub use template::{TempoTemplate, TempoTxType};
 
@@ -1063,39 +1063,36 @@ fn derive_inline_access_signer(
     };
     let offset = u32::try_from(offset)
         .map_err(|_| eyre::eyre!("inline key_authorization access-key counter exceeded u32"))?;
-    match source {
-        InlineAccessKeySource::Default => {
-            let index = INLINE_ACCESS_KEY_START_INDEX.checked_add(offset).ok_or_else(|| {
-                eyre::eyre!("inline key_authorization access-key index overflowed")
-            })?;
-            derive_mnemonic_signer(INLINE_ACCESS_KEY_MNEMONIC, index)
-        }
-        InlineAccessKeySource::Configured(source) => {
-            let (start, len) = inline_access_key_range(&source)?;
-            let offset_usize = usize::try_from(offset).map_err(|_| {
-                eyre::eyre!("inline key_authorization access-key counter exceeded usize")
-            })?;
-            if offset_usize >= len {
-                bail!(
-                    "inline access_key range exhausted after {len} key(s); increase `access_key.range`"
-                );
-            }
-            let index = start.checked_add(offset).ok_or_else(|| {
-                eyre::eyre!("inline key_authorization access-key index overflowed")
-            })?;
-            derive_mnemonic_signer(&source.mnemonic, index)
-        }
+    if let Some(len) = source.len &&
+        offset >= len
+    {
+        bail!("inline access_key range exhausted after {len} key(s); increase `access_key.range`");
     }
+    let index = source
+        .start
+        .checked_add(offset)
+        .ok_or_else(|| eyre::eyre!("inline key_authorization access-key index overflowed"))?;
+    derive_mnemonic_signer(source.mnemonic, index)
 }
 
-enum InlineAccessKeySource {
-    Default,
-    Configured(AccountPoolDef),
+/// Mnemonic and index window that inline access keys are derived from.
+struct InlineAccessKeySource<'a> {
+    mnemonic: &'a str,
+    start: u32,
+    /// Number of usable indices, or `None` when unbounded.
+    len: Option<u32>,
 }
 
-fn inline_access_key_source(access_key: Option<&AccessKeyDef>) -> Result<InlineAccessKeySource> {
+fn inline_access_key_source(
+    access_key: Option<&AccessKeyDef>,
+) -> Result<InlineAccessKeySource<'_>> {
+    let default = InlineAccessKeySource {
+        mnemonic: INLINE_ACCESS_KEY_MNEMONIC,
+        start: INLINE_ACCESS_KEY_START_INDEX,
+        len: None,
+    };
     let Some(access_key) = access_key else {
-        return Ok(InlineAccessKeySource::Default);
+        return Ok(default);
     };
 
     if access_key.from_setup.is_some() {
@@ -1104,28 +1101,30 @@ fn inline_access_key_source(access_key: Option<&AccessKeyDef>) -> Result<InlineA
     if access_key.pair.is_some() {
         bail!("`auth.mode: key_authorization` does not support `access_key.pair`");
     }
-
-    match access_key.inline_source()? {
-        Some(source) => Ok(InlineAccessKeySource::Configured(source)),
-        None => Ok(InlineAccessKeySource::Default),
+    if access_key.index.is_some() && access_key.range.is_some() {
+        bail!("inline access_key must set at most one of `index` or `range`");
     }
-}
 
-fn inline_access_key_range(source: &AccountPoolDef) -> Result<(u32, usize)> {
-    if let Some(index) = source.index {
-        return Ok((index, usize::MAX));
-    }
-    if let Some([start, end]) = source.range {
-        let len = end
-            .checked_sub(start)
-            .ok_or_else(|| eyre::eyre!("inline access_key range end must be >= start"))?;
-        if len == 0 {
-            bail!("inline access_key range must not be empty");
+    let Some(mnemonic) = access_key.mnemonic.as_deref() else {
+        if access_key.has_inline_source_fields() {
+            bail!("inline access_key `index` or `range` requires `mnemonic`");
         }
-        return Ok((start, len as usize));
-    }
-
-    Ok((INLINE_ACCESS_KEY_START_INDEX, usize::MAX))
+        return Ok(default);
+    };
+    let (start, len) = match (access_key.index, access_key.range) {
+        (Some(index), _) => (index, None),
+        (None, Some([start, end])) => {
+            let len = end
+                .checked_sub(start)
+                .ok_or_else(|| eyre::eyre!("inline access_key range end must be >= start"))?;
+            if len == 0 {
+                bail!("inline access_key range must not be empty");
+            }
+            (start, Some(len))
+        }
+        (None, None) => (INLINE_ACCESS_KEY_START_INDEX, None),
+    };
+    Ok(InlineAccessKeySource { mnemonic, start, len })
 }
 
 fn inline_access_key_counter_key() -> [u8; 20] {
@@ -1185,7 +1184,7 @@ fn build_key_restrictions(
 fn resolve_token_limits(
     limits: &Option<Vec<TokenLimitDef>>,
     ctx: &mut BuildContext<'_>,
-) -> Result<Option<Vec<tempo_primitives::transaction::TokenLimit>>> {
+) -> Result<Option<Vec<TokenLimit>>> {
     let Some(limits) = limits else {
         return Ok(None);
     };
@@ -1193,8 +1192,11 @@ fn resolve_token_limits(
     limits
         .iter()
         .map(|limit| {
-            let amount = ctx.resolve_value(&limit.limit)?;
-            Ok(token_limit(limit.token, amount, limit.period))
+            Ok(TokenLimit {
+                token: limit.token,
+                limit: ctx.resolve_value(&limit.limit)?,
+                period: limit.period,
+            })
         })
         .collect::<Result<Vec<_>>>()
         .map(Some)
