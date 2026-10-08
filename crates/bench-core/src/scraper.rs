@@ -195,7 +195,7 @@ async fn scraper_loop(
             }
         }
 
-        match client.get(&config.url).send().await {
+        match client.get(&config.url).send().await.and_then(reqwest::Response::error_for_status) {
             Ok(resp) => match resp.text().await {
                 Ok(text) => {
                     let mut samples = parse_prometheus_text(&text, offset_ms, unix_ms);
@@ -253,7 +253,49 @@ fn apply_labels(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        io::{Read, Write},
+        net::TcpListener,
+    };
+
+    #[tokio::test]
+    async fn non_success_status_counts_as_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/metrics", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.read(&mut [0; 1024]);
+                let body = "reth_db_size 1\n";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+
+        let config = ScraperConfig::new(url).with_interval(Duration::from_millis(5));
+        let handle = start_scrapers(
+            &[config],
+            RunClock::new(),
+            SampleStore::new().unwrap(),
+            Arc::new(Vec::new),
+            None,
+        )
+        .pop()
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while handle.error_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(handle.scrape_count(), 0);
+        handle.stop().await;
+    }
 
     #[test]
     fn apply_node_label_adds_label_to_all_samples() {
