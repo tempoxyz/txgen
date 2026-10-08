@@ -189,9 +189,6 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    if args.count == Some(0) {
-        bail!("--count must be greater than zero");
-    }
     let destinations = ScenarioReportDestinations::parse(&args.reports)?;
     let metadata = parse_metadata(&args.metadata)?;
     let spec = ScenarioSpec::load(&args.scenario)?;
