@@ -1,40 +1,12 @@
 use axum::{routing::post, Json, Router};
 use serde_json::{json, Value};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{fs, process::Command};
 use tokio::{net::TcpListener, task::JoinHandle};
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let suffix =
-            SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after epoch").as_nanos();
-        let path = std::env::temp_dir()
-            .join(format!("txgen-scenario-cli-{}-{suffix}", std::process::id()));
-        fs::create_dir_all(&path).expect("create temporary test directory");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_scenario_writes_report_and_exits_nonzero() {
     let (rpc_url, server) = spawn_failing_checkpoint_rpc().await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     let workload_path = directory.path().join("workload.yaml");
     let scenario_path = directory.path().join("scenario.yaml");
 
