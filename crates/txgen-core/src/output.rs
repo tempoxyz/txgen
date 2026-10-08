@@ -133,18 +133,13 @@ impl<W: Write> NdjsonWriter<W> {
     }
 }
 
-/// Create a writer for stdout.
-pub fn stdout_writer() -> NdjsonWriter<std::io::BufWriter<std::io::Stdout>> {
-    NdjsonWriter::new(std::io::BufWriter::new(std::io::stdout()))
-}
-
-/// Create a writer for a file.
-pub fn file_writer(
-    path: &std::path::Path,
-) -> Result<NdjsonWriter<std::io::BufWriter<std::fs::File>>> {
-    let file = std::fs::File::create(path)?;
-    let buf = std::io::BufWriter::new(file);
-    Ok(NdjsonWriter::new(buf))
+/// Create a writer for `path`, or for stdout when no path is given.
+pub fn ndjson_writer(path: Option<&std::path::Path>) -> Result<NdjsonWriter<Box<dyn Write>>> {
+    let writer: Box<dyn Write> = match path {
+        Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
+        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    };
+    Ok(NdjsonWriter::new(writer))
 }
 
 #[cfg(test)]

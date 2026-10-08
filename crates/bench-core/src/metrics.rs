@@ -104,13 +104,15 @@ impl LatencyStats {
     }
 }
 
-/// Calculate percentile from a sorted slice.
-fn percentile(sorted: &[Duration], p: usize) -> Duration {
+/// Return the `p`th percentile of an ascending slice, or the default value
+/// when it is empty.
+///
+/// Uses the element at index `len * p / 100`, clamped to the last element.
+pub fn percentile<T: Copy + Default>(sorted: &[T], p: usize) -> T {
     if sorted.is_empty() {
-        return Duration::ZERO;
+        return T::default();
     }
-    let idx = (sorted.len() * p / 100).min(sorted.len() - 1);
-    sorted[idx]
+    sorted[(sorted.len() * p / 100).min(sorted.len() - 1)]
 }
 
 /// Compute latency statistics from an unsorted slice of durations.
@@ -262,9 +264,9 @@ impl RunStats {
         let mut block_times: Vec<u64> = blocks.iter().filter_map(|b| b.block_time_ms).collect();
         block_times.sort();
 
-        let block_time_p50_ms = percentile_u64(&block_times, 50);
-        let block_time_p95_ms = percentile_u64(&block_times, 95);
-        let block_time_p99_ms = percentile_u64(&block_times, 99);
+        let block_time_p50_ms = percentile(&block_times, 50);
+        let block_time_p95_ms = percentile(&block_times, 95);
+        let block_time_p99_ms = percentile(&block_times, 99);
 
         Self {
             start_block,
@@ -281,14 +283,6 @@ impl RunStats {
             block_time_p99_ms,
         }
     }
-}
-
-fn percentile_u64(sorted: &[u64], p: usize) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let idx = (sorted.len() * p / 100).min(sorted.len() - 1);
-    sorted[idx]
 }
 
 /// Collect block statistics from the chain.
@@ -419,20 +413,6 @@ struct ThroughputCounts {
     failed: u64,
 }
 
-/// Options controlling metrics collection behavior.
-#[derive(Debug, Clone, Copy)]
-pub struct MetricsCollectorOptions {
-    /// Whether to retain per-transaction latency samples for aggregate latency
-    /// stats and `time_series.latencies` reporting.
-    pub collect_latencies: bool,
-}
-
-impl Default for MetricsCollectorOptions {
-    fn default() -> Self {
-        Self { collect_latencies: true }
-    }
-}
-
 #[derive(Debug)]
 struct MetricsAggregation {
     throughput: BTreeMap<u64, ThroughputCounts>,
@@ -530,16 +510,14 @@ impl std::fmt::Debug for MetricsCollector {
 impl MetricsCollector {
     /// Create a new metrics collector with a shared [`RunClock`].
     pub fn new(clock: RunClock) -> Arc<Self> {
-        Self::new_with_options(clock, MetricsCollectorOptions::default())
+        Self::new_with_latencies(clock, true)
     }
 
     /// Create a new metrics collector with explicit latency collection behavior.
+    ///
+    /// `collect_latencies` controls whether per-transaction latency samples are
+    /// retained for aggregate latency stats and `time_series.latencies`.
     pub fn new_with_latencies(clock: RunClock, collect_latencies: bool) -> Arc<Self> {
-        Self::new_with_options(clock, MetricsCollectorOptions { collect_latencies })
-    }
-
-    /// Create a new metrics collector with explicit options.
-    pub fn new_with_options(clock: RunClock, options: MetricsCollectorOptions) -> Arc<Self> {
         let (latency_tx, latency_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (aggregation_shutdown_tx, aggregation_shutdown_rx) = oneshot::channel();
@@ -556,7 +534,7 @@ impl MetricsCollector {
             success: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             clock,
-            collect_latencies: options.collect_latencies,
+            collect_latencies,
             latency_tx,
             event_tx,
             aggregation,

@@ -131,6 +131,7 @@ pub async fn execute(args: CallArgs) -> Result<()> {
 }
 
 /// One replay against one endpoint.
+#[derive(Clone)]
 struct Replay {
     client: reqwest::Client,
     url: String,
@@ -177,7 +178,7 @@ impl Replay {
     async fn prime(&self, connections: usize) -> Result<()> {
         let mut opened = JoinSet::new();
         for _ in 0..connections {
-            let replay = self.clone_handles();
+            let replay = self.clone();
             opened.spawn(async move { replay.rpc("eth_chainId", serde_json::json!([])).await });
         }
         while let Some(result) = opened.join_next().await {
@@ -222,10 +223,9 @@ impl Replay {
             let offset_ms = clock.offset_ms();
             match Arc::clone(&semaphore).try_acquire_owned() {
                 Ok(permit) => {
-                    let replay = self.clone_handles();
-                    let body = self.corpus.records()[slot].body().to_string();
+                    let replay = self.clone();
                     tokio::spawn(async move {
-                        let outcome = replay.send(&body).await;
+                        let outcome = replay.send(slot).await;
                         if record {
                             replay.recorder.record_open_loop(slot, offset_ms, outcome);
                         }
@@ -276,7 +276,7 @@ impl Replay {
         let mut workers = JoinSet::new();
 
         for _ in 0..args.concurrency.get() {
-            let replay = self.clone_handles();
+            let replay = self.clone();
             let cursor = cursor.clone();
             workers.spawn(async move {
                 loop {
@@ -286,8 +286,7 @@ impl Replay {
                     }
                     let slot = (ticket % records) as usize;
                     let pass = (ticket / records) as u32;
-                    let body = replay.corpus.records()[slot].body().to_string();
-                    let outcome = replay.send(&body).await;
+                    let outcome = replay.send(slot).await;
                     replay.recorder.record_closed_loop(slot, pass, outcome);
                 }
             });
@@ -324,17 +323,18 @@ impl Replay {
         Ok(elapsed)
     }
 
-    /// Send one request and digest its response.
+    /// Send one corpus record and digest its response.
     ///
     /// Never logs or returns the body: failures are reported as a status and
     /// counted per method.
-    async fn send(&self, body: &str) -> RequestOutcome {
+    async fn send(&self, slot: usize) -> RequestOutcome {
+        let body = self.corpus.records()[slot].body().to_owned();
         let started = Instant::now();
         let response = self
             .client
             .post(&self.url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body.to_string())
+            .body(body)
             .send()
             .await;
 
@@ -372,15 +372,6 @@ impl Replay {
             bail!("{method} failed: {}", error["message"].as_str().unwrap_or("unknown error"));
         }
         Ok(response["result"].clone())
-    }
-
-    fn clone_handles(&self) -> Self {
-        Self {
-            client: self.client.clone(),
-            url: self.url.clone(),
-            corpus: self.corpus.clone(),
-            recorder: self.recorder.clone(),
-        }
     }
 }
 
