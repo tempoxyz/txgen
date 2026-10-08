@@ -36,3 +36,4 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 serde_json.workspace = true
 serde_yaml.workspace = true
 tokio = { workspace = true, features = ["net"] }
+tempfile = "3"
