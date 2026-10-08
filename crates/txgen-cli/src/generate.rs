@@ -885,10 +885,7 @@ where
             error.chain().any(|cause| {
                 cause
                     .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe) ||
-                    cause.downcast_ref::<serde_json::Error>().is_some_and(|error| {
-                        error.io_error_kind() == Some(std::io::ErrorKind::BrokenPipe)
-                    })
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
             });
         if !closed {
             return Err(error);
@@ -1550,10 +1547,6 @@ struct SigningPool {
 
 impl SigningPool {
     fn new(worker_count: usize) -> Result<Self> {
-        if worker_count == 0 {
-            bail!("signing worker count must be at least 1");
-        }
-
         let (result_tx, result_rx) = mpsc::channel();
         let pool = ThreadPoolBuilder::new()
             .num_threads(worker_count)
@@ -1569,17 +1562,8 @@ impl SigningPool {
             next_sequence: 0,
             next_to_write: 0,
             in_flight: 0,
-            max_in_flight: worker_count.saturating_mul(64).max(1),
+            max_in_flight: worker_count.saturating_mul(64),
         })
-    }
-
-    fn next_sequence(&mut self) -> Result<u64> {
-        let sequence = self.next_sequence;
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .ok_or_else(|| eyre::eyre!("signing job sequence counter overflowed u64"))?;
-        Ok(sequence)
     }
 
     fn submit<A: NetworkAdapter + 'static, W: Write>(
@@ -1598,7 +1582,8 @@ impl SigningPool {
             self.recv_one(writer)?;
         }
 
-        let sequence = self.next_sequence()?;
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
         let result_tx = self.result_tx.clone();
         self.pool.spawn_fifo(move || submit_signing_job::<A>(sequence, prepared, result_tx));
         self.in_flight += 1;
@@ -1614,26 +1599,14 @@ impl SigningPool {
     }
 
     fn drain_available<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
-        loop {
-            match self.result_rx.try_recv() {
-                Ok(result) => self.handle_result(result, writer)?,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    if self.in_flight > 0 {
-                        bail!("signing worker pool stopped before completing all jobs");
-                    }
-                    break;
-                }
-            }
+        while let Ok(result) = self.result_rx.try_recv() {
+            self.handle_result(result, writer)?;
         }
         Ok(())
     }
 
     fn recv_one<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
-        let result = self
-            .result_rx
-            .recv()
-            .map_err(|_| eyre::eyre!("signing worker pool stopped before completing all jobs"))?;
+        let result = self.result_rx.recv().expect("the pool holds a result sender");
         self.handle_result(result, writer)
     }
 
@@ -1642,24 +1615,15 @@ impl SigningPool {
         result: SigningResult,
         writer: &mut NdjsonWriter<W>,
     ) -> Result<()> {
-        let tx = result.result?;
-        if self.completed.insert(result.sequence, tx).is_some() {
-            bail!("received duplicate signing result for sequence {}", result.sequence);
-        }
+        self.completed.insert(result.sequence, result.result?);
         self.write_ready(writer)
     }
 
     fn write_ready<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
         while let Some(tx) = self.completed.remove(&self.next_to_write) {
-            if self.in_flight == 0 {
-                bail!("received unexpected signing result");
-            }
             writer.write(&tx)?;
             self.in_flight -= 1;
-            self.next_to_write = self
-                .next_to_write
-                .checked_add(1)
-                .ok_or_else(|| eyre::eyre!("written signing result counter overflowed u64"))?;
+            self.next_to_write += 1;
         }
         Ok(())
     }
@@ -1772,11 +1736,8 @@ where
                     .sequences
                     .get(&name)
                     .ok_or_else(|| eyre::eyre!("sequence '{}' not found", name))?;
-                let sequence_instance = sequence_instances;
-                sequence_instances = sequence_instances
-                    .checked_add(1)
-                    .ok_or_else(|| eyre::eyre!("sequence instance counter overflowed u64"))?;
-                let sequence_key = compute_sequence_key(&name, sequence_instance);
+                let sequence_key = compute_sequence_key(&name, sequence_instances);
+                sequence_instances += 1;
                 // A single step has no dependent transaction to wait for its inclusion.
                 let inclusion_keys = (sequence.steps.len() > 1).then_some(sequence_key);
                 let bindings = resolve_sequence_bindings(&sequence.bindings, ctx, setup_bindings)
