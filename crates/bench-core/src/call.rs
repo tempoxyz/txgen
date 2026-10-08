@@ -17,7 +17,7 @@
 //! Diagnostics identify records by their 1-based line number so a corpus of
 //! captured traffic stays usable in a public CI log.
 
-use crate::reporter::JsonLatency;
+use crate::{metrics::percentile, reporter::JsonLatency};
 use alloy_primitives::{hex, keccak256, Keccak256, B256};
 use eyre::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -1389,13 +1389,6 @@ fn digest_rpc_error(error: &[u8]) -> ResponseSummary {
 
 fn named_counts(counts: &BTreeMap<Arc<str>, usize>) -> BTreeMap<String, u64> {
     counts.iter().map(|(key, count)| (key.to_string(), *count as u64)).collect()
-}
-
-fn percentile(sorted: &[u64], p: usize) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    sorted[(sorted.len() * p / 100).min(sorted.len() - 1)]
 }
 
 fn median(sorted: &[u64]) -> u64 {

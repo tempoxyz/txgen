@@ -1,6 +1,9 @@
 //! Receipt-based transaction gas metric collection and aggregation.
 
-use crate::sender::{RpcReceiptDetails, RpcSubmitter};
+use crate::{
+    metrics::percentile,
+    sender::{RpcReceiptDetails, RpcSubmitter},
+};
 use alloy_eips::BlockId;
 use alloy_network::{primitives::ReceiptResponse, AnyNetwork};
 use alloy_primitives::{Address, TxHash, B256, U256};
@@ -545,11 +548,6 @@ pub fn total_fees_paid(records: &[ReceiptGasRecord]) -> Option<U256> {
     let mut fees = records.iter().filter_map(ReceiptGasRecord::fee_paid);
     let first = fees.next()?;
     fees.try_fold(first, U256::checked_add)
-}
-
-fn percentile(samples: &[U256], percentile: usize) -> U256 {
-    let index = (samples.len() * percentile / 100).min(samples.len() - 1);
-    samples[index]
 }
 
 fn u256_to_f64(value: U256) -> f64 {

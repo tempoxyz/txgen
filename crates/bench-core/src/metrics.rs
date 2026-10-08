@@ -111,13 +111,15 @@ impl LatencyStats {
     }
 }
 
-/// Calculate percentile from a sorted slice.
-fn percentile(sorted: &[Duration], p: usize) -> Duration {
+/// Return the `p`th percentile of an ascending slice, or the default value
+/// when it is empty.
+///
+/// Uses the element at index `len * p / 100`, clamped to the last element.
+pub fn percentile<T: Copy + Default>(sorted: &[T], p: usize) -> T {
     if sorted.is_empty() {
-        return Duration::ZERO;
+        return T::default();
     }
-    let idx = (sorted.len() * p / 100).min(sorted.len() - 1);
-    sorted[idx]
+    sorted[(sorted.len() * p / 100).min(sorted.len() - 1)]
 }
 
 /// Compute latency statistics from an unsorted slice of durations.
@@ -283,9 +285,9 @@ impl RunStats {
         let mut block_times: Vec<u64> = blocks.iter().filter_map(|b| b.block_time_ms).collect();
         block_times.sort();
 
-        let block_time_p50_ms = percentile_u64(&block_times, 50);
-        let block_time_p95_ms = percentile_u64(&block_times, 95);
-        let block_time_p99_ms = percentile_u64(&block_times, 99);
+        let block_time_p50_ms = percentile(&block_times, 50);
+        let block_time_p95_ms = percentile(&block_times, 95);
+        let block_time_p99_ms = percentile(&block_times, 99);
 
         Self {
             start_block,
@@ -302,14 +304,6 @@ impl RunStats {
             block_time_p99_ms,
         }
     }
-}
-
-fn percentile_u64(sorted: &[u64], p: usize) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let idx = (sorted.len() * p / 100).min(sorted.len() - 1);
-    sorted[idx]
 }
 
 /// Collect block statistics from the chain.
