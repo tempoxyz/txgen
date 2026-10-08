@@ -59,7 +59,7 @@ pub async fn execute(args: CallArgs) -> Result<()> {
         head_hash = %identity.head_hash,
         "Node identity"
     );
-    replay.prime(args.concurrency).await?;
+    replay.prime(args.concurrency.get()).await?;
 
     let clock = match args.reporting.metrics_align {
         Some(start) => RunClock::new_with_start_unix_ms(start),
@@ -140,7 +140,7 @@ struct Replay {
 
 impl Replay {
     fn new(args: &CallArgs, corpus: Arc<Corpus>) -> Result<Self> {
-        let pool = args.max_concurrent.max(args.concurrency);
+        let pool = args.max_concurrent.max(args.concurrency).get();
         let client = reqwest::Client::builder()
             .timeout(args.timeout)
             .pool_max_idle_per_host(pool)
@@ -199,7 +199,7 @@ impl Replay {
         }
 
         let record = args.phase == CallPhase::Measure;
-        let semaphore = Arc::new(Semaphore::new(args.max_concurrent));
+        let semaphore = Arc::new(Semaphore::new(args.max_concurrent.get()));
         let mut rng = rand::rngs::StdRng::seed_from_u64(args.seed);
         let started = tokio::time::Instant::now();
         let mut progress = started + PROGRESS_INTERVAL;
@@ -247,14 +247,14 @@ impl Replay {
                     issued,
                     dropped,
                     rps = issued as f64 / elapsed.max(f64::MIN_POSITIVE),
-                    in_flight = args.max_concurrent - semaphore.available_permits(),
+                    in_flight = args.max_concurrent.get() - semaphore.available_permits(),
                     "Open-loop progress"
                 );
                 progress = tokio::time::Instant::now() + PROGRESS_INTERVAL;
             }
         }
 
-        drain(&semaphore, args.max_concurrent).await;
+        drain(&semaphore, args.max_concurrent.get()).await;
         let elapsed = started.elapsed().as_secs_f64();
         tracing::info!(issued, dropped, elapsed_secs = elapsed, "Open-loop phase complete");
         Ok(elapsed)
@@ -275,7 +275,7 @@ impl Replay {
         let started = Instant::now();
         let mut workers = JoinSet::new();
 
-        for _ in 0..args.concurrency {
+        for _ in 0..args.concurrency.get() {
             let replay = self.clone_handles();
             let cursor = cursor.clone();
             workers.spawn(async move {
@@ -407,9 +407,9 @@ fn run_config(args: &CallArgs) -> CallRunConfig {
         rps: args.rps,
         duration_secs: args.requests.is_none().then_some(args.duration.as_secs_f64()),
         requests: args.requests,
-        max_concurrent: args.max_concurrent as u64,
+        max_concurrent: args.max_concurrent.get() as u64,
         passes: if args.phase == CallPhase::Measure { args.passes } else { 0 },
-        concurrency: args.concurrency as u64,
+        concurrency: args.concurrency.get() as u64,
         seed: args.seed,
         timeout_secs: args.timeout.as_secs_f64(),
         methods: (!args.methods.is_empty()).then(|| args.methods.clone()),
@@ -508,6 +508,7 @@ mod tests {
         collections::HashMap,
         io::{BufRead, BufReader as StdBufReader, Read},
         net::{TcpListener, TcpStream},
+        num::NonZeroUsize,
         sync::{
             atomic::{AtomicBool, AtomicUsize},
             Mutex,
@@ -685,9 +686,9 @@ mod tests {
             rps: 0,
             duration: Duration::from_millis(200),
             requests: None,
-            max_concurrent: 16,
+            max_concurrent: NonZeroUsize::new(16).unwrap(),
             passes: 0,
-            concurrency: 2,
+            concurrency: NonZeroUsize::new(2).unwrap(),
             seed: 1,
             block_tag: None,
             strip_fees: false,
@@ -735,7 +736,7 @@ mod tests {
         let mut args = args(&server.url, file.path());
         args.rps = 100;
         args.requests = Some(40);
-        args.max_concurrent = 4;
+        args.max_concurrent = NonZeroUsize::new(4).unwrap();
         args.timeout = Duration::from_millis(400);
 
         let replay = Replay::new(&args, Arc::new(load_corpus(&args).unwrap())).unwrap();
@@ -759,7 +760,7 @@ mod tests {
         let file = corpus_file(3);
         let mut args = args(&server.url, file.path());
         args.passes = 2;
-        args.concurrency = 1;
+        args.concurrency = NonZeroUsize::new(1).unwrap();
 
         let replay = Replay::new(&args, Arc::new(load_corpus(&args).unwrap())).unwrap();
         let elapsed = replay.run_closed_loop(&args).await.unwrap();
