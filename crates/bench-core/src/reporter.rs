@@ -9,7 +9,9 @@ use crate::{
     call::{CallReport, MethodStats},
     clickhouse::ClickHouseClient,
     composition::RunComposition,
-    metrics::{BenchMetrics, BlockStats, RunStats, ThroughputSample, TimeSeriesMetrics},
+    metrics::{
+        BenchMetrics, BlockStats, LatencyStats, RunStats, ThroughputSample, TimeSeriesMetrics,
+    },
     receipt_clickhouse::{insert_receipt_gas_records, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE},
     receipt_metrics::{ReceiptGasRecord, ReceiptMetricGroup},
     sample::{Sample, SampleArchive},
@@ -23,6 +25,7 @@ use std::{
     fs::File,
     io::{BufWriter, Write},
     path::Path,
+    time::Duration,
 };
 
 /// Unified final report passed to reporters at finalization.
@@ -451,6 +454,35 @@ pub struct JsonLatency {
     pub p99_ms: f64,
 }
 
+impl From<&LatencyStats> for JsonLatency {
+    fn from(stats: &LatencyStats) -> Self {
+        let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        Self {
+            min_ms: ms(stats.min),
+            max_ms: ms(stats.max),
+            mean_ms: ms(stats.mean),
+            p50_ms: ms(stats.p50),
+            p90_ms: None,
+            p95_ms: ms(stats.p95),
+            p99_ms: ms(stats.p99),
+        }
+    }
+}
+
+impl From<&JsonLatency> for LatencyStats {
+    fn from(latency: &JsonLatency) -> Self {
+        let duration = |ms: f64| Duration::from_secs_f64(ms / 1000.0);
+        Self {
+            min: duration(latency.min_ms),
+            max: duration(latency.max_ms),
+            mean: duration(latency.mean_ms),
+            p50: duration(latency.p50_ms),
+            p95: duration(latency.p95_ms),
+            p99: duration(latency.p99_ms),
+        }
+    }
+}
+
 /// Time-series data in JSON format.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct JsonTimeSeries {
@@ -558,15 +590,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
                     Some(metrics.elapsed.as_secs_f64()),
                     Some(metrics.tps()),
                     Some(metrics.success_rate()),
-                    metrics.latency.as_ref().map(|latency| JsonLatency {
-                        min_ms: latency.min.as_secs_f64() * 1000.0,
-                        max_ms: latency.max.as_secs_f64() * 1000.0,
-                        mean_ms: latency.mean.as_secs_f64() * 1000.0,
-                        p50_ms: latency.p50.as_secs_f64() * 1000.0,
-                        p90_ms: None,
-                        p95_ms: latency.p95.as_secs_f64() * 1000.0,
-                        p99_ms: latency.p99.as_secs_f64() * 1000.0,
-                    }),
+                    metrics.latency.as_ref().map(JsonLatency::from),
                     ts,
                 )
             } else {
