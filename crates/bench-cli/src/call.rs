@@ -12,19 +12,18 @@ use crate::{
     load_metric_names,
     metrics_forwarder::{build_metrics_forwarder, finish_metrics_forwarder},
     metrics_url::metrics_scraper_configs,
-    send::parse_metadata,
     CallArgs, CallPhase,
 };
 use bench_core::{
-    digest_response, parse_reporters, start_scrapers, CallMethod, CallReport, CallRunConfig,
-    ConsoleReporter, Corpus, CorpusOptions, FinalReport, NodeIdentity, ReplayRecorder,
-    ReplayResults, RequestOutcome, RequestStatus, ResponseKind, ResponseSummary, RunClock,
-    SampleStore,
+    digest_response, parse_metadata, parse_reporters, start_scrapers, CallMethod, CallReport,
+    CallRunConfig, ConsoleReporter, Corpus, CorpusOptions, FinalReport, NodeIdentity,
+    ReplayRecorder, ReplayResults, RequestOutcome, RequestStatus, ResponseKind, ResponseSummary,
+    RunClock, SampleStore,
 };
 use eyre::{bail, Context, Result};
 use rand::{Rng, SeedableRng};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     io::{BufWriter, Write},
     path::Path,
     sync::{
@@ -55,7 +54,7 @@ pub async fn execute(args: CallArgs) -> Result<()> {
         "Starting RPC corpus replay"
     );
 
-    let metadata = parse_metadata(&args.metadata)?;
+    let metadata: HashMap<_, _> = parse_metadata(&args.metadata)?;
     let scraper_configs =
         metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
 

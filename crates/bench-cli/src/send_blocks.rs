@@ -10,7 +10,6 @@ use crate::{
     load_metric_names,
     metrics_forwarder::{build_metrics_forwarder, finish_metrics_forwarder, push_samples},
     metrics_url::metrics_scraper_configs,
-    send::parse_metadata,
     wait_for_persistence::WaitForPersistence,
     SendBlocksArgs,
 };
@@ -25,12 +24,12 @@ use alloy_rpc_types_engine::{
 };
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    parse_reporters, start_scrapers, BlockStats, ConsoleReporter, FinalReport, ProgressState,
-    Reporter, RunClock, RunStats, Sample, SampleStore,
+    parse_metadata, parse_reporters, start_scrapers, BlockStats, ConsoleReporter, FinalReport,
+    ProgressState, Reporter, RunClock, RunStats, Sample, SampleStore,
 };
 use eyre::{Context, Result};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     io::BufRead,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -124,7 +123,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let jwt_secret =
         JwtSecret::from_hex(jwt_secret_hex.trim()).wrap_err("invalid JWT secret hex")?;
 
-    let metadata = parse_metadata(&args.metadata)?;
+    let metadata: HashMap<_, _> = parse_metadata(&args.metadata)?;
     let scraper_configs =
         metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
     let persistence_policy = args.wait_for_persistence;

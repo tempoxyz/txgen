@@ -57,9 +57,9 @@ pub use receipt_metrics::{
 };
 pub use receipt_tracker::ReceiptTracker;
 pub use reporter::{
-    parse_reporters, ClickHouseConfig, ClickHouseReporter, ConsoleReporter, FinalReport,
-    JsonLatency, JsonLatencySample, JsonReport, JsonReporter, JsonTimeSeries, ProgressState,
-    Reporter,
+    parse_metadata, parse_reporters, ClickHouseConfig, ClickHouseReporter, ConsoleReporter,
+    FinalReport, JsonLatency, JsonLatencySample, JsonReport, JsonReporter, JsonTimeSeries,
+    ProgressState, Reporter,
 };
 pub use sample::{Sample, SampleArchive, SampleStore};
 pub use scraper::{start_scrapers, SampleCallback, ScraperConfig, ScraperHandle};
