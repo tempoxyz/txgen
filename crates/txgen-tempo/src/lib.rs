@@ -1,16 +1,15 @@
 pub mod auth_token_map;
-pub mod late_sign;
+mod late_sign;
 mod nonce;
 mod template;
 mod zone;
 pub mod zone_auth;
 
-pub use late_sign::{
-    sign_tempo_expiring, SignerLocator, TempoExpiringPayload, TempoLateSigner,
-    FORMAT_TEMPO_EXPIRING_RELATIVE,
+pub use late_sign::TempoLateSigner;
+use late_sign::{
+    valid_before_from_now, validate_valid_for_secs, SignerLocator, TempoExpiringPayload,
 };
-pub use nonce::{prefetch_parallel_nonces, NONCE_PRECOMPILE};
-pub use txgen_cli::fetch_protocol_nonces;
+use nonce::prefetch_parallel_nonces;
 
 use alloy_eips::eip2718::{Decodable2718, Encodable2718};
 use alloy_network::TransactionBuilder;
@@ -29,7 +28,7 @@ use tempo_alloy::{
 use tempo_primitives::{
     transaction::{
         Call, KeyAuthorization, KeychainSignature, PrimitiveSignature, SignatureType,
-        TEMPO_EXPIRING_NONCE_KEY, TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS,
+        TEMPO_EXPIRING_NONCE_KEY,
     },
     TempoSignature, TempoTxEnvelope,
 };
@@ -168,6 +167,7 @@ impl RequestSignContext<TempoNetwork> for TempoSignContext {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KeychainAuthorizePoolDef {
     accounts: KeychainAccountsDef,
     access_keys: AccountPoolDef,
@@ -190,6 +190,7 @@ struct KeychainAuthorizePoolDef {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct KeychainAccountsDef {
     pool: String,
 }
@@ -241,7 +242,7 @@ impl TempoAdapter {
                     &nonce_rpc.provider,
                     address,
                     nonce_key,
-                    nonce_rpc.pending,
+                    false,
                 ))
             })?;
             ctx.nonces.reset(scheduling_key, n);
@@ -504,12 +505,7 @@ impl NetworkAdapter for TempoAdapter {
                     }
                     TempoNonceMode::Expiring => {
                         req.set_nonce_key(TEMPO_EXPIRING_NONCE_KEY);
-                        if is_late_sign {
-                            validate_expiring_valid_for_secs(&template)?;
-                            None
-                        } else {
-                            Some(resolve_expiring_valid_before(&template)?)
-                        }
+                        resolve_expiring_valid_before(&template, is_late_sign)?
                     }
                 };
 
@@ -839,63 +835,28 @@ fn resolve_nonce_mode(
     }
 }
 
-fn resolve_expiring_valid_before(template: &TempoTemplate) -> Result<u64> {
+/// Resolve the absolute `valid_before` of an expiring nonce template. Returns
+/// `None` when signing is deferred, since bench then assigns it at send time.
+fn resolve_expiring_valid_before(
+    template: &TempoTemplate,
+    is_late_sign: bool,
+) -> Result<Option<u64>> {
     match (template.valid_before, template.valid_for_secs) {
         (Some(_), Some(_)) => {
             bail!(
                 "expiring nonce templates must set either `valid_before` or `valid_for_secs`, not both"
             );
         }
-        (Some(valid_before), None) => {
-            if valid_before == 0 {
-                bail!("expiring nonce templates require `valid_before` to be greater than 0");
-            }
-            Ok(valid_before)
-        }
-        (None, Some(valid_for_secs)) => {
-            if valid_for_secs == 0 {
-                bail!("expiring nonce templates require `valid_for_secs` to be greater than 0");
-            }
-            if valid_for_secs > TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS {
-                bail!(
-                    "expiring nonce templates require `valid_for_secs` <= {} seconds",
-                    TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS
-                );
-            }
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_secs())
-                .unwrap_or(0)
-                .checked_add(valid_for_secs)
-                .ok_or_else(|| {
-                    eyre::eyre!("expiring nonce `valid_for_secs` overflowed unix timestamp")
-                })
-        }
         (None, None) => {
             bail!("expiring nonce templates require either `valid_before` or `valid_for_secs`");
         }
+        (Some(valid_before), None) => Ok(Some(valid_before)),
+        (None, Some(valid_for_secs)) if is_late_sign => {
+            validate_valid_for_secs(valid_for_secs)?;
+            Ok(None)
+        }
+        (None, Some(valid_for_secs)) => Ok(Some(valid_before_from_now(valid_for_secs)?.get())),
     }
-}
-
-fn validate_expiring_valid_for_secs(template: &TempoTemplate) -> Result<()> {
-    if template.valid_before.is_some() {
-        bail!(
-            "expiring nonce templates must set either `valid_before` or `valid_for_secs`, not both"
-        );
-    }
-    let valid_for_secs = template
-        .valid_for_secs
-        .ok_or_else(|| eyre::eyre!("expiring nonce templates require `valid_for_secs`"))?;
-    if valid_for_secs == 0 {
-        bail!("expiring nonce templates require `valid_for_secs` to be greater than 0");
-    }
-    if valid_for_secs > TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS {
-        bail!(
-            "expiring nonce templates require `valid_for_secs` <= {} seconds",
-            TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS
-        );
-    }
-    Ok(())
 }
 
 /// Deterministically perturb the maximum fee so expiring nonce transactions never
@@ -1281,6 +1242,7 @@ fn account_ref_value(pool: &str, index: usize) -> Result<serde_yaml::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::late_sign::sign_tempo_expiring;
     use alloy_consensus::SignableTransaction;
     use alloy_eips::eip2718::{Decodable2718, Encodable2718};
     use alloy_network::{NetworkTransactionBuilder, TxSignerSync};
@@ -1745,6 +1707,19 @@ nonce_key:
             assert_eq!(request.request.nonce(), Some(nonce));
             assert_eq!(request.request.max_fee_per_gas(), template.max_fee_per_gas);
             assert!(ctx.take_nonce_reservations().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_template_rejects_unknown_fields() {
+        let base = "type: tempo\nfrom: { pool: users, select: random }\ngas_limit: 21000\n";
+        for (extra, field) in [
+            ("max_fee_pre_gas: 1", "max_fee_pre_gas"),
+            ("calls: [{ to: '0x0000000000000000000000000000000000000001', function: 'f()', vaule: 1 }]", "vaule"),
+            ("auth: { mode: keychain, acess_key: { from_setup: keys } }", "acess_key"),
+        ] {
+            let error = serde_yaml::from_str::<TempoTemplate>(&format!("{base}{extra}\n")).unwrap_err();
+            assert!(error.to_string().contains(&format!("unknown field `{field}`")), "{error}");
         }
     }
 

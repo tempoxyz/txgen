@@ -361,7 +361,7 @@ async fn execute_source<S: TxSource>(
     );
     if let Some(end_ms) = measurement_end_unix_ms {
         report.metadata.insert("measurement_end_unix_ms".into(), end_ms.to_string());
-        report.retain_samples_until(end_ms)?;
+        report.retain_samples_until(end_ms);
         if let Some(ts) = report.time_series.as_mut() {
             let end_offset_ms = end_ms.saturating_sub(clock.start_unix_ms());
             ts.latencies.retain(|l| l.offset_ms <= end_offset_ms);
@@ -392,7 +392,7 @@ async fn execute_source<S: TxSource>(
         // samples captured after the last real block.
         let cutoff_ms = trim_trailing_empty_blocks(&mut block_stats);
         if let Some(cutoff_ms) = cutoff_ms {
-            report.retain_samples_until(cutoff_ms)?;
+            report.retain_samples_until(cutoff_ms);
             if let Some(ts) = report.time_series.as_mut() {
                 ts.latencies
                     .retain(|l| l.offset_ms <= cutoff_ms.saturating_sub(clock.start_unix_ms()));

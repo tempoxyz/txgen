@@ -3,12 +3,12 @@ use axum::{extract::State, routing::post, Json, Router};
 use serde_json::{json, Value};
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 use txgen_cli::scenario::{execute_scenario, FailurePolicy, ScenarioExecutionConfig, ScenarioSpec};
@@ -101,35 +101,12 @@ impl BridgeState {
     }
 }
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let suffix =
-            SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after epoch").as_nanos();
-        let path = std::env::temp_dir()
-            .join(format!("txgen-two-chain-scenario-{}-{suffix}", std::process::id()));
-        fs::create_dir_all(&path).expect("create temporary test directory");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn executes_two_chain_roundtrip_with_backfilled_events() {
     let bridge = Arc::new(Mutex::new(BridgeState::default()));
     let (x_url, x_server) = spawn_rpc(MockChain::X, 1_001, bridge.clone()).await;
     let (y_url, y_server) = spawn_rpc(MockChain::Y, 1_002, bridge.clone()).await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
 
     write_fixture_files(directory.path(), &x_url, &y_url);
     let scenario = ScenarioSpec::load(&directory.path().join("scenario.yaml"))
@@ -209,7 +186,7 @@ async fn dag_runs_independent_delayed_branches_concurrently_before_join() {
         checkpoint_max_active.clone(),
     )
     .await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     write_fixture_files(directory.path(), &x_url, &y_url);
     fs::write(
         directory.path().join("dag-branches.yaml"),
@@ -282,7 +259,7 @@ scenario:
 async fn dag_rejects_unordered_regular_nonce_submissions_from_one_account() {
     let bridge = Arc::new(Mutex::new(BridgeState::default()));
     let (rpc_url, server) = spawn_rpc(MockChain::X, 1_001, bridge.clone()).await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     write_fixture_files(directory.path(), &rpc_url, &rpc_url);
     fs::write(
         directory.path().join("dag-regular-nonce.yaml"),
@@ -346,7 +323,7 @@ async fn execute_seeded_roundtrip(seed: u64) -> (Vec<Bytes>, Vec<Bytes>) {
     let bridge = Arc::new(Mutex::new(BridgeState::default()));
     let (x_url, x_server) = spawn_rpc(MockChain::X, 1_001, bridge.clone()).await;
     let (y_url, y_server) = spawn_rpc(MockChain::Y, 1_002, bridge.clone()).await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     write_fixture_files(directory.path(), &x_url, &y_url);
     let scenario = ScenarioSpec::load(&directory.path().join("scenario.yaml")).unwrap();
     let report = execute_scenario::<EthereumAdapter>(
@@ -377,7 +354,7 @@ async fn execute_seeded_roundtrip(seed: u64) -> (Vec<Bytes>, Vec<Bytes>) {
 async fn releases_account_lease_after_instance_timeout() {
     let bridge = Arc::new(Mutex::new(BridgeState::default()));
     let (rpc_url, server) = spawn_rpc(MockChain::X, 1_001, bridge).await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     write_fixture_files(directory.path(), &rpc_url, &rpc_url);
     fs::write(
         directory.path().join("lease-timeout.yaml"),
@@ -450,7 +427,7 @@ scenario:
 async fn handles_reverted_receipts_according_to_step_policy() {
     let bridge = Arc::new(Mutex::new(BridgeState::default()));
     let (rpc_url, server) = spawn_rpc_with_receipt_status(MockChain::X, 1_001, false, bridge).await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     write_fixture_files(directory.path(), &rpc_url, &rpc_url);
     fs::write(
         directory.path().join("reverted-submit.yaml"),
@@ -543,7 +520,7 @@ scenario:
 async fn rejects_invalid_literal_overlay_before_submission() {
     let bridge = Arc::new(Mutex::new(BridgeState::default()));
     let (rpc_url, server) = spawn_rpc(MockChain::X, 1_001, bridge.clone()).await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     write_fixture_files(directory.path(), &rpc_url, &rpc_url);
     fs::write(
         directory.path().join("invalid-overlay.yaml"),

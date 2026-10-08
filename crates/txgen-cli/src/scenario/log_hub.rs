@@ -92,7 +92,6 @@ struct WindowUpdate {
 struct HubState {
     next_id: u64,
     generation: u64,
-    epoch: u64,
     running: bool,
     interests: BTreeMap<u64, LogInterest>,
 }
@@ -128,7 +127,6 @@ impl LogPollHub {
             state: Mutex::new(HubState {
                 next_id: 0,
                 generation: 0,
-                epoch: 0,
                 running: false,
                 interests: BTreeMap::new(),
             }),
@@ -170,16 +168,9 @@ impl LogPollHub {
         })
     }
 
-    fn bump_epoch(&self) {
-        self.state.lock().expect("log hub state lock").epoch += 1;
-    }
-
-    fn epoch(&self) -> u64 {
-        self.state.lock().expect("log hub state lock").epoch
-    }
-
     async fn run(self: Arc<Self>) {
         let mut checkpoint = None::<(u64, B256)>;
+        let mut epoch = 0;
         let mut consecutive_scan_failures = 0;
         let mut wake = None;
         let mut registry_updates = self.registry_updates.subscribe();
@@ -209,7 +200,7 @@ impl LogPollHub {
                     }
                 }
             }
-            let (update, next_tick) = match self.scan(&plan, &mut checkpoint).await {
+            let (update, next_tick) = match self.scan(&plan, &mut checkpoint, &mut epoch).await {
                 Ok(Some(window)) => {
                     consecutive_scan_failures = 0;
                     (Some(Ok(window)), interval)
@@ -265,16 +256,7 @@ impl LogPollHub {
     }
 
     async fn subscribe_wake(&self) -> Result<Option<WakeStream>, String> {
-        if self.subscription_behavior == SubscriptionBehavior::Disabled {
-            return Ok(None);
-        }
-        let Some(provider) = &self.websocket_provider else {
-            return if self.subscription_behavior == SubscriptionBehavior::Require {
-                Err("subscription observation mode has no connected WebSocket".to_string())
-            } else {
-                Ok(None)
-            };
-        };
+        let Some(provider) = &self.websocket_provider else { return Ok(None) };
         match provider.subscribe_blocks().await {
             Ok(subscription) => {
                 Ok(Some(Box::pin(subscription.into_stream().map(|_| ())) as WakeStream))
@@ -293,6 +275,7 @@ impl LogPollHub {
         &self,
         plan: &TickPlan,
         checkpoint: &mut Option<(u64, B256)>,
+        epoch: &mut u64,
     ) -> Result<Option<LogWindow>, String> {
         let provider = &self.provider;
         let head = provider.get_block_number().await.map_err(|error| error.to_string())?;
@@ -309,7 +292,7 @@ impl LogPollHub {
             };
             if !intact {
                 *checkpoint = None;
-                self.bump_epoch();
+                *epoch += 1;
             }
         }
 
@@ -342,17 +325,11 @@ impl LogPollHub {
         // hash chain then proves every scanned ancestor unchanged as well.
         if block_hash(provider, head).await? != Some(head_hash) {
             *checkpoint = None;
-            self.bump_epoch();
+            *epoch += 1;
             return Ok(None);
         }
         *checkpoint = Some((head, head_hash));
-        Ok(Some(LogWindow {
-            epoch: self.epoch(),
-            head,
-            coverage_start,
-            observed,
-            logs: Arc::new(logs),
-        }))
+        Ok(Some(LogWindow { epoch: *epoch, head, coverage_start, observed, logs: Arc::new(logs) }))
     }
 }
 
