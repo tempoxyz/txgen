@@ -52,12 +52,9 @@ pub struct ReceiptGasRecord {
 }
 
 impl ReceiptGasRecord {
-    /// Calculate the transaction fee when an effective gas price is available.
-    ///
-    /// Valid Ethereum receipt field widths fit exactly in a `U256`. An
-    /// out-of-range RPC response is omitted instead of wrapping the fee.
-    pub fn fee_paid(&self) -> Option<U256> {
-        self.effective_gas_price.and_then(|price| self.gas_used.checked_mul(price))
+    /// The gas fields of this record.
+    pub fn sample(&self) -> ReceiptGasSample {
+        ReceiptGasSample { gas_used: self.gas_used, effective_gas_price: self.effective_gas_price }
     }
 }
 
@@ -105,15 +102,15 @@ impl ReceiptMetricDistribution {
 
         samples.sort_unstable();
         let count = samples.len() as u64;
-        let mean = samples.iter().copied().map(u256_to_f64).sum::<f64>() / count as f64;
+        let mean = samples.iter().map(f64::from).sum::<f64>() / count as f64;
 
         Self {
             count,
-            min: Some(u256_to_f64(samples[0])),
+            min: Some(f64::from(samples[0])),
             mean: Some(mean),
-            p50: Some(u256_to_f64(percentile(&samples, 50))),
-            p95: Some(u256_to_f64(percentile(&samples, 95))),
-            p99: Some(u256_to_f64(percentile(&samples, 99))),
+            p50: Some(f64::from(percentile(&samples, 50))),
+            p95: Some(f64::from(percentile(&samples, 95))),
+            p99: Some(f64::from(percentile(&samples, 99))),
         }
     }
 }
@@ -152,13 +149,7 @@ impl ReceiptCollection {
     pub fn metrics_for_records(records: &[ReceiptGasRecord]) -> ReceiptMetrics {
         let mut accumulator = ReceiptMetricsAccumulator::default();
         for record in records {
-            accumulator.record(
-                record.labels.clone(),
-                ReceiptGasSample {
-                    gas_used: record.gas_used,
-                    effective_gas_price: record.effective_gas_price,
-                },
-            );
+            accumulator.record(record.labels.clone(), record.sample());
         }
 
         accumulator.into_metrics()
@@ -545,13 +536,9 @@ async fn collect_receipt(
 /// Returns `None` when no record has a calculable fee or when the aggregate
 /// exceeds `U256`.
 pub fn total_fees_paid(records: &[ReceiptGasRecord]) -> Option<U256> {
-    let mut fees = records.iter().filter_map(ReceiptGasRecord::fee_paid);
+    let mut fees = records.iter().filter_map(|record| record.sample().fee_paid());
     let first = fees.next()?;
     fees.try_fold(first, U256::checked_add)
-}
-
-fn u256_to_f64(value: U256) -> f64 {
-    value.to_string().parse().expect("a U256 decimal value always fits in a finite f64")
 }
 
 #[cfg(test)]
@@ -587,7 +574,7 @@ mod tests {
         let collection = ReceiptCollection::from_records(vec![record.clone()]);
 
         assert_eq!(collection.records, vec![record.clone()]);
-        assert_eq!(record.fee_paid(), Some(U256::from(42_000)));
+        assert_eq!(record.sample().fee_paid(), Some(U256::from(42_000)));
         assert_eq!(collection.metrics.len(), 1);
         assert_eq!(collection.metrics[0].labels, labels("transfer"));
         assert_eq!(collection.metrics[0].gas_used.count, 1);
