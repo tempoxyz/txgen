@@ -380,12 +380,8 @@ where
                             _ = tokio::time::sleep(delay) => {}
                             joined = tasks.join_next() => {
                                 if let Some(joined) = joined {
-                                    let outcome = joined.wrap_err("scenario instance task failed")?;
                                     in_flight -= 1;
-                                    if outcome.failure.is_some() && config.failure_policy == FailurePolicy::FailFast {
-                                        stop_starting = true;
-                                    }
-                                    outcomes.record(outcome);
+                                    stop_starting |= record_instance(joined, config.failure_policy, &mut outcomes)?;
                                 }
                             }
                         }
@@ -419,12 +415,8 @@ where
             tokio::select! {
                 joined = tasks.join_next() => {
                     if let Some(joined) = joined {
-                        let outcome = joined.wrap_err("scenario instance task failed")?;
                         in_flight -= 1;
-                        if outcome.failure.is_some() && config.failure_policy == FailurePolicy::FailFast {
-                            stop_starting = true;
-                        }
-                        outcomes.record(outcome);
+                        stop_starting |= record_instance(joined, config.failure_policy, &mut outcomes)?;
                     }
                 }
                 _ = tokio::time::sleep(PROGRESS_LOG_INTERVAL.saturating_sub(last_progress.elapsed())) => {
@@ -465,19 +457,12 @@ where
             .iter()
             .enumerate()
             .map(|(index, step)| {
-                let dependencies = match self.spec.scenario.execution {
-                    ScenarioExecutionMode::Sequential if index > 0 => {
-                        vec![self.spec.scenario.steps[index - 1].effective_id(index - 1)]
-                    }
-                    ScenarioExecutionMode::Sequential => Vec::new(),
-                    ScenarioExecutionMode::Dag => step.depends_on.clone(),
-                };
                 (
                     step.effective_id(index),
                     step_name(index, step),
                     step.action.chain().to_string(),
                     step.action.name().to_string(),
-                    dependencies,
+                    self.step_dependencies(index),
                     step.provenance.clone(),
                 )
             })
@@ -554,22 +539,15 @@ where
         let (mut context, _leases) = match self.bind_instance(instance, &mut rng).await {
             Ok(binding) => binding,
             Err(error) => {
-                let detail = error.sanitized_detail();
-                return InstanceOutcome {
-                    instance,
-                    started_at_unix_ms: unix_ms(started_at),
-                    finished_at_unix_ms: unix_ms(SystemTime::now()),
-                    elapsed: started.elapsed(),
-                    steps: Vec::new(),
-                    failure: Some(InstanceFailure {
-                        step_index: 0,
-                        step_name: "bindings".to_string(),
-                        failure_provenance: None,
-                        classification: error.classification.to_string(),
-                        timed_out: false,
-                        detail,
-                    }),
+                let failure = InstanceFailure {
+                    step_index: 0,
+                    step_name: "bindings".to_string(),
+                    failure_provenance: None,
+                    classification: error.classification.to_string(),
+                    timed_out: false,
+                    detail: error.sanitized_detail(),
                 };
+                return instance_outcome(instance, started_at, started, Vec::new(), Some(failure));
             }
         };
 
@@ -604,13 +582,8 @@ where
         let mut step_outcomes = Vec::new();
 
         for (index, step) in self.spec.scenario.steps.iter().enumerate() {
-            let dependencies = (index > 0)
-                .then(|| self.spec.scenario.steps[index - 1].effective_id(index - 1))
-                .into_iter()
-                .collect();
-            let (result, outcome) = self
-                .execute_one_step(instance, index, step, dependencies, context, rng, clock)
-                .await;
+            let (result, outcome) =
+                self.execute_one_step(instance, index, step, context, rng, clock).await;
 
             match result {
                 Ok(value) => {
@@ -647,14 +620,7 @@ where
             }
         }
 
-        InstanceOutcome {
-            instance,
-            started_at_unix_ms: unix_ms(started_at),
-            finished_at_unix_ms: unix_ms(SystemTime::now()),
-            elapsed: started.elapsed(),
-            steps: step_outcomes,
-            failure: None,
-        }
+        instance_outcome(instance, started_at, started, step_outcomes, None)
     }
 
     async fn run_dag_instance(
@@ -702,13 +668,11 @@ where
                 );
                 running.push(async move {
                     let mut rng = StdRng::seed_from_u64(step_seed);
-                    let dependencies = step.depends_on.clone();
                     let (result, outcome) = engine
                         .execute_one_step(
                             instance,
                             index,
                             &step,
-                            dependencies,
                             &step_context,
                             &mut rng,
                             &step_clock,
@@ -753,23 +717,26 @@ where
             return failed_outcome(instance, started_at, started, outcomes, index, &step, error);
         }
 
-        InstanceOutcome {
-            instance,
-            started_at_unix_ms: unix_ms(started_at),
-            finished_at_unix_ms: unix_ms(SystemTime::now()),
-            elapsed: started.elapsed(),
-            steps: outcomes,
-            failure: None,
+        instance_outcome(instance, started_at, started, outcomes, None)
+    }
+
+    /// Steps that must finish before `index` starts.
+    fn step_dependencies(&self, index: usize) -> Vec<String> {
+        let steps = &self.spec.scenario.steps;
+        match self.spec.scenario.execution {
+            ScenarioExecutionMode::Sequential if index > 0 => {
+                vec![steps[index - 1].effective_id(index - 1)]
+            }
+            ScenarioExecutionMode::Sequential => Vec::new(),
+            ScenarioExecutionMode::Dag => steps[index].depends_on.clone(),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn execute_one_step(
         &self,
         instance: u64,
         index: usize,
         step: &StepDef,
-        depends_on: Vec<String>,
         context: &RuntimeContext,
         rng: &mut StdRng,
         clock: &RunClock,
@@ -807,7 +774,7 @@ where
             id,
             name,
             kind,
-            depends_on,
+            depends_on: self.step_dependencies(index),
             provenance: step.provenance.clone(),
             success: result.is_ok(),
             latency: step_started.elapsed(),
@@ -1216,22 +1183,44 @@ fn failed_outcome(
     step: &StepDef,
     error: StepError,
 ) -> InstanceOutcome {
-    let detail = error.sanitized_detail();
+    let failure = InstanceFailure {
+        step_index,
+        step_name: step_name(step_index, step),
+        failure_provenance: step.provenance.clone(),
+        classification: error.classification.to_string(),
+        timed_out: error.classification == "timeout",
+        detail: error.sanitized_detail(),
+    };
+    instance_outcome(instance, started_at, started, steps, Some(failure))
+}
+
+fn instance_outcome(
+    instance: u64,
+    started_at: SystemTime,
+    started: Instant,
+    steps: Vec<StepOutcome>,
+    failure: Option<InstanceFailure>,
+) -> InstanceOutcome {
     InstanceOutcome {
         instance,
         started_at_unix_ms: unix_ms(started_at),
         finished_at_unix_ms: unix_ms(SystemTime::now()),
         elapsed: started.elapsed(),
         steps,
-        failure: Some(InstanceFailure {
-            step_index,
-            step_name: step_name(step_index, step),
-            failure_provenance: step.provenance.clone(),
-            classification: error.classification.to_string(),
-            timed_out: error.classification == "timeout",
-            detail,
-        }),
+        failure,
     }
+}
+
+/// Record a finished instance and return whether it stops further starts.
+fn record_instance(
+    joined: Result<InstanceOutcome, tokio::task::JoinError>,
+    failure_policy: FailurePolicy,
+    outcomes: &mut ScenarioAccumulator,
+) -> Result<bool> {
+    let outcome = joined.wrap_err("scenario instance task failed")?;
+    let stop = outcome.failure.is_some() && failure_policy == FailurePolicy::FailFast;
+    outcomes.record(outcome);
+    Ok(stop)
 }
 
 struct ChainRuntime<A: NetworkAdapter> {
