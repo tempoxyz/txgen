@@ -59,7 +59,7 @@ pub async fn execute(args: CallArgs) -> Result<()> {
         head_hash = %identity.head_hash,
         "Node identity"
     );
-    replay.prime(args.concurrency.get()).await?;
+    replay.prime().await?;
 
     let clock = match args.reporting.metrics_align {
         Some(start) => RunClock::new_with_start_unix_ms(start),
@@ -137,18 +137,20 @@ struct Replay {
     url: String,
     corpus: Arc<Corpus>,
     recorder: Arc<ReplayRecorder>,
+    /// Most requests either loop can have in flight.
+    connections: usize,
 }
 
 impl Replay {
     fn new(args: &CallArgs, corpus: Arc<Corpus>) -> Result<Self> {
-        let pool = args.max_concurrent.max(args.concurrency).get();
+        let connections = args.max_concurrent.max(args.concurrency).get();
         let client = reqwest::Client::builder()
             .timeout(args.timeout)
-            .pool_max_idle_per_host(pool)
+            .pool_max_idle_per_host(connections)
             .build()
             .wrap_err("failed to build the replay HTTP client")?;
         let recorder = Arc::new(ReplayRecorder::new(&corpus, MAX_REPORTED_NONDETERMINISTIC));
-        Ok(Self { client, url: args.rpc_url.clone(), corpus, recorder })
+        Ok(Self { client, url: args.rpc_url.clone(), corpus, recorder, connections })
     }
 
     /// Read the chain and head the corpus is replayed against.
@@ -175,7 +177,8 @@ impl Replay {
     }
 
     /// Open the connections the replay will use before anything is timed.
-    async fn prime(&self, connections: usize) -> Result<()> {
+    async fn prime(&self) -> Result<()> {
+        let connections = self.connections;
         let mut opened = JoinSet::new();
         for _ in 0..connections {
             let replay = self.clone();
@@ -699,6 +702,18 @@ mod tests {
                 metrics_forward: None,
             },
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn primes_a_connection_for_every_open_loop_slot() {
+        let server = StubServer::start(StubBehavior::Fast);
+        let file = corpus_file(1);
+        let args = args(&server.url, file.path());
+
+        let replay = Replay::new(&args, Arc::new(load_corpus(&args).unwrap())).unwrap();
+        replay.prime().await.unwrap();
+
+        assert_eq!(server.served(), args.max_concurrent.get());
     }
 
     #[tokio::test(flavor = "multi_thread")]
