@@ -8,10 +8,8 @@ use super::{
         AccountSelection, BindingDef, ChainDef, ChainId, ObservationMode, ScenarioExecutionMode,
         ScenarioSpec, StepAction, StepDef, SubmitAwait, SubmitStep,
     },
-    value::{
-        collect_variable_paths, eval_expression, materialize_yaml, RuntimeContext, RuntimeValue,
-    },
-    wait::{self, DEFAULT_POLL_INTERVAL},
+    value::{collect_variable_paths, materialize_yaml, RuntimeContext, RuntimeValue},
+    wait::{self, expression_hash, object, DEFAULT_POLL_INTERVAL},
 };
 use crate::{
     generate::{
@@ -21,7 +19,6 @@ use crate::{
     NetworkAdapter, ScenarioActionContext,
 };
 use alloy_consensus::{SignableTransaction, Signed};
-use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_eips::{eip2718::Encodable2718, BlockNumberOrTag};
 use alloy_network::{
     primitives::{BlockResponse, HeaderResponse},
@@ -2825,17 +2822,6 @@ fn account_binding_value(pool: &str, index: usize, address: Address) -> RuntimeV
             ]),
         ),
     ])
-}
-
-fn expression_hash(value: &serde_yaml::Value, context: &RuntimeContext) -> Result<TxHash> {
-    match eval_expression(value, context)?.coerce_dyn_sol(&DynSolType::FixedBytes(32))? {
-        DynSolValue::FixedBytes(value, 32) => Ok(value),
-        _ => unreachable!("bytes32 coercion returned another type"),
-    }
-}
-
-fn object<const N: usize>(values: [(&str, RuntimeValue); N]) -> RuntimeValue {
-    RuntimeValue::Object(values.into_iter().map(|(key, value)| (key.to_string(), value)).collect())
 }
 
 fn step_name(index: usize, step: &StepDef) -> String {
