@@ -39,7 +39,6 @@ pub struct BenchMetrics {
     /// Failed transactions (rejected by RPC or network error).
     pub failed: u64,
     /// Total elapsed time.
-    #[serde(with = "duration_serde")]
     pub elapsed: Duration,
     /// Latency statistics, when latency collection is enabled.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -70,22 +69,16 @@ impl BenchMetrics {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LatencyStats {
     /// Minimum latency observed.
-    #[serde(with = "duration_serde")]
     pub min: Duration,
     /// Maximum latency observed.
-    #[serde(with = "duration_serde")]
     pub max: Duration,
     /// Mean latency.
-    #[serde(with = "duration_serde")]
     pub mean: Duration,
     /// P50 latency.
-    #[serde(with = "duration_serde")]
     pub p50: Duration,
     /// P95 latency.
-    #[serde(with = "duration_serde")]
     pub p95: Duration,
     /// P99 latency.
-    #[serde(with = "duration_serde")]
     pub p99: Duration,
 }
 
@@ -139,7 +132,6 @@ pub struct LatencySample {
     /// Offset from benchmark start in milliseconds.
     pub offset_ms: u64,
     /// Latency of this request.
-    #[serde(with = "duration_serde")]
     pub latency: Duration,
 }
 
@@ -740,33 +732,6 @@ impl MetricsCollector {
             .collect();
 
         TimeSeriesMetrics { throughput, latencies: latency_samples }
-    }
-}
-
-mod duration_serde {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::time::Duration;
-
-    #[derive(Serialize, Deserialize)]
-    struct DurationRepr {
-        secs: u64,
-        nanos: u32,
-    }
-
-    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        DurationRepr { secs: duration.as_secs(), nanos: duration.subsec_nanos() }
-            .serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let repr = DurationRepr::deserialize(deserializer)?;
-        Ok(Duration::new(repr.secs, repr.nanos))
     }
 }
 
