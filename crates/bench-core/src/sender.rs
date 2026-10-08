@@ -206,7 +206,7 @@ impl std::error::Error for RpcSubmitError {}
 /// clients have independent rate limits, allowing scenario-instance start rate
 /// limiting to remain separate from transaction submission rate limiting.
 /// Generated transactions are ordered using the same submission and inclusion
-/// key semantics as [`Sender`]. Raw submissions bypass key ordering.
+/// key semantics as [`Sender`].
 #[derive(Clone)]
 pub struct RpcSubmitter {
     endpoints: Arc<[RpcEndpoint]>,
@@ -376,17 +376,6 @@ impl RpcSubmitter {
         }
 
         Ok(submission)
-    }
-
-    /// Submit raw EIP-2718 transaction bytes and wait for RPC acceptance.
-    pub async fn submit_raw(&self, raw: &Bytes) -> Result<RpcSubmission> {
-        let _permit = self.acquire_permit().await?;
-
-        let endpoint = self.endpoint_for_hash(keccak256(raw));
-        let headers = self.headers_for(&endpoint, "eth_sendRawTransaction", None, None)?;
-        submit_raw_rpc(&endpoint, raw, headers)
-            .await
-            .map_err(|error| rpc_request_error(error, self.request_auth.is_some(), "submission"))
     }
 
     /// Fetch a transaction receipt through a sender-authenticated endpoint.
@@ -1973,8 +1962,19 @@ mod tests {
         )
         .unwrap();
 
-        let submission =
-            submitter.submit_raw(&Bytes::from_static(&[0x02, 0xf8, 0x70])).await.unwrap();
+        let submission = submitter
+            .submit(&GeneratedTx {
+                depends_on: Vec::new(),
+                phase: TxPhase::Workload,
+                id: None,
+                sender: None,
+                raw: Bytes::from_static(&[0x02, 0xf8, 0x70]),
+                late_sign: None,
+                submission_keys: vec![SchedulingKey::from([0x11; 20])],
+                inclusion_keys: Vec::new(),
+            })
+            .await
+            .unwrap();
 
         assert_eq!(submission.tx_hash, tx_hash);
         assert!(submission.submitted_at.duration_since(std::time::UNIX_EPOCH).is_ok());
