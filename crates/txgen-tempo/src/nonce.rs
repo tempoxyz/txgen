@@ -120,7 +120,9 @@ async fn fetch_parallel_lane_nonce<P: Provider<Ethereum>>(
     let storage_value = request.await.wrap_err_with(|| {
         format!("failed to fetch parallel nonce for {address} lane {nonce_key}")
     })?;
-    Ok(storage_value.to::<u64>())
+    u64::try_from(storage_value).wrap_err_with(|| {
+        format!("parallel nonce {storage_value} for {address} lane {nonce_key} exceeds u64")
+    })
 }
 
 /// Collect constant 2D nonce lanes that can be prefetched before generation.
@@ -257,6 +259,19 @@ mod tests {
         let expected: U256 =
             "0x2028c9f493f53a125e5a3e03d423a869339e3d2dd8a77340dd393eab48750b1c".parse().unwrap();
         assert_eq!(compute_nonce_storage_key(address, nonce_key), expected);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_parallel_nonce_is_an_error() {
+        let asserter = alloy_transport::mock::Asserter::new();
+        asserter.push_success(&U256::MAX);
+        let provider = alloy_provider::ProviderBuilder::<_, _, Ethereum>::new()
+            .connect_mocked_client(asserter);
+
+        let error = fetch_parallel_lane_nonce(&provider, Address::ZERO, U256::from(1), false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds u64"), "{error}");
     }
 
     #[test]
