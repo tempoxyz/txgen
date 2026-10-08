@@ -2877,7 +2877,7 @@ mix: [{template: transfer, weight: 1}]
                 serde_json::to_value(U256::from(expected_rng.random::<u64>()))?
             );
         }
-        assert_eq!(ctx.nonces.peek(&[0x33; 20]), 7);
+        assert_eq!(ctx.nonces.current(&[0x33; 20]), 7);
         assert_eq!(ctx.rng.random::<u64>(), StdRng::seed_from_u64(42).random::<u64>());
         Ok(())
     }
