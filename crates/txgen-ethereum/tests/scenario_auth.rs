@@ -8,10 +8,13 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::task::JoinHandle;
 use txgen_cli::scenario::{execute_scenario, FailurePolicy, ScenarioExecutionConfig, ScenarioSpec};
 use txgen_core::derive_mnemonic_signer;
 use txgen_ethereum::EthereumAdapter;
+
+mod common;
+use common::{block_value, quantity, receipt_value};
 
 const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
 const AUTH_HEADER: &str = "x-zone-auth";
@@ -210,13 +213,8 @@ async fn preflights_all_setup_sender_auth_before_dispatch() {
 }
 
 async fn spawn_rpc(role: RpcRole, shared: Arc<Mutex<SharedState>>) -> (String, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock RPC");
-    let address = listener.local_addr().expect("mock RPC address");
-    let app = Router::new().route("/", post(handle_rpc)).with_state(RpcState { role, shared });
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve mock RPC");
-    });
-    (format!("http://{address}"), server)
+    common::serve(Router::new().route("/", post(handle_rpc)).with_state(RpcState { role, shared }))
+        .await
 }
 
 async fn handle_rpc(
@@ -294,7 +292,7 @@ async fn handle_rpc(
                 }
                 _ => return rpc_error(id, -32001, "unknown sender authentication"),
             };
-            receipt_value(transaction_hash, sender)
+            receipt_value(transaction_hash, sender, HEAD_BLOCK, true)
         }
         _ => return rpc_error(id, -32601, &format!("unsupported {method} on {:?} RPC", state.role)),
     };
@@ -308,53 +306,6 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Json<Value> {
         "id": id,
         "error": { "code": code, "message": message }
     }))
-}
-
-fn receipt_value(transaction_hash: B256, sender: Address) -> Value {
-    json!({
-        "status": "0x1",
-        "cumulativeGasUsed": "0x5208",
-        "logs": [],
-        "logsBloom": format!("0x{}", "00".repeat(256)),
-        "type": "0x2",
-        "transactionHash": transaction_hash,
-        "transactionIndex": "0x0",
-        "blockHash": B256::repeat_byte(0x55),
-        "blockNumber": quantity(HEAD_BLOCK),
-        "gasUsed": "0x5208",
-        "effectiveGasPrice": "0x1",
-        "from": sender,
-        "to": Address::repeat_byte(0x22),
-        "contractAddress": null
-    })
-}
-
-fn block_value(number: u64, hash: B256) -> Value {
-    json!({
-        "hash": hash,
-        "parentHash": B256::ZERO,
-        "sha3Uncles": B256::ZERO,
-        "miner": Address::ZERO,
-        "stateRoot": B256::ZERO,
-        "transactionsRoot": B256::ZERO,
-        "receiptsRoot": B256::ZERO,
-        "logsBloom": format!("0x{}", "00".repeat(256)),
-        "difficulty": "0x0",
-        "number": quantity(number),
-        "gasLimit": "0x1c9c380",
-        "gasUsed": "0x0",
-        "timestamp": "0x0",
-        "extraData": "0x",
-        "mixHash": B256::ZERO,
-        "nonce": "0x0000000000000000",
-        "baseFeePerGas": "0x0",
-        "transactions": [],
-        "uncles": []
-    })
-}
-
-fn quantity(value: u64) -> String {
-    format!("0x{value:x}")
 }
 
 fn write_fixture_files(
