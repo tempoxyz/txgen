@@ -69,7 +69,7 @@ pub struct ExtractArgs {
     pub buffer_size: NonZeroUsize,
 
     /// Include RLP-encoded block access lists from eth_getBlockAccessListByBlockNumber.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub bal: bool,
 
     /// Output raw blocks, the signed transactions contained in them, or an
@@ -210,14 +210,11 @@ pub struct ExtractBigBlocksArgs {
     pub output: Option<PathBuf>,
 
     /// Number of source blocks to prefetch ahead.
-    ///
-    /// Big-block extraction currently fetches sequentially; this flag is accepted for CLI
-    /// compatibility with `extract` and future pipelining.
     #[arg(long, default_value = "20")]
     pub buffer_size: NonZeroUsize,
 
     /// Include and merge block access lists from eth_getBlockAccessListByBlockNumber.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     pub bal: bool,
 }
 
@@ -242,12 +239,12 @@ fn parse_gas_limit(value: &str) -> Result<u64, String> {
 // Extract implementation
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, serde::Serialize)]
-struct BigBlockData<T> {
-    env_switches: Vec<T>,
+#[derive(serde::Serialize)]
+struct BigBlockData {
+    env_switches: Vec<ExecutionData>,
     prior_block_hashes: Vec<(u64, B256)>,
     block_number: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     merged_block_access_list: Option<Bytes>,
 }
 
@@ -1032,7 +1029,6 @@ where
     let start = std::time::Instant::now();
     let mut emitted = 0_u64;
     let mut accumulated_block_hashes = Vec::new();
-    let mut first_source_block = None;
 
     // Buffered prefetch stream: keeps `buffer_size` block fetches in flight concurrently.
     let buffer_size = args.buffer_size.get();
@@ -1055,21 +1051,18 @@ where
                 .next()
                 .await
                 .ok_or_else(|| eyre::eyre!("block stream exhausted unexpectedly"))??;
-            first_source_block.get_or_insert(fetched.execution_data.block_number());
             accumulated_gas =
                 accumulated_gas.saturating_add(fetched.execution_data.payload.as_v1().gas_used);
             blocks.push(fetched.execution_data);
             block_access_lists.push(fetched.block_access_list);
         }
 
-        let merged_block_access_list = merge_block_access_lists(&blocks, block_access_lists);
-        let big_block = build_big_block(
-            blocks,
-            emitted,
-            first_source_block.unwrap_or(args.from),
-            accumulated_block_hashes.clone(),
-            merged_block_access_list,
-        )?;
+        let big_block = BigBlockData {
+            merged_block_access_list: merge_block_access_lists(&blocks, block_access_lists),
+            env_switches: blocks,
+            prior_block_hashes: accumulated_block_hashes.clone(),
+            block_number: args.from + emitted,
+        };
 
         for switch_data in &big_block.env_switches {
             accumulated_block_hashes.push((switch_data.block_number(), switch_data.block_hash()));
@@ -1145,25 +1138,6 @@ where
     let client =
         RpcClient::builder().layer(retry_layer).http(rpc.parse().wrap_err("invalid RPC URL")?);
     Ok(RootProvider::<N>::new(client))
-}
-
-fn build_big_block(
-    blocks: Vec<ExecutionData>,
-    big_block_idx: u64,
-    first_source_block: u64,
-    prior_block_hashes: Vec<(u64, B256)>,
-    merged_block_access_list: Option<Bytes>,
-) -> Result<BigBlockData<ExecutionData>> {
-    if blocks.is_empty() {
-        bail!("cannot build a big block with no source blocks");
-    }
-
-    Ok(BigBlockData {
-        env_switches: blocks,
-        prior_block_hashes,
-        block_number: first_source_block + big_block_idx,
-        merged_block_access_list,
-    })
 }
 
 #[cfg(test)]
