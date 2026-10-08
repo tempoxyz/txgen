@@ -860,7 +860,7 @@ pub(crate) fn unix_ms(time: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-fn duration_ms(duration: Duration) -> u64 {
+pub(crate) fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 

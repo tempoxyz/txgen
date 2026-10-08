@@ -1,8 +1,8 @@
 use super::{
     error::StepError,
     report::{
-        unix_ms, ChainReportConfig, InstanceFailure, InstanceOutcome, ProtocolMilestone,
-        ScenarioAccumulator, ScenarioReport, ScenarioReportConfig, StepOutcome,
+        duration_ms, unix_ms, ChainReportConfig, InstanceFailure, InstanceOutcome,
+        ProtocolMilestone, ScenarioAccumulator, ScenarioReport, ScenarioReportConfig, StepOutcome,
     },
     schema::{
         AccountSelection, BindingDef, ChainDef, ChainId, ObservationMode, ScenarioExecutionMode,
@@ -491,23 +491,17 @@ where
                 chain_id: chain.chain_id,
                 workload: chain.workload_path.display().to_string(),
                 observation_mode: observation_mode_name(chain.observation_mode).to_string(),
-                observation_poll_interval_ms: u64::try_from(
-                    chain.observation_poll_interval.as_millis(),
-                )
-                .unwrap_or(u64::MAX),
+                observation_poll_interval_ms: duration_ms(chain.observation_poll_interval),
                 subscription_configured: chain.observation_subscription_configured,
             })
             .collect();
         let report_configuration = ScenarioReportConfig {
             chains: chain_configuration,
             requested_instances: config.count,
-            run_duration_ms: config
-                .duration
-                .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+            run_duration_ms: config.duration.map(duration_ms),
             starts_per_second: config.starts_per_second,
             maximum_in_flight: config.max_in_flight,
-            default_step_timeout_ms: u64::try_from(self.default_step_timeout.as_millis())
-                .unwrap_or(u64::MAX),
+            default_step_timeout_ms: duration_ms(self.default_step_timeout),
             transaction_rate_per_chain: config.transaction_rate,
             maximum_rpc_in_flight_per_chain: config.max_rpc_in_flight,
             seed: config.seed,
@@ -2025,10 +2019,7 @@ where
                     ),
                     (
                         "acceptance_latency",
-                        RuntimeValue::Uint(U256::from(
-                            u64::try_from(submission.acceptance_latency.as_millis())
-                                .unwrap_or(u64::MAX),
-                        )),
+                        RuntimeValue::Uint(U256::from(duration_ms(submission.acceptance_latency))),
                     ),
                     ("receipt", receipt),
                 ]),
@@ -2858,9 +2849,7 @@ fn observation_milestone(
     clock: &RunClock,
 ) -> ProtocolMilestone {
     let since_first = observation.first_observed.monotonic.elapsed();
-    let first_offset_ms = clock
-        .offset_ms()
-        .saturating_sub(u64::try_from(since_first.as_millis()).unwrap_or(u64::MAX));
+    let first_offset_ms = clock.offset_ms().saturating_sub(duration_ms(since_first));
     ProtocolMilestone {
         kind: kind.to_string(),
         chain: chain.to_string(),
