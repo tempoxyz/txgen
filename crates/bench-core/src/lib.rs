@@ -37,8 +37,8 @@ pub use composition::{
     block_composition, BlockComposition, KindComposition, RunComposition, TransactionComposition,
 };
 pub use metrics::{
-    collect_block_stats, compute_latency_stats, trim_trailing_empty_blocks, BenchMetrics,
-    BlockStats, LatencySample, LatencyStats, MetricsCollector, MetricsCollectorOptions, RunStats,
+    collect_block_stats, compute_latency_stats, percentile, trim_trailing_empty_blocks,
+    BenchMetrics, BlockStats, LatencySample, LatencyStats, MetricsCollector, RunStats,
     ThroughputSample, TimeSeriesMetrics,
 };
 pub use prometheus::parse_prometheus_text;
