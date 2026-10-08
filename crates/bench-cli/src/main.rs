@@ -562,8 +562,9 @@ fn load_metric_names(path: Option<&PathBuf>) -> Result<Option<HashSet<String>>> 
     Ok(Some(names))
 }
 
-fn tracing_env_filter() -> tracing_subscriber::EnvFilter {
-    tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into())
+/// Log at INFO by default; `RUST_LOG` directives, including a bare level, take precedence.
+fn tracing_env_filter(rust_log: &str) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::builder().parse_lossy(format!("info,{rust_log}"))
 }
 
 fn allow_diagnostic_event(metadata: &tracing::Metadata<'_>) -> bool {
@@ -590,7 +591,8 @@ fn init_tracing() {
         Layer,
     };
 
-    let filter = tracing_env_filter().and(filter_fn(allow_diagnostic_event));
+    let rust_log = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).unwrap_or_default();
+    let filter = tracing_env_filter(&rust_log).and(filter_fn(allow_diagnostic_event));
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_filter(filter))
         .init();
@@ -945,6 +947,13 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["bench", "call", "-i", "c.jsonl", "--max-concurrent", "0"])
             .is_err());
+    }
+
+    #[test]
+    fn tracing_env_filter_defaults_to_info_and_honors_rust_log() {
+        assert_eq!(tracing_env_filter("").to_string(), "info");
+        assert_eq!(tracing_env_filter("debug").to_string(), "debug");
+        assert_eq!(tracing_env_filter("alloy=trace").to_string(), "alloy=trace,info");
     }
 
     #[test]
