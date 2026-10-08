@@ -4,9 +4,9 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 use txgen_cli::scenario::{execute_scenario, FailurePolicy, ScenarioExecutionConfig, ScenarioSpec};
@@ -46,35 +46,12 @@ struct ObservedRequest {
     transaction_hash: Option<B256>,
 }
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let suffix =
-            SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after epoch").as_nanos();
-        let path = std::env::temp_dir()
-            .join(format!("txgen-scenario-auth-{}-{suffix}", std::process::id()));
-        fs::create_dir_all(&path).expect("create temporary test directory");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routes_sender_authenticated_requests_separately_from_queries() {
     let shared = Arc::new(Mutex::new(SharedState::default()));
     let (submission_url, submission_server) = spawn_rpc(RpcRole::Submission, shared.clone()).await;
     let (query_url, query_server) = spawn_rpc(RpcRole::Query, shared.clone()).await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     let sender_zero = derive_mnemonic_signer(TEST_MNEMONIC, 0).unwrap().address();
     let sender_one = derive_mnemonic_signer(TEST_MNEMONIC, 1).unwrap().address();
 
@@ -182,7 +159,7 @@ async fn preflights_all_setup_sender_auth_before_dispatch() {
     let shared = Arc::new(Mutex::new(SharedState::default()));
     let (submission_url, submission_server) = spawn_rpc(RpcRole::Submission, shared.clone()).await;
     let (query_url, query_server) = spawn_rpc(RpcRole::Query, shared.clone()).await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     let sender_zero = derive_mnemonic_signer(TEST_MNEMONIC, 0).unwrap().address();
     let sender_one = derive_mnemonic_signer(TEST_MNEMONIC, 1).unwrap().address();
 

@@ -30,8 +30,6 @@ pub type SampleCallback = Arc<dyn Fn() -> Vec<Sample> + Send + Sync>;
 pub struct ScraperConfig {
     /// URL of the Prometheus metrics endpoint (e.g. `http://127.0.0.1:9001/metrics`).
     pub url: String,
-    /// Optional node label to add to scraped Prometheus samples.
-    pub node_label: Option<String>,
     /// Additional labels to add to scraped Prometheus samples.
     pub labels: BTreeMap<String, String>,
     /// Scrape interval.
@@ -45,17 +43,10 @@ impl ScraperConfig {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
-            node_label: None,
             labels: BTreeMap::new(),
             interval: Duration::from_millis(500),
             timeout: Duration::from_secs(2),
         }
-    }
-
-    /// Set the `node` label applied to scraped Prometheus samples.
-    pub fn with_node_label(mut self, label: impl Into<String>) -> Self {
-        self.node_label = Some(label.into());
-        self
     }
 
     /// Set labels applied to scraped Prometheus samples.
@@ -67,12 +58,6 @@ impl ScraperConfig {
     /// Set the scrape interval.
     pub fn with_interval(mut self, interval: Duration) -> Self {
         self.interval = interval;
-        self
-    }
-
-    /// Set the HTTP timeout.
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
         self
     }
 }
@@ -199,7 +184,7 @@ async fn scraper_loop(
             Ok(resp) => match resp.text().await {
                 Ok(text) => {
                     let mut samples = parse_prometheus_text(&text, offset_ms, unix_ms);
-                    apply_labels(&mut samples, config.node_label.as_deref(), &config.labels);
+                    apply_labels(&mut samples, &config.labels);
                     if !samples.is_empty() &&
                         let Err(err) = push_samples(&store, forwarder.as_ref(), samples).await
                     {
@@ -235,17 +220,8 @@ async fn push_samples(
     Ok(())
 }
 
-fn apply_labels(
-    samples: &mut [Sample],
-    node_label: Option<&str>,
-    labels: &BTreeMap<String, String>,
-) {
-    if let Some(node_label) = node_label {
-        for sample in &mut *samples {
-            sample.labels.insert("node".to_string(), node_label.to_string());
-        }
-    }
-    for sample in &mut *samples {
+fn apply_labels(samples: &mut [Sample], labels: &BTreeMap<String, String>) {
+    for sample in samples {
         sample.labels.extend(labels.iter().map(|(key, value)| (key.clone(), value.clone())));
     }
 }
@@ -298,47 +274,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_node_label_adds_label_to_all_samples() {
-        let mut samples = vec![
-            Sample {
-                name: "reth_db_size".to_string(),
-                labels: BTreeMap::new(),
-                value: 1.0,
-                offset_ms: 10,
-                unix_ms: 1000,
-            },
-            Sample {
-                name: "reth_table_size".to_string(),
-                labels: BTreeMap::from([("table".to_string(), "Headers".to_string())]),
-                value: 2.0,
-                offset_ms: 10,
-                unix_ms: 1000,
-            },
-        ];
-
-        apply_labels(&mut samples, Some("a"), &BTreeMap::new());
-
-        assert_eq!(samples[0].labels["node"], "a");
-        assert_eq!(samples[1].labels["node"], "a");
-        assert_eq!(samples[1].labels["table"], "Headers");
-    }
-
-    #[test]
-    fn apply_node_label_overwrites_existing_node_label() {
-        let mut samples = vec![Sample {
-            name: "reth_db_size".to_string(),
-            labels: BTreeMap::from([("node".to_string(), "old".to_string())]),
-            value: 1.0,
-            offset_ms: 10,
-            unix_ms: 1000,
-        }];
-
-        apply_labels(&mut samples, Some("new"), &BTreeMap::new());
-
-        assert_eq!(samples[0].labels["node"], "new");
-    }
-
-    #[test]
     fn apply_labels_adds_validator_identity() {
         let mut samples = vec![Sample {
             name: "reth_db_size".to_string(),
@@ -352,7 +287,7 @@ mod tests {
             ("validator".to_string(), "v0".to_string()),
         ]);
 
-        apply_labels(&mut samples, None, &labels);
+        apply_labels(&mut samples, &labels);
 
         assert_eq!(samples[0].labels["validator"], "v0");
         assert_eq!(samples[0].labels["region"], "us-east-1");

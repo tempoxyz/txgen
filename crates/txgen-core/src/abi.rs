@@ -184,6 +184,7 @@ fn parse_bytecode_str(value: &str) -> Result<Bytes> {
 
 /// Definition of a contract call in the workload spec.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CallDef {
     /// Target contract address.
     pub to: GenValue<Address>,
