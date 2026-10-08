@@ -37,23 +37,9 @@ impl RuntimeContext {
     /// Construct a context from a complete set of immutable roots.
     pub fn new(roots: BTreeMap<String, RuntimeValue>) -> Result<Self> {
         for name in roots.keys() {
-            validate_root_name(name)?;
+            validate_component(name, "runtime root")?;
         }
         Ok(Self { roots: Arc::new(roots) })
-    }
-
-    /// Return the context roots without allowing mutation.
-    pub fn roots(&self) -> &BTreeMap<String, RuntimeValue> {
-        &self.roots
-    }
-
-    /// Return a new context containing one additional root.
-    ///
-    /// Existing contexts and values remain immutable. Duplicate roots are rejected.
-    pub fn with_root(&self, name: impl Into<String>, value: RuntimeValue) -> Result<Self> {
-        let name = name.into();
-        validate_root_name(&name)?;
-        self.with_path(name, value)
     }
 
     /// Return a new context containing one additional value at a dotted save path.
@@ -391,15 +377,6 @@ pub fn coerce_event_filter(
     eval_expression(expression, context)?.coerce_dyn_sol(expected)
 }
 
-/// Compare an expected runtime filter to a decoded event value using the event ABI type.
-pub fn event_value_matches(
-    expected: &RuntimeValue,
-    actual: &DynSolValue,
-    sol_type: &DynSolType,
-) -> Result<bool> {
-    Ok(expected.coerce_dyn_sol(sol_type)? == *actual)
-}
-
 /// Collect all `{ var: path }` references nested within a YAML value.
 pub fn collect_variable_paths(value: &serde_yaml::Value) -> Result<BTreeSet<String>> {
     let mut paths = BTreeSet::new();
@@ -409,13 +386,7 @@ pub fn collect_variable_paths(value: &serde_yaml::Value) -> Result<BTreeSet<Stri
 
 /// Validate dotted runtime-variable path syntax without consulting a context.
 pub fn validate_variable_path(path: &str) -> Result<()> {
-    if path.is_empty() {
-        bail!("runtime variable path must not be empty");
-    }
-    if path.split('.').any(str::is_empty) {
-        bail!("runtime variable path '{path}' contains an empty component");
-    }
-    Ok(())
+    validate_path(path, "runtime variable")
 }
 
 fn collect_variable_paths_inner(
@@ -706,12 +677,25 @@ fn recognized_operator(value: &str) -> Option<&'static str> {
     }
 }
 
-fn validate_root_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        bail!("runtime root name must not be empty");
+pub(crate) fn validate_name(name: &str, context: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("{context} name must not be empty");
     }
+    Ok(())
+}
+
+pub(crate) fn validate_component(name: &str, context: &str) -> Result<()> {
+    validate_name(name, context)?;
     if name.contains('.') {
-        bail!("runtime root name '{name}' must not contain '.'");
+        bail!("{context} '{name}' must be one name component and cannot contain '.'");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_path(path: &str, context: &str) -> Result<()> {
+    validate_name(path, context)?;
+    if path.split('.').any(str::is_empty) {
+        bail!("{context} '{path}' contains an empty path component");
     }
     Ok(())
 }
@@ -800,11 +784,15 @@ mod tests {
     #[test]
     fn contexts_are_immutable_and_reject_duplicate_roots() {
         let original = RuntimeContext::empty();
-        let extended = original.with_root("saved", RuntimeValue::Bool(true)).unwrap();
+        let extended = original.with_path("saved", RuntimeValue::Bool(true)).unwrap();
         assert!(original.get("saved").is_err());
         assert_eq!(extended.get("saved").unwrap(), &RuntimeValue::Bool(true));
-        assert!(extended.with_root("saved", RuntimeValue::Bool(false)).is_err());
-        assert!(extended.with_root("bad.root", RuntimeValue::Null).is_err());
+        assert!(extended.with_path("saved", RuntimeValue::Bool(false)).is_err());
+        assert!(RuntimeContext::new(BTreeMap::from([(
+            "bad.root".to_string(),
+            RuntimeValue::Null
+        )]))
+        .is_err());
     }
 
     #[test]
@@ -825,7 +813,7 @@ mod tests {
         assert!(second.with_path("transfer.receipt", RuntimeValue::Bool(false)).is_err());
         assert!(second.with_path("transfer", RuntimeValue::Null).is_err());
         assert!(RuntimeContext::empty()
-            .with_root("transfer", RuntimeValue::Null)
+            .with_path("transfer", RuntimeValue::Null)
             .unwrap()
             .with_path("transfer.receipt", RuntimeValue::Bool(true))
             .is_err());
@@ -839,9 +827,9 @@ mod tests {
         let (first, second) = tokio::join!(
             async move {
                 tokio::task::yield_now().await;
-                first_base.with_root("result", RuntimeValue::Uint(U256::from(1)))
+                first_base.with_path("result", RuntimeValue::Uint(U256::from(1)))
             },
-            async move { second_base.with_root("result", RuntimeValue::Uint(U256::from(2))) },
+            async move { second_base.with_path("result", RuntimeValue::Uint(U256::from(2))) },
         );
         let first = first.unwrap();
         let second = second.unwrap();
@@ -1191,18 +1179,5 @@ outer:
             runtime[4],
             RuntimeValue::Array(vec![RuntimeValue::String("value".to_string())])
         );
-    }
-
-    #[test]
-    fn event_value_equality_uses_expected_type() {
-        let expected = RuntimeValue::Uint(U256::from(7));
-        let actual = DynSolValue::Uint(U256::from(7), 128);
-        assert!(event_value_matches(&expected, &actual, &DynSolType::Uint(128)).unwrap());
-        assert!(!event_value_matches(
-            &RuntimeValue::Uint(U256::from(8)),
-            &actual,
-            &DynSolType::Uint(128)
-        )
-        .unwrap());
     }
 }
