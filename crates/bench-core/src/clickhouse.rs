@@ -134,11 +134,6 @@ impl ClickHouseClient {
                 .append_pair("wait_for_async_insert", "1");
         }
 
-        let rt = tokio::runtime::Handle::try_current()
-            .context("ClickHouse inserts require a Tokio runtime")?;
-        if !matches!(rt.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread) {
-            bail!("ClickHouse inserts require a multi-threaded Tokio runtime");
-        }
         let mut req = self.client.post(url).header("Content-Type", "application/json");
         if let Some(ref user) = self.user {
             req = req.header("X-ClickHouse-User", user);
@@ -146,13 +141,12 @@ impl ClickHouseClient {
         if let Some(ref password) = self.password {
             req = req.header("X-ClickHouse-Key", password);
         }
-        let resp = tokio::task::block_in_place(|| rt.block_on(req.body(body).send()))
+        let resp = crate::block_on(req.body(body).send())?
             .wrap_err_with(|| format!("failed to insert into {table}"))?;
 
         let status = resp.status();
         if !status.is_success() {
-            let body = tokio::task::block_in_place(|| rt.block_on(resp.text()))
-                .unwrap_or_else(|_| "<no body>".to_string());
+            let body = crate::block_on(resp.text())?.unwrap_or_else(|_| "<no body>".to_string());
             bail!("ClickHouse insert into {table} failed (HTTP {status}): {body}");
         }
 
