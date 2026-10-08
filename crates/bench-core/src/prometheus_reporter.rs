@@ -71,15 +71,9 @@ pub struct PrometheusConfig {
 }
 
 impl PrometheusConfig {
-    /// Build a config from a base URL and the user `--metadata` map.
-    ///
-    /// Metadata labels are applied to samples before reporters run; this
-    /// config only reads connection knobs (auth, tenant, batching) from
-    /// environment variables. See the module docs for the list.
-    pub fn from_metadata(
-        base_url: &str,
-        _metadata: &std::collections::HashMap<String, String>,
-    ) -> Result<Self> {
+    /// Build a config from a base URL, reading connection knobs (auth, tenant,
+    /// batching) from environment variables. See the module docs for the list.
+    pub fn from_env(base_url: &str) -> Result<Self> {
         let bearer_token = std::env::var("PROMETHEUS_BEARER_TOKEN").ok().filter(|s| !s.is_empty());
         let basic_auth = match (
             std::env::var("PROMETHEUS_USER").ok(),
@@ -689,12 +683,8 @@ mod tests {
     }
 
     #[test]
-    fn config_trims_url_and_does_not_forward_metadata_as_extra_labels() {
-        let metadata = std::collections::HashMap::from([
-            ("git-sha".to_string(), "abc".to_string()),
-            ("scenario".to_string(), "tip20".to_string()),
-        ]);
-        let cfg = PrometheusConfig::from_metadata("http://prometheus:8428/", &metadata).unwrap();
+    fn config_trims_base_url() {
+        let cfg = PrometheusConfig::from_env("http://prometheus:8428/").unwrap();
         let reporter = PrometheusReporter::new(cfg.clone()).unwrap();
 
         assert_eq!(cfg.base_url, "http://prometheus:8428");
@@ -719,8 +709,7 @@ mod tests {
             bodies
         });
 
-        let mut cfg =
-            PrometheusConfig::from_metadata(&base_url, &std::collections::HashMap::new()).unwrap();
+        let mut cfg = PrometheusConfig::from_env(&base_url).unwrap();
         cfg.batch_size = 2;
         cfg.timeout = Duration::from_secs(5);
 
@@ -778,8 +767,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut cfg =
-            PrometheusConfig::from_metadata(&base_url, &std::collections::HashMap::new()).unwrap();
+        let mut cfg = PrometheusConfig::from_env(&base_url).unwrap();
         cfg.batch_size = 2;
         cfg.encode_workers = 2;
         cfg.timeout = Duration::from_secs(5);
