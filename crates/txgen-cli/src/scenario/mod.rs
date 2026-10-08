@@ -3,7 +3,7 @@
 use alloy_consensus::{SignableTransaction, Signed};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_network::Network;
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{Args, Subcommand};
 use eyre::{bail, Result, WrapErr};
 use rand::Rng;
 use std::{collections::BTreeMap, io::Write, path::PathBuf, time::Duration};
@@ -102,8 +102,8 @@ pub struct ScenarioRunArgs {
     pub seed: Option<u64>,
 
     /// Behavior after an instance fails.
-    #[arg(long, value_enum, default_value_t = FailurePolicyArg::Continue)]
-    failure_policy: FailurePolicyArg,
+    #[arg(long, value_enum, default_value_t = FailurePolicy::Continue)]
+    failure_policy: FailurePolicy,
 
     /// Maximum transaction submissions per second on each chain (0 = unlimited).
     #[arg(long, default_value_t = 0)]
@@ -124,21 +124,6 @@ pub struct ScenarioRunArgs {
     /// Include the first N individual lifecycle records in the report.
     #[arg(long, default_value_t = 0)]
     pub sample_instances: usize,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum FailurePolicyArg {
-    FailFast,
-    Continue,
-}
-
-impl From<FailurePolicyArg> for FailurePolicy {
-    fn from(value: FailurePolicyArg) -> Self {
-        match value {
-            FailurePolicyArg::FailFast => Self::FailFast,
-            FailurePolicyArg::Continue => Self::Continue,
-        }
-    }
 }
 
 pub(crate) async fn run_scenario_command<A>(args: ScenarioArgs) -> Result<()>
@@ -228,7 +213,7 @@ where
             max_in_flight: args.max_in_flight,
             step_timeout: args.step_timeout,
             seed,
-            failure_policy: args.failure_policy.into(),
+            failure_policy: args.failure_policy,
             transaction_rate: args.tx_rate,
             max_rpc_in_flight: args.max_rpc_in_flight,
             sample_instances: args.sample_instances,

@@ -54,7 +54,7 @@ const FALLBACK_STEP_TIMEOUT: Duration = Duration::from_secs(300);
 const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Failure behavior after one scenario instance fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum FailurePolicy {
     /// Stop starting new instances; allow already-started instances to finish.
     FailFast,
