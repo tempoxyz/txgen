@@ -43,6 +43,10 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     let mut metadata = parse_metadata(&args.metadata)?;
     metadata
         .insert("max_pending".to_string(), max_pending.map_or(0, |limit| limit.get()).to_string());
+    if let (Some(payments), Some(general)) = (args.max_pending_payments, args.max_pending_general) {
+        metadata.insert("max_pending_payments".to_string(), payments.to_string());
+        metadata.insert("max_pending_general".to_string(), general.to_string());
+    }
     let scraper_configs =
         metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
 
@@ -170,6 +174,13 @@ async fn execute_source<S: TxSource>(
             .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
     if let Some(limit) = args.pending_limit()? {
         sender = sender.with_max_pending(limit);
+    }
+    if let (Some(payments), Some(general)) = (args.max_pending_payments, args.max_pending_general) {
+        sender = sender.with_split_pending_limits(
+            payments,
+            general,
+            Arc::new(txgen_tempo::pending_class),
+        );
     }
     if let Some(late_signer) = late_signer {
         sender = sender.with_late_signer(late_signer);

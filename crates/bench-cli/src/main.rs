@@ -126,6 +126,15 @@ pub struct SendArgs {
     #[arg(long)]
     pub max_pending: Option<u64>,
 
+    /// Experimental pending payment budget for independent Tempo expiring transactions.
+    /// Full classes skip offered transactions before submission so the other can advance.
+    #[arg(long, requires = "max_pending_general", conflicts_with = "max_pending")]
+    pub max_pending_payments: Option<NonZeroUsize>,
+
+    /// Experimental pending general budget; requires --max-pending-payments.
+    #[arg(long, requires = "max_pending_payments", conflicts_with = "max_pending")]
+    pub max_pending_general: Option<NonZeroUsize>,
+
     /// Number of times to retry failed transaction submissions.
     ///
     /// Set to 0 to never retry. If omitted, retries forever.
@@ -212,6 +221,9 @@ pub struct SendArgs {
 
 impl SendArgs {
     fn pending_limit(&self) -> Result<Option<NonZeroUsize>> {
+        if self.max_pending_payments.is_some() {
+            return Ok(None);
+        }
         let limit = usize::try_from(self.max_pending.unwrap_or(self.tps))
             .context("pending limit exceeds this platform's capacity")?;
         Ok(NonZeroUsize::new(limit))
@@ -688,6 +700,32 @@ mod tests {
                 panic!("expected send command");
             };
             assert_eq!(args.pending_limit().unwrap().map(NonZeroUsize::get), expected);
+        }
+    }
+
+    #[test]
+    fn test_split_pending_flags_require_two_nonzero_exclusive_limits() {
+        let flags = ["--max-pending-payments", "40000", "--max-pending-general", "10000"];
+        let cli = Cli::try_parse_from(["bench", "send", "--tps", "50000"].into_iter().chain(flags))
+            .unwrap();
+        let Command::Send(args) = cli.command else { panic!("expected send command") };
+        assert_eq!(args.pending_limit().unwrap(), None);
+        assert_eq!(args.max_pending_payments.unwrap().get(), 40000);
+        assert_eq!(args.max_pending_general.unwrap().get(), 10000);
+        for invalid in [
+            vec!["--max-pending-payments", "40000"],
+            vec!["--max-pending-general", "10000"],
+            vec!["--max-pending-payments", "0", "--max-pending-general", "10000"],
+            vec![
+                "--max-pending-payments",
+                "40000",
+                "--max-pending-general",
+                "10000",
+                "--max-pending",
+                "50000",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(["bench", "send"].into_iter().chain(invalid)).is_err());
         }
     }
 

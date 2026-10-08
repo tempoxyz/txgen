@@ -3,7 +3,7 @@
 use alloy_consensus::SignableTransaction;
 use alloy_eips::eip2718::Encodable2718;
 use alloy_network::{NetworkTransactionBuilder, TxSignerSync};
-use alloy_primitives::Bytes;
+use alloy_primitives::{Bytes, Signature, U256};
 use alloy_signer::SignerSync;
 use eyre::{bail, Result, WrapErr};
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tempo_alloy::rpc::TempoTransactionRequest;
-use tempo_primitives::{transaction::TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS, TempoTxEnvelope};
+use tempo_primitives::{
+    transaction::TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS, TempoSignature, TempoTxEnvelope,
+};
 use txgen_core::{AccountManager, LateSignSpec, WorkloadSpec};
 
 /// Discriminator for relative Tempo expiring-nonce signing.
@@ -60,6 +62,26 @@ impl TempoExpiringPayload {
             );
         }
         Ok(serde_json::from_value(spec.payload.clone())?)
+    }
+
+    /// Classify the unsigned request without assigning an expiry or signing it.
+    pub fn pending_class(self) -> Result<bench_core::sender::PendingClass> {
+        let tx = self
+            .request
+            .build_aa()
+            .map_err(|error| eyre::eyre!("invalid Tempo request: {error}"))?;
+        if !tx.is_expiring_nonce_tx() {
+            bail!("split pending limits require expiring-nonce transactions");
+        }
+        // Payment classification does not examine the outer signature. This envelope
+        // exists only for classification and is never encoded or submitted.
+        let signature = TempoSignature::from(Signature::new(U256::ZERO, U256::ZERO, false));
+        let envelope = TempoTxEnvelope::AA(tx.into_signed(signature));
+        Ok(if envelope.is_payment_v2() {
+            bench_core::sender::PendingClass::Payment
+        } else {
+            bench_core::sender::PendingClass::General
+        })
     }
 }
 

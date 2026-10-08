@@ -65,6 +65,23 @@ pub fn transaction_expiry(raw: &Bytes) -> Option<u64> {
         .map(NonZeroU64::get)
 }
 
+/// Classify independent expiring transactions using Tempo's T5 payment rules.
+/// Other transaction types must not be omitted by split pending admission.
+pub fn pending_class(tx: &GeneratedTx) -> Result<bench_core::sender::PendingClass> {
+    if let Some(spec) = &tx.late_sign {
+        return TempoExpiringPayload::from_spec(spec)?.pending_class();
+    }
+    let envelope = TempoTxEnvelope::decode_2718(&mut tx.raw.as_ref())?;
+    if !envelope.is_expiring_nonce() {
+        bail!("split pending limits require expiring-nonce transactions");
+    }
+    Ok(if envelope.is_payment_v2() {
+        bench_core::sender::PendingClass::Payment
+    } else {
+        bench_core::sender::PendingClass::General
+    })
+}
+
 /// Tempo network adapter for transaction generation.
 ///
 /// Supports all Ethereum transaction types (legacy, EIP-2930, EIP-1559)
@@ -1748,6 +1765,63 @@ nonce_key:
         assert_ne!(tx_req.key, sender.0 .0);
         let generated = sign_tempo_request(tx_req, &ctx, "expiry");
         assert_eq!(transaction_expiry(&generated.raw), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn test_pending_class_agrees_for_signed_and_deferred_expiring_transactions() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        ctx.set_defer_signing(true);
+
+        for payment in [false, true] {
+            let mut template = base_template(TempoTxType::Tempo);
+            template.expiring_nonce = true;
+            template.valid_for_secs = Some(25);
+            template.value = GenValue::Literal(U256::ZERO);
+            if payment {
+                template.to = Some(GenValue::Literal(
+                    "0x20c0000000000000000000000000000000000001".parse().unwrap(),
+                ));
+                // transfer(address,uint256), with two ABI words.
+                let mut input = vec![0xa9, 0x05, 0x9c, 0xbb];
+                input.resize(68, 0);
+                template.input = Some(GenValue::Literal(Bytes::from(input)));
+            }
+            let request = TempoAdapter::new().build_request(template, &mut ctx).unwrap();
+            let spec = request.late_sign.unwrap();
+            let payload = TempoExpiringPayload::from_spec(&spec).unwrap();
+            let expected = if payment {
+                bench_core::sender::PendingClass::Payment
+            } else {
+                bench_core::sender::PendingClass::General
+            };
+            assert_eq!(payload.clone().pending_class().unwrap(), expected);
+            let mut tx = GeneratedTx {
+                depends_on: vec![],
+                phase: TxPhase::Workload,
+                id: None,
+                raw: sign_tempo_expiring(&payload, &accounts).unwrap(),
+                late_sign: None,
+                sender: None,
+                submission_keys: vec![],
+                inclusion_keys: vec![],
+            };
+            assert_eq!(pending_class(&tx).unwrap(), expected);
+            tx.raw = Bytes::new();
+            tx.late_sign = Some(spec);
+            assert_eq!(pending_class(&tx).unwrap(), expected);
+        }
+        let request =
+            TempoAdapter::new().build_request(base_template(TempoTxType::Tempo), &mut ctx).unwrap();
+        let generated = sign_tempo_request(request, &ctx, "ordered");
+        assert_eq!(
+            pending_class(&generated).unwrap_err().to_string(),
+            "split pending limits require expiring-nonce transactions"
+        );
     }
 
     #[test]
