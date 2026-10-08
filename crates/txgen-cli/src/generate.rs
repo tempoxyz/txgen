@@ -8,6 +8,7 @@ use alloy_primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
 use alloy_provider::{DynProvider, Provider};
 use clap::{ArgGroup, Args};
 use eyre::{bail, Result, WrapErr};
+use futures::{stream, StreamExt};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::{
@@ -30,6 +31,7 @@ fn default_signing_workers() -> usize {
 
 const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const GAS_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+const NONCE_FETCH_CONCURRENCY: usize = 32;
 
 #[derive(Args)]
 #[command(group(
@@ -933,23 +935,31 @@ async fn fetch_protocol_nonces_with_state(
         let started = Instant::now();
         let mut last_progress = started;
         eprintln!("fetching {state} nonces for {pool_name} ({total} accounts)...");
-        for (idx, address) in addresses.iter().enumerate() {
-            let request = Provider::get_transaction_count(&provider, *address);
-            let request = if pending { request.pending() } else { request.latest() };
-            let nonce = tokio::time::timeout(std::time::Duration::from_secs(10), request)
-                .await
-                .wrap_err_with(|| format!("timeout fetching nonce for {}[{}]", pool_name, idx))?
-                .wrap_err_with(|| {
-                    format!("failed to fetch nonce for {}[{}] ({})", pool_name, idx, address)
-                })?;
-
-            let scheduling_key = address.0 .0;
-            nonces.reset(scheduling_key, nonce);
+        let mut fetches = stream::iter(addresses.into_iter().enumerate())
+            .map(|(idx, address)| {
+                let provider = &provider;
+                async move {
+                    let request = Provider::get_transaction_count(provider, address);
+                    let request = if pending { request.pending() } else { request.latest() };
+                    let nonce = tokio::time::timeout(std::time::Duration::from_secs(10), request)
+                        .await
+                        .wrap_err_with(|| format!("timeout fetching nonce for {pool_name}[{idx}]"))?
+                        .wrap_err_with(|| {
+                            format!("failed to fetch nonce for {pool_name}[{idx}] ({address})")
+                        })?;
+                    Ok::<_, eyre::Report>((address, nonce))
+                }
+            })
+            .buffer_unordered(NONCE_FETCH_CONCURRENCY);
+        let mut completed = 0;
+        while let Some(result) = fetches.next().await {
+            let (address, nonce) = result?;
+            nonces.reset(address.0 .0, nonce);
+            completed += 1;
 
             if last_progress.elapsed() >= PROGRESS_LOG_INTERVAL {
                 eprintln!(
-                    "nonce prefetch progress: pool={pool_name} completed={} total={total} state={state} elapsed={:?}",
-                    idx + 1,
+                    "nonce prefetch progress: pool={pool_name} completed={completed} total={total} state={state} elapsed={:?}",
                     started.elapsed(),
                 );
                 last_progress = Instant::now();
