@@ -127,6 +127,13 @@ fn choose_yaml_value<'a>(
     Ok(&choices[idx])
 }
 
+fn choose<T: DeserializeOwned>(
+    choices: &[serde_yaml::Value],
+    resolver: &mut ValueResolver<'_>,
+) -> Result<T> {
+    Ok(serde_yaml::from_value(choose_yaml_value(choices, resolver)?.clone())?)
+}
+
 fn yaml_i128(value: &serde_yaml::Value, context: &str) -> Result<i128> {
     serde_yaml::from_value(value.clone())
         .map_err(|err| eyre::eyre!("{context} must be an integer: {err}"))
@@ -167,10 +174,7 @@ impl FromGenerator for u64 {
         match generator {
             Generator::Uniform(range) => Ok(sample_uniform_i128(range, resolver)?.try_into()?),
             Generator::Const(v) => Ok(serde_yaml::from_value(v.clone())?),
-            Generator::Choice(choices) => {
-                let idx = resolver.rng.random_range(0..choices.len());
-                Ok(serde_yaml::from_value(choices[idx].clone())?)
-            }
+            Generator::Choice(choices) => choose(choices, resolver),
             Generator::Random => Ok(resolver.rng.random()),
             _ => {
                 bail!("cannot generate u64 from {:?}", generator);
@@ -184,10 +188,7 @@ impl FromGenerator for u128 {
         match generator {
             Generator::Uniform(range) => Ok(sample_uniform_i128(range, resolver)?.try_into()?),
             Generator::Const(v) => Ok(serde_yaml::from_value(v.clone())?),
-            Generator::Choice(choices) => {
-                let idx = resolver.rng.random_range(0..choices.len());
-                Ok(serde_yaml::from_value(choices[idx].clone())?)
-            }
+            Generator::Choice(choices) => choose(choices, resolver),
             Generator::Random => Ok(resolver.rng.random()),
             _ => {
                 bail!("cannot generate u128 from {:?}", generator);
@@ -213,17 +214,7 @@ impl FromGenerator for U256 {
                     bail!("cannot parse U256 from {:?}", v);
                 }
             }
-            Generator::Choice(choices) => {
-                let idx = resolver.rng.random_range(0..choices.len());
-                let v = &choices[idx];
-                if let Some(n) = v.as_u64() {
-                    Ok(U256::from(n))
-                } else if let Some(s) = v.as_str() {
-                    Ok(s.parse()?)
-                } else {
-                    bail!("cannot parse U256 from {:?}", v);
-                }
-            }
+            Generator::Choice(choices) => choose(choices, resolver),
             Generator::Random => Ok(resolver.rng.random()),
             _ => {
                 bail!("cannot generate U256 from {:?}", generator);
@@ -250,11 +241,7 @@ impl FromGenerator for Address {
                 let s: String = serde_yaml::from_value(v.clone())?;
                 Ok(s.parse()?)
             }
-            Generator::Choice(choices) => {
-                let idx = resolver.rng.random_range(0..choices.len());
-                let s: String = serde_yaml::from_value(choices[idx].clone())?;
-                Ok(s.parse()?)
-            }
+            Generator::Choice(choices) => choose(choices, resolver),
             Generator::Random => Ok(resolver.rng.random()),
             _ => {
                 bail!("cannot generate Address from {:?}", generator);
@@ -297,11 +284,7 @@ impl FromGenerator for B256 {
                 let s: String = serde_yaml::from_value(v.clone())?;
                 Ok(s.parse()?)
             }
-            Generator::Choice(choices) => {
-                let idx = resolver.rng.random_range(0..choices.len());
-                let s: String = serde_yaml::from_value(choices[idx].clone())?;
-                Ok(s.parse()?)
-            }
+            Generator::Choice(choices) => choose(choices, resolver),
             Generator::Random => Ok(resolver.rng.random()),
             _ => {
                 bail!("cannot generate B256 from {:?}", generator);
@@ -314,10 +297,7 @@ impl FromGenerator for String {
     fn from_generator(generator: &Generator, resolver: &mut ValueResolver<'_>) -> Result<Self> {
         match generator {
             Generator::Const(v) => Ok(serde_yaml::from_value(v.clone())?),
-            Generator::Choice(choices) => {
-                let idx = resolver.rng.random_range(0..choices.len());
-                Ok(serde_yaml::from_value(choices[idx].clone())?)
-            }
+            Generator::Choice(choices) => choose(choices, resolver),
             _ => {
                 bail!("cannot generate String from {:?}", generator);
             }
@@ -489,5 +469,19 @@ uniform:
 
         assert_eq!(address, expected);
         Ok(())
+    }
+
+    #[test]
+    fn test_empty_choice_fails() {
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
+        let generator = Generator::Choice(Vec::new());
+
+        assert!(u64::from_generator(&generator, &mut resolver).is_err());
+        assert!(u128::from_generator(&generator, &mut resolver).is_err());
+        assert!(U256::from_generator(&generator, &mut resolver).is_err());
+        assert!(Address::from_generator(&generator, &mut resolver).is_err());
+        assert!(B256::from_generator(&generator, &mut resolver).is_err());
+        assert!(String::from_generator(&generator, &mut resolver).is_err());
     }
 }
