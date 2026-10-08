@@ -317,6 +317,7 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
             writeln!(self.writer, "  Total Sent:      {:>10}", metrics.sent)?;
             writeln!(self.writer, "  Successful:      {:>10}", metrics.success)?;
             writeln!(self.writer, "  Failed:          {:>10}", metrics.failed)?;
+            writeln!(self.writer, "  Not Included:    {:>10}", metrics.inclusion_failed)?;
             writeln!(self.writer)?;
             writeln!(self.writer, "  Duration:        {:>10.2}s", metrics.elapsed.as_secs_f64())?;
             writeln!(self.writer, "  Throughput:      {:>10.2} tx/s", metrics.tps())?;
@@ -400,6 +401,9 @@ pub struct JsonReport {
     /// Failed transactions (send mode).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed: Option<u64>,
+    /// Accepted transactions that reverted, expired, or were not confirmed included (send mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inclusion_failed: Option<u64>,
     /// Elapsed time in seconds (send mode).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_secs: Option<f64>,
@@ -597,6 +601,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             sent,
             success,
             failed,
+            inclusion_failed: report.bench_metrics.as_ref().map(|metrics| metrics.inclusion_failed),
             elapsed_secs,
             tps,
             success_rate,
@@ -1076,6 +1081,7 @@ mod tests {
             sent: 1000,
             success: 950,
             failed: 50,
+            inclusion_failed: 0,
             elapsed: Duration::from_secs(10),
             latency: Some(LatencyStats {
                 min: Duration::from_millis(1),

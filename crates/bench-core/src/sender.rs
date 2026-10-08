@@ -1508,19 +1508,19 @@ async fn submit_tx(
                     %tx_hash,
                     "Transaction reverted",
                 );
-                metrics.record_failure();
+                metrics.record_inclusion_failure();
             }
             Ok(())
         }
         Ok(Inclusion::Expired) => {
             tracing::debug!(%tx_hash, "Transaction expired before inclusion");
-            metrics.record_failure();
+            metrics.record_inclusion_failure();
             Ok(())
         }
         Err(error) => {
             // The tracker only returns static diagnostics without RPC credentials.
             tracing::error!(%error, %tx_hash, "Failed waiting for transaction inclusion");
-            metrics.record_failure();
+            metrics.record_inclusion_failure();
             Err(error)
         }
     };

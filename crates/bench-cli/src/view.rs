@@ -19,6 +19,7 @@ pub fn execute(args: ViewArgs) -> Result<()> {
             sent,
             success: report.success.unwrap_or(0),
             failed: report.failed.unwrap_or(0),
+            inclusion_failed: report.inclusion_failed.unwrap_or(0),
             elapsed: Duration::from_secs_f64(report.elapsed_secs.unwrap_or(0.0)),
             latency: report.latency.map(|lat| LatencyStats {
                 min: Duration::from_secs_f64(lat.min_ms / 1000.0),
