@@ -329,14 +329,9 @@ impl SampleStore {
         Ok(SampleArchive { path: inner.path.clone(), len: inner.len, retain_until_unix_ms: None })
     }
 
-    /// Number of samples currently stored.
-    pub async fn len(&self) -> usize {
+    #[cfg(test)]
+    async fn len(&self) -> usize {
         self.inner.lock().await.len
-    }
-
-    /// Whether the store is empty.
-    pub async fn is_empty(&self) -> bool {
-        self.len().await == 0
     }
 }
 
@@ -382,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn push_and_iterate_archive() {
         let store = SampleStore::new().unwrap();
-        assert!(store.is_empty().await);
+        assert_eq!(store.len().await, 0);
 
         store.push_batch(vec![make_sample("a", 1.0, 0), make_sample("b", 2.0, 100)]).await.unwrap();
 

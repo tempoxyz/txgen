@@ -3,7 +3,7 @@
 use alloy_consensus::{SignableTransaction, Signed};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_network::Network;
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{Args, Subcommand};
 use eyre::{bail, Result, WrapErr};
 use rand::Rng;
 use std::{collections::BTreeMap, io::Write, path::PathBuf, time::Duration};
@@ -29,8 +29,8 @@ pub use report::{
 };
 pub use schema::*;
 pub use value::{
-    coerce_event_filter, collect_variable_paths, eval_expression, event_value_matches,
-    materialize_yaml, RuntimeContext, RuntimeValue,
+    coerce_event_filter, collect_variable_paths, eval_expression, materialize_yaml, RuntimeContext,
+    RuntimeValue,
 };
 
 /// Nested `scenario` command.
@@ -102,8 +102,8 @@ pub struct ScenarioRunArgs {
     pub seed: Option<u64>,
 
     /// Behavior after an instance fails.
-    #[arg(long, value_enum, default_value_t = FailurePolicyArg::Continue)]
-    failure_policy: FailurePolicyArg,
+    #[arg(long, value_enum, default_value_t = FailurePolicy::Continue)]
+    failure_policy: FailurePolicy,
 
     /// Maximum transaction submissions per second on each chain (0 = unlimited).
     #[arg(long, default_value_t = 0)]
@@ -124,21 +124,6 @@ pub struct ScenarioRunArgs {
     /// Include the first N individual lifecycle records in the report.
     #[arg(long, default_value_t = 0)]
     pub sample_instances: usize,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum FailurePolicyArg {
-    FailFast,
-    Continue,
-}
-
-impl From<FailurePolicyArg> for FailurePolicy {
-    fn from(value: FailurePolicyArg) -> Self {
-        match value {
-            FailurePolicyArg::FailFast => Self::FailFast,
-            FailurePolicyArg::Continue => Self::Continue,
-        }
-    }
 }
 
 pub(crate) async fn run_scenario_command<A>(args: ScenarioArgs) -> Result<()>
@@ -204,9 +189,6 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    if args.count == Some(0) {
-        bail!("--count must be greater than zero");
-    }
     let destinations = ScenarioReportDestinations::parse(&args.reports)?;
     let metadata: BTreeMap<_, _> = bench_core::parse_metadata(&args.metadata)?;
     let spec = ScenarioSpec::load(&args.scenario)?;
@@ -228,7 +210,7 @@ where
             max_in_flight: args.max_in_flight,
             step_timeout: args.step_timeout,
             seed,
-            failure_policy: args.failure_policy.into(),
+            failure_policy: args.failure_policy,
             transaction_rate: args.tx_rate,
             max_rpc_in_flight: args.max_rpc_in_flight,
             sample_instances: args.sample_instances,
@@ -280,20 +262,8 @@ impl ScenarioReportDestinations {
 }
 
 fn canonical_clickhouse_url(value: &str) -> Result<String> {
-    let mut url = url::Url::parse(value).wrap_err("invalid scenario ClickHouse report URL")?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        bail!("scenario ClickHouse report URL must use HTTP or HTTPS");
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        bail!(
-            "scenario ClickHouse report URL must not contain credentials; use CLICKHOUSE_USER and CLICKHOUSE_PASSWORD"
-        );
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        bail!("scenario ClickHouse report URL must not contain a query string or fragment");
-    }
-    let path = url.path().trim_end_matches('/').to_string();
-    url.set_path(if path.is_empty() { "/" } else { &path });
+    let url = bench_core::clickhouse::parse_endpoint(value)
+        .wrap_err("invalid scenario ClickHouse report URL")?;
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
 

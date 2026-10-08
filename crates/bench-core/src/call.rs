@@ -17,7 +17,7 @@
 //! Diagnostics identify records by their 1-based line number so a corpus of
 //! captured traffic stays usable in a public CI log.
 
-use crate::reporter::JsonLatency;
+use crate::{metrics::percentile, reporter::JsonLatency};
 use alloy_primitives::{hex, keccak256, Keccak256, B256};
 use eyre::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -33,10 +33,16 @@ use std::{
 const MAX_ERROR_CAPTURE: usize = 64 * 1024;
 
 /// The shape a `meta.label` must have, as documented in errors.
-const LABEL_PATTERN: &str = "^[A-Za-z0-9._+:-]{1,48}$";
+pub const LABEL_PATTERN: &str = "^[A-Za-z0-9._+:-]{1,48}$";
 
 /// Maximum length of a `meta.label`.
 const MAX_LABEL_LEN: usize = 48;
+
+/// Whether `label` matches [`LABEL_PATTERN`].
+pub fn is_valid_label(label: &str) -> bool {
+    (1..=MAX_LABEL_LEN).contains(&label.len()) &&
+        label.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._+:-".contains(&byte))
+}
 
 /// Maximum length of a member key tracked while scanning a response.
 const MAX_KEY_LEN: usize = 32;
@@ -142,11 +148,6 @@ impl Corpus {
         self.records.is_empty()
     }
 
-    /// Retained record count per reporting key.
-    pub fn counts_per_method(&self) -> &BTreeMap<Arc<str>, usize> {
-        &self.counts
-    }
-
     /// Record count per reporting key dropped by the `--methods` filter.
     pub fn skipped_per_method(&self) -> &BTreeMap<Arc<str>, usize> {
         &self.skipped
@@ -193,10 +194,8 @@ impl CorpusRecord {
     }
 
     /// Parse the request parameters back out of the stored body.
-    ///
-    /// Re-parses on every call; intended for diagnostics and tests, not for
-    /// the replay path, which sends [`body`](Self::body) as is.
-    pub fn params(&self) -> Result<serde_json::Value> {
+    #[cfg(test)]
+    fn params(&self) -> Result<serde_json::Value> {
         let request: serde_json::Value = serde_json::from_str(&self.body)?;
         Ok(request["params"].clone())
     }
@@ -491,7 +490,8 @@ impl ResponseScanner {
     /// Bounded regardless of response size: a `result` member is hashed as it
     /// arrives and never accumulated, and a captured `error` member stops at
     /// [`MAX_ERROR_CAPTURE`].
-    pub fn retained_bytes(&self) -> usize {
+    #[cfg(test)]
+    fn retained_bytes(&self) -> usize {
         self.key.capacity() + self.error.as_ref().map_or(0, Vec::capacity)
     }
 
@@ -1346,9 +1346,7 @@ fn reporting_key(line: usize, method: CallMethod, label: Option<&str>) -> Result
         return Ok(Arc::from(method.as_str()));
     };
 
-    let valid = (1..=MAX_LABEL_LEN).contains(&label.len()) &&
-        label.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._+:-".contains(&byte));
-    if !valid {
+    if !is_valid_label(label) {
         bail!("corpus line {line}: `meta.label` must match {LABEL_PATTERN}");
     }
 
@@ -1389,13 +1387,6 @@ fn digest_rpc_error(error: &[u8]) -> ResponseSummary {
 
 fn named_counts(counts: &BTreeMap<Arc<str>, usize>) -> BTreeMap<String, u64> {
     counts.iter().map(|(key, count)| (key.to_string(), *count as u64)).collect()
-}
-
-fn percentile(sorted: &[u64], p: usize) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    sorted[(sorted.len() * p / 100).min(sorted.len() - 1)]
 }
 
 fn median(sorted: &[u64]) -> u64 {
