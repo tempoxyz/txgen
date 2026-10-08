@@ -16,11 +16,11 @@ use std::{
     net::{TcpListener, TcpStream},
     path::Path,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex,
+        atomic::{fence, AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, Weak,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
 use txgen_core::{GeneratedTx, LateSignSpec, SchedulingKey, TxPhase};
@@ -47,6 +47,7 @@ struct MockState {
     head_delay_ms: AtomicUsize,
     head_ready: AtomicBool,
     reject_sends: AtomicBool,
+    hold_sends: AtomicBool,
     unsupported_receipts: AtomicBool,
     lose_send_response: AtomicBool,
     chain: Mutex<MockChain>,
@@ -81,6 +82,9 @@ impl MockState {
             "eth_sendRawTransaction" => {
                 if self.reject_sends.load(Ordering::SeqCst) {
                     return HttpResponse::ok(json!({"code": -32000, "message": "rejected"}));
+                }
+                while self.hold_sends.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
                 }
                 let raw = request.params[0].as_str().unwrap().to_string();
                 let previous = self.sends_in_flight.fetch_add(1, Ordering::SeqCst);
@@ -343,19 +347,49 @@ fn replace_auth_file(path: &Path, contents: &str) {
     std::fs::rename(replacement, path).unwrap();
 }
 
+/// Holds every submission at the mock until `delayed_sender` is authenticated,
+/// then waits for the in-flight submissions to finish. This keeps the first
+/// transaction active while later ones queue, and guarantees its key release is
+/// queued before the sender continues the dispatch loop that authenticated
+/// `delayed_sender`.
 struct DelayedAuth {
     inner: SenderHeaderAuthProvider,
     delayed_sender: Address,
+    rpc: Arc<MockState>,
+    this: Weak<Self>,
 }
 
 impl RequestAuthProvider for DelayedAuth {
     fn headers_for(&self, context: &RpcRequestContext<'_>) -> Result<HeaderMap> {
         if context.method == "eth_sendRawTransaction" && context.sender == Some(self.delayed_sender)
         {
-            thread::sleep(Duration::from_millis(200));
+            self.rpc.hold_sends.store(false, Ordering::SeqCst);
+            // Each submission worker holds a provider clone until it returns, after
+            // queueing its key release. Only the sender's own reference then remains.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.this.strong_count() > 1 {
+                assert!(Instant::now() < deadline, "in-flight submissions did not finish");
+                thread::sleep(Duration::from_millis(1));
+            }
+            fence(Ordering::Acquire);
         }
         self.inner.headers_for(context)
     }
+}
+
+fn delayed_auth(rpc: &MockRpc, temp: &TempDir) -> Arc<dyn RequestAuthProvider> {
+    rpc.state.hold_sends.store(true, Ordering::SeqCst);
+    Arc::new_cyclic(|this| DelayedAuth {
+        inner: SenderHeaderAuthProvider::from_file(
+            AUTH_HEADER,
+            auth_file(temp),
+            Duration::from_secs(60),
+        )
+        .unwrap(),
+        delayed_sender: Address::repeat_byte(0x02),
+        rpc: rpc.state.clone(),
+        this: this.clone(),
+    })
 }
 
 fn transaction(raw: u8, sender: Option<Address>, key: u8, wait_for_receipt: bool) -> GeneratedTx {
@@ -505,20 +539,11 @@ async fn atomic_map_reload_updates_requests_and_malformed_map_keeps_last_value()
 async fn older_auth_failure_does_not_report_error_after_current_tx_is_dispatched() {
     let rpc = MockRpc::start();
     let temp = TempDir::new().unwrap();
-    let request_auth: Arc<dyn RequestAuthProvider> = Arc::new(DelayedAuth {
-        inner: SenderHeaderAuthProvider::from_file(
-            AUTH_HEADER,
-            auth_file(&temp),
-            Duration::from_secs(60),
-        )
-        .unwrap(),
-        delayed_sender: Address::repeat_byte(0x02),
-    });
-    let mut sender = sender(&rpc, Some(request_auth), 3);
+    let mut sender = sender(&rpc, Some(delayed_auth(&rpc, &temp)), 3);
 
     // A is active on key 7. B queues behind A but has no auth mapping. C is
-    // disjoint and its auth lookup pauses long enough for A to complete. Pump
-    // dispatches C, then discovers B's older auth failure.
+    // disjoint and its auth lookup waits for A to complete. Pump dispatches C,
+    // then discovers B's older auth failure.
     sender.send(transaction(2, Some(Address::repeat_byte(0x01)), 7, false)).await.unwrap();
     sender.send(transaction(1, Some(Address::repeat_byte(0x09)), 7, false)).await.unwrap();
     sender
@@ -565,16 +590,7 @@ async fn flush_cancels_queued_transactions_after_authentication_failure() {
 async fn deferred_authentication_failure_rejects_the_next_send_before_submission() {
     let rpc = MockRpc::start();
     let temp = TempDir::new().unwrap();
-    let request_auth: Arc<dyn RequestAuthProvider> = Arc::new(DelayedAuth {
-        inner: SenderHeaderAuthProvider::from_file(
-            AUTH_HEADER,
-            auth_file(&temp),
-            Duration::from_secs(60),
-        )
-        .unwrap(),
-        delayed_sender: Address::repeat_byte(0x02),
-    });
-    let mut sender = sender(&rpc, Some(request_auth), 3);
+    let mut sender = sender(&rpc, Some(delayed_auth(&rpc, &temp)), 3);
 
     sender.send(transaction(2, Some(Address::repeat_byte(0x01)), 7, false)).await.unwrap();
     sender.send(transaction(1, Some(Address::repeat_byte(0x09)), 7, false)).await.unwrap();

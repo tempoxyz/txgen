@@ -63,7 +63,7 @@ impl ReceiptGasRow {
             block_hash: record.block_hash.map(|hash| hash.to_string()),
             gas_used: record.gas_used.to_string(),
             effective_gas_price: record.effective_gas_price.map(|price| price.to_string()),
-            fee_paid: record.fee_paid().map(|fee| fee.to_string()),
+            fee_paid: record.sample().fee_paid().map(|fee| fee.to_string()),
         })
     }
 }

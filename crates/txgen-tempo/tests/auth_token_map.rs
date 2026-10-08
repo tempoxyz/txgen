@@ -1,9 +1,8 @@
 use std::{
     collections::BTreeMap,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Child, Command, Output, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant},
 };
@@ -15,36 +14,6 @@ const TEST_MNEMONIC: &str = "test test test test test test test test test test t
 const MNEMONIC_ENV: &str = "TXGEN_AUTH_TOKEN_MAP_TEST_MNEMONIC";
 const ZONE_ID: u32 = 71;
 const CHAIN_ID: u64 = 421_700_071;
-static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
-
-struct TestDir(PathBuf);
-
-impl TestDir {
-    fn new() -> Self {
-        let sequence = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir()
-            .join(format!("txgen-auth-token-map-cli-{}-{sequence}", std::process::id()));
-        fs::create_dir(&path).unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-
-        Self(path)
-    }
-
-    fn join(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 struct ChildGuard(Option<Child>);
 
@@ -76,9 +45,9 @@ fn selected_thousand_account_pool_matches_the_flat_token_contract() {
     const START: u32 = 11;
     const END: u32 = 1_011;
 
-    let directory = TestDir::new();
-    let spec = directory.join("spec.yaml");
-    let output_path = directory.join("tokens.json");
+    let directory = tempfile::tempdir().unwrap();
+    let spec = directory.path().join("spec.yaml");
+    let output_path = directory.path().join("tokens.json");
     write_spec(&spec, "users", START, END);
 
     let output = auth_command(&spec, "users", &output_path, ZONE_ID, 600, 30).output().unwrap();
@@ -152,9 +121,9 @@ fn selected_thousand_account_pool_matches_the_flat_token_contract() {
 
 #[test]
 fn rejects_unknown_and_empty_account_pools() {
-    let directory = TestDir::new();
-    let spec = directory.join("spec.yaml");
-    let output_path = directory.join("tokens.json");
+    let directory = tempfile::tempdir().unwrap();
+    let spec = directory.path().join("spec.yaml");
+    let output_path = directory.path().join("tokens.json");
     write_spec(&spec, "users", 0, 1);
 
     let unknown = auth_command(&spec, "missing", &output_path, ZONE_ID, 600, 30).output().unwrap();
@@ -169,8 +138,8 @@ fn rejects_unknown_and_empty_account_pools() {
 
 #[test]
 fn rejects_invalid_zone_ttl_and_refresh_windows() {
-    let directory = TestDir::new();
-    let spec = directory.join("spec.yaml");
+    let directory = tempfile::tempdir().unwrap();
+    let spec = directory.path().join("spec.yaml");
     write_spec(&spec, "users", 0, 1);
 
     let cases = [
@@ -184,7 +153,7 @@ fn rejects_invalid_zone_ttl_and_refresh_windows() {
     for (index, (zone_id, ttl_secs, refresh_before_secs, expected_error)) in
         cases.into_iter().enumerate()
     {
-        let output_path = directory.join(&format!("invalid-{index}.json"));
+        let output_path = directory.path().join(format!("invalid-{index}.json"));
         let output =
             auth_command(&spec, "users", &output_path, zone_id, ttl_secs, refresh_before_secs)
                 .output()
@@ -196,9 +165,9 @@ fn rejects_invalid_zone_ttl_and_refresh_windows() {
 
 #[test]
 fn existing_output_requires_force_and_force_replaces_it_securely() {
-    let directory = TestDir::new();
-    let spec = directory.join("spec.yaml");
-    let output_path = directory.join("tokens.json");
+    let directory = tempfile::tempdir().unwrap();
+    let spec = directory.path().join("spec.yaml");
+    let output_path = directory.path().join("tokens.json");
     write_spec(&spec, "users", 0, 1);
     fs::write(&output_path, b"last-valid-map").unwrap();
 
@@ -225,9 +194,9 @@ fn existing_output_requires_force_and_force_replaces_it_securely() {
 #[cfg(unix)]
 #[test]
 fn watch_writes_the_initial_map_and_exits_cleanly_on_sigterm() {
-    let directory = TestDir::new();
-    let spec = directory.join("spec.yaml");
-    let output_path = directory.join("tokens.json");
+    let directory = tempfile::tempdir().unwrap();
+    let spec = directory.path().join("spec.yaml");
+    let output_path = directory.path().join("tokens.json");
     write_spec(&spec, "users", 3, 5);
 
     let child = auth_command(&spec, "users", &output_path, ZONE_ID, 600, 30)
