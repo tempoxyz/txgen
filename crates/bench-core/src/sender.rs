@@ -304,50 +304,32 @@ impl RpcSubmitter {
             .clone()
             .enqueue(tx.submission_keys.clone(), tx.inclusion_keys.clone())
             .map_err(RpcSubmitError::before_send)?;
-        let mut order = match deadline {
-            Some(deadline) => {
-                tokio::time::timeout_at(deadline, order.acquire()).await.map_err(|_| {
-                    RpcSubmitError::deadline(
-                        RpcSubmitFailureKind::BeforeSend,
-                        "submission deadline elapsed before dispatch",
-                        None,
-                    )
-                })?
-            }
-            None => order.acquire().await,
+        let before_dispatch = |_| {
+            RpcSubmitError::deadline(
+                RpcSubmitFailureKind::BeforeSend,
+                "submission deadline elapsed before dispatch",
+                None,
+            )
         };
-        let permit = match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, self.acquire_permit())
-                .await
-                .map_err(|_| {
-                    RpcSubmitError::deadline(
-                        RpcSubmitFailureKind::BeforeSend,
-                        "submission deadline elapsed before dispatch",
-                        None,
-                    )
-                })?
-                .map_err(RpcSubmitError::before_send)?,
-            None => self.acquire_permit().await.map_err(RpcSubmitError::before_send)?,
-        };
+        let mut order = with_deadline(deadline, order.acquire()).await.map_err(before_dispatch)?;
+        let permit = with_deadline(deadline, self.acquire_permit())
+            .await
+            .map_err(before_dispatch)?
+            .map_err(RpcSubmitError::before_send)?;
 
         let inclusion = if tx.inclusion_keys.is_empty() {
             None
         } else {
-            let registration = self.receipt_tracker.prepare();
-
-            let waiter = match deadline {
-                Some(deadline) => {
-                    tokio::time::timeout_at(deadline, registration).await.map_err(|_| {
-                        RpcSubmitError::deadline(
-                            RpcSubmitFailureKind::BeforeSend,
-                            "submission deadline elapsed starting inclusion observation",
-                            None,
-                        )
-                    })?
-                }
-                None => registration.await,
-            }
-            .map_err(RpcSubmitError::before_send)?;
+            let waiter = with_deadline(deadline, self.receipt_tracker.prepare())
+                .await
+                .map_err(|_| {
+                    RpcSubmitError::deadline(
+                        RpcSubmitFailureKind::BeforeSend,
+                        "submission deadline elapsed starting inclusion observation",
+                        None,
+                    )
+                })?
+                .map_err(RpcSubmitError::before_send)?;
 
             Some(waiter)
         };
@@ -366,23 +348,16 @@ impl RpcSubmitter {
             .map_err(RpcSubmitError::before_send)?;
 
         let redact = self.request_auth.is_some();
-        let submission = match deadline {
-            Some(deadline) => {
-                tokio::time::timeout_at(deadline, submit_raw_rpc(&endpoint, &raw, headers))
-                    .await
-                    .map_err(|_| {
-                        RpcSubmitError::deadline(
-                            RpcSubmitFailureKind::Ambiguous,
-                            "submission deadline elapsed after RPC dispatch; acceptance is unknown",
-                            Some(expected_hash),
-                        )
-                    })?
-                    .map_err(|error| RpcSubmitError::from_transport(error, redact, expected_hash))?
-            }
-            None => submit_raw_rpc(&endpoint, &raw, headers)
-                .await
-                .map_err(|error| RpcSubmitError::from_transport(error, redact, expected_hash))?,
-        };
+        let submission = with_deadline(deadline, submit_raw_rpc(&endpoint, &raw, headers))
+            .await
+            .map_err(|_| {
+                RpcSubmitError::deadline(
+                    RpcSubmitFailureKind::Ambiguous,
+                    "submission deadline elapsed after RPC dispatch; acceptance is unknown",
+                    Some(expected_hash),
+                )
+            })?
+            .map_err(|error| RpcSubmitError::from_transport(error, redact, expected_hash))?;
 
         drop(permit);
 
@@ -1524,6 +1499,16 @@ async fn submit_tx(
 
     release_keys(&completion_tx, pending.inclusion_keys);
     result
+}
+
+async fn with_deadline<T>(
+    deadline: Option<tokio::time::Instant>,
+    future: impl Future<Output = T>,
+) -> std::result::Result<T, tokio::time::error::Elapsed> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, future).await,
+        None => Ok(future.await),
+    }
 }
 
 fn resolve_raw(
