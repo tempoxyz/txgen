@@ -423,9 +423,7 @@ impl NetworkAdapter for TempoAdapter {
     ) -> Result<TxRequest<TempoTransactionRequest, TempoSignContext>> {
         let selected = ctx.select_signer(&template.from)?;
         let is_tempo = template.tx_type == TempoTxType::Tempo;
-        if template.auth.is_some() && !is_tempo {
-            bail!("Tempo keychain auth is only supported for `type: tempo` templates");
-        }
+        validate_tx_type_fields(&template)?;
         let nonce_mode = resolve_nonce_mode(&template, is_tempo, ctx)?;
         if !matches!(nonce_mode, TempoNonceMode::Expiring) &&
             let Some(valid_for_secs) = template.valid_for_secs
@@ -804,20 +802,45 @@ impl NetworkAdapter for TempoAdapter {
     }
 }
 
+fn validate_tx_type_fields(template: &TempoTemplate) -> Result<()> {
+    if template.calls.is_some() &&
+        (template.call.is_some() || template.to.is_some() || template.input.is_some())
+    {
+        bail!("`calls` cannot be combined with `call`, `to`, or `input`");
+    }
+    if template.tx_type == TempoTxType::Tempo {
+        if template.gas_price.is_some() {
+            bail!("`gas_price` is not supported for `type: tempo`; use `max_fee_per_gas`");
+        }
+        return Ok(());
+    }
+    let tempo_only = [
+        ("calls", template.calls.is_some()),
+        ("nonce_key", template.nonce_key.is_some()),
+        ("expiring_nonce", template.expiring_nonce),
+        ("fee_token", template.fee_token.is_some()),
+        ("sponsor", template.sponsor.is_some()),
+        ("valid_after", template.valid_after.is_some()),
+        ("valid_before", template.valid_before.is_some()),
+        ("valid_for_secs", template.valid_for_secs.is_some()),
+        ("auth", template.auth.is_some()),
+    ];
+    if let Some((field, _)) = tempo_only.iter().find(|(_, set)| *set) {
+        bail!("`{field}` is only supported for `type: tempo` templates");
+    }
+    Ok(())
+}
+
 fn resolve_nonce_mode(
     template: &TempoTemplate,
     is_tempo: bool,
     ctx: &mut BuildContext<'_>,
 ) -> Result<TempoNonceMode> {
-    let resolved_nonce_key =
-        template.nonce_key.as_ref().map(|nonce_key| ctx.resolve_value(nonce_key)).transpose()?;
-
     if !is_tempo {
-        if template.expiring_nonce || resolved_nonce_key == Some(TEMPO_EXPIRING_NONCE_KEY) {
-            bail!("expiring nonce mode is only supported for Tempo transactions");
-        }
         return Ok(TempoNonceMode::Protocol);
     }
+    let resolved_nonce_key =
+        template.nonce_key.as_ref().map(|nonce_key| ctx.resolve_value(nonce_key)).transpose()?;
 
     if template.expiring_nonce {
         if resolved_nonce_key.is_some() {
@@ -1253,7 +1276,7 @@ mod tests {
     use std::collections::HashMap;
     use tempo_primitives::TEMPO_TX_TYPE_ID;
     use txgen_core::{
-        AccountManager, AccountPoolDef, AccountRef, ArtifactManager, GasConfig, GenValue,
+        AccountManager, AccountPoolDef, AccountRef, ArtifactManager, CallDef, GasConfig, GenValue,
         Generator, NonceReservationKind, NonceTracker, SelectMode,
     };
 
@@ -1738,6 +1761,48 @@ nonce_key:
 
         assert!(!raw.is_empty());
         assert_eq!(raw[0], 0x02);
+    }
+
+    #[test]
+    fn test_rejects_fields_unsupported_by_tx_type() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        let mut assert_rejected = |template: TempoTemplate, message: &str| {
+            let error = TempoAdapter::new().build_request(template, &mut ctx).err().unwrap();
+            assert!(error.to_string().contains(message), "{error}");
+        };
+        let calls = Some(vec![CallDef {
+            to: GenValue::Literal(Address::ZERO),
+            abi: None,
+            function: "transfer()".to_string(),
+            args: Default::default(),
+            value: GenValue::Literal(U256::ZERO),
+        }]);
+
+        let mut template = base_template(TempoTxType::Eip1559);
+        template.to = None;
+        template.calls = calls.clone();
+        assert_rejected(template, "`calls` is only supported");
+
+        let mut template = base_template(TempoTxType::Legacy);
+        template.nonce_key = Some(GenValue::Literal(U256::from(1)));
+        assert_rejected(template, "`nonce_key` is only supported");
+
+        let mut template = base_template(TempoTxType::Eip2930);
+        template.sponsor = Some(template.from.clone());
+        assert_rejected(template, "`sponsor` is only supported");
+
+        let mut template = base_template(TempoTxType::Tempo);
+        template.gas_price = Some(1);
+        assert_rejected(template, "`gas_price` is not supported");
+
+        let mut template = base_template(TempoTxType::Tempo);
+        template.calls = calls;
+        assert_rejected(template, "`calls` cannot be combined");
     }
 
     #[test]
