@@ -196,7 +196,7 @@ pub struct BlockStats {
 }
 
 /// Run summary statistics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunStats {
     /// Starting block number.
     pub start_block: u64,
@@ -240,20 +240,7 @@ impl RunStats {
 
     fn from_blocks_with_duration_ms(blocks: &[BlockStats], duration_ms: u64) -> Self {
         if blocks.is_empty() {
-            return Self {
-                start_block: 0,
-                end_block: 0,
-                total_blocks: 0,
-                total_txs: 0,
-                total_gas: 0,
-                duration_ms: 0,
-                avg_blocks_per_second: 0.0,
-                avg_tps: 0.0,
-                avg_gas_per_second: 0.0,
-                block_time_p50_ms: 0,
-                block_time_p95_ms: 0,
-                block_time_p99_ms: 0,
-            };
+            return Self::default();
         }
 
         let start_block = blocks.first().map(|b| b.number).unwrap_or(0);
@@ -588,22 +575,17 @@ impl MetricsCollector {
         self.clock.elapsed()
     }
 
-    /// Get the elapsed time since start.
-    fn elapsed(&self) -> Duration {
-        self.clock.elapsed()
-    }
-
     /// Record a sent transaction.
     pub fn record_sent(&self) {
         self.sent.fetch_add(1, Ordering::Relaxed);
-        let offset = self.elapsed();
+        let offset = self.clock.elapsed();
         let _ = self.event_tx.send(TimestampedEvent { offset, event: TxEvent::Sent });
     }
 
     /// Record a successful transaction with its latency.
     pub fn record_success(&self, latency: Duration) {
         self.success.fetch_add(1, Ordering::Relaxed);
-        let offset = self.elapsed();
+        let offset = self.clock.elapsed();
         if self.collect_latencies {
             let _ = self.latency_tx.send(TimestampedLatency { offset, latency });
         }
@@ -613,7 +595,7 @@ impl MetricsCollector {
     /// Record a failed transaction.
     pub fn record_failure(&self) {
         self.failed.fetch_add(1, Ordering::Relaxed);
-        let offset = self.elapsed();
+        let offset = self.clock.elapsed();
         let _ = self.event_tx.send(TimestampedEvent { offset, event: TxEvent::Failed });
     }
 
