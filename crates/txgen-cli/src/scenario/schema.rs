@@ -1633,7 +1633,7 @@ where
 }
 
 const fn default_observation_poll_interval() -> Duration {
-    Duration::from_millis(50)
+    super::wait::DEFAULT_POLL_INTERVAL
 }
 
 fn parse_duration_value(value: serde_yaml::Value) -> Result<Duration> {
