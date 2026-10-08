@@ -8,8 +8,11 @@
 use crate::{
     call::{CallReport, MethodStats},
     clickhouse::ClickHouseClient,
+    clock::unix_ms,
     composition::RunComposition,
-    metrics::{BenchMetrics, BlockStats, RunStats, ThroughputSample, TimeSeriesMetrics},
+    metrics::{
+        BenchMetrics, BlockStats, LatencyStats, RunStats, ThroughputSample, TimeSeriesMetrics,
+    },
     receipt_clickhouse::{insert_receipt_gas_records, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE},
     receipt_metrics::{ReceiptGasRecord, ReceiptMetricGroup},
     sample::{Sample, SampleArchive},
@@ -23,6 +26,7 @@ use std::{
     fs::File,
     io::{BufWriter, Write},
     path::Path,
+    time::Duration,
 };
 
 /// Unified final report passed to reporters at finalization.
@@ -96,11 +100,10 @@ impl FinalReport {
     }
 
     /// Retain only samples at or before the given Unix millisecond timestamp.
-    pub fn retain_samples_until(&mut self, cutoff_ms: u64) -> Result<()> {
+    pub fn retain_samples_until(&mut self, cutoff_ms: u64) {
         if let Some(archive) = self.sample_archive.as_mut() {
             archive.retain_until(cutoff_ms);
         }
-        Ok(())
     }
 }
 
@@ -162,11 +165,6 @@ pub struct ConsoleReporter<W: Write + Send = Box<dyn Write + Send>> {
 }
 
 impl ConsoleReporter {
-    /// Create a new console reporter writing to stdout.
-    pub fn stdout(show_progress: bool) -> Self {
-        Self { writer: Box::new(std::io::stdout()), show_progress }
-    }
-
     /// Create a new console reporter writing to stderr.
     pub fn stderr(show_progress: bool) -> Self {
         Self { writer: Box::new(std::io::stderr()), show_progress }
@@ -432,9 +430,6 @@ pub struct JsonReport {
     /// Exact total fees paid, encoded as a decimal base-unit string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_fees_paid: Option<String>,
-    /// Unified time-series samples (internal + node metrics).
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub samples: Vec<Sample>,
     /// RPC corpus replay results (call mode only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call: Option<CallReport>,
@@ -458,6 +453,35 @@ pub struct JsonLatency {
     pub p95_ms: f64,
     /// P99 latency in milliseconds.
     pub p99_ms: f64,
+}
+
+impl From<&LatencyStats> for JsonLatency {
+    fn from(stats: &LatencyStats) -> Self {
+        let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        Self {
+            min_ms: ms(stats.min),
+            max_ms: ms(stats.max),
+            mean_ms: ms(stats.mean),
+            p50_ms: ms(stats.p50),
+            p90_ms: None,
+            p95_ms: ms(stats.p95),
+            p99_ms: ms(stats.p99),
+        }
+    }
+}
+
+impl From<&JsonLatency> for LatencyStats {
+    fn from(latency: &JsonLatency) -> Self {
+        let duration = |ms: f64| Duration::from_secs_f64(ms / 1000.0);
+        Self {
+            min: duration(latency.min_ms),
+            max: duration(latency.max_ms),
+            mean: duration(latency.mean_ms),
+            p50: duration(latency.p50_ms),
+            p95: duration(latency.p95_ms),
+            p99: duration(latency.p99_ms),
+        }
+    }
 }
 
 /// Time-series data in JSON format.
@@ -497,11 +521,6 @@ pub struct JsonReporter<W: Write + Send = Box<dyn Write + Send>> {
 }
 
 impl JsonReporter {
-    /// Create a JSON reporter writing to stdout.
-    pub fn stdout() -> Self {
-        Self { writer: Box::new(std::io::stdout()), benchmark_id: None, samples_path: None }
-    }
-
     /// Create a JSON reporter writing to a file.
     ///
     /// Samples are written to a sibling gzip-compressed NDJSON file derived
@@ -533,11 +552,7 @@ impl<W: Write + Send> JsonReporter<W> {
 /// - `output.json`            → `output.samples.ndjson.gz`
 fn samples_path_from_report(report_path: &Path) -> Option<std::path::PathBuf> {
     let stem = report_path.file_stem()?.to_str()?;
-    let filename = format!("{stem}.samples.ndjson.gz");
-    match report_path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => Some(p.join(filename)),
-        _ => Some(std::path::PathBuf::from(filename)),
-    }
+    Some(report_path.with_file_name(format!("{stem}.samples.ndjson.gz")))
 }
 
 impl<W: Write + Send> Reporter for JsonReporter<W> {
@@ -572,15 +587,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
                     Some(metrics.elapsed.as_secs_f64()),
                     Some(metrics.tps()),
                     Some(metrics.success_rate()),
-                    metrics.latency.as_ref().map(|latency| JsonLatency {
-                        min_ms: latency.min.as_secs_f64() * 1000.0,
-                        max_ms: latency.max.as_secs_f64() * 1000.0,
-                        mean_ms: latency.mean.as_secs_f64() * 1000.0,
-                        p50_ms: latency.p50.as_secs_f64() * 1000.0,
-                        p90_ms: None,
-                        p95_ms: latency.p95.as_secs_f64() * 1000.0,
-                        p99_ms: latency.p99.as_secs_f64() * 1000.0,
-                    }),
+                    metrics.latency.as_ref().map(JsonLatency::from),
                     ts,
                 )
             } else {
@@ -608,7 +615,6 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             receipt_metrics: report.receipt_metrics.clone(),
             block_composition: report.block_composition.clone(),
             total_fees_paid: report.total_fees_paid.map(|fees| fees.to_string()),
-            samples: Vec::new(),
             call: report.call.clone(),
         };
 
@@ -656,14 +662,9 @@ fn copy_and_gzip_samples_ndjson(report: &FinalReport, path: &Path) -> Result<usi
 /// ClickHouse reporter configuration.
 #[derive(Clone)]
 pub struct ClickHouseConfig {
-    /// ClickHouse HTTP endpoint (e.g. `https://host:8443`).
+    /// ClickHouse HTTP endpoint (e.g. `https://host:8443`). The database and
+    /// credentials are read by [`ClickHouseClient::from_env`].
     pub url: String,
-    /// Database name (from `CLICKHOUSE_DATABASE`, default: `default`).
-    pub database: String,
-    /// ClickHouse user (from `CLICKHOUSE_USER`).
-    pub user: Option<String>,
-    /// ClickHouse password (from `CLICKHOUSE_PASSWORD`).
-    pub password: Option<String>,
     /// Run identifier.
     pub run_id: uuid::Uuid,
     /// Benchmark start time.
@@ -696,9 +697,6 @@ impl fmt::Debug for ClickHouseConfig {
         formatter
             .debug_struct("ClickHouseConfig")
             .field("url", &url)
-            .field("database", &self.database)
-            .field("user", &self.user)
-            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
             .field("run_id", &self.run_id)
             .field("started_at", &self.started_at)
             .field("scenario_name", &self.scenario_name)
@@ -741,10 +739,6 @@ impl ClickHouseConfig {
             );
         }
 
-        let database =
-            std::env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "default".to_string());
-        let user = std::env::var("CLICKHOUSE_USER").ok();
-        let password = std::env::var("CLICKHOUSE_PASSWORD").ok();
         let sample_batch_size = std::env::var("CLICKHOUSE_SAMPLE_BATCH_SIZE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -766,9 +760,6 @@ impl ClickHouseConfig {
 
         Ok(Self {
             url: url.to_string(),
-            database,
-            user,
-            password,
             run_id,
             started_at: std::time::SystemTime::now(),
             scenario_name: metadata["scenario"].clone(),
@@ -799,20 +790,14 @@ pub struct ClickHouseReporter {
 impl ClickHouseReporter {
     /// Create a new ClickHouse reporter.
     pub fn new(config: ClickHouseConfig) -> Result<Self> {
-        let client = ClickHouseClient::new(
-            config.url.clone(),
-            config.database.clone(),
-            config.user.clone(),
-            config.password.clone(),
-        )?;
+        let client = ClickHouseClient::from_env(&config.url)?;
 
         tracing::info!(
             run_id = %config.run_id,
             scenario = %config.scenario_name,
             platform = %config.platform,
             mode = %config.mode,
-            url = %client.endpoint_origin(),
-            database = %config.database,
+            ?client,
             sample_batch_size = config.sample_batch_size,
             "ClickHouse reporter initialized"
         );
@@ -824,8 +809,8 @@ impl ClickHouseReporter {
     fn build_run_row(&self, finished_at: std::time::SystemTime) -> ClickHouseRunRow<'_> {
         ClickHouseRunRow {
             run_id: self.config.run_id,
-            started_at: system_time_to_millis(self.config.started_at),
-            finished_at: system_time_to_millis(finished_at),
+            started_at: unix_ms(self.config.started_at),
+            finished_at: unix_ms(finished_at),
             scenario_name: &self.config.scenario_name,
             platform: &self.config.platform,
             mode: &self.config.mode,
@@ -991,12 +976,6 @@ struct ClickHouseMetricSampleRow<'a> {
     value: f64,
 }
 
-/// Convert a [`SystemTime`](std::time::SystemTime) to Unix milliseconds.
-fn system_time_to_millis(t: std::time::SystemTime) -> u64 {
-    // SAFETY: SystemTime::now() is always after UNIX_EPOCH
-    t.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
-}
-
 /// Parse reporter specifications into boxed reporters.
 ///
 /// Supported formats:
@@ -1019,10 +998,6 @@ pub fn parse_reporters(
 ) -> Result<Vec<Box<dyn Reporter>>> {
     let mut reporters: Vec<Box<dyn Reporter>> = Vec::new();
     let benchmark_id = uuid::Uuid::new_v4();
-
-    if specs.is_empty() {
-        return Ok(reporters);
-    }
 
     for spec in specs {
         if spec == "console" {
@@ -1434,7 +1409,7 @@ mod tests {
             let source_content = std::fs::read_to_string(&source_samples_path).unwrap();
             assert_eq!(source_content.lines().count(), 2);
 
-            report.retain_samples_until(1000).unwrap();
+            report.retain_samples_until(1000);
             assert_eq!(std::fs::read_to_string(&source_samples_path).unwrap(), source_content);
 
             reporter.finalize(&report).unwrap();

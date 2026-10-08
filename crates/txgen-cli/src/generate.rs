@@ -18,10 +18,9 @@ use std::{
     time::{Duration, Instant},
 };
 use txgen_core::{
-    dedup_scheduling_keys, merge_yaml, AbiEncodePackedDef, AbiHashDef, AccountManager,
-    AddressPoolManager, ArtifactManager, BuildContext, EcdsaSigner, GeneratedTx, LateSignSpec,
-    MixItem, NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase,
-    WorkloadSpec,
+    dedup_scheduling_keys, merge_yaml, AbiValuesDef, AccountManager, AddressPoolManager,
+    ArtifactManager, BuildContext, EcdsaSigner, GeneratedTx, LateSignSpec, MixItem, NdjsonWriter,
+    NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase, WorkloadSpec,
 };
 
 fn default_signing_workers() -> usize {
@@ -926,7 +925,7 @@ async fn fetch_protocol_nonces_with_state(
     let provider =
         alloy_provider::ProviderBuilder::<_, _, alloy_provider::network::Ethereum>::new()
             .connect_http(rpc_url.parse().wrap_err("invalid RPC URL")?);
-    let state = "latest";
+    let state = if pending { "pending" } else { "latest" };
 
     for (pool_name, addresses) in accounts.all_addresses() {
         let total = addresses.len();
@@ -2024,12 +2023,7 @@ fn binding_dependency_names(
 ) -> HashSet<String> {
     let mut deps = HashSet::new();
     match binding {
-        SequenceBinding::AbiEncodePacked(def) => {
-            for value in &def.values {
-                collect_var_names(value, bindings, &mut deps);
-            }
-        }
-        SequenceBinding::AbiHash(def) => {
+        SequenceBinding::AbiEncodePacked(def) | SequenceBinding::AbiHash(def) => {
             for value in &def.values {
                 collect_var_names(value, bindings, &mut deps);
             }
@@ -2040,7 +2034,7 @@ fn binding_dependency_names(
 }
 
 fn resolve_abi_encode_packed(
-    def: &AbiEncodePackedDef,
+    def: &AbiValuesDef,
     bindings: &std::collections::HashMap<String, ResolvedBinding>,
 ) -> Result<Bytes> {
     let values = resolve_abi_values(&def.types, &def.values, bindings, "abi_encode_packed")?;
@@ -2048,7 +2042,7 @@ fn resolve_abi_encode_packed(
 }
 
 fn resolve_abi_hash(
-    def: &AbiHashDef,
+    def: &AbiValuesDef,
     bindings: &std::collections::HashMap<String, ResolvedBinding>,
 ) -> Result<B256> {
     let values = resolve_abi_values(&def.types, &def.values, bindings, "abi_hash")?;
@@ -2877,7 +2871,7 @@ mix: [{template: transfer, weight: 1}]
                 serde_json::to_value(U256::from(expected_rng.random::<u64>()))?
             );
         }
-        assert_eq!(ctx.nonces.peek(&[0x33; 20]), 7);
+        assert_eq!(ctx.nonces.current(&[0x33; 20]), 7);
         assert_eq!(ctx.rng.random::<u64>(), StdRng::seed_from_u64(42).random::<u64>());
         Ok(())
     }

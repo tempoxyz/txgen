@@ -49,27 +49,7 @@ impl ClickHouseClient {
         user: Option<String>,
         password: Option<String>,
     ) -> Result<Self> {
-        let url = url.into();
-        let trimmed_url = url.trim();
-        if trimmed_url.is_empty() {
-            bail!("ClickHouse endpoint must not be empty");
-        }
-
-        let mut parsed = reqwest::Url::parse(trimmed_url).context("invalid ClickHouse endpoint")?;
-        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-            bail!("ClickHouse endpoint must be an HTTP or HTTPS URL");
-        }
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            bail!(
-                "ClickHouse endpoint must not contain credentials; use CLICKHOUSE_USER and CLICKHOUSE_PASSWORD"
-            );
-        }
-        if parsed.query().is_some() || parsed.fragment().is_some() {
-            bail!("ClickHouse endpoint must not contain a query string or fragment");
-        }
-        let path = parsed.path().trim_end_matches('/').to_string();
-        parsed.set_path(if path.is_empty() { "/" } else { &path });
-
+        let parsed = parse_endpoint(&url.into())?;
         let database = database.into();
         validate_identifier("database", &database)?;
 
@@ -81,34 +61,16 @@ impl ClickHouseClient {
         Ok(Self { url: parsed, database, user, password, client })
     }
 
-    /// Return the ClickHouse database used by this client.
-    pub fn database(&self) -> &str {
-        &self.database
-    }
-
     /// Return a log-safe endpoint containing only the URL origin.
     pub fn endpoint_origin(&self) -> String {
         self.url.origin().ascii_serialization()
     }
 
-    /// Insert rows into a table using ClickHouse's `FORMAT JSONEachRow` protocol.
-    pub fn insert_rows<T: Serialize>(&self, table: &str, rows: &[T]) -> Result<()> {
-        self.insert_rows_with_mode(table, rows, false)
-    }
-
-    /// Insert rows and wait until ClickHouse has committed them.
+    /// Insert rows into a table using ClickHouse's `FORMAT JSONEachRow` protocol
+    /// and wait until ClickHouse has committed them.
     ///
     /// Use this when a later insert acts as a visibility marker for this batch.
     pub fn insert_rows_synchronous<T: Serialize>(&self, table: &str, rows: &[T]) -> Result<()> {
-        self.insert_rows_with_mode(table, rows, true)
-    }
-
-    fn insert_rows_with_mode<T: Serialize>(
-        &self,
-        table: &str,
-        rows: &[T],
-        synchronous: bool,
-    ) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -125,20 +87,11 @@ impl ClickHouseClient {
 
         let query = format!("INSERT INTO {}.{} FORMAT JSONEachRow", self.database, table);
         let mut url = self.url.clone();
-        url.query_pairs_mut().append_pair("query", &query);
-        if synchronous {
-            // A synchronous acknowledgement is required when callers use a
-            // later insert as a visibility marker for earlier table writes.
-            url.query_pairs_mut()
-                .append_pair("async_insert", "0")
-                .append_pair("wait_for_async_insert", "1");
-        }
+        url.query_pairs_mut()
+            .append_pair("query", &query)
+            .append_pair("async_insert", "0")
+            .append_pair("wait_for_async_insert", "1");
 
-        let rt = tokio::runtime::Handle::try_current()
-            .context("ClickHouse inserts require a Tokio runtime")?;
-        if !matches!(rt.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread) {
-            bail!("ClickHouse inserts require a multi-threaded Tokio runtime");
-        }
         let mut req = self.client.post(url).header("Content-Type", "application/json");
         if let Some(ref user) = self.user {
             req = req.header("X-ClickHouse-User", user);
@@ -146,19 +99,42 @@ impl ClickHouseClient {
         if let Some(ref password) = self.password {
             req = req.header("X-ClickHouse-Key", password);
         }
-        let resp = tokio::task::block_in_place(|| rt.block_on(req.body(body).send()))
+        let resp = crate::block_on(req.body(body).send())?
             .wrap_err_with(|| format!("failed to insert into {table}"))?;
 
         let status = resp.status();
         if !status.is_success() {
-            let body = tokio::task::block_in_place(|| rt.block_on(resp.text()))
-                .unwrap_or_else(|_| "<no body>".to_string());
+            let body = crate::block_on(resp.text())?.unwrap_or_else(|_| "<no body>".to_string());
             bail!("ClickHouse insert into {table} failed (HTTP {status}): {body}");
         }
 
         tracing::info!(table, rows = rows.len(), "Inserted rows into ClickHouse");
         Ok(())
     }
+}
+
+/// Validate a credential-free HTTP(S) ClickHouse endpoint and drop any trailing slash.
+pub fn parse_endpoint(url: &str) -> Result<reqwest::Url> {
+    let trimmed_url = url.trim();
+    if trimmed_url.is_empty() {
+        bail!("ClickHouse endpoint must not be empty");
+    }
+
+    let mut parsed = reqwest::Url::parse(trimmed_url).context("invalid ClickHouse endpoint")?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        bail!("ClickHouse endpoint must be an HTTP or HTTPS URL");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!(
+            "ClickHouse endpoint must not contain credentials; use CLICKHOUSE_USER and CLICKHOUSE_PASSWORD"
+        );
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        bail!("ClickHouse endpoint must not contain a query string or fragment");
+    }
+    let path = parsed.path().trim_end_matches('/').to_string();
+    parsed.set_path(if path.is_empty() { "/" } else { &path });
+    Ok(parsed)
 }
 
 fn validate_identifier(kind: &str, value: &str) -> Result<()> {
@@ -263,7 +239,6 @@ mod tests {
             Some("secret".to_string()),
         )
         .unwrap();
-        assert_eq!(client.database(), "analytics");
         assert_eq!(client.endpoint_origin(), url);
         let debug = format!("{client:?}");
         assert!(debug.contains("[REDACTED]"));
@@ -294,21 +269,20 @@ mod tests {
         let client = ClickHouseClient::new(url, "default", None, None).unwrap();
 
         let error = client
-            .insert_rows("missing", &[TestRow { id: 1, name: "first" }])
+            .insert_rows_synchronous("missing", &[TestRow { id: 1, name: "first" }])
             .unwrap_err()
             .to_string();
-        let request = request.recv().unwrap();
+        request.recv().unwrap();
 
         assert!(error.contains("ClickHouse insert into missing failed (HTTP 400 Bad Request)"));
         assert!(error.contains("unknown table"));
-        assert!(!request.contains("async_insert"));
     }
 
     #[tokio::test]
     async fn current_thread_runtime_returns_an_error_instead_of_panicking() {
         let client = ClickHouseClient::new("http://127.0.0.1:1", "default", None, None).unwrap();
         let error = client
-            .insert_rows("rows", &[TestRow { id: 1, name: "first" }])
+            .insert_rows_synchronous("rows", &[TestRow { id: 1, name: "first" }])
             .unwrap_err()
             .to_string();
         assert!(error.contains("multi-threaded Tokio runtime"));

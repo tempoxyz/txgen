@@ -1,17 +1,15 @@
 use super::{
     error::{StepError, StepErrorKind},
     report::{
-        unix_ms, ChainReportConfig, InstanceFailure, InstanceOutcome, ProtocolMilestone,
-        ScenarioAccumulator, ScenarioReport, ScenarioReportConfig, StepOutcome,
+        duration_ms, unix_ms, ChainReportConfig, InstanceFailure, InstanceOutcome,
+        ProtocolMilestone, ScenarioAccumulator, ScenarioReport, ScenarioReportConfig, StepOutcome,
     },
     schema::{
         AccountSelection, BindingDef, ChainDef, ChainId, ObservationMode, ScenarioExecutionMode,
         ScenarioSpec, StepAction, StepDef, SubmitAwait, SubmitStep,
     },
-    value::{
-        collect_variable_paths, eval_expression, materialize_yaml, RuntimeContext, RuntimeValue,
-    },
-    wait::{self, DEFAULT_POLL_INTERVAL},
+    value::{collect_variable_paths, materialize_yaml, RuntimeContext, RuntimeValue},
+    wait::{self, expression_hash, object, DEFAULT_POLL_INTERVAL},
 };
 use crate::{
     generate::{
@@ -21,7 +19,6 @@ use crate::{
     NetworkAdapter, ScenarioActionContext,
 };
 use alloy_consensus::{SignableTransaction, Signed};
-use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_eips::{eip2718::Encodable2718, BlockNumberOrTag};
 use alloy_network::{
     primitives::{BlockResponse, HeaderResponse},
@@ -57,7 +54,7 @@ const FALLBACK_STEP_TIMEOUT: Duration = Duration::from_secs(300);
 const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Failure behavior after one scenario instance fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum FailurePolicy {
     /// Stop starting new instances; allow already-started instances to finish.
     FailFast,
@@ -491,23 +488,17 @@ where
                 chain_id: chain.chain_id,
                 workload: chain.workload_path.display().to_string(),
                 observation_mode: observation_mode_name(chain.observation_mode).to_string(),
-                observation_poll_interval_ms: u64::try_from(
-                    chain.observation_poll_interval.as_millis(),
-                )
-                .unwrap_or(u64::MAX),
+                observation_poll_interval_ms: duration_ms(chain.observation_poll_interval),
                 subscription_configured: chain.observation_subscription_configured,
             })
             .collect();
         let report_configuration = ScenarioReportConfig {
             chains: chain_configuration,
             requested_instances: config.count,
-            run_duration_ms: config
-                .duration
-                .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+            run_duration_ms: config.duration.map(duration_ms),
             starts_per_second: config.starts_per_second,
             maximum_in_flight: config.max_in_flight,
-            default_step_timeout_ms: u64::try_from(self.default_step_timeout.as_millis())
-                .unwrap_or(u64::MAX),
+            default_step_timeout_ms: duration_ms(self.default_step_timeout),
             transaction_rate_per_chain: config.transaction_rate,
             maximum_rpc_in_flight_per_chain: config.max_rpc_in_flight,
             seed: config.seed,
@@ -1011,7 +1002,6 @@ where
                     sender,
                     hash,
                     wait_receipt.confirmations.unwrap_or(0),
-                    observation.subscription_behavior(),
                 )
                 .await?;
                 let milestone = observation_milestone(
@@ -1032,7 +1022,6 @@ where
             }
             StepAction::WaitLog(wait_log) => {
                 let observation = chain.observation.for_step(wait_log.poll_interval);
-                let behavior = observation.subscription_behavior();
                 let (result, event_names) = if wait_log.events.is_empty() {
                     let abi = chain
                         .artifacts
@@ -1046,7 +1035,6 @@ where
                             abi,
                             wait_log,
                             context,
-                            behavior,
                         )
                         .await?,
                         vec![wait_log.event.clone()],
@@ -1095,7 +1083,6 @@ where
                             hash,
                             &prepared,
                             wait_log.confirmations.unwrap_or(0),
-                            behavior,
                         )
                         .await?,
                         names,
@@ -1959,7 +1946,6 @@ where
                     Some(materialized.sender),
                     submission.tx_hash,
                     0,
-                    self.observation.subscription_behavior(),
                 ),
             )
             .await
@@ -2008,10 +1994,7 @@ where
                     ),
                     (
                         "acceptance_latency",
-                        RuntimeValue::Uint(U256::from(
-                            u64::try_from(submission.acceptance_latency.as_millis())
-                                .unwrap_or(u64::MAX),
-                        )),
+                        RuntimeValue::Uint(U256::from(duration_ms(submission.acceptance_latency))),
                     ),
                     ("receipt", receipt),
                 ]),
@@ -2799,17 +2782,6 @@ fn account_binding_value(pool: &str, index: usize, address: Address) -> RuntimeV
     ])
 }
 
-fn expression_hash(value: &serde_yaml::Value, context: &RuntimeContext) -> Result<TxHash> {
-    match eval_expression(value, context)?.coerce_dyn_sol(&DynSolType::FixedBytes(32))? {
-        DynSolValue::FixedBytes(value, 32) => Ok(value),
-        _ => unreachable!("bytes32 coercion returned another type"),
-    }
-}
-
-fn object<const N: usize>(values: [(&str, RuntimeValue); N]) -> RuntimeValue {
-    RuntimeValue::Object(values.into_iter().map(|(key, value)| (key.to_string(), value)).collect())
-}
-
 fn step_name(index: usize, step: &StepDef) -> String {
     step.save.clone().unwrap_or_else(|| format!("step_{}_{}", index + 1, step.action.name()))
 }
@@ -2830,9 +2802,7 @@ fn observation_milestone(
     clock: &RunClock,
 ) -> ProtocolMilestone {
     let since_first = observation.first_observed.monotonic.elapsed();
-    let first_offset_ms = clock
-        .offset_ms()
-        .saturating_sub(u64::try_from(since_first.as_millis()).unwrap_or(u64::MAX));
+    let first_offset_ms = clock.offset_ms().saturating_sub(duration_ms(since_first));
     ProtocolMilestone {
         kind: kind.to_string(),
         chain: chain.to_string(),
@@ -2846,7 +2816,7 @@ fn observation_milestone(
         block_hash: Some(observation.block_hash),
         transaction_index: observation.transaction_index,
         log_index: (observation.log_indices.len() == 1).then(|| observation.log_indices[0]),
-        canonical_block_timestamp_ms: observation.block_timestamp_ms,
+        canonical_block_timestamp_ms: Some(observation.block_timestamp_ms),
         confirmation_depth: observation.confirmation_depth,
         event_names,
         log_indices: observation.log_indices.clone(),
