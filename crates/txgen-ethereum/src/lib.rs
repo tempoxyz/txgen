@@ -1,11 +1,11 @@
 mod template;
 
 use alloy_network::{Ethereum, TransactionBuilder};
-use alloy_primitives::{Bytes, TxKind, U256};
+use alloy_primitives::{Address, Bytes, TxKind, U256};
 use alloy_rpc_types_eth::TransactionRequest;
 use eyre::Result;
 use txgen_cli::{NetworkAdapter, TxRequest};
-use txgen_core::BuildContext;
+use txgen_core::{BuildContext, CallDef, GenValue};
 
 pub use template::{EthTxType, EthereumTemplate};
 
@@ -33,39 +33,8 @@ impl NetworkAdapter for EthereumAdapter {
         let key: [u8; 20] = selected.address.0 .0;
         let nonce = ctx.next_nonce(key);
 
-        let (to, value, input) = resolve_call_data(&template, ctx)?;
-
-        let mut req = TransactionRequest::default();
-        req.set_chain_id(ctx.chain_id);
-        req.set_nonce(nonce);
-        req.set_gas_limit(template.gas_limit);
-
-        req.set_kind(to);
-        req.set_value(value);
-        if !input.is_empty() {
-            req.set_input(input);
-        }
-
-        match template.tx_type {
-            EthTxType::Legacy => {
-                req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
-            }
-            EthTxType::Eip2930 => {
-                req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
-                req.set_access_list(Default::default());
-            }
-            EthTxType::Eip1559 => {
-                req.set_max_fee_per_gas(
-                    template.max_fee_per_gas.unwrap_or(ctx.gas.max_fee_per_gas),
-                );
-                req.set_max_priority_fee_per_gas(
-                    template.max_priority_fee_per_gas.unwrap_or(ctx.gas.max_priority_fee_per_gas),
-                );
-            }
-        }
-
         Ok(TxRequest {
-            request: req,
+            request: build_transaction_request(&template, nonce, ctx)?,
             signer_pool: selected.pool,
             signer_index: selected.index,
             key,
@@ -86,22 +55,64 @@ impl NetworkAdapter for EthereumAdapter {
     }
 }
 
-fn resolve_call_data(
+/// Build an unsigned legacy, EIP-2930 or EIP-1559 request from `template`.
+pub fn build_transaction_request(
     template: &EthereumTemplate,
+    nonce: u64,
+    ctx: &mut BuildContext<'_>,
+) -> Result<TransactionRequest> {
+    let (to, value, input) = resolve_call_data(
+        template.call.as_ref(),
+        &template.to,
+        &template.value,
+        template.input.as_ref(),
+        ctx,
+    )?;
+
+    let mut req = TransactionRequest::default();
+    req.set_chain_id(ctx.chain_id);
+    req.set_nonce(nonce);
+    req.set_gas_limit(template.gas_limit);
+
+    req.set_kind(to);
+    req.set_value(value);
+    if !input.is_empty() {
+        req.set_input(input);
+    }
+
+    match template.tx_type {
+        EthTxType::Legacy => {
+            req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
+        }
+        EthTxType::Eip2930 => {
+            req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
+            req.set_access_list(Default::default());
+        }
+        EthTxType::Eip1559 => {
+            req.set_max_fee_per_gas(template.max_fee_per_gas.unwrap_or(ctx.gas.max_fee_per_gas));
+            req.set_max_priority_fee_per_gas(
+                template.max_priority_fee_per_gas.unwrap_or(ctx.gas.max_priority_fee_per_gas),
+            );
+        }
+    }
+    Ok(req)
+}
+
+/// Resolve `call`, or the raw `to`/`value`/`input` fields when it is unset.
+pub fn resolve_call_data(
+    call: Option<&CallDef>,
+    to: &Option<GenValue<Address>>,
+    value: &GenValue<U256>,
+    input: Option<&GenValue<Bytes>>,
     ctx: &mut BuildContext<'_>,
 ) -> Result<(TxKind, U256, Bytes)> {
-    if let Some(ref call) = template.call {
+    if let Some(call) = call {
         let encoded = ctx.encode_call(call)?;
         Ok((TxKind::Call(encoded.to), encoded.value, encoded.input))
     } else {
-        let to = ctx.resolve_to(&template.to)?;
-        let value = ctx.resolve_value(&template.value)?;
-        let input = template
-            .input
-            .as_ref()
-            .map(|input| ctx.resolve_value(input))
-            .transpose()?
-            .unwrap_or_default();
+        let to = ctx.resolve_to(to)?;
+        let value = ctx.resolve_value(value)?;
+        let input = input.map(|input| ctx.resolve_value(input)).transpose()?.unwrap_or_default();
         Ok((to, value, input))
     }
 }

@@ -42,6 +42,7 @@ use txgen_core::{
     derive_mnemonic_signer, AccountPoolDef, BuildContext, EcdsaSigner, GeneratedTx, SchedulingKey,
     SelectedSigner, TxPhase,
 };
+use txgen_ethereum::{build_transaction_request, resolve_call_data, EthereumTemplate};
 
 use template::{
     resolve_allowed_calls, AccessKeyDef, AllowedCallsDef, KeyTypeDef, TempoAuthDef, TempoAuthMode,
@@ -462,8 +463,6 @@ impl NetworkAdapter for TempoAdapter {
             }
         };
 
-        let (to, value, input, calls) = resolve_call_data(&template, is_tempo, ctx)?;
-
         let mut req = TempoTransactionRequest::default();
         req.set_chain_id(ctx.chain_id);
         req.set_nonce(nonce);
@@ -473,8 +472,8 @@ impl NetworkAdapter for TempoAdapter {
         let mut deferred_sponsor = None;
         let mut late_sign = None;
 
-        match template.tx_type {
-            TempoTxType::Tempo => {
+        match template.tx_type.evm_type() {
+            None => {
                 req.set_max_fee_per_gas(
                     template.max_fee_per_gas.unwrap_or(ctx.gas.max_fee_per_gas),
                 );
@@ -482,7 +481,7 @@ impl NetworkAdapter for TempoAdapter {
                     template.max_priority_fee_per_gas.unwrap_or(ctx.gas.max_priority_fee_per_gas),
                 );
 
-                req.calls = calls;
+                req.calls = resolve_calls(&template, ctx)?;
 
                 let is_expiring = matches!(nonce_mode, TempoNonceMode::Expiring);
                 let is_late_sign = ctx.defer_signing() &&
@@ -559,35 +558,20 @@ impl NetworkAdapter for TempoAdapter {
                         Some(ctx.accounts.get_by_index(&sponsor.pool, sponsor.index)?.clone());
                 }
             }
-            TempoTxType::Legacy => {
-                req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
-                req.set_kind(to);
-                req.set_value(value);
-                if !input.is_empty() {
-                    req.set_input(input);
-                }
-            }
-            TempoTxType::Eip2930 => {
-                req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
-                req.set_access_list(Default::default());
-                req.set_kind(to);
-                req.set_value(value);
-                if !input.is_empty() {
-                    req.set_input(input);
-                }
-            }
-            TempoTxType::Eip1559 => {
-                req.set_max_fee_per_gas(
-                    template.max_fee_per_gas.unwrap_or(ctx.gas.max_fee_per_gas),
-                );
-                req.set_max_priority_fee_per_gas(
-                    template.max_priority_fee_per_gas.unwrap_or(ctx.gas.max_priority_fee_per_gas),
-                );
-                req.set_kind(to);
-                req.set_value(value);
-                if !input.is_empty() {
-                    req.set_input(input);
-                }
+            Some(tx_type) => {
+                let template = EthereumTemplate {
+                    tx_type,
+                    from: template.from,
+                    gas_limit: template.gas_limit,
+                    value: template.value,
+                    to: template.to,
+                    input: template.input,
+                    call: template.call,
+                    gas_price: template.gas_price,
+                    max_fee_per_gas: template.max_fee_per_gas,
+                    max_priority_fee_per_gas: template.max_priority_fee_per_gas,
+                };
+                req = build_transaction_request(&template, nonce, ctx)?.into();
             }
         }
 
@@ -917,57 +901,25 @@ pub(crate) fn compute_parallel_scheduling_key(sender: Address, nonce_key: U256) 
     key
 }
 
-/// Resolve call data from the template into (to, value, input, calls).
-///
-/// For tempo transactions, the result is returned as `calls`; for EVM types
-/// it is returned as `(to, value, input)`.
-fn resolve_call_data(
-    template: &TempoTemplate,
-    is_tempo: bool,
-    ctx: &mut BuildContext<'_>,
-) -> Result<(TxKind, U256, Bytes, Vec<Call>)> {
-    if let Some(ref call_defs) = template.calls {
-        let mut calls = Vec::with_capacity(call_defs.len());
-        for call_def in call_defs {
+/// Resolve the batched `calls` of a Tempo transaction, or its single call.
+fn resolve_calls(template: &TempoTemplate, ctx: &mut BuildContext<'_>) -> Result<Vec<Call>> {
+    let Some(call_defs) = &template.calls else {
+        let (to, value, input) = resolve_call_data(
+            template.call.as_ref(),
+            &template.to,
+            &template.value,
+            template.input.as_ref(),
+            ctx,
+        )?;
+        return Ok(vec![Call { to, value, input }]);
+    };
+    call_defs
+        .iter()
+        .map(|call_def| {
             let encoded = ctx.encode_call(call_def)?;
-            calls.push(Call {
-                to: TxKind::Call(encoded.to),
-                value: encoded.value,
-                input: encoded.input,
-            });
-        }
-        Ok((TxKind::Create, U256::ZERO, Bytes::new(), calls))
-    } else if let Some(ref call_def) = template.call {
-        let encoded = ctx.encode_call(call_def)?;
-        if is_tempo {
-            Ok((
-                TxKind::Create,
-                U256::ZERO,
-                Bytes::new(),
-                vec![Call {
-                    to: TxKind::Call(encoded.to),
-                    value: encoded.value,
-                    input: encoded.input,
-                }],
-            ))
-        } else {
-            Ok((TxKind::Call(encoded.to), encoded.value, encoded.input, Vec::new()))
-        }
-    } else {
-        let to = ctx.resolve_to(&template.to)?;
-        let value: U256 = ctx.resolve_value(&template.value)?;
-        let input = template
-            .input
-            .as_ref()
-            .map(|input| ctx.resolve_value(input))
-            .transpose()?
-            .unwrap_or_default();
-        if is_tempo {
-            Ok((TxKind::Create, U256::ZERO, Bytes::new(), vec![Call { to, value, input }]))
-        } else {
-            Ok((to, value, input, Vec::new()))
-        }
-    }
+            Ok(Call { to: TxKind::Call(encoded.to), value: encoded.value, input: encoded.input })
+        })
+        .collect()
 }
 
 fn sign_keychain_request(

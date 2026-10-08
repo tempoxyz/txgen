@@ -6084,6 +6084,7 @@ dependencies = [
  "tokio",
  "txgen-cli",
  "txgen-core",
+ "txgen-ethereum",
  "zeroize",
 ]
 
