@@ -55,7 +55,8 @@ enum IncludeDef {
     Many(Vec<PathBuf>),
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(transparent)]
 struct Includes(Option<IncludeDef>);
 
 impl Includes {
@@ -65,15 +66,6 @@ impl Includes {
             Some(IncludeDef::One(path)) => vec![path.clone()],
             Some(IncludeDef::Many(paths)) => paths.clone(),
         }
-    }
-}
-
-impl<'de> Deserialize<'de> for Includes {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Option::<IncludeDef>::deserialize(deserializer).map(Self)
     }
 }
 
