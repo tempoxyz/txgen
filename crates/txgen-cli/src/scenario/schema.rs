@@ -606,7 +606,6 @@ impl ScenarioSpec {
         match self.scenario.execution {
             ScenarioExecutionMode::Sequential => {
                 self.validate_declared_step_ids(false)?;
-                let mut available = self.binding_roots();
                 for (index, step) in self.scenario.steps.iter().enumerate() {
                     if !step.depends_on.is_empty() {
                         bail!(
@@ -614,16 +613,13 @@ impl ScenarioSpec {
                             step.diagnostic_label(index)
                         );
                     }
-                    self.validate_step(index, step, &saves, &available, None)?;
-                    if let Some(save) = &step.save {
-                        available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
-                    }
+                    self.validate_step(index, step, &saves, &self.available_roots(0..index), None)?;
                 }
             }
             ScenarioExecutionMode::Dag => {
                 let graph = self.validate_dag_graph()?;
                 for (index, step) in self.scenario.steps.iter().enumerate() {
-                    let available = self.available_roots_for_ancestors(&graph.ancestors[index]);
+                    let available = self.available_roots(graph.ancestors[index].iter().copied());
                     self.validate_step(
                         index,
                         step,
@@ -638,34 +634,23 @@ impl ScenarioSpec {
         Ok(())
     }
 
-    fn binding_roots(&self) -> BTreeMap<String, AvailableRoot> {
-        self.scenario
-            .bindings
-            .iter()
-            .map(|(name, binding)| {
-                (
-                    name.clone(),
-                    match binding {
-                        BindingDef::Account(_) => AvailableRoot::AccountBinding,
-                        BindingDef::Bytes32(_) => AvailableRoot::Bytes32Binding,
-                    },
-                )
-            })
-            .collect()
-    }
-
-    fn available_roots_for_ancestors(
+    /// Bindings plus the saves of the given steps.
+    fn available_roots(
         &self,
-        ancestors: &BTreeSet<usize>,
+        steps: impl IntoIterator<Item = usize>,
     ) -> BTreeMap<String, AvailableRoot> {
-        let mut available = self.binding_roots();
-        for index in ancestors {
-            let step = &self.scenario.steps[*index];
-            if let Some(save) = &step.save {
-                available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
-            }
-        }
-        available
+        let bindings = self.scenario.bindings.iter().map(|(name, binding)| {
+            let root = match binding {
+                BindingDef::Account(_) => AvailableRoot::AccountBinding,
+                BindingDef::Bytes32(_) => AvailableRoot::Bytes32Binding,
+            };
+            (name.clone(), root)
+        });
+        let saves = steps.into_iter().filter_map(|index| {
+            let step = &self.scenario.steps[index];
+            Some((step.save.clone()?, AvailableRoot::Saved(step.saved_kind())))
+        });
+        bindings.chain(saves).collect()
     }
 
     fn validate_declared_step_ids(&self, require_all: bool) -> Result<BTreeMap<String, usize>> {
@@ -800,20 +785,11 @@ impl ScenarioSpec {
         accepts_precomputed_hash: bool,
         filter_name: &str,
     ) -> Result<()> {
-        let mut available = self.binding_roots();
-        match self.scenario.execution {
-            ScenarioExecutionMode::Sequential => {
-                for step in self.scenario.steps.iter().take(step_index) {
-                    if let Some(save) = &step.save {
-                        available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
-                    }
-                }
-            }
-            ScenarioExecutionMode::Dag => {
-                let graph = self.validate_dag_graph()?;
-                available = self.available_roots_for_ancestors(&graph.ancestors[step_index]);
-            }
-        }
+        let available = match self.scenario.execution {
+            ScenarioExecutionMode::Sequential => self.available_roots(0..step_index),
+            ScenarioExecutionMode::Dag => self
+                .available_roots(self.validate_dag_graph()?.ancestors[step_index].iter().copied()),
+        };
 
         let Some(actual) = expression_static_type(expression, &available)? else {
             return Ok(());
@@ -838,26 +814,13 @@ impl ScenarioSpec {
         label: &str,
     ) -> Result<()> {
         let saves = self.collect_saves()?;
-        let mut available = self.binding_roots();
-        match self.scenario.execution {
-            ScenarioExecutionMode::Sequential => {
-                for step in self.scenario.steps.iter().take(step_index) {
-                    if let Some(save) = &step.save {
-                        available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
-                    }
-                }
-            }
-            ScenarioExecutionMode::Dag => {
-                // The expanded concrete steps validate every actual parameter use
-                // against its dependency ancestry. Retain all save shapes here so
-                // the fragment-boundary check can still determine the argument type.
-                for step in &self.scenario.steps {
-                    if let Some(save) = &step.save {
-                        available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
-                    }
-                }
-            }
-        }
+        let available = match self.scenario.execution {
+            ScenarioExecutionMode::Sequential => self.available_roots(0..step_index),
+            // The expanded concrete steps validate every actual parameter use
+            // against its dependency ancestry. Retain all save shapes here so
+            // the fragment-boundary check can still determine the argument type.
+            ScenarioExecutionMode::Dag => self.available_roots(0..self.scenario.steps.len()),
+        };
 
         let paths = collect_variable_paths(expression)
             .map_err(|error| eyre::eyre!("invalid {label}: {error}"))?;
