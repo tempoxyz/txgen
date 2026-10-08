@@ -1579,6 +1579,9 @@ mod tests {
         get_logs_calls: usize,
         get_logs_ranges: Vec<(u64, u64)>,
         get_logs_topics: Vec<serde_json::Value>,
+        /// Signalled after every served `eth_getLogs`, so tests can sequence
+        /// chain mutations against observed queries instead of wall time.
+        get_logs_served: Arc<tokio::sync::Notify>,
     }
 
     impl MockNode {
@@ -1647,7 +1650,9 @@ mod tests {
                         log.block_number.is_some_and(|number| number >= from && number <= to)
                     })
                     .collect();
-                serde_json::to_value(&logs).expect("serialize mock logs")
+                let logs = serde_json::to_value(&logs).expect("serialize mock logs");
+                node.get_logs_served.notify_one();
+                logs
             }
             _ => {
                 return axum::Json(serde_json::json!({
@@ -2294,11 +2299,17 @@ mod tests {
 
         // After the empty chain is scanned end to end, reorg deep history: a
         // new head hash plus an event well below the recent rescan window.
+        // Gate on the served pre-window query rather than wall time: the
+        // shared poller only publishes its latest window, so a waiter that
+        // first runs after the reorg legitimately scans that history once.
         let reorg = tokio::spawn({
             let node = node.clone();
             let log = log.clone();
             async move {
-                tokio::time::sleep(Duration::from_millis(60)).await;
+                let served = node.lock().unwrap().get_logs_served.clone();
+                while !node.lock().unwrap().get_logs_ranges.contains(&(0, 36)) {
+                    served.notified().await;
+                }
                 let mut node = node.lock().unwrap();
                 node.hashes.insert(100, B256::repeat_byte(0x88));
                 node.hashes.insert(10, log.block_hash.unwrap());
