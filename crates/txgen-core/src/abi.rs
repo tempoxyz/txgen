@@ -1,6 +1,6 @@
-use alloy_dyn_abi::DynSolValue;
+use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_json_abi::{JsonAbi, Param};
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_primitives::{Address, Bytes, B256, I256, U256};
 use eyre::{bail, ensure, Result, WrapErr};
 use serde::Deserialize;
 use std::{
@@ -567,102 +567,106 @@ fn yaml_to_sol_value(
     sol_type: &str,
     resolver: &mut ValueResolver<'_>,
 ) -> Result<DynSolValue> {
-    // Handle generator expressions
+    let ty = DynSolType::parse(sol_type)
+        .map_err(|err| eyre::eyre!("unsupported Solidity type {sol_type}: {err}"))?;
+    yaml_to_dyn_value(value, &ty, resolver)
+}
+
+fn yaml_to_dyn_value(
+    value: &serde_yaml::Value,
+    ty: &DynSolType,
+    resolver: &mut ValueResolver<'_>,
+) -> Result<DynSolValue> {
     if parse_generator(value).is_some() {
-        return resolve_generator_to_sol(value, sol_type, resolver);
+        return resolve_generator_to_sol(value, ty, resolver);
     }
 
-    // Direct value conversion
-    match sol_type {
-        "address" => {
+    match ty {
+        DynSolType::Address => {
             let s: String = serde_yaml::from_value(value.clone())?;
-            let addr: Address = s.parse()?;
-            Ok(DynSolValue::Address(addr))
+            Ok(DynSolValue::Address(s.parse()?))
         }
-        "bool" => {
-            let b: bool = serde_yaml::from_value(value.clone())?;
-            Ok(DynSolValue::Bool(b))
-        }
-        "string" => {
+        DynSolType::Bool => Ok(DynSolValue::Bool(serde_yaml::from_value(value.clone())?)),
+        DynSolType::String => Ok(DynSolValue::String(serde_yaml::from_value(value.clone())?)),
+        DynSolType::Bytes => {
             let s: String = serde_yaml::from_value(value.clone())?;
-            Ok(DynSolValue::String(s))
+            Ok(DynSolValue::Bytes(s.parse::<Bytes>()?.to_vec()))
         }
-        "bytes" => {
-            let s: String = serde_yaml::from_value(value.clone())?;
-            let bytes: Bytes = s.parse()?;
-            Ok(DynSolValue::Bytes(bytes.to_vec()))
-        }
-        t if t.starts_with("uint") => {
+        DynSolType::Uint(bits) => {
             let val: U256 = serde_yaml::from_value(value.clone())
-                .wrap_err_with(|| format!("invalid {t} literal"))?;
-            Ok(DynSolValue::Uint(val, parse_uint_bits(t)?))
+                .wrap_err_with(|| format!("invalid {ty} literal"))?;
+            ensure!(val.bit_len() <= *bits, "{val} is out of range for {ty}");
+            Ok(DynSolValue::Uint(val, *bits))
         }
-        t if t.starts_with("int") => {
-            let val: i64 = serde_yaml::from_value(value.clone())?;
-            let bits = parse_int_bits(t)?;
-            Ok(DynSolValue::Int(alloy_primitives::I256::try_from(val)?, bits))
+        DynSolType::Int(bits) => {
+            let val: I256 = serde_yaml::from_value(value.clone())
+                .wrap_err_with(|| format!("invalid {ty} literal"))?;
+            ensure!(val.bits() as usize <= *bits, "{val} is out of range for {ty}");
+            Ok(DynSolValue::Int(val, *bits))
         }
-        t if t.starts_with("bytes") && t.len() > 5 => {
-            // Fixed bytes (bytes1, bytes32, etc.)
+        DynSolType::FixedBytes(size) => {
             let s: String = serde_yaml::from_value(value.clone())?;
             let bytes: Bytes = s.parse()?;
-            let size: usize = t[5..].parse()?;
-            ensure!(size <= 32, "invalid fixed bytes size {size}");
-            ensure!(bytes.len() == size, "{t} expects {size} bytes, got {}", bytes.len());
-            let mut fixed = [0u8; 32];
-            fixed[..size].copy_from_slice(&bytes);
-            Ok(DynSolValue::FixedBytes(B256::from(fixed), size))
+            ensure!(bytes.len() == *size, "{ty} expects {size} bytes, got {}", bytes.len());
+            let mut fixed = B256::ZERO;
+            fixed[..*size].copy_from_slice(&bytes);
+            Ok(DynSolValue::FixedBytes(fixed, *size))
         }
-        t if t.ends_with("[]") => {
-            // Dynamic array
-            let inner_type = &t[..t.len() - 2];
-            let arr: Vec<serde_yaml::Value> = serde_yaml::from_value(value.clone())?;
-            let values: Result<Vec<_>> =
-                arr.iter().map(|v| yaml_to_sol_value(v, inner_type, resolver)).collect();
-            Ok(DynSolValue::Array(values?))
+        DynSolType::Array(inner) | DynSolType::FixedArray(inner, _) => {
+            let values = value
+                .as_sequence()
+                .ok_or_else(|| eyre::eyre!("{ty} must be a list"))?
+                .iter()
+                .map(|value| yaml_to_dyn_value(value, inner, resolver))
+                .collect::<Result<Vec<_>>>()?;
+            if let DynSolType::FixedArray(_, len) = ty {
+                ensure!(values.len() == *len, "{ty} expects {len} values, got {}", values.len());
+                Ok(DynSolValue::FixedArray(values))
+            } else {
+                Ok(DynSolValue::Array(values))
+            }
+        }
+        DynSolType::Tuple(types) => {
+            let values = value.as_sequence().ok_or_else(|| eyre::eyre!("{ty} must be a list"))?;
+            ensure!(
+                values.len() == types.len(),
+                "{ty} expects {} values, got {}",
+                types.len(),
+                values.len()
+            );
+            values
+                .iter()
+                .zip(types)
+                .map(|(value, ty)| yaml_to_dyn_value(value, ty, resolver))
+                .collect::<Result<Vec<_>>>()
+                .map(DynSolValue::Tuple)
         }
         _ => {
-            bail!("unsupported Solidity type: {}", sol_type);
+            bail!("unsupported Solidity type: {ty}");
         }
     }
 }
 
 fn resolve_generator_to_sol(
     value: &serde_yaml::Value,
-    sol_type: &str,
+    ty: &DynSolType,
     resolver: &mut ValueResolver<'_>,
 ) -> Result<DynSolValue> {
     if matches!(parse_generator(value), Some(Generator::Random)) {
-        let value = match sol_type {
-            "address" => serde_yaml::Value::String(resolver.resolve::<Address>(value)?.to_string()),
-            t if t.starts_with("uint") => {
-                serde_yaml::Value::String(resolver.resolve::<U256>(value)?.to_string())
+        return match ty {
+            DynSolType::Address => Ok(DynSolValue::Address(resolver.resolve(value)?)),
+            DynSolType::Uint(bits) => {
+                let val: U256 = resolver.resolve(value)?;
+                Ok(DynSolValue::Uint(val >> (256 - bits), *bits))
             }
             _ => {
-                bail!("generator not supported for type: {}", sol_type);
+                bail!("generator not supported for type: {ty}");
             }
         };
-        return yaml_to_sol_value(&value, sol_type, resolver);
     }
 
     let value = resolver.resolve_yaml(value)?;
-    yaml_to_sol_value(&value, sol_type, resolver)
-}
-
-fn parse_uint_bits(t: &str) -> Result<usize> {
-    if t == "uint" {
-        return Ok(256);
-    }
-    let bits: usize = t[4..].parse()?;
-    Ok(bits)
-}
-
-fn parse_int_bits(t: &str) -> Result<usize> {
-    if t == "int" {
-        return Ok(256);
-    }
-    let bits: usize = t[3..].parse()?;
-    Ok(bits)
+    yaml_to_dyn_value(&value, ty, resolver)
 }
 
 #[cfg(test)]
@@ -793,6 +797,63 @@ tag: "0x33333333333333333333333333333333"
             .expect_err("fractional uint literals should fail");
 
         assert!(err.to_string().contains("invalid uint256 literal"));
+    }
+
+    #[test]
+    fn test_integer_literals_check_width() -> Result<()> {
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
+        let encode = |literal: &str, ty: &str, resolver: &mut ValueResolver<'_>| {
+            yaml_to_sol_value(&serde_yaml::from_str(literal)?, ty, resolver)
+        };
+
+        assert_eq!(encode("255", "uint8", &mut resolver)?, DynSolValue::Uint(U256::from(255), 8));
+        assert!(encode("256", "uint8", &mut resolver).is_err());
+        assert_eq!(
+            encode("-128", "int8", &mut resolver)?,
+            DynSolValue::Int(I256::try_from(-128)?, 8)
+        );
+        assert!(encode("128", "int8", &mut resolver).is_err());
+        assert_eq!(
+            encode("\"-0x10000000000000000\"", "int256", &mut resolver)?,
+            DynSolValue::Int(I256::try_from(-(1i128 << 64))?, 256)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_literals() -> Result<()> {
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
+        let encode = |literal: &str, ty: &str, resolver: &mut ValueResolver<'_>| {
+            yaml_to_sol_value(&serde_yaml::from_str(literal)?, ty, resolver)
+        };
+
+        assert_eq!(
+            encode("[1, \"0x2\"]", "uint256[]", &mut resolver)?,
+            DynSolValue::Array(vec![
+                DynSolValue::Uint(U256::from(1), 256),
+                DynSolValue::Uint(U256::from(2), 256),
+            ])
+        );
+        assert_eq!(
+            encode("[-1]", "int24[]", &mut resolver)?,
+            DynSolValue::Array(vec![DynSolValue::Int(I256::MINUS_ONE, 24)])
+        );
+        assert_eq!(
+            encode(&format!("[\"{}\"]", B256::repeat_byte(1)), "bytes32[]", &mut resolver)?,
+            DynSolValue::Array(vec![DynSolValue::FixedBytes(B256::repeat_byte(1), 32)])
+        );
+        assert_eq!(
+            encode("[[1, 2]]", "uint8[2][]", &mut resolver)?,
+            DynSolValue::Array(vec![DynSolValue::FixedArray(vec![
+                DynSolValue::Uint(U256::from(1), 8),
+                DynSolValue::Uint(U256::from(2), 8),
+            ])])
+        );
+        assert!(encode("[1, 2, 3]", "uint8[2]", &mut resolver).is_err());
+        assert!(encode("[300]", "uint8[]", &mut resolver).is_err());
+        Ok(())
     }
 
     #[test]
