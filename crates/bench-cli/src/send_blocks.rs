@@ -123,9 +123,11 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let jwt_secret =
         JwtSecret::from_hex(jwt_secret_hex.trim()).wrap_err("invalid JWT secret hex")?;
 
-    let metadata: HashMap<_, _> = parse_metadata(&args.metadata)?;
-    let scraper_configs =
-        metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
+    let metadata: HashMap<_, _> = parse_metadata(&args.reporting.metadata)?;
+    let scraper_configs = metrics_scraper_configs(
+        &args.reporting.metrics_url,
+        Duration::from_millis(args.reporting.scrape_interval_ms),
+    )?;
     let persistence_policy = args.wait_for_persistence;
     tracing::info!(
         engine = %args.engine,
@@ -144,21 +146,29 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let testing_provider =
         RootProvider::<Ethereum>::new_http(args.rpc.parse().wrap_err("invalid RPC URL")?);
 
-    let clickhouse_metric_names = load_metric_names(args.clickhouse_metrics_file.as_ref())?;
-    let mut reporters =
-        parse_reporters(&args.reports, "send-blocks", &metadata, clickhouse_metric_names)?;
+    let clickhouse_metric_names =
+        load_metric_names(args.reporting.clickhouse_metrics_file.as_ref())?;
+    let mut reporters = parse_reporters(
+        &args.reporting.reports,
+        "send-blocks",
+        &metadata,
+        clickhouse_metric_names,
+    )?;
     if reporters.is_empty() {
         reporters.push(Box::new(ConsoleReporter::stderr(false)));
     }
 
-    let clock = match args.metrics_align {
+    let clock = match args.reporting.metrics_align {
         Some(start) => RunClock::new_with_start_unix_ms(start),
         None => RunClock::new(),
     };
     let store = SampleStore::with_labels(metadata.clone())?;
     let counters = Arc::new(BlockCounters::default());
-    let metrics_forwarder =
-        build_metrics_forwarder(args.metrics_forward.as_deref(), &metadata, &scraper_configs)?;
+    let metrics_forwarder = build_metrics_forwarder(
+        args.reporting.metrics_forward.as_deref(),
+        &metadata,
+        &scraper_configs,
+    )?;
 
     // Start background scraper if metrics URL is configured.
     let scraper_handles = if !scraper_configs.is_empty() {
