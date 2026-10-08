@@ -1935,7 +1935,7 @@ where
 }
 
 fn resolve_sequence_bindings(
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
+    bindings: &BTreeMap<String, SequenceBinding>,
     ctx: &mut BuildContext<'_>,
     globals: &std::collections::HashMap<String, ResolvedBinding>,
 ) -> Result<std::collections::HashMap<String, ResolvedBinding>> {
@@ -1957,7 +1957,7 @@ fn resolve_sequence_bindings(
 
 fn resolve_sequence_binding(
     name: &str,
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
+    bindings: &BTreeMap<String, SequenceBinding>,
     resolved: &mut std::collections::HashMap<String, ResolvedBinding>,
     resolving: &mut HashSet<String>,
     ctx: &mut BuildContext<'_>,
@@ -2003,7 +2003,7 @@ fn resolve_sequence_binding(
 
 fn resolve_binding_dependencies(
     binding: &SequenceBinding,
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
+    bindings: &BTreeMap<String, SequenceBinding>,
     resolved: &mut std::collections::HashMap<String, ResolvedBinding>,
     resolving: &mut HashSet<String>,
     ctx: &mut BuildContext<'_>,
@@ -2019,9 +2019,9 @@ fn resolve_binding_dependencies(
 
 fn binding_dependency_names(
     binding: &SequenceBinding,
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
-) -> HashSet<String> {
-    let mut deps = HashSet::new();
+    bindings: &BTreeMap<String, SequenceBinding>,
+) -> BTreeSet<String> {
+    let mut deps = BTreeSet::new();
     match binding {
         SequenceBinding::AbiEncodePacked(def) | SequenceBinding::AbiHash(def) => {
             for value in &def.values {
@@ -2084,8 +2084,8 @@ fn yaml_to_json(value: serde_yaml::Value) -> Result<serde_json::Value> {
 
 fn collect_var_names(
     value: &serde_yaml::Value,
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
-    names: &mut HashSet<String>,
+    bindings: &BTreeMap<String, SequenceBinding>,
+    names: &mut BTreeSet<String>,
 ) {
     match value {
         serde_yaml::Value::Mapping(mapping) if mapping.len() == 1 => {
@@ -2116,7 +2116,7 @@ fn collect_var_names(
 
 fn referenced_local_binding(
     path: &str,
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
+    bindings: &BTreeMap<String, SequenceBinding>,
 ) -> Option<String> {
     let first = path.split('.').next().unwrap_or(path);
     if bindings.contains_key(first) {
@@ -2680,6 +2680,50 @@ call:
         assert_eq!(values[2], var("is_bid"));
         assert_eq!(values[3], var("tick"));
         assert_eq!(yaml_get(yaml_get(&values[4], "if"), "cond"), &var("is_bid"));
+        Ok(())
+    }
+
+    #[test]
+    fn seeded_sequence_bindings_resolve_deterministically() -> Result<()> {
+        let yaml = r#"
+chain_id: 1
+templates: {t: {}}
+sequences:
+  s:
+    bindings:
+      digest:
+        abi_hash: { types: [bytes32, bytes32, bytes32], values: [{ var: x6 }, { var: x4 }, { var: x2 }] }
+      x1: { bytes32: { random_bytes: 32 } }
+      x2: { bytes32: { random_bytes: 32 } }
+      x3: { bytes32: { random_bytes: 32 } }
+      x4: { bytes32: { random_bytes: 32 } }
+      x5: { bytes32: { random_bytes: 32 } }
+      x6: { bytes32: { random_bytes: 32 } }
+    steps: [{template: t}]
+mix: [{sequence: s, weight: 1}]
+"#;
+        let names = ["digest", "x1", "x2", "x3", "x4", "x5", "x6"];
+
+        let resolve = || -> Result<Vec<String>> {
+            let spec = WorkloadSpec::parse(yaml)?;
+            let accounts = AccountManager::empty();
+            let artifacts = ArtifactManager::empty();
+            let gas = GasConfig::default();
+            let mut nonces = NonceTracker::new();
+            let mut rng = StdRng::seed_from_u64(7);
+            let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+            let resolved = resolve_sequence_bindings(
+                &spec.sequences["s"].bindings,
+                &mut ctx,
+                &HashMap::new(),
+            )?;
+            Ok(names.iter().map(|name| format!("{:?}", resolved[*name])).collect())
+        };
+
+        let expected = resolve()?;
+        for _ in 0..8 {
+            assert_eq!(resolve()?, expected);
+        }
         Ok(())
     }
 
