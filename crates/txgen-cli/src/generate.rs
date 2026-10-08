@@ -1007,11 +1007,7 @@ where
     );
     build_ctx.set_defer_signing(ctx.defer_signing);
 
-    let writer: Box<dyn Write> = match &output {
-        Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
-        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
-    };
-    let mut writer = NdjsonWriter::new(writer);
+    let mut writer = txgen_core::output::ndjson_writer(output.as_deref())?;
     let setup_bindings = if let Some(state) = &ctx.setup_state_in {
         state.bindings()
     } else {
