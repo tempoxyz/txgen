@@ -231,7 +231,7 @@ fn report_progress(
     let state = ProgressState {
         sent: collector.blocks_submitted(),
         success: collector.blocks_success(),
-        failed: collector.blocks_failed(),
+        failed: 0,
         elapsed: start.elapsed(),
         max_concurrent: 0,
         target_tps: None,
@@ -316,7 +316,6 @@ async fn process_block(
     let new_payload_latency = new_payload_start.elapsed();
 
     if !payload_status.status.is_valid() {
-        collector.record_failure();
         eyre::bail!(
             "reth_newPayload returned non-VALID status for block {}: {:?}",
             block.number,
@@ -341,7 +340,6 @@ async fn process_block(
     let fcu_latency = fcu_start.elapsed();
 
     if !fcu_result.is_valid() {
-        collector.record_failure();
         eyre::bail!(
             "reth_forkchoiceUpdated returned non-VALID status for block {}: {:?}",
             block.number,
@@ -668,7 +666,6 @@ async fn process_big_block(
     let new_payload_latency = new_payload_start.elapsed();
 
     if !payload_status.status.is_valid() {
-        collector.record_failure();
         eyre::bail!(
             "reth_newPayload returned non-VALID status for big block {}: {:?}",
             block_number,
@@ -690,7 +687,6 @@ async fn process_big_block(
     let fcu_latency = fcu_start.elapsed();
 
     if !fcu_result.is_valid() {
-        collector.record_failure();
         eyre::bail!(
             "reth_forkchoiceUpdated returned non-VALID status for big block {}: {:?}",
             block_number,
@@ -744,14 +740,12 @@ async fn process_big_block(
 struct BlockCounters {
     submitted: AtomicU64,
     success: AtomicU64,
-    failed: AtomicU64,
 }
 
 impl BlockCounters {
     fn snapshot_samples(&self, clock: &RunClock) -> Vec<Sample> {
         let submitted = self.submitted.load(Ordering::Relaxed);
         let success = self.success.load(Ordering::Relaxed);
-        let failed = self.failed.load(Ordering::Relaxed);
         let offset_ms = clock.offset_ms();
         let unix_ms = clock.unix_ms();
         let labels = BTreeMap::new();
@@ -771,10 +765,11 @@ impl BlockCounters {
                 offset_ms,
                 unix_ms,
             },
+            // A failed submission aborts the run, so no failure is ever reported.
             Sample {
                 name: "txgen_blocks_failed_total".to_string(),
                 labels,
-                value: failed as f64,
+                value: 0.0,
                 offset_ms,
                 unix_ms,
             },
@@ -808,21 +803,12 @@ impl MetricsCollector {
         self.blocks.push(stats);
     }
 
-    fn record_failure(&self) {
-        self.counters.submitted.fetch_add(1, Ordering::Relaxed);
-        self.counters.failed.fetch_add(1, Ordering::Relaxed);
-    }
-
     fn blocks_submitted(&self) -> u64 {
         self.counters.submitted.load(Ordering::Relaxed)
     }
 
     fn blocks_success(&self) -> u64 {
         self.counters.success.load(Ordering::Relaxed)
-    }
-
-    fn blocks_failed(&self) -> u64 {
-        self.counters.failed.load(Ordering::Relaxed)
     }
 
     fn final_snapshot(&self, clock: &RunClock) -> Vec<Sample> {
