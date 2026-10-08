@@ -11,7 +11,9 @@ use alloy_consensus::Header as ConsensusHeader;
 use alloy_network::Ethereum;
 use alloy_primitives::{Address, Bytes, B256};
 use alloy_provider::{ext::TestingApi, Provider, RootProvider};
-use alloy_reth::{BigBlockData, RethApi, RethNewPayloadInput, RethNewPayloadParams};
+use alloy_reth::{
+    BigBlockData, RethApi, RethNewPayloadInput, RethNewPayloadParams, RethPayloadStatus,
+};
 use alloy_rlp::{Decodable, Header};
 use alloy_rpc_types_engine::{
     ExecutionData, ForkchoiceState, JwtSecret, PayloadAttributes, TestingBuildBlockRequestV1,
@@ -231,7 +233,7 @@ fn report_progress(
     let state = ProgressState {
         sent: collector.blocks_submitted(),
         success: collector.blocks_success(),
-        failed: collector.blocks_failed(),
+        failed: 0,
         elapsed: start.elapsed(),
         max_concurrent: 0,
         target_tps: None,
@@ -302,96 +304,137 @@ async fn process_block(
     forkchoice_anchor: Option<B256>,
     persistence_policy: WaitForPersistence,
 ) -> Result<()> {
-    let input: RethNewPayloadInput<()> = match block.bal.clone() {
+    let input = match block.bal.clone() {
         Some(bal) => RethNewPayloadInput::block_rlp_with_bal(block.raw.clone(), bal),
         None => RethNewPayloadInput::block_rlp(block.raw.clone()),
     };
-    let wait = persistence_policy.should_wait(collector.blocks_submitted());
-
-    let new_payload_start = Instant::now();
-    let payload_status = provider
-        .reth_new_payload(RethNewPayloadParams::new(input).with_wait_for_persistence(wait))
-        .await
-        .wrap_err("reth_newPayload failed")?;
-    let new_payload_latency = new_payload_start.elapsed();
-
-    if !payload_status.status.is_valid() {
-        collector.record_failure();
-        eyre::bail!(
-            "reth_newPayload returned non-VALID status for block {}: {:?}",
-            block.number,
-            payload_status.status,
-        );
-    }
-
-    let (safe_block_hash, finalized_block_hash) = if let Some(anchor) = forkchoice_anchor {
-        (anchor, anchor)
-    } else {
-        let safe_hash = collector.prev_block_hash.unwrap_or(block.key);
-        (safe_hash, *collector.finalized_hash.get_or_insert(safe_hash))
-    };
-
-    let forkchoice_state =
-        ForkchoiceState { head_block_hash: block.key, safe_block_hash, finalized_block_hash };
-    let fcu_start = Instant::now();
-    let fcu_result = provider
-        .reth_forkchoice_updated(forkchoice_state)
-        .await
-        .wrap_err("reth_forkchoiceUpdated failed")?;
-    let fcu_latency = fcu_start.elapsed();
-
-    if !fcu_result.is_valid() {
-        collector.record_failure();
-        eyre::bail!(
-            "reth_forkchoiceUpdated returned non-VALID status for block {}: {:?}",
-            block.number,
-            fcu_result.payload_status,
-        );
-    }
-
-    let total_latency = new_payload_latency + fcu_latency;
-    let payload_status_str = payload_status.status.status.to_string();
-
-    let timestamp_ms = block.timestamp * 1000;
-    let block_time_ms = collector.prev_timestamp_ms.map(|prev| timestamp_ms.saturating_sub(prev));
-    collector.prev_timestamp_ms = Some(timestamp_ms);
-
-    let block_stats = BlockStats {
+    let summary = BlockSummary {
+        kind: "block",
         number: block.number,
-        timestamp_ms,
+        hash: block.key,
+        timestamp_ms: block.timestamp * 1000,
         tx_count: block.tx_count,
         gas_used: block.gas_used,
         gas_limit: block.gas_limit,
-        block_time_ms,
-        new_payload_ms: Some(new_payload_latency.as_millis() as u64),
-        forkchoice_updated_ms: Some(fcu_latency.as_millis() as u64),
-        new_payload_server_latency_us: Some(payload_status.latency_us),
-        persistence_wait_us: payload_status.persistence_wait_us,
-        execution_cache_wait_us: payload_status.execution_cache_wait_us,
-        sparse_trie_wait_us: payload_status.sparse_trie_wait_us,
     };
+    submit_block(provider, collector, persistence_policy, input, forkchoice_anchor, summary).await
+}
 
-    collector.record_success(block_stats);
+/// Header fields reported for a submitted canonical block.
+struct BlockSummary {
+    kind: &'static str,
+    number: u64,
+    hash: B256,
+    timestamp_ms: u64,
+    tx_count: usize,
+    gas_used: u64,
+    gas_limit: u64,
+}
+
+/// Submit a canonical block and record its stats.
+///
+/// Without a forkchoice anchor, the previous block is safe and the last
+/// 32-block checkpoint is finalized.
+async fn submit_block(
+    provider: &(impl Provider + RethApi<Ethereum>),
+    collector: &mut MetricsCollector,
+    persistence_policy: WaitForPersistence,
+    input: RethNewPayloadInput<ExecutionData>,
+    forkchoice_anchor: Option<B256>,
+    block: BlockSummary,
+) -> Result<()> {
+    let (safe_block_hash, finalized_block_hash) = match forkchoice_anchor {
+        Some(anchor) => (anchor, anchor),
+        None => {
+            let safe_hash = collector.prev_block_hash.unwrap_or(block.hash);
+            (safe_hash, *collector.finalized_hash.get_or_insert(safe_hash))
+        }
+    };
+    let forkchoice_state =
+        ForkchoiceState { head_block_hash: block.hash, safe_block_hash, finalized_block_hash };
+    let wait = persistence_policy.should_wait(collector.blocks_submitted());
+    let label = format!("{} {}", block.kind, block.number);
+    let Submission { status, new_payload, forkchoice_updated } =
+        submit(provider, input, wait, forkchoice_state, &label).await?;
 
     tracing::info!(
         block = block.number,
         txs = block.tx_count,
         gas = block.gas_used,
-        new_payload_ms = new_payload_latency.as_millis(),
-        forkchoice_updated_ms = fcu_latency.as_millis(),
-        total_ms = total_latency.as_millis(),
-        new_payload_server_latency_us = payload_status.latency_us,
-        status = %payload_status_str,
-        "Submitted block"
+        new_payload_ms = new_payload.as_millis(),
+        forkchoice_updated_ms = forkchoice_updated.as_millis(),
+        total_ms = (new_payload + forkchoice_updated).as_millis(),
+        new_payload_server_latency_us = status.latency_us,
+        status = %status.status.status,
+        "Submitted {}",
+        block.kind
     );
 
-    collector.prev_block_hash = Some(block.key);
-
+    let block_time_ms =
+        collector.prev_timestamp_ms.map(|prev| block.timestamp_ms.saturating_sub(prev));
+    collector.prev_timestamp_ms = Some(block.timestamp_ms);
+    collector.prev_block_hash = Some(block.hash);
     if block.number.is_multiple_of(32) {
-        collector.finalized_hash = Some(block.key);
+        collector.finalized_hash = Some(block.hash);
+    }
+    collector.record_success(BlockStats {
+        number: block.number,
+        timestamp_ms: block.timestamp_ms,
+        tx_count: block.tx_count,
+        gas_used: block.gas_used,
+        gas_limit: block.gas_limit,
+        block_time_ms,
+        new_payload_ms: Some(new_payload.as_millis() as u64),
+        forkchoice_updated_ms: Some(forkchoice_updated.as_millis() as u64),
+        new_payload_server_latency_us: Some(status.latency_us),
+        persistence_wait_us: status.persistence_wait_us,
+        execution_cache_wait_us: status.execution_cache_wait_us,
+        sparse_trie_wait_us: status.sparse_trie_wait_us,
+    });
+    Ok(())
+}
+
+/// Engine API status and client-side latencies of one block submission.
+struct Submission {
+    status: RethPayloadStatus,
+    new_payload: Duration,
+    forkchoice_updated: Duration,
+}
+
+/// Send `reth_newPayload` and then `reth_forkchoiceUpdated`; both must be VALID.
+async fn submit(
+    provider: &(impl Provider + RethApi<Ethereum>),
+    input: RethNewPayloadInput<ExecutionData>,
+    wait_for_persistence: bool,
+    forkchoice_state: ForkchoiceState,
+    label: &str,
+) -> Result<Submission> {
+    let start = Instant::now();
+    let status = provider
+        .reth_new_payload(
+            RethNewPayloadParams::new(input).with_wait_for_persistence(wait_for_persistence),
+        )
+        .await
+        .wrap_err_with(|| format!("reth_newPayload failed for {label}"))?;
+    let new_payload = start.elapsed();
+    if !status.status.is_valid() {
+        eyre::bail!("reth_newPayload returned non-VALID status for {label}: {:?}", status.status);
     }
 
-    Ok(())
+    let start = Instant::now();
+    let fcu_result = provider
+        .reth_forkchoice_updated(forkchoice_state)
+        .await
+        .wrap_err_with(|| format!("reth_forkchoiceUpdated failed for {label}"))?;
+    let forkchoice_updated = start.elapsed();
+    if !fcu_result.is_valid() {
+        eyre::bail!(
+            "reth_forkchoiceUpdated returned non-VALID status for {label}: {:?}",
+            fcu_result.payload_status,
+        );
+    }
+
+    Ok(Submission { status, new_payload, forkchoice_updated })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -513,45 +556,20 @@ async fn process_synthetic_block(
     let (payload, sidecar) = envelope.into_payload_and_sidecar(parent_beacon_block_root);
     let execution_data = ExecutionData::new(payload, sidecar);
 
-    let payload_status = provider
-        .reth_new_payload(
-            RethNewPayloadParams::new(RethNewPayloadInput::execution_data(execution_data))
-                .with_wait_for_persistence(wait),
-        )
-        .await
-        .wrap_err_with(|| {
-            format!("reth_newPayload failed for synthetic fork block after block {}", block.number)
-        })?;
-
-    if !payload_status.status.is_valid() {
-        eyre::bail!(
-            "reth_newPayload returned non-VALID status for synthetic fork block after block {}: {:?}",
-            block.number,
-            payload_status.status,
-        );
-    }
-
-    let fcu_result = provider
-        .reth_forkchoice_updated(ForkchoiceState {
-            head_block_hash: synthetic_block_hash,
-            safe_block_hash: branch_point_hash,
-            finalized_block_hash: branch_point_hash,
-        })
-        .await
-        .wrap_err_with(|| {
-            format!(
-                "reth_forkchoiceUpdated failed for synthetic fork block after block {}",
-                block.number
-            )
-        })?;
-
-    if !fcu_result.is_valid() {
-        eyre::bail!(
-            "reth_forkchoiceUpdated returned non-VALID status for synthetic fork block after block {}: {:?}",
-            block.number,
-            fcu_result.payload_status,
-        );
-    }
+    let forkchoice_state = ForkchoiceState {
+        head_block_hash: synthetic_block_hash,
+        safe_block_hash: branch_point_hash,
+        finalized_block_hash: branch_point_hash,
+    };
+    let label = format!("synthetic fork block after block {}", block.number);
+    submit(
+        provider,
+        RethNewPayloadInput::execution_data(execution_data),
+        wait,
+        forkchoice_state,
+        &label,
+    )
+    .await?;
 
     Ok(synthetic_block_hash)
 }
@@ -642,101 +660,22 @@ async fn process_big_block(
     collector: &mut MetricsCollector,
     persistence_policy: WaitForPersistence,
 ) -> Result<()> {
-    let first_payload = big_block
-        .env_switches
-        .first()
-        .ok_or_else(|| eyre::eyre!("big-block payload contains no execution payloads"))?;
-    let last_payload = big_block
-        .env_switches
-        .last()
-        .ok_or_else(|| eyre::eyre!("big-block payload contains no execution payloads"))?;
-
+    let payloads = &big_block.env_switches;
+    let (Some(first_payload), Some(last_payload)) = (payloads.first(), payloads.last()) else {
+        eyre::bail!("big-block payload contains no execution payloads");
+    };
     let block_hash = last_payload.block_hash();
-    let block_number = big_block.block_number;
-    let tx_count = big_block.env_switches.iter().map(|data| data.transaction_count()).sum();
-    let gas_used = big_block.env_switches.iter().map(|data| data.payload.as_v1().gas_used).sum();
-    let gas_limit = big_block.env_switches.iter().map(|data| data.payload.gas_limit()).sum();
-    let wait = persistence_policy.should_wait(collector.blocks_submitted());
-
+    let summary = BlockSummary {
+        kind: "big block",
+        number: big_block.block_number,
+        hash: block_hash,
+        timestamp_ms: first_payload.payload.timestamp() * 1000,
+        tx_count: payloads.iter().map(|data| data.transaction_count()).sum(),
+        gas_used: payloads.iter().map(|data| data.payload.as_v1().gas_used).sum(),
+        gas_limit: payloads.iter().map(|data| data.payload.gas_limit()).sum(),
+    };
     let input = RethNewPayloadInput::big_block_data(big_block.clone());
-
-    let new_payload_start = Instant::now();
-    let payload_status = provider
-        .reth_new_payload(RethNewPayloadParams::new(input).with_wait_for_persistence(wait))
-        .await
-        .wrap_err("reth_newPayload failed")?;
-    let new_payload_latency = new_payload_start.elapsed();
-
-    if !payload_status.status.is_valid() {
-        collector.record_failure();
-        eyre::bail!(
-            "reth_newPayload returned non-VALID status for big block {}: {:?}",
-            block_number,
-            payload_status.status,
-        );
-    }
-
-    let forkchoice_state = ForkchoiceState {
-        head_block_hash: block_hash,
-        safe_block_hash: block_hash,
-        finalized_block_hash: block_hash,
-    };
-
-    let fcu_start = Instant::now();
-    let fcu_result = provider
-        .reth_forkchoice_updated(forkchoice_state)
-        .await
-        .wrap_err("reth_forkchoiceUpdated failed")?;
-    let fcu_latency = fcu_start.elapsed();
-
-    if !fcu_result.is_valid() {
-        collector.record_failure();
-        eyre::bail!(
-            "reth_forkchoiceUpdated returned non-VALID status for big block {}: {:?}",
-            block_number,
-            fcu_result.payload_status,
-        );
-    }
-
-    let timestamp_ms = first_payload.payload.timestamp() * 1000;
-    let block_time_ms = collector.prev_timestamp_ms.map(|prev| timestamp_ms.saturating_sub(prev));
-    collector.prev_timestamp_ms = Some(timestamp_ms);
-
-    let block_stats = BlockStats {
-        number: block_number,
-        timestamp_ms,
-        tx_count,
-        gas_used,
-        gas_limit,
-        block_time_ms,
-        new_payload_ms: Some(new_payload_latency.as_millis() as u64),
-        forkchoice_updated_ms: Some(fcu_latency.as_millis() as u64),
-        new_payload_server_latency_us: Some(payload_status.latency_us),
-        persistence_wait_us: payload_status.persistence_wait_us,
-        execution_cache_wait_us: payload_status.execution_cache_wait_us,
-        sparse_trie_wait_us: payload_status.sparse_trie_wait_us,
-    };
-
-    collector.record_success(block_stats);
-
-    tracing::info!(
-        block = block_number,
-        txs = tx_count,
-        gas = gas_used,
-        new_payload_ms = new_payload_latency.as_millis(),
-        forkchoice_updated_ms = fcu_latency.as_millis(),
-        total_ms = (new_payload_latency + fcu_latency).as_millis(),
-        new_payload_server_latency_us = payload_status.latency_us,
-        status = %payload_status.status.status,
-        "Submitted big block"
-    );
-
-    collector.prev_block_hash = Some(block_hash);
-    if block_number.is_multiple_of(32) {
-        collector.finalized_hash = Some(block_hash);
-    }
-
-    Ok(())
+    submit_block(provider, collector, persistence_policy, input, Some(block_hash), summary).await
 }
 
 /// Shared atomic counters for the scraper snapshot callback.
@@ -744,14 +683,12 @@ async fn process_big_block(
 struct BlockCounters {
     submitted: AtomicU64,
     success: AtomicU64,
-    failed: AtomicU64,
 }
 
 impl BlockCounters {
     fn snapshot_samples(&self, clock: &RunClock) -> Vec<Sample> {
         let submitted = self.submitted.load(Ordering::Relaxed);
         let success = self.success.load(Ordering::Relaxed);
-        let failed = self.failed.load(Ordering::Relaxed);
         let offset_ms = clock.offset_ms();
         let unix_ms = clock.unix_ms();
         let labels = BTreeMap::new();
@@ -771,10 +708,11 @@ impl BlockCounters {
                 offset_ms,
                 unix_ms,
             },
+            // A failed submission aborts the run, so no failure is ever reported.
             Sample {
                 name: "txgen_blocks_failed_total".to_string(),
                 labels,
-                value: failed as f64,
+                value: 0.0,
                 offset_ms,
                 unix_ms,
             },
@@ -808,21 +746,12 @@ impl MetricsCollector {
         self.blocks.push(stats);
     }
 
-    fn record_failure(&self) {
-        self.counters.submitted.fetch_add(1, Ordering::Relaxed);
-        self.counters.failed.fetch_add(1, Ordering::Relaxed);
-    }
-
     fn blocks_submitted(&self) -> u64 {
         self.counters.submitted.load(Ordering::Relaxed)
     }
 
     fn blocks_success(&self) -> u64 {
         self.counters.success.load(Ordering::Relaxed)
-    }
-
-    fn blocks_failed(&self) -> u64 {
-        self.counters.failed.load(Ordering::Relaxed)
     }
 
     fn final_snapshot(&self, clock: &RunClock) -> Vec<Sample> {
