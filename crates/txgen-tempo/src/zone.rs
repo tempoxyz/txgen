@@ -18,7 +18,7 @@ use k256::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use txgen_cli::ScenarioActionContext;
+use txgen_cli::{ScenarioActionContext, ScenarioActionDiagnostic};
 
 const PREPARE_ENCRYPTED_DEPOSIT: &str = "prepare_encrypted_deposit";
 pub(crate) const SCENARIO_ACTIONS: &[&str] = &[PREPARE_ENCRYPTED_DEPOSIT];
@@ -70,7 +70,9 @@ pub(crate) async fn invoke(
     match action {
         PREPARE_ENCRYPTED_DEPOSIT => {
             let arguments: PrepareEncryptedDepositArgs = serde_yaml::from_value(arguments.clone())
-                .wrap_err("invalid prepare_encrypted_deposit arguments")?;
+                .wrap_err(ScenarioActionDiagnostic(
+                    "invalid prepare_encrypted_deposit arguments",
+                ))?;
             prepare_encrypted_deposit(arguments, context).await
         }
         _ => Err(eyre::eyre!("unsupported Tempo scenario action '{action}'")),
@@ -83,7 +85,9 @@ async fn prepare_encrypted_deposit(
 ) -> Result<serde_yaml::Value> {
     let portal_address = match arguments.portal_address {
         Some(portal_address) => portal_address,
-        None => configured_portal_address(context.chain_id, arguments.zone_id)?,
+        None => configured_portal_address(context.chain_id, arguments.zone_id).wrap_err(
+            ScenarioActionDiagnostic("no portal address configured for this chain and zone"),
+        )?,
     };
     let (sequencer_x, sequencer_y_parity, key_index) =
         active_encryption_key(context.query_provider, portal_address).await?;
@@ -110,7 +114,7 @@ async fn prepare_encrypted_deposit(
         portal_address: portal_address.to_string(),
         zone_id: arguments.zone_id,
     })
-    .wrap_err("failed to encode prepared encrypted deposit")
+    .wrap_err(ScenarioActionDiagnostic("failed to encode prepared encrypted deposit"))
 }
 
 fn configured_portal_address(chain_id: u64, zone_id: u32) -> Result<Address> {
@@ -129,14 +133,19 @@ async fn active_encryption_key(
 ) -> Result<(B256, u8, U256)> {
     for _ in 0..2 {
         let count_before = encryption_key_count(provider, portal).await?;
-        ensure!(count_before > U256::ZERO, "ZonePortal has no encryption key");
+        ensure!(
+            count_before > U256::ZERO,
+            ScenarioActionDiagnostic("ZonePortal has no encryption key")
+        );
         let (x, y_parity) = sequencer_encryption_key(provider, portal).await?;
         let count_after = encryption_key_count(provider, portal).await?;
         if count_before == count_after {
             return Ok((x, normalize_y_parity(y_parity)?, count_before - U256::from(1)));
         }
     }
-    Err(eyre::eyre!("ZonePortal encryption key rotated while preparing the recipient"))
+    Err(eyre::Report::new(ScenarioActionDiagnostic(
+        "ZonePortal encryption key rotated while preparing the recipient",
+    )))
 }
 
 async fn encryption_key_count(
@@ -144,7 +153,10 @@ async fn encryption_key_count(
     portal: Address,
 ) -> Result<U256> {
     let output = call_portal(provider, portal, "encryptionKeyCount()").await?;
-    ensure!(output.len() == 32, "invalid encryptionKeyCount response length");
+    ensure!(
+        output.len() == 32,
+        ScenarioActionDiagnostic("invalid encryptionKeyCount response length")
+    );
     Ok(U256::from_be_slice(&output))
 }
 
@@ -153,10 +165,13 @@ async fn sequencer_encryption_key(
     portal: Address,
 ) -> Result<(B256, u8)> {
     let output = call_portal(provider, portal, "sequencerEncryptionKey()").await?;
-    ensure!(output.len() == 96, "invalid sequencerEncryptionKey response length");
+    ensure!(
+        output.len() == 96,
+        ScenarioActionDiagnostic("invalid sequencerEncryptionKey response length")
+    );
     ensure!(
         output[32..63].iter().all(|byte| *byte == 0),
-        "sequencerEncryptionKey returned an invalid y parity"
+        ScenarioActionDiagnostic("sequencerEncryptionKey returned an invalid y parity")
     );
     Ok((B256::from_slice(&output[..32]), output[63]))
 }
@@ -176,14 +191,20 @@ async fn call_portal(
         )
         .block(BlockId::latest())
         .await
-        .wrap_err_with(|| format!("failed to call ZonePortal.{signature}"))
+        .wrap_err(ScenarioActionDiagnostic(match signature {
+            "encryptionKeyCount()" => "call ZonePortal.encryptionKeyCount()",
+            "sequencerEncryptionKey()" => "call ZonePortal.sequencerEncryptionKey()",
+            _ => "call ZonePortal",
+        }))
 }
 
 fn normalize_y_parity(y_parity: u8) -> Result<u8> {
     match y_parity {
         0 | 1 => Ok(0x02 + y_parity),
         0x02 | 0x03 => Ok(y_parity),
-        _ => Err(eyre::eyre!("invalid sequencer encryption key y parity {y_parity}")),
+        _ => Err(eyre::Report::new(ScenarioActionDiagnostic(
+            "invalid sequencer encryption key y parity",
+        ))),
     }
 }
 
@@ -228,8 +249,9 @@ fn encrypt_deposit_with_material(
     let mut sequencer_bytes = [0u8; 33];
     sequencer_bytes[0] = sequencer_y_parity;
     sequencer_bytes[1..].copy_from_slice(sequencer_x.as_slice());
-    let sequencer_key = PublicKey::from_sec1_bytes(&sequencer_bytes)
-        .map_err(|_| eyre::eyre!("invalid sequencer encryption public key"))?;
+    let sequencer_key = PublicKey::from_sec1_bytes(&sequencer_bytes).map_err(|_| {
+        eyre::eyre!(ScenarioActionDiagnostic("invalid sequencer encryption public key"))
+    })?;
 
     let ephemeral_public = ephemeral_key.public_key().to_encoded_point(true);
     let ephemeral_bytes = ephemeral_public.as_bytes();
@@ -245,7 +267,8 @@ fn encrypt_deposit_with_material(
     info[84..].copy_from_slice(sender.as_slice());
     let hkdf = Hkdf::<Sha256>::new(Some(b"ecies-aes-key"), shared_secret.raw_secret_bytes());
     let mut aes_key = [0u8; 32];
-    hkdf.expand(&info, &mut aes_key).map_err(|_| eyre::eyre!("HKDF expansion failed"))?;
+    hkdf.expand(&info, &mut aes_key)
+        .map_err(|_| eyre::eyre!(ScenarioActionDiagnostic("HKDF expansion failed")))?;
 
     let mut ciphertext = Vec::with_capacity(64);
     ciphertext.extend_from_slice(recipient.as_slice());
@@ -255,7 +278,7 @@ fn encrypt_deposit_with_material(
     let nonce_value = Nonce::from(nonce);
     let tag = cipher
         .encrypt_in_place_detached(&nonce_value, &[], &mut ciphertext)
-        .map_err(|_| eyre::eyre!("AES-GCM encryption failed"))?;
+        .map_err(|_| eyre::eyre!(ScenarioActionDiagnostic("AES-GCM encryption failed")))?;
 
     Ok(EncryptedDeposit {
         ephemeral_pubkey_x,
@@ -453,5 +476,28 @@ zoneId: 9
         assert_eq!(encrypted["nonce"].as_str().unwrap().len(), 2 + 12 * 2);
         assert_eq!(encrypted["tag"].as_str().unwrap().len(), 2 + 16 * 2);
         assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn portal_rpc_failure_retains_a_safe_operation_and_typed_cause() {
+        let asserter = Asserter::new();
+        asserter.push_failure(
+            serde_json::from_value(serde_json::json!({
+                "code": -32005,
+                "message": "rate limited with sensitive remote text",
+                "data": "secret response data"
+            }))
+            .unwrap(),
+        );
+        let provider = ProviderBuilder::new_with_network::<AnyNetwork>()
+            .connect_mocked_client(asserter)
+            .erased();
+        let error = active_encryption_key(&provider, Address::ZERO).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ScenarioActionDiagnostic>().unwrap().0,
+            "call ZonePortal.encryptionKeyCount()"
+        );
+        let rpc = error.downcast_ref::<alloy_transport::TransportError>().unwrap();
+        assert_eq!(rpc.as_error_resp().unwrap().code, -32005);
     }
 }

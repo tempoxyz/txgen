@@ -1448,4 +1448,76 @@ scenario:
         assert_eq!(accumulator.reservoir.len(), MAX_LATENCY_SAMPLES);
         assert!((distribution.min_ms - 0.000_001).abs() < f64::EPSILON);
     }
+
+    #[test]
+    fn invoke_failure_detail_survives_when_the_instance_is_not_sampled() {
+        let mut accumulator = ScenarioAccumulator::new(1, 1);
+        accumulator.record(InstanceOutcome {
+            instance: 0,
+            started_at_unix_ms: 1,
+            finished_at_unix_ms: 2,
+            elapsed: Duration::from_millis(1),
+            steps: Vec::new(),
+            failure: None,
+        });
+        let error = super::super::error::StepError::invoke(eyre::Report::new(
+            super::super::error::ScenarioActionDiagnostic(
+                "ZonePortal encryption key rotated while preparing the recipient",
+            ),
+        ));
+        accumulator.record(InstanceOutcome {
+            instance: 100,
+            started_at_unix_ms: 3,
+            finished_at_unix_ms: 4,
+            elapsed: Duration::from_millis(1),
+            steps: Vec::new(),
+            failure: Some(InstanceFailure {
+                step_index: 0,
+                step_name: "redeem_encryption".into(),
+                failure_provenance: None,
+                classification: error.classification.into(),
+                timed_out: false,
+                detail: error.sanitized_detail(),
+            }),
+        });
+        let now = SystemTime::now();
+        let report = ScenarioReport::build(
+            "earn".into(),
+            ScenarioReportConfig {
+                chains: Vec::new(),
+                requested_instances: Some(2),
+                run_duration_ms: None,
+                starts_per_second: 0.0,
+                maximum_in_flight: 1,
+                default_step_timeout_ms: 1_000,
+                transaction_rate_per_chain: 0,
+                maximum_rpc_in_flight_per_chain: 1,
+                seed: 1,
+                failure_policy: "continue".into(),
+            },
+            now,
+            now,
+            Duration::from_millis(2),
+            2,
+            1,
+            &[(
+                "redeem_encryption".into(),
+                "redeem_encryption".into(),
+                "l1".into(),
+                "invoke".into(),
+                Vec::new(),
+                None,
+            )],
+            Vec::new(),
+            Vec::new(),
+            accumulator,
+        );
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["sampled_instances"][0]["instance"], 0);
+        assert_eq!(json["failures"][0]["classification"], "invoke_error");
+        assert_eq!(
+            json["failures"][0]["sample_detail"],
+            "ZonePortal encryption key rotated while preparing the recipient"
+        );
+    }
 }

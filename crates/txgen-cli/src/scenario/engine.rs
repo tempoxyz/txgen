@@ -1,5 +1,5 @@
 use super::{
-    error::StepError,
+    error::{ScenarioActionDiagnostic, StepError},
     report::{
         duration_ms, unix_ms, ChainReportConfig, InstanceFailure, InstanceOutcome,
         ProtocolMilestone, ScenarioAccumulator, ScenarioReport, ScenarioReportConfig, StepOutcome,
@@ -910,14 +910,17 @@ where
                         },
                     )
                     .await
-                    .map_err(|error| StepError::new("invoke_error", error.to_string()))?;
-                let RuntimeValue::Object(mut output) = RuntimeValue::from_yaml(&output)
-                    .map_err(|error| StepError::new("invoke_error", error.to_string()))?
+                    .map_err(StepError::invoke)?;
+                let RuntimeValue::Object(mut output) =
+                    RuntimeValue::from_yaml(&output).map_err(|error| {
+                        StepError::invoke(
+                            error.wrap_err(ScenarioActionDiagnostic("invalid action output")),
+                        )
+                    })?
                 else {
-                    return Err(StepError::new(
-                        "invoke_error",
+                    return Err(StepError::invoke(eyre::Report::new(ScenarioActionDiagnostic(
                         "scenario action returned a non-object value",
-                    ));
+                    ))));
                 };
                 output.insert("chain".to_string(), RuntimeValue::String(chain.name.clone()));
                 output.insert("action".to_string(), RuntimeValue::String(invoke.action.clone()));
