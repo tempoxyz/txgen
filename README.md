@@ -1245,6 +1245,14 @@ Runs a query-only action supplied by the selected network adapter. `with` values
 
 The Tempo adapter provides `prepare_encrypted_deposit`, which reads the current ZonePortal encryption key and creates a fresh secp256k1/AES-GCM payload for each invocation. `sender` is required and must be the address that will call `ZonePortal.deposit`; it is bound into the encryption key derivation. Cryptographic material always comes from the operating system and is intentionally not controlled by the scenario seed. `portalAddress` is optional for Zone IDs known to viem; supply it for other deployments. `memo` is an optional `bytes32` and defaults to zero.
 
+Adapter invocation failures retain bounded, safe diagnostics in the JSON report's
+`failures[].sample_detail`, including failures outside `sampled_instances`.
+`prepare_encrypted_deposit` identifies the failed portal call or key validation and
+includes numeric RPC error codes or HTTP statuses when available. RPC messages, response bodies,
+credentials, and action arguments are excluded. Custom adapters can opt in with
+`txgen_cli::ScenarioActionDiagnostic` containing fixed, secret-free text; unannotated
+adapter errors receive a generic diagnostic.
+
 ```yaml
 - invoke:
     chain: l1
