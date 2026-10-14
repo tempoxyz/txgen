@@ -294,7 +294,7 @@ pub struct SendBlocksArgs {
     #[arg(
         long,
         value_name = "DELAY",
-        default_value = "50ms",
+        default_value = "200ms",
         value_parser = parse_duration_millis_fallback,
         requires = "mempool"
     )]
@@ -304,7 +304,7 @@ pub struct SendBlocksArgs {
     #[arg(
         long,
         value_name = "FRACTION",
-        default_value_t = 1.0,
+        default_value_t = 0.5,
         value_parser = parse_fraction,
         requires = "mempool"
     )]
@@ -390,7 +390,7 @@ pub struct CallArgs {
     pub requests_csv: Option<PathBuf>,
 
     /// Exit non-zero above this HTTP and transport failure rate.
-    #[arg(long, default_value_t = 1.0, value_name = "PERCENT")]
+    #[arg(long, default_value_t = 0.5, value_name = "PERCENT")]
     pub max_fail_rate_pct: f64,
 
     #[command(flatten)]
