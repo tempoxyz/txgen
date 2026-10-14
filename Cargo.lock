@@ -1392,6 +1392,7 @@ dependencies = [
  "bench-core",
  "clap",
  "eyre",
+ "futures",
  "humantime",
  "rand 0.9.4",
  "reqwest",

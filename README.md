@@ -481,6 +481,14 @@ bench send-blocks \
   --rpc http://localhost:8545 \
   --reorg 8 \
   --input blocks.ndjson
+
+# Fill the node's transaction pool with each block's transactions before its payload.
+bench send-blocks \
+  --engine http://localhost:8551 \
+  --jwt-secret /path/to/jwt.hex \
+  --rpc http://localhost:8545 \
+  --mempool --mempool-delay 200ms --mempool-fraction 0.5 \
+  --input blocks.ndjson
 ```
 
 | Flag | Description |
@@ -492,7 +500,10 @@ bench send-blocks \
 | `--wait-time <DURATION>` | Minimum interval between block submissions. Accepts `100ms`, `2s`, or bare milliseconds like `400` |
 | `--reorg [DEPTH]` | Build synthetic side-fork blocks and alternate forkchoice updates to exercise reorg paths. If `DEPTH` is omitted, defaults to `8`. Requires raw RLP block input |
 | `--reorg-gap <BLOCKS>` | Add `BLOCKS` canonical blocks between resolved side chains (default: `0`; requires `--reorg`) |
-| `--rpc <URL>` | Regular HTTP RPC endpoint for `testing_buildBlockV1` when `--reorg` is enabled (default: `http://localhost:8545`) |
+| `--rpc <URL>` | Regular HTTP RPC endpoint for `testing_buildBlockV1` when `--reorg` is enabled and for `--mempool` (default: `http://localhost:8545`) |
+| `--mempool` | Before each block's `reth_newPayload`, wait until the node's head is the block's parent, then submit the block's transactions to `--rpc` via `eth_sendRawTransaction`. Skips blob transactions, which blocks carry without sidecars. Requires raw RLP block input; conflicts with `--reorg` |
+| `--mempool-delay <DURATION>` | Delay between submitting a block's transactions and its `reth_newPayload` (default: `200ms`; requires `--mempool`) |
+| `--mempool-fraction <FRACTION>` | Fraction in `(0, 1]` of each block's non-blob transactions to submit, selected by transaction hash so every run submits the same ones (default: `1`; requires `--mempool`) |
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
 | `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
 | `--metrics-url <URL or NODE:URL,...>` | Prometheus endpoint(s) to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
@@ -502,7 +513,9 @@ bench send-blocks \
 
 For `send-blocks`, aggregate run rates use benchmark wall-clock duration. Per-block timestamps remain the original chain timestamps from the input. With `--reorg`, canonical block stats remain canonical-only, but the wall-clock duration includes synthetic fork block build/submission work.
 
-**Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API). Big-block inputs require a `reth-bb` compatible node. `--reorg` additionally requires `testing_buildBlockV1` on the regular HTTP RPC endpoint. Because synthetic forks intentionally omit transactions, start Reth with `--http --http.api eth,testing --testing.skip-invalid-transactions`. `--rpc-url` and `--local-rpc-url` are accepted as backwards-compatible aliases for `--rpc`.
+With `--mempool`, transaction submission and `--mempool-delay` happen before each block's measured `reth_newPayload` and outside `--wait-time`, which still covers only `reth_newPayload` and `reth_forkchoiceUpdated`. Each block logs the accepted, rejected, blob and unselected transaction counts and the pool's pending and queued counts; the run ends with a summary that groups rejections by error message.
+
+**Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API). Big-block inputs require a `reth-bb` compatible node. `--reorg` additionally requires `testing_buildBlockV1` on the regular HTTP RPC endpoint. Because synthetic forks intentionally omit transactions, start Reth with `--http --http.api eth,testing --testing.skip-invalid-transactions`. `--mempool` additionally requires `eth_sendRawTransaction`, `eth_blockNumber` and `txpool_status` on the regular HTTP RPC endpoint, for example `--http --http.api eth,txpool`. `--rpc-url` and `--local-rpc-url` are accepted as backwards-compatible aliases for `--rpc`.
 
 #### `bench call`
 
@@ -2212,7 +2225,8 @@ Summary of which RPC methods are required by each feature:
 | `reth_newPayload` | `bench send-blocks` |
 | `reth_forkchoiceUpdated` | `bench send-blocks` |
 | `testing_buildBlockV1` | `bench send-blocks --reorg` |
-| `txpool_status` | `bench send` (query RPC when configured; pool drain wait) |
+| `eth_sendRawTransaction`, `eth_blockNumber` | `bench send-blocks --mempool` |
+| `txpool_status` | `bench send` (query RPC when configured; pool drain wait), `bench send-blocks --mempool` |
 
 > **Note:** `debug_*` methods require a node with the debug namespace enabled (typically archive nodes), and `trace_*` methods the trace namespace. `reth_*` methods are custom reth Engine API extensions.
 
