@@ -272,7 +272,7 @@ pub struct SendBlocksArgs {
     #[arg(long, value_name = "BLOCKS", default_value_t = 0, requires = "reorg")]
     pub reorg_gap: usize,
 
-    /// Regular HTTP RPC URL for testing_buildBlockV1.
+    /// Regular HTTP RPC URL for testing_buildBlockV1 and --mempool.
     #[arg(
         long = "rpc",
         alias = "rpc-url",
@@ -280,6 +280,35 @@ pub struct SendBlocksArgs {
         default_value = "http://localhost:8545"
     )]
     pub rpc: String,
+
+    /// Submit each block's transactions to --rpc via eth_sendRawTransaction before its
+    /// reth_newPayload, once the node's head is the block's parent.
+    ///
+    /// Blob transactions are skipped because blocks carry no sidecars.
+    #[arg(long, conflicts_with = "reorg")]
+    pub mempool: bool,
+
+    /// Delay between submitting a block's transactions and its reth_newPayload.
+    ///
+    /// Bare integers are treated as milliseconds.
+    #[arg(
+        long,
+        value_name = "DELAY",
+        default_value = "200ms",
+        value_parser = parse_duration_millis_fallback,
+        requires = "mempool"
+    )]
+    pub mempool_delay: Duration,
+
+    /// Fraction of each block's non-blob transactions to submit, selected by transaction hash.
+    #[arg(
+        long,
+        value_name = "FRACTION",
+        default_value_t = 1.0,
+        value_parser = parse_fraction,
+        requires = "mempool"
+    )]
+    pub mempool_fraction: f64,
 }
 
 /// Arguments for the `call` subcommand.
@@ -454,6 +483,14 @@ fn parse_reorg_depth(s: &str) -> Result<usize, String> {
     Ok(depth)
 }
 
+fn parse_fraction(s: &str) -> Result<f64, String> {
+    let fraction = s.trim().parse::<f64>().map_err(|e| format!("invalid fraction {s:?}: {e}"))?;
+    if !(fraction > 0.0 && fraction <= 1.0) {
+        return Err(format!("{s:?} must be in (0, 1]"));
+    }
+    Ok(fraction)
+}
+
 fn parse_wait_for_persistence(s: &str) -> Result<WaitForPersistence, String> {
     match s {
         "always" => Ok(WaitForPersistence::Always),
@@ -600,6 +637,44 @@ mod tests {
             "--reorg-gap=0",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn test_parse_fraction() {
+        assert_eq!(parse_fraction("1"), Ok(1.0));
+        assert_eq!(parse_fraction("0.25"), Ok(0.25));
+        for invalid in ["0", "-0.5", "1.01", "NaN", "abc"] {
+            assert!(parse_fraction(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn test_send_blocks_mempool_flags() {
+        let parse = |flags: &[&str]| {
+            Cli::try_parse_from(
+                [
+                    "bench",
+                    "send-blocks",
+                    "--engine=http://localhost:8551",
+                    "--jwt-secret=/tmp/jwt.hex",
+                ]
+                .into_iter()
+                .chain(flags.iter().copied()),
+            )
+        };
+
+        let Command::SendBlocks(args) =
+            parse(&["--mempool", "--mempool-delay=50", "--mempool-fraction=0.5"]).unwrap().command
+        else {
+            panic!("expected send-blocks");
+        };
+        assert!(args.mempool);
+        assert_eq!(args.mempool_delay, Duration::from_millis(50));
+        assert_eq!(args.mempool_fraction, 0.5);
+
+        assert!(parse(&["--mempool-delay=50"]).is_err());
+        assert!(parse(&["--mempool-fraction=0.5"]).is_err());
+        assert!(parse(&["--mempool", "--reorg"]).is_err());
     }
 
     #[test]

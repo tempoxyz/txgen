@@ -15,8 +15,11 @@ use crate::{
 };
 use alloy_consensus::Header as ConsensusHeader;
 use alloy_network::Ethereum;
-use alloy_primitives::{Address, Bytes, B256};
-use alloy_provider::{ext::TestingApi, Provider, RootProvider};
+use alloy_primitives::{keccak256, Address, Bytes, B256};
+use alloy_provider::{
+    ext::{TestingApi, TxPoolApi},
+    Provider, RootProvider,
+};
 use alloy_reth::{BigBlockData, RethApi, RethNewPayloadInput, RethNewPayloadParams};
 use alloy_rlp::{Decodable, Header};
 use alloy_rpc_types_engine::{
@@ -28,6 +31,7 @@ use bench_core::{
     ProgressState, Reporter, RunClock, RunStats, Sample, SampleStore,
 };
 use eyre::{Context, Result};
+use futures::StreamExt;
 use std::{
     collections::{BTreeMap, HashMap},
     io::BufRead,
@@ -112,6 +116,7 @@ impl ReorgState {
 struct ProcessingState<'a> {
     collector: &'a mut MetricsCollector,
     reorg_state: Option<&'a mut ReorgState>,
+    mempool: Option<&'a mut MempoolReplay>,
     persistence_policy: &'a WaitForPersistence,
 }
 
@@ -136,6 +141,8 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         wait_time_ms = args.wait_time.map(|d| d.as_millis()),
         reorg_depth = args.reorg,
         reorg_gap = args.reorg.map(|_| args.reorg_gap),
+        mempool_delay_ms = args.mempool.then_some(args.mempool_delay.as_millis()),
+        mempool_fraction = args.mempool.then_some(args.mempool_fraction),
         rpc = %args.rpc,
         "Starting block submission"
     );
@@ -185,6 +192,11 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
 
     let mut collector = MetricsCollector::new(counters);
     let mut reorg_state = args.reorg.map(|depth| ReorgState::new(depth, args.reorg_gap));
+    let mut mempool = args.mempool.then(|| MempoolReplay {
+        delay: args.mempool_delay,
+        fraction: args.mempool_fraction,
+        totals: MempoolStats::default(),
+    });
     let start = Instant::now();
 
     if let Some(ref path) = args.input {
@@ -202,6 +214,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                 ProcessingState {
                     collector: &mut collector,
                     reorg_state: reorg_state.as_mut(),
+                    mempool: mempool.as_mut(),
                     persistence_policy: &persistence_policy,
                 },
                 args.wait_time,
@@ -232,6 +245,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
                 ProcessingState {
                     collector: &mut collector,
                     reorg_state: reorg_state.as_mut(),
+                    mempool: mempool.as_mut(),
                     persistence_policy: &persistence_policy,
                 },
                 args.wait_time,
@@ -255,6 +269,17 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             None,
         )
         .await?;
+    }
+
+    if let Some(MempoolReplay { totals, .. }) = &mempool {
+        tracing::info!(
+            accepted = totals.accepted,
+            rejected = totals.rejected_total(),
+            blobs = totals.blobs,
+            unselected = totals.unselected,
+            rejections = ?totals.rejected,
+            "Mempool submission summary"
+        );
     }
 
     // Stop the scraper before finalizing.
@@ -343,7 +368,7 @@ async fn process_input_and_wait(
     start: Instant,
     reporters: &mut [Box<dyn Reporter>],
 ) -> Result<()> {
-    let ProcessingState { collector, reorg_state, persistence_policy } = state;
+    let ProcessingState { collector, reorg_state, mempool, persistence_policy } = state;
     if let Some(reorg_state) = reorg_state {
         let InputLine::RawBlock(block) = input else {
             eyre::bail!("--reorg is only supported for raw RLP block input");
@@ -360,6 +385,13 @@ async fn process_input_and_wait(
             Some(block),
         )
         .await;
+    }
+
+    if let Some(mempool) = mempool {
+        let InputLine::RawBlock(block) = &input else {
+            eyre::bail!("--mempool is only supported for raw RLP block input");
+        };
+        submit_to_mempool(testing_provider, block, mempool).await?;
     }
 
     let block_start = Instant::now();
@@ -658,7 +690,8 @@ fn extract_block_header_from_block_rlp(raw: &[u8]) -> Result<ConsensusHeader> {
     ConsensusHeader::decode(&mut block_payload).wrap_err("failed to decode block header")
 }
 
-fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<Vec<Bytes>> {
+/// Returns the EIP-2718 encoded transactions of an RLP-encoded block.
+fn extract_encoded_txs_from_block_rlp(raw: &[u8]) -> Result<Vec<&[u8]>> {
     let mut block_buf = raw;
     let mut block_payload = Header::decode_bytes(&mut block_buf, true)
         .wrap_err("failed to decode outer block RLP list")?;
@@ -671,36 +704,44 @@ fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<Vec<Bytes>> {
         .wrap_err("failed to decode transactions RLP list")?;
 
     let mut transactions = Vec::new();
-    let mut skipped_blob_txs = 0usize;
-    let mut non_blob_txs = 0usize;
-    let mut dropped_non_blob_txs = 0usize;
     while !txs_payload.is_empty() {
         let item_start = txs_payload;
         let header =
             Header::decode(&mut txs_payload).wrap_err("failed to decode transaction RLP item")?;
         let header_len = item_start.len() - txs_payload.len();
-        let payload = &txs_payload[..header.payload_length];
-        let encoded = &item_start[..header_len + header.payload_length];
-
         if header.list {
-            non_blob_txs += 1;
-            if should_keep_reorg_transaction(non_blob_txs) {
-                transactions.push(Bytes::copy_from_slice(encoded));
-            } else {
-                dropped_non_blob_txs += 1;
-            }
-        } else if payload.first() == Some(&0x03) {
-            skipped_blob_txs += 1;
+            // Legacy transactions are encoded as the RLP list itself.
+            transactions.push(&item_start[..header_len + header.payload_length]);
         } else {
-            non_blob_txs += 1;
-            if should_keep_reorg_transaction(non_blob_txs) {
-                transactions.push(Bytes::copy_from_slice(payload));
-            } else {
-                dropped_non_blob_txs += 1;
-            }
+            // Typed transactions are wrapped in an RLP string.
+            transactions.push(&txs_payload[..header.payload_length]);
         }
-
         txs_payload = &txs_payload[header.payload_length..];
+    }
+
+    Ok(transactions)
+}
+
+const fn is_blob_transaction(encoded: &[u8]) -> bool {
+    matches!(encoded.first(), Some(0x03))
+}
+
+fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<Vec<Bytes>> {
+    let mut transactions = Vec::new();
+    let mut skipped_blob_txs = 0usize;
+    let mut non_blob_txs = 0usize;
+    let mut dropped_non_blob_txs = 0usize;
+    for encoded in extract_encoded_txs_from_block_rlp(raw)? {
+        if is_blob_transaction(encoded) {
+            skipped_blob_txs += 1;
+            continue;
+        }
+        non_blob_txs += 1;
+        if should_keep_reorg_transaction(non_blob_txs) {
+            transactions.push(Bytes::copy_from_slice(encoded));
+        } else {
+            dropped_non_blob_txs += 1;
+        }
     }
 
     if skipped_blob_txs > 0 {
@@ -724,6 +765,136 @@ fn should_keep_reorg_transaction(non_blob_tx_index: usize) -> bool {
 fn skip_rlp_item(buf: &mut &[u8]) -> Result<()> {
     let header = Header::decode(buf).wrap_err("failed to decode RLP item header")?;
     *buf = &buf[header.payload_length..];
+    Ok(())
+}
+
+/// Submits the transactions of each block to the node's transaction pool before its payload.
+struct MempoolReplay {
+    delay: Duration,
+    fraction: f64,
+    totals: MempoolStats,
+}
+
+/// Transaction pool submission outcomes.
+#[derive(Debug, Default)]
+struct MempoolStats {
+    accepted: u64,
+    /// Rejection counts by error message.
+    rejected: BTreeMap<String, u64>,
+    /// Blob transactions, which cannot be submitted without sidecars.
+    blobs: u64,
+    /// Transactions left out by the submitted fraction.
+    unselected: u64,
+}
+
+impl MempoolStats {
+    fn rejected_total(&self) -> u64 {
+        self.rejected.values().sum()
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.accepted += other.accepted;
+        self.blobs += other.blobs;
+        self.unselected += other.unselected;
+        for (message, count) in other.rejected {
+            *self.rejected.entry(message).or_default() += count;
+        }
+    }
+}
+
+/// Maximum concurrent `eth_sendRawTransaction` requests.
+const MEMPOOL_SUBMIT_CONCURRENCY: usize = 32;
+
+/// Maximum time to wait for the node's head to reach a block's parent.
+const MEMPOOL_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Returns the non-blob transactions of a block that `fraction` selects by transaction hash,
+/// and records the others in `stats`.
+fn select_mempool_transactions<'a>(
+    encoded_txs: Vec<&'a [u8]>,
+    fraction: f64,
+    stats: &mut MempoolStats,
+) -> Vec<&'a [u8]> {
+    let threshold = (fraction * 2f64.powi(64)) as u128;
+    encoded_txs
+        .into_iter()
+        .filter(|encoded| {
+            if is_blob_transaction(encoded) {
+                stats.blobs += 1;
+                return false;
+            }
+            let hash = keccak256(encoded);
+            let selected =
+                u128::from(u64::from_be_bytes(hash[..8].try_into().unwrap())) < threshold;
+            if !selected {
+                stats.unselected += 1;
+            }
+            selected
+        })
+        .collect()
+}
+
+async fn submit_to_mempool(
+    rpc: &impl Provider,
+    block: &BlockLine,
+    mempool: &mut MempoolReplay,
+) -> Result<()> {
+    // The pool validates against the latest state, so the parent must be canonical first.
+    let parent = block.number.saturating_sub(1);
+    let deadline = Instant::now() + MEMPOOL_HEAD_TIMEOUT;
+    loop {
+        let head = rpc.get_block_number().await.wrap_err("eth_blockNumber failed")?;
+        if head >= parent {
+            break;
+        }
+        if Instant::now() >= deadline {
+            eyre::bail!("node head {head} did not reach block {parent} before mempool submission");
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    let mut stats = MempoolStats::default();
+    let encoded_txs =
+        extract_encoded_txs_from_block_rlp(block.raw.as_ref()).wrap_err_with(|| {
+            format!("failed to extract raw transaction bytes from block {}", block.number)
+        })?;
+    let selected = select_mempool_transactions(encoded_txs, mempool.fraction, &mut stats);
+    let results = futures::stream::iter(selected)
+        .map(|encoded| rpc.send_raw_transaction(encoded))
+        .buffer_unordered(MEMPOOL_SUBMIT_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for result in results {
+        match result {
+            Ok(_) => stats.accepted += 1,
+            Err(err) => {
+                let Some(resp) = err.as_error_resp() else {
+                    return Err(err).wrap_err("eth_sendRawTransaction failed");
+                };
+                // Drop transaction-specific details such as nonces and balances.
+                let reason = resp.message.split(':').next().unwrap_or_default().to_string();
+                *stats.rejected.entry(reason).or_default() += 1;
+            }
+        }
+    }
+
+    let status = rpc.txpool_status().await.wrap_err("txpool_status failed")?;
+    tracing::info!(
+        block = block.number,
+        accepted = stats.accepted,
+        rejected = stats.rejected_total(),
+        blobs = stats.blobs,
+        unselected = stats.unselected,
+        pool_pending = status.pending,
+        pool_queued = status.queued,
+        "Submitted block transactions to the mempool"
+    );
+    if !stats.rejected.is_empty() {
+        tracing::debug!(block = block.number, rejected = ?stats.rejected, "Mempool rejections");
+    }
+    mempool.totals.merge(stats);
+
+    tokio::time::sleep(mempool.delay).await;
     Ok(())
 }
 
@@ -1029,5 +1200,33 @@ mod tests {
             .map(Bytes::from)
             .collect::<Vec<_>>();
         assert_eq!(extracted, expected);
+    }
+
+    #[test]
+    fn selects_eip2718_non_blob_transactions_for_mempool_by_hash_fraction() {
+        let mut source_transactions =
+            (0..=255).flat_map(|id| [legacy_tx(id), typed_tx(0x02, id)]).collect::<Vec<_>>();
+        source_transactions.insert(7, typed_tx(0x03, 0));
+        let block = block_with_transactions(&source_transactions);
+        let encoded = extract_encoded_txs_from_block_rlp(&block).unwrap();
+        let select = |fraction| {
+            let mut stats = MempoolStats::default();
+            let selected = select_mempool_transactions(encoded.clone(), fraction, &mut stats);
+            (selected, stats)
+        };
+
+        // Legacy transactions keep their RLP list encoding, typed ones drop the RLP string header.
+        let expected = (0..=255).flat_map(|id| [legacy_tx(id), vec![0x02, id]]).collect::<Vec<_>>();
+        let (all, stats) = select(1.0);
+        assert_eq!(all, expected);
+        assert_eq!((stats.blobs, stats.unselected), (1, 0));
+
+        let (quarter, stats) = select(0.25);
+        let (half, _) = select(0.5);
+        assert_eq!(stats.blobs, 1);
+        assert_eq!(quarter.len() + stats.unselected as usize, expected.len());
+        assert!((96..160).contains(&quarter.len()), "{}", quarter.len());
+        assert!((224..288).contains(&half.len()), "{}", half.len());
+        assert!(quarter.iter().all(|tx| half.contains(tx)));
     }
 }
