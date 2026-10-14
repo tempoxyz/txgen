@@ -285,7 +285,7 @@ pub struct SendBlocksArgs {
     /// reth_newPayload, once the node's head is the block's parent.
     ///
     /// Blob transactions are skipped because blocks carry no sidecars.
-    #[arg(long, conflicts_with = "reorg")]
+    #[arg(long, default_value_t = true, conflicts_with = "reorg")]
     pub mempool: bool,
 
     /// Delay between submitting a block's transactions and its reth_newPayload.
