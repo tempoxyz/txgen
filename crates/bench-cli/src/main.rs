@@ -294,7 +294,7 @@ pub struct SendBlocksArgs {
     #[arg(
         long,
         value_name = "DELAY",
-        default_value = "200ms",
+        default_value = "50ms",
         value_parser = parse_duration_millis_fallback,
         requires = "mempool"
     )]
