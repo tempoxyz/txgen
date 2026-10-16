@@ -321,7 +321,10 @@ impl CallDef {
             let args = self.args.resolve(resolver)?;
             encode_function_call(abi, &self.function, &args, resolver)?
         } else {
-            // Raw function selector (4 bytes) - assume function is the hex selector
+            ensure!(
+                matches!(&self.args, CallArgs::List(args) if args.is_empty()),
+                "call args require an `abi`; without one, `function` is raw hex calldata"
+            );
             self.function.parse()?
         };
 
@@ -669,8 +672,7 @@ fn parse_int_bits(t: &str) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AccountManager, AddressPoolManager, ValueResolver};
-    use rand::SeedableRng;
+    use crate::{value::TestResolver, AddressPoolManager};
 
     #[test]
     fn test_artifact_manager_empty() {
@@ -693,11 +695,8 @@ mod tests {
             ArtifactDef::Object { abi: None, bytecode: Some("contract.bin".into()) },
         )]);
         let manager = ArtifactManager::load(&definitions, &dir)?;
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = rand::rng();
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
 
         assert_eq!(manager.get("contract")?, &JsonAbi::default());
         assert_eq!(
@@ -710,11 +709,8 @@ mod tests {
 
     #[test]
     fn test_negative_uint_literal_fails() {
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = rand::rng();
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
         let value = serde_yaml::from_str::<serde_yaml::Value>("-1").expect("valid YAML");
 
         let err = yaml_to_sol_value(&value, "uint256", &mut resolver)
@@ -725,16 +721,30 @@ mod tests {
 
     #[test]
     fn test_hex_uint_literal() {
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = rand::rng();
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
         let value = serde_yaml::from_str::<serde_yaml::Value>("\"0x10\"").expect("valid YAML");
 
         let sol_value = yaml_to_sol_value(&value, "uint256", &mut resolver).unwrap();
 
         assert_eq!(sol_value, DynSolValue::Uint(U256::from(16), 256));
+    }
+
+    #[test]
+    fn test_raw_call_rejects_args() -> Result<()> {
+        let call: CallDef = serde_yaml::from_str(
+            r#"
+to: "0x0000000000000000000000000000000000000001"
+function: "0x12345678"
+args: [1]
+"#,
+        )?;
+        let mut fixture = TestResolver::default();
+
+        let err = call.encode(&ArtifactManager::empty(), &mut fixture.resolver()).unwrap_err();
+
+        assert!(err.to_string().contains("call args require an `abi`"));
+        Ok(())
     }
 
     #[test]
@@ -762,11 +772,8 @@ tag: "0x33333333333333333333333333333333"
 "#,
         )
         .unwrap();
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = rand::rng();
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
 
         let actual = yaml_to_param_value(&value, &param, &mut resolver).unwrap();
         let mut nonce = [0u8; 32];
@@ -788,11 +795,8 @@ tag: "0x33333333333333333333333333333333"
 
     #[test]
     fn test_fixed_bytes_literal_rejects_wrong_length() {
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = rand::rng();
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
         let value = serde_yaml::Value::String("0x22".to_string());
 
         let error = yaml_to_sol_value(&value, "bytes12", &mut resolver).unwrap_err();
@@ -802,11 +806,8 @@ tag: "0x33333333333333333333333333333333"
 
     #[test]
     fn test_fractional_uint_literal_fails() {
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = rand::rng();
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
         let value = serde_yaml::from_str::<serde_yaml::Value>("1.5").expect("valid YAML");
 
         let err = yaml_to_sol_value(&value, "uint256", &mut resolver)
@@ -817,21 +818,21 @@ tag: "0x33333333333333333333333333333333"
 
     #[test]
     fn test_address_pool_generator_in_abi_arg() -> Result<()> {
-        let accounts = AccountManager::empty();
         let expected = Address::from([9u8; 20]);
-        let address_pools = AddressPoolManager::from_spec(&std::collections::HashMap::from([(
-            "recipients".to_string(),
-            crate::AddressPoolDef {
-                addresses: vec![expected],
-                mnemonic: None,
-                index: None,
-                range: None,
-                fast: None,
-            },
-        )]))?;
-        let mut rng = rand::rng();
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver {
+            address_pools: AddressPoolManager::from_spec(&HashMap::from([(
+                "recipients".to_string(),
+                crate::AddressPoolDef {
+                    addresses: vec![expected],
+                    mnemonic: None,
+                    index: None,
+                    range: None,
+                    fast: None,
+                },
+            )]))?,
+            ..Default::default()
+        };
+        let mut resolver = fixture.resolver();
         let value = serde_yaml::from_str::<serde_yaml::Value>(
             r#"
 address_pool:
@@ -848,11 +849,8 @@ address_pool:
 
     #[test]
     fn test_random_generator_in_abi_arg() -> Result<()> {
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
         let value = serde_yaml::Value::String("random".to_string());
 
         assert!(matches!(
@@ -889,11 +887,8 @@ values:
       else: { uniform: { min: -30, max: { var: tick }, step: 10 } }
 "#,
         )?;
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
 
         for _ in 0..128 {
             let values = args.resolve(&mut resolver)?;
@@ -950,11 +945,8 @@ values:
 "#,
         )
         .expect("valid call args");
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
 
         let err = args.resolve(&mut resolver).expect_err("cycle should fail");
         let err = format!("{err:?}");
@@ -973,11 +965,8 @@ values:
 "#,
         )
         .expect("valid call args");
-        let accounts = AccountManager::empty();
-        let address_pools = AddressPoolManager::empty();
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let mut resolver =
-            ValueResolver { accounts: &accounts, address_pools: &address_pools, rng: &mut rng };
+        let mut fixture = TestResolver::default();
+        let mut resolver = fixture.resolver();
 
         let err = args.resolve(&mut resolver).expect_err("empty choice should fail");
         let err = format!("{err:?}");
