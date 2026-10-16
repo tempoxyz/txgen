@@ -871,7 +871,9 @@ where
     }
 
     let stdout = output.is_none();
-    if let Err(error) = generate_loop(&mut adapter, &mut ctx, output) {
+    let result =
+        tokio::task::spawn_blocking(move || generate_loop(&mut adapter, &mut ctx, output)).await?;
+    if let Err(error) = result {
         // A duration-limited consumer may finish before this producer.
         let closed = stdout &&
             error.chain().any(|cause| {
@@ -2354,15 +2356,13 @@ fn refresh_gas_estimates<A: NetworkAdapter>(
             "validation": false,
             "traceTransfers": false,
         });
-        let response = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
+        let response = tokio::runtime::Handle::current()
+            .block_on(
                 provider
                     .client()
-                    .request::<_, serde_json::Value>("eth_simulateV1", (payload, "latest"))
-                    .await
-            })
-        })
-        .wrap_err_with(|| format!("gas sampling failed for {:?}", entry.item))?;
+                    .request::<_, serde_json::Value>("eth_simulateV1", (payload, "latest")),
+            )
+            .wrap_err_with(|| format!("gas sampling failed for {:?}", entry.item))?;
         let gas = simulation_gas(&response, expected_calls)
             .wrap_err_with(|| format!("invalid gas sample for {:?}", entry.item))?;
         eprintln!(
@@ -2903,28 +2903,33 @@ mix: [{template: transfer, weight: 1}]
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let rpc = format!("http://{}", listener.local_addr()?);
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
-        let spec = sampling_spec()?;
-        let accounts = AccountManager::from_spec(&spec.accounts)?;
-        let artifacts = ArtifactManager::empty();
-        let mut nonces = NonceTracker::new();
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut ctx = BuildContext::new(1, &spec.gas, &accounts, &artifacts, &mut nonces, &mut rng);
-        let mut output = NdjsonWriter::new(Vec::new());
-        let result = generate_txs(
-            &SamplingAdapter,
-            &spec,
-            GenerationConfig {
-                limit: GenerationLimit { count: Some(1), duration: None },
-                signing_workers: 1,
-                gas_sample_rpc: Some(&rpc),
-            },
-            &HashMap::new(),
-            &mut ctx,
-            &mut output,
-        );
-        assert!(result.is_err());
-        assert_eq!(output.count(), 0);
-        assert!(output.into_inner().is_empty());
+        tokio::task::spawn_blocking(move || {
+            let spec = sampling_spec()?;
+            let accounts = AccountManager::from_spec(&spec.accounts)?;
+            let artifacts = ArtifactManager::empty();
+            let mut nonces = NonceTracker::new();
+            let mut rng = StdRng::seed_from_u64(42);
+            let mut ctx =
+                BuildContext::new(1, &spec.gas, &accounts, &artifacts, &mut nonces, &mut rng);
+            let mut output = NdjsonWriter::new(Vec::new());
+            let result = generate_txs(
+                &SamplingAdapter,
+                &spec,
+                GenerationConfig {
+                    limit: GenerationLimit { count: Some(1), duration: None },
+                    signing_workers: 1,
+                    gas_sample_rpc: Some(&rpc),
+                },
+                &HashMap::new(),
+                &mut ctx,
+                &mut output,
+            );
+            assert!(result.is_err());
+            assert_eq!(output.count(), 0);
+            assert!(output.into_inner().is_empty());
+            Ok::<_, eyre::Report>(())
+        })
+        .await??;
         server.abort();
         Ok(())
     }
