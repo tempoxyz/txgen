@@ -38,10 +38,8 @@ pub fn parse_prometheus_text(text: &str, offset_ms: u64, unix_ms: u64) -> Vec<Sa
 fn parse_line(line: &str, offset_ms: u64, unix_ms: u64) -> Option<Sample> {
     let (name, labels, rest) = if let Some(brace_start) = line.find('{') {
         let name = &line[..brace_start];
-        let brace_end = line.find('}')?;
-        let labels_str = &line[brace_start + 1..brace_end];
-        let rest = line[brace_end + 1..].trim();
-        (name, parse_labels(labels_str), rest)
+        let (labels, rest) = parse_labels(&line[brace_start + 1..])?;
+        (name, labels, rest.trim())
     } else {
         // No labels — split on first whitespace.
         let space = line.find(|c: char| c.is_ascii_whitespace())?;
@@ -58,23 +56,33 @@ fn parse_line(line: &str, offset_ms: u64, unix_ms: u64) -> Option<Sample> {
     Some(Sample { name: name.to_string(), labels, value, offset_ms, unix_ms })
 }
 
-/// Parse the label portion inside `{...}`.
+/// Parse the label portion following `{` up to the closing `}`.
 ///
-/// Input: `label1="val1",label2="val2"`
-fn parse_labels(s: &str) -> BTreeMap<String, String> {
+/// Input: `label1="val1",label2="val2"} rest`. Returns the labels and the
+/// text after the closing `}`.
+fn parse_labels(s: &str) -> Option<(BTreeMap<String, String>, &str)> {
     let mut labels = BTreeMap::new();
-    if s.is_empty() {
-        return labels;
-    }
 
-    // Simple state machine to handle commas inside quoted values.
+    // Simple state machine to handle commas, braces and escapes inside quoted values.
     let mut key = String::new();
     let mut value = String::new();
     let mut in_value = false;
     let mut in_quotes = false;
+    let mut chars = s.char_indices();
 
-    for ch in s.chars() {
+    while let Some((idx, ch)) = chars.next() {
         match ch {
+            '\\' if in_quotes => match chars.next()?.1 {
+                'n' => value.push('\n'),
+                escaped => value.push(escaped),
+            },
+            '}' if !in_quotes => {
+                // Trailing unquoted value (rare but valid).
+                if in_value && !key.is_empty() {
+                    labels.insert(key.trim().to_string(), value.trim().to_string());
+                }
+                return Some((labels, &s[idx + 1..]));
+            }
             '=' if !in_value => {
                 in_value = true;
             }
@@ -109,12 +117,7 @@ fn parse_labels(s: &str) -> BTreeMap<String, String> {
         }
     }
 
-    // Handle trailing unquoted value (rare but valid).
-    if in_value && !key.is_empty() {
-        labels.insert(key.trim().to_string(), value.trim().to_string());
-    }
-
-    labels
+    None
 }
 
 /// Parse a Prometheus value string, handling special float values.
@@ -221,6 +224,17 @@ rpc_duration_seconds_count 5000
         let samples = parse_prometheus_text(text, 0, 0);
         assert_eq!(samples.len(), 1);
         assert!(samples[0].labels.is_empty());
+    }
+
+    #[test]
+    fn labels_with_escapes_and_braces() {
+        let text = r#"foo{path="a\"}b",msg="x\\y\nz",other="{}"} 7"#;
+        let samples = parse_prometheus_text(text, 0, 0);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].labels["path"], r#"a"}b"#);
+        assert_eq!(samples[0].labels["msg"], "x\\y\nz");
+        assert_eq!(samples[0].labels["other"], "{}");
+        assert_eq!(samples[0].value, 7.0);
     }
 
     #[test]
