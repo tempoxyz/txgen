@@ -47,13 +47,8 @@ pub(crate) fn metrics_scraper_configs(
     for value in values {
         let labels = match value {
             MetricsURL::Labeled { labels, .. } => {
-                let identity = labels
-                    .iter()
-                    .map(|(key, value)| format!("{key}={value}"))
-                    .collect::<Vec<_>>()
-                    .join(";");
-                if !seen_labels.insert(identity.clone()) {
-                    bail!("duplicate --metrics-url labels `{identity}`");
+                if !seen_labels.insert(labels) {
+                    bail!("duplicate --metrics-url labels {labels:?}");
                 }
                 labels.clone()
             }
@@ -65,9 +60,7 @@ pub(crate) fn metrics_scraper_configs(
             MetricsURL::Unlabeled(_) => BTreeMap::new(),
         };
 
-        let mut config = ScraperConfig::new(value.url()).with_interval(interval);
-        config = config.with_labels(labels);
-        configs.push(config);
+        configs.push(ScraperConfig::new(value.url()).with_interval(interval).with_labels(labels));
     }
 
     Ok(configs)
