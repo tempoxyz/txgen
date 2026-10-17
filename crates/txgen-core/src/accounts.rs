@@ -1,7 +1,7 @@
 use alloy_primitives::{keccak256, Address, B256};
 use alloy_signer::Signer;
 use alloy_signer_local::{coins_bip39::English, MnemonicBuilder, Secp256k1Signer};
-use eyre::{bail, Result, WrapErr};
+use eyre::{bail, ensure, Result, WrapErr};
 use rand::Rng;
 use serde::{Deserialize, Deserializer};
 use std::{collections::HashMap, sync::Mutex};
@@ -342,10 +342,12 @@ fn selected_range(
     range: Option<[u32; 2]>,
     context: &str,
 ) -> Result<(u32, usize)> {
+    ensure!(index.is_none() || range.is_none(), "{context} must not set both 'index' and 'range'");
     if let Some(idx) = index {
         Ok((idx, 1))
     } else if let Some([start, end]) = range {
-        Ok((start, end.saturating_sub(start) as usize))
+        ensure!(start <= end, "{context} range end must be greater than or equal to start");
+        Ok((start, (end - start) as usize))
     } else {
         bail!("{context} must have either 'index' or 'range'");
     }
@@ -356,6 +358,7 @@ fn selected_fast_range(
     range: Option<[u64; 2]>,
     context: &str,
 ) -> Result<(u64, usize)> {
+    ensure!(index.is_none() || range.is_none(), "{context} must not set both 'index' and 'range'");
     if let Some(idx) = index {
         Ok((idx, 1))
     } else if let Some([start, end]) = range {
@@ -472,6 +475,28 @@ mod tests {
         // Verify all addresses are unique
         let addresses: std::collections::HashSet<_> = signers.iter().map(|s| s.address()).collect();
         assert_eq!(addresses.len(), 10);
+    }
+
+    #[test]
+    fn test_pool_rejects_invalid_index_and_range() {
+        let pool =
+            |index, range| AccountPoolDef { mnemonic: TEST_MNEMONIC.to_string(), index, range };
+        assert!(pool(Some(0), Some([0, 2])).derive_signers().is_err());
+        assert!(pool(None, Some([2, 1])).derive_signers().is_err());
+
+        let fast = FastAddressPoolDef {
+            seed: TEST_MNEMONIC.to_string(),
+            index: Some(0),
+            range: Some([0, 2]),
+        };
+        let def = AddressPoolDef {
+            addresses: Vec::new(),
+            mnemonic: None,
+            index: None,
+            range: None,
+            fast: Some(fast),
+        };
+        assert!(AddressPoolManager::from_spec(&HashMap::from([("fast".to_string(), def)])).is_err());
     }
 
     #[test]
