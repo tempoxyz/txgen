@@ -6071,6 +6071,7 @@ dependencies = [
  "bench-core",
  "clap",
  "eyre",
+ "futures",
  "hex",
  "hkdf",
  "k256",
