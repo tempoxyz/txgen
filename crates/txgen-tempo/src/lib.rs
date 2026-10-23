@@ -11,7 +11,10 @@ use late_sign::{
 };
 use nonce::prefetch_parallel_nonces;
 
-use alloy_eips::eip2718::{Decodable2718, Encodable2718};
+use alloy_eips::{
+    eip2718::{Decodable2718, Encodable2718},
+    eip2930::{AccessList, AccessListItem},
+};
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{keccak256, Address, Bytes, TxKind, U256};
 use alloy_provider::{network::Ethereum, DynProvider};
@@ -474,6 +477,9 @@ impl NetworkAdapter for TempoAdapter {
         req.set_chain_id(ctx.chain_id);
         req.set_nonce(nonce);
         req.set_gas_limit(template.gas_limit);
+        if let Some(access_list) = resolve_access_list(&template, ctx)? {
+            req.set_access_list(access_list);
+        }
         let mut sign_context = TempoSignContext::Standard;
         let mut deferred_key_authorization = None;
         let mut deferred_sponsor = None;
@@ -588,7 +594,9 @@ impl NetworkAdapter for TempoAdapter {
             }
             TempoTxType::Eip2930 => {
                 req.set_gas_price(template.gas_price.unwrap_or(ctx.gas.max_fee_per_gas));
-                req.set_access_list(Default::default());
+                if req.access_list().is_none() {
+                    req.set_access_list(Default::default());
+                }
                 req.set_kind(to);
                 req.set_value(value);
                 if !input.is_empty() {
@@ -829,6 +837,33 @@ fn validate_tx_type_fields(template: &TempoTemplate) -> Result<()> {
         bail!("`{field}` is only supported for `type: tempo` templates");
     }
     Ok(())
+}
+
+/// Resolves a template's declared access list. Legacy transactions cannot carry one.
+fn resolve_access_list(
+    template: &TempoTemplate,
+    ctx: &mut BuildContext<'_>,
+) -> Result<Option<AccessList>> {
+    let Some(items) = &template.access_list else {
+        return Ok(None);
+    };
+    if template.tx_type == TempoTxType::Legacy {
+        bail!("`access_list` is not supported for `type: legacy` templates");
+    }
+    let items = items
+        .iter()
+        .map(|item| {
+            Ok(AccessListItem {
+                address: ctx.resolve_value(&item.address)?,
+                storage_keys: item
+                    .storage_keys
+                    .iter()
+                    .map(|key| ctx.resolve_value(key))
+                    .collect::<Result<Vec<_>>>()?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(AccessList(items)))
 }
 
 fn resolve_nonce_mode(
@@ -1358,6 +1393,7 @@ mod tests {
             valid_before: None,
             valid_for_secs: None,
             calls: None,
+            access_list: None,
             auth: None,
         }
     }
@@ -1369,6 +1405,39 @@ mod tests {
         template.sponsor =
             Some(AccountRef { pool: "users".to_string(), select: SelectMode::Index(1) });
         template
+    }
+
+    #[test]
+    fn test_access_list_is_encoded_for_tempo_and_rejected_for_legacy() {
+        let accounts = test_accounts();
+        let artifacts = ArtifactManager::empty();
+        let gas = GasConfig::default();
+        let mut nonces = NonceTracker::new();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        let declared = Address::repeat_byte(0x20);
+        let key = alloy_primitives::B256::repeat_byte(0x01);
+        let mut template = base_template(TempoTxType::Tempo);
+        template.access_list = Some(vec![template::AccessListItemDef {
+            address: GenValue::Literal(declared),
+            storage_keys: vec![GenValue::Literal(key)],
+        }]);
+
+        let raw = sign_and_encode(&TempoAdapter::new(), template.clone(), &mut ctx);
+        let TempoTxEnvelope::AA(tx) = TempoTxEnvelope::decode_2718(&mut raw.as_ref()).unwrap()
+        else {
+            panic!("expected Tempo AA envelope");
+        };
+        assert_eq!(
+            tx.tx().access_list,
+            AccessList(vec![AccessListItem { address: declared, storage_keys: vec![key] }])
+        );
+
+        template.tx_type = TempoTxType::Legacy;
+        let Err(err) = TempoAdapter::new().build_request(template, &mut ctx) else {
+            panic!("legacy access list must be rejected");
+        };
+        assert!(err.to_string().contains("access_list"));
     }
 
     #[test]

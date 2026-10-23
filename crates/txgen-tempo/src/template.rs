@@ -111,9 +111,28 @@ pub struct TempoTemplate {
     #[serde(default)]
     pub calls: Option<Vec<CallDef>>,
 
+    /// EIP-2930 access list declaring addresses and storage keys the
+    /// transaction touches. Supported for `eip2930`, `eip1559` and `tempo`
+    /// templates. Under TIP-1045 a non-empty access list makes a Tempo
+    /// transaction general-lane.
+    #[serde(default)]
+    pub access_list: Option<Vec<AccessListItemDef>>,
+
     /// Tempo account-keychain authentication.
     #[serde(default)]
     pub auth: Option<TempoAuthDef>,
+}
+
+/// One access-list entry: an address and the storage keys declared for it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessListItemDef {
+    /// Declared address.
+    pub address: GenValue<Address>,
+
+    /// Declared storage keys (may be empty).
+    #[serde(default)]
+    pub storage_keys: Vec<GenValue<B256>>,
 }
 
 /// Tempo account-keychain auth mode.
