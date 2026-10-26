@@ -198,8 +198,9 @@ async fn execute_source<S: TxSource>(
     };
     let metrics = MetricsCollector::new_with_latencies(clock.clone(), args.collect_latencies);
     sender.set_metrics(metrics.clone());
-    // Warmup shares this sender; start any step-load schedule with the measurement.
-    sender.restart_rate_schedule();
+    // Warmup shares this sender and holds the schedule's first step; start the
+    // step-load schedule with the measurement.
+    sender.start_rate_schedule();
     let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
     if let Some(collector) = &receipt_collector {
         sender = sender.with_receipt_collector(collector.handle());

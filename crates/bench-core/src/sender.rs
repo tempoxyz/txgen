@@ -55,8 +55,9 @@ pub struct SenderConfig {
     pub max_concurrent: usize,
     /// Optional step-load schedule that replaces rate_limit over time.
     ///
-    /// Each step holds its rate for its duration, starting from the first
-    /// rate-limited submission; the last step's rate holds afterwards.
+    /// The first step's rate holds until Sender::start_rate_schedule starts
+    /// the schedule; each step then holds its rate for its duration, and the
+    /// last step's rate holds afterwards.
     pub rate_schedule: Vec<RateStep>,
 }
 
@@ -1292,11 +1293,12 @@ impl Sender {
         self.metrics = metrics;
     }
 
-    /// Restart a step-load schedule from its first step at the next submission,
-    /// e.g. when warmup ends and measurement begins. No-op for a constant rate.
-    pub fn restart_rate_schedule(&self) {
+    /// Start a step-load schedule from its first step now, e.g. when warmup
+    /// ends and measurement begins. Until then the first step's rate holds.
+    /// No-op for a constant rate.
+    pub fn start_rate_schedule(&self) {
         if let Some(limiter) = &self.rate_limiter {
-            limiter.restart();
+            limiter.start();
         }
     }
 
@@ -1682,7 +1684,7 @@ struct RateLimiter {
 struct RateLimiterState {
     tokens: f64,
     last_refill: Instant,
-    /// When the schedule started: the first acquisition.
+    /// When the schedule started; None holds the first step's rate.
     started: Option<Instant>,
 }
 
@@ -1715,16 +1717,17 @@ impl RateLimiter {
         }
     }
 
-    /// Restarts the schedule at the next acquisition with first-step credit.
-    fn restart(&self) {
+    /// Starts the schedule from its first step now, with first-step credit.
+    fn start(&self) {
         if self.schedule.is_empty() {
             return;
         }
         let mut state = self.state.lock().expect("rate limiter mutex poisoned");
         let first = self.schedule[0].tps as f64;
-        state.started = None;
+        let now = Instant::now();
+        state.started = Some(now);
         state.tokens = (first * RATE_LIMITER_MAX_BURST.as_secs_f64()).max(1.0);
-        state.last_refill = Instant::now();
+        state.last_refill = now;
     }
 
     /// Rate in effect the given time after the schedule started.
@@ -1742,8 +1745,9 @@ impl RateLimiter {
     fn try_acquire_or_delay(&self) -> Option<Duration> {
         let mut state = self.state.lock().expect("rate limiter mutex poisoned");
         let now = Instant::now();
-        let started = *state.started.get_or_insert(now);
-        let rate = self.rate_at(now.duration_since(started));
+        // Before the schedule starts (e.g. during warmup), hold its first step.
+        let elapsed = state.started.map_or(Duration::ZERO, |started| now.duration_since(started));
+        let rate = self.rate_at(elapsed);
         let burst_capacity = (rate * RATE_LIMITER_MAX_BURST.as_secs_f64()).max(1.0);
         state.refill(now, rate, burst_capacity);
 
@@ -2287,17 +2291,34 @@ mod tests {
     }
 
     #[test]
-    fn test_scheduled_rate_limiter_restart_returns_to_the_first_step() {
+    fn test_scheduled_rate_limiter_holds_the_first_step_until_started() {
+        let limiter = RateLimiter::scheduled(vec![
+            RateStep { tps: 100, duration: Duration::from_millis(1) },
+            RateStep { tps: 1_000, duration: Duration::from_secs(10) },
+        ]);
+        // Acquisitions before start (warmup) do not start the schedule.
+        std::thread::sleep(Duration::from_millis(5));
+        while limiter.try_acquire_or_delay().is_none() {}
+        assert_eq!(limiter.state.lock().unwrap().started, None);
+        let delay = limiter.try_acquire_or_delay().unwrap();
+        assert!(delay > Duration::from_millis(1), "first-step delay: {delay:?}");
+
+        limiter.start();
+        let started = limiter.state.lock().unwrap().started.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_scheduled_rate_limiter_start_returns_to_the_first_step() {
         let limiter = RateLimiter::scheduled(vec![
             RateStep { tps: 100, duration: Duration::from_secs(10) },
             RateStep { tps: 1_000, duration: Duration::from_secs(10) },
         ]);
         limiter.state.lock().unwrap().started = Some(Instant::now() - Duration::from_secs(15));
-        limiter.restart();
-        assert_eq!(limiter.state.lock().unwrap().started, None);
-        assert_eq!(limiter.try_acquire_or_delay(), None);
+        limiter.start();
         let started = limiter.state.lock().unwrap().started.unwrap();
         assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(limiter.state.lock().unwrap().tokens, 1.0);
     }
 
     #[test]

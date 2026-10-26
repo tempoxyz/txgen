@@ -160,8 +160,9 @@ pub struct SendArgs {
 
     /// Step-load schedule replacing --tps over time, e.g. "200:30s,2000:10s,200:60s".
     ///
-    /// Each TPS:DURATION step holds its rate for its duration, starting at the
-    /// first workload submission; the last step's rate holds afterwards. Use it
+    /// Each TPS:DURATION step holds its rate for its duration, starting when
+    /// measurement starts (warmup runs at the first step's rate); the last
+    /// step's rate holds afterwards. Use it
     /// to measure how a burst queues and how long the backlog takes to drain.
     #[arg(long, conflicts_with = "tps")]
     pub tps_schedule: Option<String>,
