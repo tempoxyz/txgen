@@ -13,7 +13,7 @@ use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     block_composition, collect_block_stats, parse_metadata, parse_reporters, start_scrapers,
     total_fees_paid, trim_trailing_empty_blocks, BlockReceiptCollector, ConsoleReporter,
-    FileSource, FinalReport, GeneratedTx, LateSigner, MetricsCollector, ProgressState,
+    FileSource, FinalReport, GeneratedTx, LateSigner, MetricsCollector, ProgressState, RateStep,
     ReceiptCollection, ReceiptTracker, Reporter, RequestAuthProvider, RpcEndpoint, RunClock,
     RunStats, SampleStore, ScraperConfig, ScraperHandle, Sender, SenderConfig,
     SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
@@ -150,7 +150,12 @@ async fn execute_source<S: TxSource>(
     source: &mut S,
     scraper_configs: &[ScraperConfig],
 ) -> Result<()> {
-    let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
+    let rate_schedule = match &args.tps_schedule {
+        Some(schedule) => RateStep::parse_schedule(schedule)?,
+        None => Vec::new(),
+    };
+    let rate_limit = rate_schedule.iter().map(|step| step.tps).max().unwrap_or(args.tps);
+    let config = SenderConfig { rate_limit, max_concurrent: args.max_concurrent, rate_schedule };
 
     let receipt_tracker = ReceiptTracker::new(query_provider.clone());
     let first_workload = run_setup_phase(

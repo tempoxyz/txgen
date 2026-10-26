@@ -61,7 +61,7 @@ pub use reporter::{
 pub use sample::{Sample, SampleArchive, SampleStore};
 pub use scraper::{start_scrapers, SampleCallback, ScraperConfig, ScraperHandle};
 pub use sender::{
-    LateSigner, RpcEndpoint, RpcReceiptDetails, RpcSubmission, RpcSubmitError,
+    LateSigner, RateStep, RpcEndpoint, RpcReceiptDetails, RpcSubmission, RpcSubmitError,
     RpcSubmitFailureKind, RpcSubmitter, Sender, SenderConfig,
 };
 pub use source::{FileSource, SourceTx, StdinSource, TxSource};

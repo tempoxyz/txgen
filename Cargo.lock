@@ -1420,6 +1420,7 @@ dependencies = [
  "flate2",
  "futures",
  "hex",
+ "humantime",
  "prometheus_remote_write",
  "prost",
  "rand 0.9.4",

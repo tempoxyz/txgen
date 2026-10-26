@@ -158,6 +158,14 @@ pub struct SendArgs {
     #[arg(long, default_value = "0")]
     pub tps: u64,
 
+    /// Step-load schedule replacing --tps over time, e.g. "200:30s,2000:10s,200:60s".
+    ///
+    /// Each TPS:DURATION step holds its rate for its duration, starting at the
+    /// first workload submission; the last step's rate holds afterwards. Use it
+    /// to measure how a burst queues and how long the backlog takes to drain.
+    #[arg(long, conflicts_with = "tps")]
+    pub tps_schedule: Option<String>,
+
     /// Maximum number of RPC requests in flight simultaneously.
     ///
     /// Controls parallelism independently of --tps. Limits how many
