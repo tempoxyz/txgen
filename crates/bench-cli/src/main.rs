@@ -226,9 +226,26 @@ pub struct SendArgs {
 }
 
 impl SendArgs {
+    /// The parsed --tps-schedule, or empty for a constant --tps.
+    fn rate_schedule(&self) -> Result<Vec<bench_core::RateStep>> {
+        match &self.tps_schedule {
+            Some(schedule) => bench_core::RateStep::parse_schedule(schedule),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Peak submission rate: the schedule's highest step, otherwise --tps.
+    fn effective_tps(&self) -> Result<u64> {
+        Ok(self.rate_schedule()?.iter().map(|step| step.tps).max().unwrap_or(self.tps))
+    }
+
     fn pending_limit(&self) -> Result<Option<NonZeroUsize>> {
-        let limit = usize::try_from(self.max_pending.unwrap_or(self.tps))
-            .context("pending limit exceeds this platform's capacity")?;
+        let limit = match self.max_pending {
+            Some(limit) => limit,
+            None => self.effective_tps()?,
+        };
+        let limit =
+            usize::try_from(limit).context("pending limit exceeds this platform's capacity")?;
         Ok(NonZeroUsize::new(limit))
     }
 }
@@ -694,6 +711,8 @@ mod tests {
             (vec!["--tps", "50000", "--max-pending", "0"], None),
             (vec!["--tps", "50000", "--max-pending", "10000"], Some(10000)),
             (vec!["--max-pending", "10000"], Some(10000)),
+            (vec!["--tps-schedule", "200:30s,2000:10s,200:60s"], Some(2000)),
+            (vec!["--tps-schedule", "200:30s,2000:10s", "--max-pending", "0"], None),
         ] {
             let cli = Cli::try_parse_from(["bench", "send"].into_iter().chain(flags)).unwrap();
             let Command::Send(args) = cli.command else {

@@ -1292,6 +1292,14 @@ impl Sender {
         self.metrics = metrics;
     }
 
+    /// Restart a step-load schedule from its first step at the next submission,
+    /// e.g. when warmup ends and measurement begins. No-op for a constant rate.
+    pub fn restart_rate_schedule(&self) {
+        if let Some(limiter) = &self.rate_limiter {
+            limiter.restart();
+        }
+    }
+
     /// Stop tracking receipts for subsequently dispatched requests.
     /// In-flight requests retain the collector they were dispatched with.
     pub fn clear_receipt_collector(&mut self) {
@@ -1705,6 +1713,18 @@ impl RateLimiter {
                 started: None,
             }),
         }
+    }
+
+    /// Restarts the schedule at the next acquisition with first-step credit.
+    fn restart(&self) {
+        if self.schedule.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().expect("rate limiter mutex poisoned");
+        let first = self.schedule[0].tps as f64;
+        state.started = None;
+        state.tokens = (first * RATE_LIMITER_MAX_BURST.as_secs_f64()).max(1.0);
+        state.last_refill = Instant::now();
     }
 
     /// Rate in effect the given time after the schedule started.
@@ -2264,6 +2284,20 @@ mod tests {
         assert_eq!(limiter.try_acquire_or_delay(), None);
         let state = limiter.state.lock().unwrap();
         assert!(state.tokens >= 3.0 && state.tokens <= 9.5, "tokens: {}", state.tokens);
+    }
+
+    #[test]
+    fn test_scheduled_rate_limiter_restart_returns_to_the_first_step() {
+        let limiter = RateLimiter::scheduled(vec![
+            RateStep { tps: 100, duration: Duration::from_secs(10) },
+            RateStep { tps: 1_000, duration: Duration::from_secs(10) },
+        ]);
+        limiter.state.lock().unwrap().started = Some(Instant::now() - Duration::from_secs(15));
+        limiter.restart();
+        assert_eq!(limiter.state.lock().unwrap().started, None);
+        assert_eq!(limiter.try_acquire_or_delay(), None);
+        let started = limiter.state.lock().unwrap().started.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

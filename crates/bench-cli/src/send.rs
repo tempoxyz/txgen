@@ -13,7 +13,7 @@ use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
     block_composition, collect_block_stats, parse_metadata, parse_reporters, start_scrapers,
     total_fees_paid, trim_trailing_empty_blocks, BlockReceiptCollector, ConsoleReporter,
-    FileSource, FinalReport, GeneratedTx, LateSigner, MetricsCollector, ProgressState, RateStep,
+    FileSource, FinalReport, GeneratedTx, LateSigner, MetricsCollector, ProgressState,
     ReceiptCollection, ReceiptTracker, Reporter, RequestAuthProvider, RpcEndpoint, RunClock,
     RunStats, SampleStore, ScraperConfig, ScraperHandle, Sender, SenderConfig,
     SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
@@ -32,7 +32,7 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     tracing::info!(
         input = args.input.as_ref().map(|p| p.display().to_string()).as_deref().unwrap_or("stdin"),
         rpc_urls = ?args.rpc_urls,
-        tps = args.tps,
+        tps = args.effective_tps()?,
         max_pending = max_pending.map_or(0, |limit| limit.get()),
         skip_setup = args.skip_setup,
         collect_latencies = args.collect_latencies,
@@ -150,11 +150,8 @@ async fn execute_source<S: TxSource>(
     source: &mut S,
     scraper_configs: &[ScraperConfig],
 ) -> Result<()> {
-    let rate_schedule = match &args.tps_schedule {
-        Some(schedule) => RateStep::parse_schedule(schedule)?,
-        None => Vec::new(),
-    };
-    let rate_limit = rate_schedule.iter().map(|step| step.tps).max().unwrap_or(args.tps);
+    let rate_schedule = args.rate_schedule()?;
+    let rate_limit = args.effective_tps()?;
     let config = SenderConfig { rate_limit, max_concurrent: args.max_concurrent, rate_schedule };
 
     let receipt_tracker = ReceiptTracker::new(query_provider.clone());
@@ -201,6 +198,8 @@ async fn execute_source<S: TxSource>(
     };
     let metrics = MetricsCollector::new_with_latencies(clock.clone(), args.collect_latencies);
     sender.set_metrics(metrics.clone());
+    // Warmup shares this sender; start any step-load schedule with the measurement.
+    sender.restart_rate_schedule();
     let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
     if let Some(collector) = &receipt_collector {
         sender = sender.with_receipt_collector(collector.handle());
