@@ -230,9 +230,12 @@ pub struct SendArgs {
 impl SendArgs {
     /// The parsed --tps-schedule, or empty for a constant --tps.
     fn rate_schedule(&self) -> Result<Vec<bench_core::RateStep>> {
-        match &self.tps_schedule {
-            Some(schedule) => bench_core::RateStep::parse_schedule(schedule),
-            None => Ok(Vec::new()),
+        match self.tps_schedule.as_deref().map(str::trim) {
+            // A set-but-empty BENCH_TPS_SCHEDULE means no schedule.
+            Some(schedule) if !schedule.is_empty() => {
+                bench_core::RateStep::parse_schedule(schedule)
+            }
+            _ => Ok(Vec::new()),
         }
     }
 
@@ -716,6 +719,7 @@ mod tests {
             (vec!["--tps-schedule", "200:30s,2000:10s,200:60s"], Some(2000)),
             (vec!["--tps-schedule", "200:30s,2000:10s", "--max-pending", "0"], None),
             (vec!["--tps", "50000", "--tps-schedule", "200:30s,2000:10s"], Some(2000)),
+            (vec!["--tps", "50000", "--tps-schedule", " "], Some(50000)),
         ] {
             let cli = Cli::try_parse_from(["bench", "send"].into_iter().chain(flags)).unwrap();
             let Command::Send(args) = cli.command else {

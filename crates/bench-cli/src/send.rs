@@ -29,6 +29,19 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         bail!("--duration must be positive");
     }
     let max_pending = args.pending_limit()?;
+    let rate_schedule = args.rate_schedule()?;
+    if !rate_schedule.is_empty() {
+        let schedule = args.tps_schedule.as_deref().unwrap_or_default();
+        if args.tps > 0 {
+            tracing::warn!(
+                schedule,
+                ignored_tps = args.tps,
+                "--tps-schedule (or BENCH_TPS_SCHEDULE) overrides --tps"
+            );
+        } else {
+            tracing::info!(schedule, "Using step-load rate schedule");
+        }
+    }
     tracing::info!(
         input = args.input.as_ref().map(|p| p.display().to_string()).as_deref().unwrap_or("stdin"),
         rpc_urls = ?args.rpc_urls,
