@@ -17,7 +17,7 @@ txgen-tempo = { path = "crates/txgen-tempo" }
 txgen-cli = { path = "crates/txgen-cli" }
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # serde
 serde = { version = "1", features = ["derive"] }
