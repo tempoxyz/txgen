@@ -162,9 +162,10 @@ pub struct SendArgs {
     ///
     /// Each TPS:DURATION step holds its rate for its duration, starting when
     /// measurement starts (warmup runs at the first step's rate); the last
-    /// step's rate holds afterwards. Use it
-    /// to measure how a burst queues and how long the backlog takes to drain.
-    #[arg(long, conflicts_with = "tps")]
+    /// step's rate holds afterwards. Use it to measure how a burst queues and
+    /// how long the backlog takes to drain. Overrides --tps when set, so
+    /// harnesses that always pass --tps can set BENCH_TPS_SCHEDULE instead.
+    #[arg(long, env = "BENCH_TPS_SCHEDULE")]
     pub tps_schedule: Option<String>,
 
     /// Maximum number of RPC requests in flight simultaneously.
@@ -714,6 +715,7 @@ mod tests {
             (vec!["--max-pending", "10000"], Some(10000)),
             (vec!["--tps-schedule", "200:30s,2000:10s,200:60s"], Some(2000)),
             (vec!["--tps-schedule", "200:30s,2000:10s", "--max-pending", "0"], None),
+            (vec!["--tps", "50000", "--tps-schedule", "200:30s,2000:10s"], Some(2000)),
         ] {
             let cli = Cli::try_parse_from(["bench", "send"].into_iter().chain(flags)).unwrap();
             let Command::Send(args) = cli.command else {
