@@ -1724,7 +1724,11 @@ where
             .wrap_err_with(|| format!("failed to configure late signing for chain '{name}'"))?;
         let mut submitter = RpcSubmitter::new_with_request_auth(
             vec![RpcEndpoint::new(format!("{name}-submission"), submission_provider)],
-            SenderConfig { rate_limit: transaction_rate, max_concurrent: max_rpc_in_flight },
+            SenderConfig {
+                rate_limit: transaction_rate,
+                max_concurrent: max_rpc_in_flight,
+                rate_schedule: Vec::new(),
+            },
             request_auth,
         )?
         .with_receipt_tracker(bench_core::ReceiptTracker::new(query_provider.clone()));

@@ -53,11 +53,67 @@ pub struct SenderConfig {
     /// Controls parallelism via a semaphore. Limits how many connections are
     /// open at once, independently of the rate limit.
     pub max_concurrent: usize,
+    /// Optional step-load schedule that replaces rate_limit over time.
+    ///
+    /// The first step's rate holds until Sender::start_rate_schedule starts
+    /// the schedule; each step then holds its rate for its duration, and the
+    /// last step's rate holds afterwards.
+    pub rate_schedule: Vec<RateStep>,
+}
+
+/// One step of a step-load schedule: submit at tps for duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateStep {
+    /// Transactions per second during this step.
+    pub tps: u64,
+    /// How long this step lasts.
+    pub duration: Duration,
+}
+
+impl RateStep {
+    /// Parses a schedule such as "200:30s,2000:10s,200:60s".
+    pub fn parse_schedule(input: &str) -> Result<Vec<Self>> {
+        let steps = input
+            .split(',')
+            .map(|step| {
+                let (tps, duration) = step.trim().split_once(':').ok_or_else(|| {
+                    eyre::eyre!("invalid rate step {step:?}: expected TPS:DURATION, e.g. 2000:10s")
+                })?;
+                let tps: u64 = tps
+                    .trim()
+                    .parse()
+                    .map_err(|_| eyre::eyre!("invalid TPS in rate step {step:?}"))?;
+                let duration = humantime::parse_duration(duration.trim())
+                    .map_err(|err| eyre::eyre!("invalid duration in rate step {step:?}: {err}"))?;
+                if tps == 0 || duration.is_zero() {
+                    eyre::bail!("rate step {step:?} needs a positive TPS and duration");
+                }
+                Ok(Self { tps, duration })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if steps.is_empty() {
+            eyre::bail!("rate schedule must have at least one step");
+        }
+        Ok(steps)
+    }
 }
 
 impl Default for SenderConfig {
     fn default() -> Self {
-        Self { rate_limit: 0, max_concurrent: 100 }
+        Self { rate_limit: 0, max_concurrent: 100, rate_schedule: Vec::new() }
+    }
+}
+
+impl SenderConfig {
+    /// Builds the rate limiter for this configuration, if any limit applies.
+    fn rate_limiter(&self) -> Option<Arc<RateLimiter>> {
+        if !self.rate_schedule.is_empty() {
+            Some(Arc::new(RateLimiter::scheduled(self.rate_schedule.clone())))
+        } else if self.rate_limit > 0 {
+            Some(Arc::new(RateLimiter::new(self.rate_limit)))
+        } else {
+            None
+        }
     }
 }
 
@@ -240,8 +296,7 @@ impl RpcSubmitter {
         }
         config.validate()?;
 
-        let rate_limiter =
-            (config.rate_limit > 0).then(|| Arc::new(RateLimiter::new(config.rate_limit)));
+        let rate_limiter = config.rate_limiter();
 
         let receipt_tracker = ReceiptTracker::new(endpoints[0].provider().clone());
         Ok(Self {
@@ -825,11 +880,7 @@ impl Sender {
         assert!(!endpoints.is_empty(), "sender requires at least one RPC endpoint");
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
 
-        let rate_limiter = if config.rate_limit > 0 {
-            Some(Arc::new(RateLimiter::new(config.rate_limit)))
-        } else {
-            None
-        };
+        let rate_limiter = config.rate_limiter();
 
         let max_buffered = max_buffered_transactions(&config, rate_limiter.as_deref());
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
@@ -1242,6 +1293,15 @@ impl Sender {
         self.metrics = metrics;
     }
 
+    /// Start a step-load schedule from its first step now, e.g. when warmup
+    /// ends and measurement begins. Until then the first step's rate holds.
+    /// No-op for a constant rate.
+    pub fn start_rate_schedule(&self) {
+        if let Some(limiter) = &self.rate_limiter {
+            limiter.start();
+        }
+    }
+
     /// Stop tracking receipts for subsequently dispatched requests.
     /// In-flight requests retain the collector they were dispatched with.
     pub fn clear_receipt_collector(&mut self) {
@@ -1616,46 +1676,93 @@ const RATE_LIMITER_MAX_BURST: Duration = Duration::from_millis(10);
 struct RateLimiter {
     rate: f64,
     burst_capacity: f64,
+    /// Step-load schedule; empty for a constant rate.
+    schedule: Vec<RateStep>,
     state: StdMutex<RateLimiterState>,
 }
 
 struct RateLimiterState {
     tokens: f64,
     last_refill: Instant,
+    /// When the schedule started; None holds the first step's rate.
+    started: Option<Instant>,
 }
 
 impl RateLimiter {
     fn new(tokens_per_sec: u64) -> Self {
+        Self::with_schedule(tokens_per_sec, Vec::new())
+    }
+
+    /// A limiter that follows schedule; buffers are sized for its peak rate.
+    fn scheduled(schedule: Vec<RateStep>) -> Self {
+        let peak = schedule.iter().map(|step| step.tps).max().unwrap_or(1);
+        Self::with_schedule(peak, schedule)
+    }
+
+    fn with_schedule(tokens_per_sec: u64, schedule: Vec<RateStep>) -> Self {
         let rate = tokens_per_sec as f64;
         let burst_capacity = (rate * RATE_LIMITER_MAX_BURST.as_secs_f64()).max(1.0);
+        let initial = schedule.first().map(|step| step.tps as f64).unwrap_or(rate);
+        let initial_tokens = (initial * RATE_LIMITER_MAX_BURST.as_secs_f64()).max(1.0);
 
         Self {
             rate,
             burst_capacity,
+            schedule,
             state: StdMutex::new(RateLimiterState {
-                tokens: burst_capacity,
+                tokens: initial_tokens,
                 last_refill: Instant::now(),
+                started: None,
             }),
         }
     }
 
+    /// Starts the schedule from its first step now, with first-step credit.
+    fn start(&self) {
+        if self.schedule.is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().expect("rate limiter mutex poisoned");
+        let first = self.schedule[0].tps as f64;
+        let now = Instant::now();
+        state.started = Some(now);
+        state.tokens = (first * RATE_LIMITER_MAX_BURST.as_secs_f64()).max(1.0);
+        state.last_refill = now;
+    }
+
+    /// Rate in effect the given time after the schedule started.
+    fn rate_at(&self, elapsed: Duration) -> f64 {
+        let mut offset = Duration::ZERO;
+        for step in &self.schedule {
+            offset += step.duration;
+            if elapsed < offset {
+                return step.tps as f64;
+            }
+        }
+        self.schedule.last().map(|step| step.tps as f64).unwrap_or(self.rate)
+    }
+
     fn try_acquire_or_delay(&self) -> Option<Duration> {
         let mut state = self.state.lock().expect("rate limiter mutex poisoned");
-        state.refill(self.rate, self.burst_capacity);
+        let now = Instant::now();
+        // Before the schedule starts (e.g. during warmup), hold its first step.
+        let elapsed = state.started.map_or(Duration::ZERO, |started| now.duration_since(started));
+        let rate = self.rate_at(elapsed);
+        let burst_capacity = (rate * RATE_LIMITER_MAX_BURST.as_secs_f64()).max(1.0);
+        state.refill(now, rate, burst_capacity);
 
         if state.tokens >= 1.0 {
             state.tokens -= 1.0;
             None
         } else {
             let missing_tokens = 1.0 - state.tokens;
-            Some(Duration::from_secs_f64(missing_tokens / self.rate))
+            Some(Duration::from_secs_f64(missing_tokens / rate))
         }
     }
 }
 
 impl RateLimiterState {
-    fn refill(&mut self, rate: f64, burst_capacity: f64) {
-        let now = Instant::now();
+    fn refill(&mut self, now: Instant, rate: f64, burst_capacity: f64) {
         let new_tokens = now.duration_since(self.last_refill).as_secs_f64() * rate;
         self.tokens = (self.tokens + new_tokens).min(burst_capacity);
         self.last_refill = now;
@@ -1710,7 +1817,7 @@ mod tests {
         let measured = MetricsCollector::new(RunClock::new());
         let mut sender = Sender::new(
             vec![mocked_provider(asserter)],
-            SenderConfig { rate_limit: 0, max_concurrent: 2 },
+            SenderConfig { rate_limit: 0, max_concurrent: 2, rate_schedule: Vec::new() },
             warmup.clone(),
         );
         for key in 1..=2 {
@@ -1857,7 +1964,7 @@ mod tests {
         asserter.push_success(&tx_hash);
         asserter.push_success(&receipt_json(tx_hash, Some("0x2")));
         let provider = mocked_provider(asserter.clone());
-        let config = SenderConfig { rate_limit: 0, max_concurrent: 1 };
+        let config = SenderConfig { rate_limit: 0, max_concurrent: 1, rate_schedule: Vec::new() };
         let collector = ReceiptCollector::start(
             RpcSubmitter::new(vec![provider.clone()], config.clone()).unwrap(),
             1,
@@ -1905,7 +2012,7 @@ mod tests {
 
     #[test]
     fn test_sender_config_rejects_zero_concurrency() {
-        let config = SenderConfig { rate_limit: 0, max_concurrent: 0 };
+        let config = SenderConfig { rate_limit: 0, max_concurrent: 0, rate_schedule: Vec::new() };
         assert!(config.validate().is_err());
 
         let provider = mocked_provider(Asserter::new());
@@ -1958,7 +2065,7 @@ mod tests {
 
         let submitter = RpcSubmitter::new(
             vec![mocked_provider(asserter.clone())],
-            SenderConfig { rate_limit: 0, max_concurrent: 1 },
+            SenderConfig { rate_limit: 0, max_concurrent: 1, rate_schedule: Vec::new() },
         )
         .unwrap();
 
@@ -1990,7 +2097,7 @@ mod tests {
         let signer = Arc::new(StaticLateSigner { raw, calls: StdMutex::new(0) });
         let submitter = RpcSubmitter::new(
             vec![mocked_provider(asserter.clone())],
-            SenderConfig { rate_limit: 0, max_concurrent: 1 },
+            SenderConfig { rate_limit: 0, max_concurrent: 1, rate_schedule: Vec::new() },
         )
         .unwrap()
         .with_late_signer(signer.clone());
@@ -2026,9 +2133,12 @@ mod tests {
         let signer = Arc::new(StaticLateSigner { raw, calls: StdMutex::new(0) });
         let provider = mocked_provider(asserter.clone());
         let metrics = MetricsCollector::new(RunClock::new());
-        let mut sender =
-            Sender::new(vec![provider], SenderConfig { rate_limit: 0, max_concurrent: 1 }, metrics)
-                .with_late_signer(signer.clone());
+        let mut sender = Sender::new(
+            vec![provider],
+            SenderConfig { rate_limit: 0, max_concurrent: 1, rate_schedule: Vec::new() },
+            metrics,
+        )
+        .with_late_signer(signer.clone());
 
         sender
             .send(GeneratedTx {
@@ -2058,7 +2168,7 @@ mod tests {
         asserter.push_success(&TxHash::repeat_byte(0x42));
         let submitter = RpcSubmitter::new(
             vec![mocked_provider(asserter.clone())],
-            SenderConfig { rate_limit: 1, max_concurrent: 1 },
+            SenderConfig { rate_limit: 1, max_concurrent: 1, rate_schedule: Vec::new() },
         )
         .unwrap();
         let transaction = GeneratedTx {
@@ -2131,6 +2241,87 @@ mod tests {
     }
 
     #[test]
+    fn test_rate_schedule_parses_steps() {
+        let steps = RateStep::parse_schedule("200:30s, 2000:10s,200:1m").unwrap();
+        assert_eq!(
+            steps,
+            vec![
+                RateStep { tps: 200, duration: Duration::from_secs(30) },
+                RateStep { tps: 2000, duration: Duration::from_secs(10) },
+                RateStep { tps: 200, duration: Duration::from_secs(60) },
+            ]
+        );
+        assert!(RateStep::parse_schedule("").is_err());
+        assert!(RateStep::parse_schedule("200").is_err());
+        assert!(RateStep::parse_schedule("0:10s").is_err());
+        assert!(RateStep::parse_schedule("200:0s").is_err());
+    }
+
+    #[test]
+    fn test_scheduled_rate_limiter_follows_steps_and_holds_the_last() {
+        let limiter = RateLimiter::scheduled(vec![
+            RateStep { tps: 100, duration: Duration::from_secs(10) },
+            RateStep { tps: 1_000, duration: Duration::from_secs(5) },
+            RateStep { tps: 50, duration: Duration::from_secs(5) },
+        ]);
+        assert_eq!(limiter.burst_capacity, 10.0);
+        assert_eq!(limiter.rate_at(Duration::ZERO), 100.0);
+        assert_eq!(limiter.rate_at(Duration::from_secs(9)), 100.0);
+        assert_eq!(limiter.rate_at(Duration::from_secs(10)), 1_000.0);
+        assert_eq!(limiter.rate_at(Duration::from_secs(14)), 1_000.0);
+        assert_eq!(limiter.rate_at(Duration::from_secs(15)), 50.0);
+        assert_eq!(limiter.rate_at(Duration::from_secs(600)), 50.0);
+    }
+
+    #[test]
+    fn test_scheduled_rate_limiter_refills_at_the_current_step_rate() {
+        let limiter = RateLimiter::scheduled(vec![
+            RateStep { tps: 100, duration: Duration::from_secs(10) },
+            RateStep { tps: 1_000, duration: Duration::from_secs(10) },
+        ]);
+        {
+            let mut state = limiter.state.lock().unwrap();
+            state.started = Some(Instant::now() - Duration::from_secs(12));
+            state.tokens = 0.0;
+            state.last_refill = Instant::now() - Duration::from_millis(5);
+        }
+        assert_eq!(limiter.try_acquire_or_delay(), None);
+        let state = limiter.state.lock().unwrap();
+        assert!(state.tokens >= 3.0 && state.tokens <= 9.5, "tokens: {}", state.tokens);
+    }
+
+    #[test]
+    fn test_scheduled_rate_limiter_holds_the_first_step_until_started() {
+        let limiter = RateLimiter::scheduled(vec![
+            RateStep { tps: 100, duration: Duration::from_millis(1) },
+            RateStep { tps: 1_000, duration: Duration::from_secs(10) },
+        ]);
+        // Acquisitions before start (warmup) do not start the schedule.
+        std::thread::sleep(Duration::from_millis(5));
+        while limiter.try_acquire_or_delay().is_none() {}
+        assert_eq!(limiter.state.lock().unwrap().started, None);
+        let delay = limiter.try_acquire_or_delay().unwrap();
+        assert!(delay > Duration::from_millis(1), "first-step delay: {delay:?}");
+
+        limiter.start();
+        let started = limiter.state.lock().unwrap().started.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_scheduled_rate_limiter_start_returns_to_the_first_step() {
+        let limiter = RateLimiter::scheduled(vec![
+            RateStep { tps: 100, duration: Duration::from_secs(10) },
+            RateStep { tps: 1_000, duration: Duration::from_secs(10) },
+        ]);
+        limiter.state.lock().unwrap().started = Some(Instant::now() - Duration::from_secs(15));
+        limiter.start();
+        let started = limiter.state.lock().unwrap().started.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(limiter.state.lock().unwrap().tokens, 1.0);
+    }
+
+    #[test]
     fn test_rate_limiter_burst_capacity_is_bounded() {
         let limiter = RateLimiter::new(10_000);
         assert_eq!(limiter.burst_capacity, 100.0);
@@ -2167,11 +2358,13 @@ mod tests {
 
     #[test]
     fn test_max_buffered_transactions_uses_existing_sender_knobs() {
-        let config = SenderConfig { rate_limit: 10_000, max_concurrent: 100 };
+        let config =
+            SenderConfig { rate_limit: 10_000, max_concurrent: 100, rate_schedule: Vec::new() };
         let limiter = RateLimiter::new(config.rate_limit);
         assert_eq!(max_buffered_transactions(&config, Some(&limiter)), 400);
 
-        let config = SenderConfig { rate_limit: 100_000, max_concurrent: 100 };
+        let config =
+            SenderConfig { rate_limit: 100_000, max_concurrent: 100, rate_schedule: Vec::new() };
         let limiter = RateLimiter::new(config.rate_limit);
         assert_eq!(max_buffered_transactions(&config, Some(&limiter)), 2_000);
     }
