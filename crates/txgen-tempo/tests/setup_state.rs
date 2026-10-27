@@ -134,3 +134,77 @@ mix:
     assert!(String::from_utf8_lossy(&output.stderr).contains("requires --count 0"));
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_workload_restores_keychain_setup_access_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec_path = dir.path().join("spec.yaml");
+    let state_path = dir.path().join("setup.json");
+    fs::write(
+        &spec_path,
+        r#"
+chain_id: 1337
+accounts:
+  users:
+    mnemonic: "test test test test test test test test test test test junk"
+    range: [0, 2]
+setup:
+  steps:
+    - id: authorize_keychain_users
+      keychain_authorize_pool:
+        accounts:
+          pool: users
+        access_keys:
+          mnemonic: "test test test test test test test test test test test junk"
+          range: [100, 102]
+        key_type: secp256k1
+templates:
+  transfer:
+    type: tempo
+    from: {pool: users, select: random}
+    gas_limit: 100000
+    to: "0x20c0000000000000000000000000000000000000"
+    auth:
+      mode: keychain
+      access_key:
+        from_setup: authorize_keychain_users
+        pair: same_index
+mix:
+  - template: transfer
+    weight: 1
+"#,
+    )
+    .unwrap();
+    let app = Router::new().route(
+        "/",
+        post(|Json(request): Json<Value>| async move {
+            Json(json!({"jsonrpc":"2.0", "id":request["id"], "result":"0x0"}))
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rpc = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_txgen-tempo"));
+        command.args(["generate", "--spec"]).arg(&spec_path).args(["--seed", "1", "--rpc", &rpc]);
+        command
+    };
+    let setup =
+        command().args(["--count", "0", "--setup-state-out"]).arg(&state_path).output().unwrap();
+    assert_success(&setup);
+    assert_eq!(String::from_utf8_lossy(&setup.stdout).lines().count(), 2);
+
+    let resumed =
+        command().args(["--count", "2", "--setup-state-in"]).arg(&state_path).output().unwrap();
+    assert_success(&resumed);
+    let transactions: Vec<Value> = String::from_utf8(resumed.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(transactions.len(), 2);
+    assert!(transactions.iter().all(|tx| tx["phase"] == "workload"));
+    server.abort();
+}

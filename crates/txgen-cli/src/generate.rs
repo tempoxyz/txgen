@@ -129,13 +129,6 @@ impl GenerateContext {
         {
             bail!("gas-weighted generation requires confirmed setup via --setup-state-in");
         }
-        if (args.setup_state_in.is_some() || args.setup_state_out.is_some()) &&
-            spec.setup.as_ref().is_some_and(|setup| {
-                setup.steps.iter().any(|step| step.keychain_authorize_pool.is_some())
-            })
-        {
-            bail!("setup state does not support keychain_authorize_pool adapter state");
-        }
         let setup_state_in = args
             .setup_state_in
             .as_ref()
@@ -1008,7 +1001,9 @@ where
 
     let mut writer = txgen_core::output::ndjson_writer(output.as_deref())?;
     let setup_bindings = if let Some(state) = &ctx.setup_state_in {
-        state.bindings()
+        let bindings = state.bindings();
+        restore_setup_extensions(adapter, &ctx.spec, &bindings, &mut build_ctx)?;
+        bindings
     } else {
         let bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
         if let Some(path) = &ctx.setup_state_out {
@@ -1033,6 +1028,33 @@ where
         eprintln!("wrote {} workload transactions to {}", written, path.display());
     }
 
+    Ok(())
+}
+
+/// Rebuild adapter state from setup extensions without emitting their transactions.
+///
+/// Extension steps such as `keychain_authorize_pool` derive their state (access keys)
+/// from the spec alone, so a resumed workload expands them again and discards the
+/// setup transactions the caller already submitted.
+fn restore_setup_extensions<A: NetworkAdapter>(
+    adapter: &mut A,
+    spec: &WorkloadSpec,
+    setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
+    ctx: &mut BuildContext<'_>,
+) -> Result<()> {
+    for step in spec.setup.iter().flat_map(|setup| &setup.steps) {
+        let Some(keychain_authorize_pool) = &step.keychain_authorize_pool else {
+            continue;
+        };
+        let local_bindings = resolve_sequence_bindings(&step.bindings, ctx, setup_bindings)?;
+        let materialized = substitute_vars(keychain_authorize_pool.clone(), &local_bindings)?;
+        adapter
+            .expand_setup_extension(&step.id, "keychain_authorize_pool", materialized, ctx)
+            .wrap_err_with(|| format!("failed to restore setup step '{}'", step.id))?
+            .ok_or_else(|| {
+                eyre::eyre!("adapter does not support setup step `keychain_authorize_pool`")
+            })?;
+    }
     Ok(())
 }
 
@@ -1084,6 +1106,8 @@ impl SetupState {
             .setup
             .iter()
             .flat_map(|setup| &setup.steps)
+            // Extension steps emit many transactions and no single binding.
+            .filter(|step| step.keychain_authorize_pool.is_none())
             .map(|step| format!("setup.{}", step.id))
             .collect();
         if self.transactions.keys().cloned().collect::<BTreeSet<_>>() != expected {
