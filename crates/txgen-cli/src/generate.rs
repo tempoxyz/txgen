@@ -1008,7 +1008,7 @@ where
         let bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
         if let Some(path) = &ctx.setup_state_out {
             writer.flush()?;
-            SetupState::from_bindings(ctx.spec.chain_id, &bindings).save(path)?;
+            SetupState::from_bindings(&ctx.spec, &bindings)?.save(path)?;
         }
         bindings
     };
@@ -1065,13 +1065,17 @@ struct SetupState {
     version: u32,
     chain_id: u64,
     transactions: BTreeMap<String, EmittedTxInfo>,
+    /// Setup extension steps, which bind no transaction, by `setup.<id>`: a hash of
+    /// each step's definition, so a resumed spec cannot sign with unauthorized keys.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    extensions: BTreeMap<String, B256>,
 }
 
 impl SetupState {
     fn from_bindings(
-        chain_id: u64,
+        spec: &WorkloadSpec,
         bindings: &std::collections::HashMap<String, ResolvedBinding>,
-    ) -> Self {
+    ) -> Result<Self> {
         let transactions = bindings
             .iter()
             .filter_map(|(id, binding)| {
@@ -1090,7 +1094,23 @@ impl SetupState {
                 }
             })
             .collect();
-        Self { version: 1, chain_id, transactions }
+        Ok(Self {
+            version: 1,
+            chain_id: spec.chain_id,
+            transactions,
+            extensions: Self::extension_hashes(spec)?,
+        })
+    }
+
+    fn extension_hashes(spec: &WorkloadSpec) -> Result<BTreeMap<String, B256>> {
+        spec.setup
+            .iter()
+            .flat_map(|setup| &setup.steps)
+            .filter_map(|step| step.keychain_authorize_pool.as_ref().map(|def| (step, def)))
+            .map(|(step, def)| {
+                Ok((format!("setup.{}", step.id), keccak256(serde_yaml::to_string(def)?)))
+            })
+            .collect()
     }
 
     fn save(&self, path: &std::path::Path) -> Result<()> {
@@ -1112,6 +1132,9 @@ impl SetupState {
             .collect();
         if self.transactions.keys().cloned().collect::<BTreeSet<_>>() != expected {
             bail!("setup state step IDs do not match this workload");
+        }
+        if self.extensions != Self::extension_hashes(spec)? {
+            bail!("setup state keychain_authorize_pool steps do not match this workload");
         }
         Ok(())
     }

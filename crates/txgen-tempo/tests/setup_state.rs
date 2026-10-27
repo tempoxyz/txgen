@@ -206,5 +206,14 @@ mix:
         .collect();
     assert_eq!(transactions.len(), 2);
     assert!(transactions.iter().all(|tx| tx["phase"] == "workload"));
+
+    // Keys that setup never authorized must not be used to sign the workload.
+    let spec = fs::read_to_string(&spec_path).unwrap();
+    fs::write(&spec_path, spec.replace("range: [100, 102]", "range: [200, 202]")).unwrap();
+    let changed =
+        command().args(["--count", "2", "--setup-state-in"]).arg(&state_path).output().unwrap();
+    assert!(!changed.status.success());
+    assert!(changed.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&changed.stderr).contains("keychain_authorize_pool steps"));
     server.abort();
 }

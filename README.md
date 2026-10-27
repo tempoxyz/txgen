@@ -1917,9 +1917,10 @@ contract addresses and transaction hashes. Reuse that file only after every setu
 transaction succeeds, with the same spec and chain. `--setup-state-in` emits only
 workload transactions, retains the original `setup.<id>.*` bindings, and requires
 `--rpc` to fetch current nonces without reserving setup nonces again. Chain IDs,
-state versions, and setup step IDs are checked. `keychain_authorize_pool` steps
-are not recorded in the file: their access keys come from the spec, so a resumed
-workload derives them again without emitting the setup transactions.
+state versions, and setup step IDs are checked. The file records a hash of each
+`keychain_authorize_pool` step, which must still match: its access keys come from
+the spec, so a resumed workload derives them again without emitting the setup
+transactions.
 
 ```yaml
 artifacts:
