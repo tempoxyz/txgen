@@ -129,13 +129,6 @@ impl GenerateContext {
         {
             bail!("gas-weighted generation requires confirmed setup via --setup-state-in");
         }
-        if (args.setup_state_in.is_some() || args.setup_state_out.is_some()) &&
-            spec.setup.as_ref().is_some_and(|setup| {
-                setup.steps.iter().any(|step| step.keychain_authorize_pool.is_some())
-            })
-        {
-            bail!("setup state does not support keychain_authorize_pool adapter state");
-        }
         let setup_state_in = args
             .setup_state_in
             .as_ref()
@@ -1008,12 +1001,14 @@ where
 
     let mut writer = txgen_core::output::ndjson_writer(output.as_deref())?;
     let setup_bindings = if let Some(state) = &ctx.setup_state_in {
-        state.bindings()
+        let bindings = state.bindings();
+        restore_setup_extensions(adapter, &ctx.spec, &bindings, &mut build_ctx)?;
+        bindings
     } else {
         let bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
         if let Some(path) = &ctx.setup_state_out {
             writer.flush()?;
-            SetupState::from_bindings(ctx.spec.chain_id, &bindings).save(path)?;
+            SetupState::from_bindings(&ctx.spec, &bindings)?.save(path)?;
         }
         bindings
     };
@@ -1036,6 +1031,33 @@ where
     Ok(())
 }
 
+/// Rebuild adapter state from setup extensions without emitting their transactions.
+///
+/// Extension steps such as `keychain_authorize_pool` derive their state (access keys)
+/// from the spec alone, so a resumed workload expands them again and discards the
+/// setup transactions the caller already submitted.
+fn restore_setup_extensions<A: NetworkAdapter>(
+    adapter: &mut A,
+    spec: &WorkloadSpec,
+    setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
+    ctx: &mut BuildContext<'_>,
+) -> Result<()> {
+    for step in spec.setup.iter().flat_map(|setup| &setup.steps) {
+        let Some(keychain_authorize_pool) = &step.keychain_authorize_pool else {
+            continue;
+        };
+        let local_bindings = resolve_sequence_bindings(&step.bindings, ctx, setup_bindings)?;
+        let materialized = substitute_vars(keychain_authorize_pool.clone(), &local_bindings)?;
+        adapter
+            .expand_setup_extension(&step.id, "keychain_authorize_pool", materialized, ctx)
+            .wrap_err_with(|| format!("failed to restore setup step '{}'", step.id))?
+            .ok_or_else(|| {
+                eyre::eyre!("adapter does not support setup step `keychain_authorize_pool`")
+            })?;
+    }
+    Ok(())
+}
+
 /// Public setup outputs only; this file is not evidence that setup succeeded.
 /// The caller must wait for successful submission/inclusion before reusing it.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1043,13 +1065,17 @@ struct SetupState {
     version: u32,
     chain_id: u64,
     transactions: BTreeMap<String, EmittedTxInfo>,
+    /// Setup extension steps, which bind no transaction, by `setup.<id>`: a hash of
+    /// each step's definition, so a resumed spec cannot sign with unauthorized keys.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    extensions: BTreeMap<String, B256>,
 }
 
 impl SetupState {
     fn from_bindings(
-        chain_id: u64,
+        spec: &WorkloadSpec,
         bindings: &std::collections::HashMap<String, ResolvedBinding>,
-    ) -> Self {
+    ) -> Result<Self> {
         let transactions = bindings
             .iter()
             .filter_map(|(id, binding)| {
@@ -1068,7 +1094,23 @@ impl SetupState {
                 }
             })
             .collect();
-        Self { version: 1, chain_id, transactions }
+        Ok(Self {
+            version: 1,
+            chain_id: spec.chain_id,
+            transactions,
+            extensions: Self::extension_hashes(spec)?,
+        })
+    }
+
+    fn extension_hashes(spec: &WorkloadSpec) -> Result<BTreeMap<String, B256>> {
+        spec.setup
+            .iter()
+            .flat_map(|setup| &setup.steps)
+            .filter_map(|step| step.keychain_authorize_pool.as_ref().map(|def| (step, def)))
+            .map(|(step, def)| {
+                Ok((format!("setup.{}", step.id), keccak256(serde_yaml::to_string(def)?)))
+            })
+            .collect()
     }
 
     fn save(&self, path: &std::path::Path) -> Result<()> {
@@ -1084,10 +1126,15 @@ impl SetupState {
             .setup
             .iter()
             .flat_map(|setup| &setup.steps)
+            // Extension steps emit many transactions and no single binding.
+            .filter(|step| step.keychain_authorize_pool.is_none())
             .map(|step| format!("setup.{}", step.id))
             .collect();
         if self.transactions.keys().cloned().collect::<BTreeSet<_>>() != expected {
             bail!("setup state step IDs do not match this workload");
+        }
+        if self.extensions != Self::extension_hashes(spec)? {
+            bail!("setup state keychain_authorize_pool steps do not match this workload");
         }
         Ok(())
     }

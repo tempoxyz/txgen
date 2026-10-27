@@ -1666,9 +1666,8 @@ failures abort generation; there are no retries or fallback estimates.
 
 Confirm setup before sampling: generate setup with `--count 0 --setup-state-out
 setup.json`, submit it successfully, then generate workload with
-`--setup-state-in setup.json --gas-weighted-mix`. Setup-state reuse does not
-support `keychain_authorize_pool`. Gas shares are estimates, not guarantees for
-individual mined blocks; inspect the report's `block_composition` for actuals.
+`--setup-state-in setup.json --gas-weighted-mix`. Gas shares are estimates,
+not guarantees for individual mined blocks; inspect the report's `block_composition` for actuals.
 
 ### Account Selection
 
@@ -1918,8 +1917,10 @@ contract addresses and transaction hashes. Reuse that file only after every setu
 transaction succeeds, with the same spec and chain. `--setup-state-in` emits only
 workload transactions, retains the original `setup.<id>.*` bindings, and requires
 `--rpc` to fetch current nonces without reserving setup nonces again. Chain IDs,
-state versions, and setup step IDs are checked. Keychain setup extensions are not
-supported by this state file because they also initialize adapter state.
+state versions, and setup step IDs are checked. The file records a hash of each
+`keychain_authorize_pool` step, which must still match: its access keys come from
+the spec, so a resumed workload derives them again without emitting the setup
+transactions.
 
 ```yaml
 artifacts:
