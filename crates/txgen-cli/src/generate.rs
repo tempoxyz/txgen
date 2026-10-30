@@ -1568,9 +1568,20 @@ async fn ensure_createx_deployed(spec: &WorkloadSpec, rpc_url: &str) -> Result<(
     let provider =
         alloy_provider::ProviderBuilder::<_, _, alloy_provider::network::Ethereum>::new()
             .connect_http(rpc_url.parse().wrap_err("invalid RPC URL")?);
+    ensure_createx_code(spec, &provider).await
+}
+
+/// [`ensure_createx_deployed`] over an existing provider, for scenario setup.
+pub(crate) async fn ensure_createx_code<N: Network>(
+    spec: &WorkloadSpec,
+    provider: &impl Provider<N>,
+) -> Result<()> {
+    if !spec_uses_create2(spec) {
+        return Ok(());
+    }
     let code = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        Provider::get_code_at(&provider, CREATEX_ADDRESS),
+        provider.get_code_at(CREATEX_ADDRESS),
     )
     .await
     .wrap_err("timeout fetching CreateX code")?
