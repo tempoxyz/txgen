@@ -1486,6 +1486,7 @@ where
             &mut nonces,
             &mut rng,
         );
+        crate::generate::ensure_createx_code(&self.spec, &self.query_provider).await?;
         let submitter = self.submitter.clone();
         let setup = materialize_setup_online(
             &mut adapter,
@@ -1587,6 +1588,7 @@ where
             observation_subscription_configured,
             submitter,
         } = self;
+        crate::generate::ensure_createx_code(&spec, &query_provider).await?;
         let setup = {
             let mut rng = StdRng::seed_from_u64(setup_seed);
             let mut context = BuildContext::new_with_address_pools(
