@@ -1867,7 +1867,8 @@ A deploy step with `create2: {salt: N}` deploys through the CreateX predeploy
 transaction. Its `setup.<id>.address` then depends only on the salt and init code, not on the
 sender's nonce, so CREATE2 deploys can share one sender and use expiring or 2D nonces. The salt
 must fit CreateX's 11 free salt bytes (below 2^88); give each deployment of the same init code
-its own salt, since a second deploy to the same address reverts.
+its own salt, since a second deploy to the same address reverts. With `--rpc`, `generate` fails up
+front when the chain has no code at the CreateX address.
 
 ```yaml
     - id: portal_0

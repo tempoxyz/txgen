@@ -864,6 +864,7 @@ where
         eprintln!("starting nonce prefetch");
         adapter.prefetch_nonces(&mut ctx, rpc).await?;
         eprintln!("nonce prefetch completed: elapsed={:?}", nonce_prefetch_started.elapsed());
+        ensure_createx_deployed(&ctx.spec, rpc).await?;
     }
 
     let stdout = output.is_none();
@@ -1545,6 +1546,41 @@ fn createx_deploy_create2_calldata(salt: B256, init_code: Bytes) -> Bytes {
     calldata.into()
 }
 
+/// Whether any setup step deploys with `create2`.
+fn spec_uses_create2(spec: &WorkloadSpec) -> bool {
+    let key = serde_yaml::Value::String("create2".to_string());
+    spec.setup.as_ref().is_some_and(|setup| {
+        setup.steps.iter().any(|step| {
+            step.deploy
+                .as_ref()
+                .and_then(|deploy| deploy.as_mapping())
+                .is_some_and(|deploy| deploy.contains_key(&key))
+        })
+    })
+}
+
+/// Fails before generation when a spec has CREATE2 deploys but the chain has no CreateX: a call
+/// to an account without code succeeds, so setup would bind addresses where nothing was deployed.
+async fn ensure_createx_deployed(spec: &WorkloadSpec, rpc_url: &str) -> Result<()> {
+    if !spec_uses_create2(spec) {
+        return Ok(());
+    }
+    let provider =
+        alloy_provider::ProviderBuilder::<_, _, alloy_provider::network::Ethereum>::new()
+            .connect_http(rpc_url.parse().wrap_err("invalid RPC URL")?);
+    let code = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        Provider::get_code_at(&provider, CREATEX_ADDRESS),
+    )
+    .await
+    .wrap_err("timeout fetching CreateX code")?
+    .wrap_err("failed to fetch CreateX code")?;
+    if code.is_empty() {
+        bail!("create2 deploy steps need CreateX at {CREATEX_ADDRESS}, which has no code on this chain");
+    }
+    Ok(())
+}
+
 /// Builds the transaction template for a deploy step. A step with `create2: {salt: N}`
 /// deploys through CreateX, so its address is known before it lands and does not depend on
 /// the sender's nonce: such steps may use expiring or 2D nonces and share one sender. Returns
@@ -1562,8 +1598,11 @@ fn build_deploy_template_value(
     let input_key = serde_yaml::Value::String("input".to_string());
     let to_key = serde_yaml::Value::String("to".to_string());
 
-    if mapping.contains_key(&input_key) || mapping.contains_key(&to_key) {
-        bail!("deploy setup steps must not set `to` or `input`");
+    if ["to", "input", "call", "calls"]
+        .iter()
+        .any(|key| mapping.contains_key(serde_yaml::Value::String((*key).to_string())))
+    {
+        bail!("deploy setup steps must not set `to`, `input`, `call` or `calls`");
     }
     let create2 = mapping
         .remove(serde_yaml::Value::String("create2".to_string()))
