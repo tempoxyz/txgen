@@ -1862,6 +1862,25 @@ concurrency, and `--max-pending`. Transactions on the same ordered nonce lane st
 submit in nonce order, without waiting for receipts. Expiring nonces provide no
 implicit execution ordering.
 
+A deploy step with `create2: {salt: N}` deploys through the CreateX predeploy
+(`0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed`) with `deployCreate2` instead of a contract-creation
+transaction. Its `setup.<id>.address` then depends only on the salt and init code, not on the
+sender's nonce, so CREATE2 deploys can share one sender and use expiring or 2D nonces. The salt
+must fit CreateX's 11 free salt bytes (below 2^88); give each deployment of the same init code
+its own salt, since a second deploy to the same address reverts.
+
+```yaml
+    - id: portal_0
+      deploy:
+        type: tempo
+        from: {pool: deployer, select: {index: 0}}
+        expiring_nonce: true
+        artifact: PortalFixture
+        gas_limit: 10000000
+        create2: {salt: 0}
+```
+
+
 Declare real receipt dependencies with `depends_on`, referencing setup **step IDs**:
 
 ```yaml

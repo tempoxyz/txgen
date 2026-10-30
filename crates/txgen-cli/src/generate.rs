@@ -605,8 +605,8 @@ where
 
     let (generated, info) = if let Some(deploy) = &step.deploy {
         let materialized = substitute_vars(deploy.clone(), &local_bindings)?;
-        let value = build_deploy_template_value(materialized, ctx)?;
-        let result = materialize_setup_value_online(
+        let (value, create2_address) = build_deploy_template_value(materialized, ctx)?;
+        let mut result = materialize_setup_value_online(
             adapter,
             &format!("setup.{}", step.id),
             value,
@@ -615,6 +615,9 @@ where
             output.prepare_timeout,
         )
         .await?;
+        if create2_address.is_some() {
+            result.1.created_address = create2_address;
+        }
         if result.1.created_address.is_none() {
             bail!("deploy setup step did not produce a contract creation transaction");
         }
@@ -1461,8 +1464,8 @@ where
 
     let info = if let Some(deploy) = &step.deploy {
         let materialized = substitute_vars(deploy.clone(), &local_bindings)?;
-        let value = build_deploy_template_value(materialized, ctx)?;
-        let info = emit_template_value(
+        let (value, create2_address) = build_deploy_template_value(materialized, ctx)?;
+        let mut info = emit_template_value(
             adapter,
             &format!("setup.{}", step.id),
             value,
@@ -1472,6 +1475,9 @@ where
             writer,
         )?
         .expect("setup emissions request tx info");
+        if create2_address.is_some() {
+            info.created_address = create2_address;
+        }
         if info.created_address.is_none() {
             bail!("deploy setup step did not produce a contract creation transaction");
         }
@@ -1504,10 +1510,49 @@ where
     Ok(())
 }
 
+/// CreateX (https://github.com/pcaversaccio/createx), predeployed at the same address on Tempo
+/// and most EVM chains. Setup deploys with a `create2` block go through it.
+const CREATEX_ADDRESS: Address =
+    alloy_primitives::address!("ba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed");
+
+/// Selector of CreateX `deployCreate2(bytes32,bytes)`.
+const CREATEX_DEPLOY_CREATE2_SELECTOR: [u8; 4] = [0x26, 0x30, 0x76, 0x68];
+
+/// The CreateX salt for a deploy step's `create2.salt`: zero sender bytes and a zero
+/// redeploy-protection byte, so the address depends on neither the sender nor the chain ID,
+/// with the step's salt in the low 11 bytes.
+fn createx_salt(salt: u128) -> Result<B256> {
+    if salt >> 88 != 0 {
+        bail!("create2 salt {salt} does not fit CreateX's 11 free salt bytes");
+    }
+    Ok(B256::from(U256::from(salt)))
+}
+
+/// The address CreateX `deployCreate2(salt, init_code)` creates for a salt from
+/// [`createx_salt`]: CreateX hashes such a salt as `keccak256(abi.encode(salt))`.
+fn createx_create2_address(salt: B256, init_code: &[u8]) -> Address {
+    CREATEX_ADDRESS.create2(keccak256(salt), keccak256(init_code))
+}
+
+fn createx_deploy_create2_calldata(salt: B256, init_code: Bytes) -> Bytes {
+    let args = DynSolValue::Tuple(vec![
+        DynSolValue::FixedBytes(salt, 32),
+        DynSolValue::Bytes(init_code.to_vec()),
+    ])
+    .abi_encode_params();
+    let mut calldata = CREATEX_DEPLOY_CREATE2_SELECTOR.to_vec();
+    calldata.extend(args);
+    calldata.into()
+}
+
+/// Builds the transaction template for a deploy step. A step with `create2: {salt: N}`
+/// deploys through CreateX, so its address is known before it lands and does not depend on
+/// the sender's nonce: such steps may use expiring or 2D nonces and share one sender. Returns
+/// that address for CREATE2 deploys.
 fn build_deploy_template_value(
     value: serde_yaml::Value,
     ctx: &mut BuildContext<'_>,
-) -> Result<serde_yaml::Value> {
+) -> Result<(serde_yaml::Value, Option<Address>)> {
     let serde_yaml::Value::Mapping(mut mapping) = value else {
         bail!("deploy setup step must be a mapping");
     };
@@ -1520,6 +1565,11 @@ fn build_deploy_template_value(
     if mapping.contains_key(&input_key) || mapping.contains_key(&to_key) {
         bail!("deploy setup steps must not set `to` or `input`");
     }
+    let create2 = mapping
+        .remove(serde_yaml::Value::String("create2".to_string()))
+        .map(serde_yaml::from_value::<Create2Deploy>)
+        .transpose()
+        .wrap_err("invalid deploy `create2`")?;
 
     let artifact_value = mapping
         .remove(&artifact_key)
@@ -1536,9 +1586,24 @@ fn build_deploy_template_value(
         let mut resolver = ctx.resolver();
         artifacts.encode_constructor(&artifact, &constructor_args, &mut resolver)?
     };
-    mapping.insert(input_key, serde_yaml::Value::String(initcode.to_string()));
+    let Some(create2) = create2 else {
+        mapping.insert(input_key, serde_yaml::Value::String(initcode.to_string()));
+        return Ok((serde_yaml::Value::Mapping(mapping), None));
+    };
+    let salt = createx_salt(create2.salt)?;
+    let address = createx_create2_address(salt, &initcode);
+    let calldata = createx_deploy_create2_calldata(salt, initcode);
+    mapping.insert(to_key, serde_yaml::Value::String(CREATEX_ADDRESS.to_string()));
+    mapping.insert(input_key, serde_yaml::Value::String(calldata.to_string()));
+    Ok((serde_yaml::Value::Mapping(mapping), Some(address)))
+}
 
-    Ok(serde_yaml::Value::Mapping(mapping))
+/// A deploy step's `create2` block.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Create2Deploy {
+    /// Salt in CreateX's 11 free bytes; give each deployment of the same init code its own.
+    salt: u128,
 }
 
 type NetworkRequest<A> = <<A as NetworkAdapter>::Network as Network>::TransactionRequest;
@@ -2428,6 +2493,20 @@ mod tests {
     use alloy_rpc_types_eth::TransactionRequest;
     use std::collections::HashMap;
     use txgen_core::{derive_mnemonic_signer, GasConfig};
+
+    #[test]
+    fn createx_create2_address_matches_createx() {
+        // eth_call of CreateX deployCreate2(salt 42, init code returning 0x01) on Ethereum mainnet.
+        let salt = createx_salt(42).unwrap();
+        let init_code = alloy_primitives::hex!("600160005360016000f3");
+        assert_eq!(
+            createx_create2_address(salt, &init_code),
+            alloy_primitives::address!("fe440002F39c56EC83D442734e15Dd79F4c9ac3f")
+        );
+        let calldata = createx_deploy_create2_calldata(salt, Bytes::from_static(&[0x60, 0x80]));
+        assert_eq!(&calldata[..4], &[0x26, 0x30, 0x76, 0x68]);
+        assert!(createx_salt(1u128 << 88).is_err());
+    }
 
     struct PendingPrepareAdapter;
     struct MutatingKeyAdapter;
