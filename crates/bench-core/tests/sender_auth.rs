@@ -422,6 +422,7 @@ fn sender(
         metrics,
         request_auth,
     )
+    .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -741,6 +742,7 @@ async fn pending_limit_keeps_uncertain_submissions_until_inclusion() {
         .erased();
     let metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
     let mut sender = Sender::new(vec![provider], SenderConfig::default(), metrics)
+        .unwrap()
         .with_max_pending(1.try_into().unwrap());
     sender.send(transaction(2, None, 1, false)).await.unwrap();
     sender.send(transaction(3, None, 2, false)).await.unwrap();
