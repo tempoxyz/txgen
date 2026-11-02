@@ -14,6 +14,7 @@ path = "src/bin/main.rs"
 bench-core.workspace = true
 txgen-core.workspace = true
 txgen-cli.workspace = true
+txgen-ethereum.workspace = true
 
 # serde
 serde.workspace = true
@@ -42,6 +43,7 @@ k256.workspace = true
 sha2.workspace = true
 
 # misc
+futures.workspace = true
 rand.workspace = true
 rustix.workspace = true
 eyre.workspace = true

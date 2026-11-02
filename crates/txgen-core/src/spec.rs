@@ -2,7 +2,7 @@ use crate::{yaml, AccountPoolDef, AccountRef, AddressPoolDef, ArtifactDef, GenVa
 use alloy_primitives::{Address, B256, U256};
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Deserializer};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Workload specification parsed from YAML.
 #[derive(Debug, Clone, Deserialize)]
@@ -141,7 +141,7 @@ pub struct SetupStep {
     pub id: String,
     /// Values resolved once for this setup step.
     #[serde(default)]
-    pub bindings: HashMap<String, SequenceBinding>,
+    pub bindings: BTreeMap<String, SequenceBinding>,
     /// Contract deployment definition.
     #[serde(default)]
     pub deploy: Option<serde_yaml::Value>,
@@ -159,7 +159,7 @@ pub struct SetupStep {
 pub struct SequenceDef {
     /// Values resolved once per sequence instance and reused by steps.
     #[serde(default)]
-    pub bindings: HashMap<String, SequenceBinding>,
+    pub bindings: BTreeMap<String, SequenceBinding>,
     /// Ordered transaction steps.
     pub steps: Vec<SequenceStep>,
 }
