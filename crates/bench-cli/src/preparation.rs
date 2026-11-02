@@ -1,8 +1,8 @@
 //! Validator readiness gates for warmup and the pre-measurement reset.
-use crate::SendArgs;
+use crate::{send::next_workload_tx, SendArgs};
 use alloy_network::AnyNetwork;
 use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
-use bench_core::{parse_prometheus_text, GeneratedTx, RunClock, Sender, TxPhase, TxSource};
+use bench_core::{parse_prometheus_text, GeneratedTx, RunClock, Sender, TxSource};
 use eyre::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -37,16 +37,9 @@ pub(crate) async fn prepare_workload<S: TxSource>(
                 if let Some(result) = observers.try_join_next() {
                     return result?;
                 }
-                let tx = match next.take() {
-                    Some(tx) => tx,
-                    None => source
-                        .next_tx()
-                        .await?
-                        .ok_or_else(|| eyre::eyre!("input ended during warmup"))?,
-                };
-                if tx.phase == TxPhase::Setup {
-                    bail!("setup transaction appeared during warmup");
-                }
+                let tx = next_workload_tx(source, &mut next)
+                    .await?
+                    .ok_or_else(|| eyre::eyre!("input ended during warmup"))?;
                 sender.send(tx).await?;
             }
         })
@@ -106,15 +99,9 @@ async fn warm_up<S: TxSource>(
     let start = std::time::Instant::now();
     tracing::info!(?duration, "Starting workload warmup");
     while start.elapsed() < duration {
-        let tx = match next.take() {
-            Some(tx) => tx,
-            None => source.next_tx().await?.ok_or_else(|| {
-                eyre::eyre!("input ended during warmup; generate warmup plus measurement duration")
-            })?,
-        };
-        if tx.phase == TxPhase::Setup {
-            bail!("setup transaction appeared after workload started");
-        }
+        let tx = next_workload_tx(source, &mut next).await?.ok_or_else(|| {
+            eyre::eyre!("input ended during warmup; generate warmup plus measurement duration")
+        })?;
         sender.send(tx).await?;
     }
     tracing::info!(elapsed = ?start.elapsed(), "Warmup complete; starting measurement");

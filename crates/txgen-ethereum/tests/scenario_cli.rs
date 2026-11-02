@@ -1,7 +1,9 @@
 use axum::{routing::post, Json, Router};
 use serde_json::{json, Value};
 use std::{fs, process::Command};
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::task::JoinHandle;
+
+mod common;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_scenario_writes_report_and_exits_nonzero() {
@@ -61,14 +63,7 @@ scenario:
 }
 
 async fn spawn_failing_checkpoint_rpc() -> (String, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock RPC");
-    let address = listener.local_addr().expect("mock RPC address");
-    let server = tokio::spawn(async move {
-        axum::serve(listener, Router::new().route("/", post(handle_rpc)))
-            .await
-            .expect("serve mock RPC");
-    });
-    (format!("http://{address}"), server)
+    common::serve(Router::new().route("/", post(handle_rpc))).await
 }
 
 async fn handle_rpc(Json(request): Json<Value>) -> Json<Value> {

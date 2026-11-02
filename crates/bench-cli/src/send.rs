@@ -13,7 +13,7 @@ use bench_core::{
     SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use txgen_tempo::TempoLateSigner;
 
 const SETUP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
@@ -23,10 +23,23 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         bail!("--duration must be positive");
     }
     let max_pending = args.pending_limit()?;
+    let rate_schedule = args.rate_schedule()?;
+    if !rate_schedule.is_empty() {
+        let schedule = args.tps_schedule.as_deref().unwrap_or_default();
+        if args.tps > 0 {
+            tracing::warn!(
+                schedule,
+                ignored_tps = args.tps,
+                "--tps-schedule (or BENCH_TPS_SCHEDULE) overrides --tps"
+            );
+        } else {
+            tracing::info!(schedule, "Using step-load rate schedule");
+        }
+    }
     tracing::info!(
         input = args.input.as_ref().map(|p| p.display().to_string()).as_deref().unwrap_or("stdin"),
         rpc_urls = ?args.rpc_urls,
-        tps = args.tps,
+        tps = args.effective_tps()?,
         max_pending = max_pending.map_or(0, |limit| limit.get()),
         skip_setup = args.skip_setup,
         collect_latencies = args.collect_latencies,
@@ -73,35 +86,60 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         .wrap_err("failed to configure deferred signing")?
         .map(|signer| Arc::new(signer) as Arc<dyn LateSigner>);
 
+    let senders = SenderFactory {
+        endpoints,
+        config: SenderConfig {
+            rate_limit: args.effective_tps()?,
+            max_concurrent: args.max_concurrent,
+            rate_schedule,
+        },
+        request_auth,
+        late_signer,
+        max_pending,
+        receipt_tracker: ReceiptTracker::new(query_provider.clone()),
+    };
+
     match &args.input {
         Some(path) => {
             let mut source = FileSource::new(path).wrap_err("failed to open input file")?;
-            execute_source(
-                &args,
-                &metadata,
-                endpoints,
-                query_provider,
-                request_auth,
-                late_signer.clone(),
-                &mut source,
-                &scraper_configs,
-            )
-            .await
+            execute_source(&args, &metadata, senders, query_provider, &mut source, &scraper_configs)
+                .await
         }
         None => {
             let mut source = StdinSource::new();
-            execute_source(
-                &args,
-                &metadata,
-                endpoints,
-                query_provider,
-                request_auth,
-                late_signer,
-                &mut source,
-                &scraper_configs,
-            )
-            .await
+            execute_source(&args, &metadata, senders, query_provider, &mut source, &scraper_configs)
+                .await
         }
+    }
+}
+
+/// Shared configuration for the setup sender and the workload sender.
+struct SenderFactory {
+    endpoints: Vec<RpcEndpoint>,
+    config: SenderConfig,
+    request_auth: Option<Arc<dyn RequestAuthProvider>>,
+    late_signer: Option<Arc<dyn LateSigner>>,
+    max_pending: Option<NonZeroUsize>,
+    receipt_tracker: ReceiptTracker,
+}
+
+impl SenderFactory {
+    fn build(&self, metrics: Arc<MetricsCollector>) -> Result<Sender> {
+        let mut sender = Sender::new_with_request_auth(
+            self.endpoints.clone(),
+            self.config.clone(),
+            metrics,
+            self.request_auth.clone(),
+        )?
+        .with_receipt_tracker(self.receipt_tracker.clone())
+        .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
+        if let Some(limit) = self.max_pending {
+            sender = sender.with_max_pending(limit);
+        }
+        if let Some(late_signer) = &self.late_signer {
+            sender = sender.with_late_signer(late_signer.clone());
+        }
+        Ok(sender)
     }
 }
 
@@ -129,44 +167,20 @@ fn build_request_auth(args: &SendArgs) -> Result<Option<Arc<dyn RequestAuthProvi
     )?)))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn execute_source<S: TxSource>(
     args: &SendArgs,
     metadata: &HashMap<String, String>,
-    endpoints: Vec<RpcEndpoint>,
+    senders: SenderFactory,
     query_provider: DynProvider<AnyNetwork>,
-    request_auth: Option<Arc<dyn RequestAuthProvider>>,
-    late_signer: Option<Arc<dyn LateSigner>>,
     source: &mut S,
     scraper_configs: &[ScraperConfig],
 ) -> Result<()> {
-    let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
-
-    let receipt_tracker = ReceiptTracker::new(query_provider.clone());
-    let first_workload = run_setup_phase(
-        args,
-        source,
-        &endpoints,
-        request_auth.clone(),
-        late_signer.clone(),
-        &config,
-        receipt_tracker.clone(),
-    )
-    .await?;
+    let config = &senders.config;
+    let first_workload = run_setup_phase(args, source, &senders).await?;
 
     // Keep one sender across warmup and measurement, including its pending work,
     // nonce ordering, rate limiter and HTTP connection pool.
-    let warmup_metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
-    let mut sender =
-        Sender::new_with_request_auth(endpoints, config.clone(), warmup_metrics, request_auth)
-            .with_receipt_tracker(receipt_tracker)
-            .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
-    if let Some(limit) = args.pending_limit()? {
-        sender = sender.with_max_pending(limit);
-    }
-    if let Some(late_signer) = late_signer {
-        sender = sender.with_late_signer(late_signer);
-    }
+    let mut sender = senders.build(MetricsCollector::new_with_latencies(RunClock::new(), false))?;
     let mut start_block =
         query_provider.get_block_number().await.wrap_err("failed to get starting block number")?;
     let prepared =
@@ -186,6 +200,9 @@ async fn execute_source<S: TxSource>(
     };
     let metrics = MetricsCollector::new_with_latencies(clock.clone(), args.collect_latencies);
     sender.set_metrics(metrics.clone());
+    // Warmup shares this sender and holds the schedule's first step; start the
+    // step-load schedule with the measurement.
+    sender.start_rate_schedule();
     let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
     if let Some(collector) = &receipt_collector {
         sender = sender.with_receipt_collector(collector.handle());
@@ -213,7 +230,7 @@ async fn execute_source<S: TxSource>(
         source,
         &mut sender,
         &metrics,
-        &config,
+        config,
         &mut reporting.reporters,
         SendInterval {
             first_workload: prepared.first_workload,
@@ -245,7 +262,7 @@ async fn execute_source<S: TxSource>(
                 source,
                 &mut sender,
                 &tail_metrics,
-                &config,
+                config,
                 &mut [],
                 SendInterval {
                     first_workload: None,
@@ -265,7 +282,7 @@ async fn execute_source<S: TxSource>(
     let measured_elapsed = args.duration.unwrap_or_else(|| metrics.elapsed_since_start());
 
     let (sent, success, failed) = metrics.counts();
-    if (!args.warmup.is_zero() || args.warmup_validators.is_some()) && sent == 0 {
+    if args.has_warmup() && sent == 0 {
         bail!("input ended before any measured requests were dispatched");
     }
     tracing::info!(sent, success, failed, "Bench send completed; starting post-processing");
@@ -317,14 +334,11 @@ async fn execute_source<S: TxSource>(
 
     let mut final_metrics = metrics.finalize().await;
     final_metrics.elapsed = measured_elapsed;
-    tracing::info!("Metrics finalized");
 
     let time_series = metrics.time_series().await;
-    tracing::info!("Time series built");
 
     // Finalize the sample archive before reporters read it.
     let sample_archive = reporting.store.finish().await?;
-    tracing::info!("Sample archive finalized");
 
     // Collect per-block stats from the chain. The range starts one block after
     // the block that was current before sending (start_block is the last
@@ -360,7 +374,7 @@ async fn execute_source<S: TxSource>(
             "Block stats collected"
         );
 
-        if !args.warmup.is_zero() || args.warmup_validators.is_some() {
+        if args.has_warmup() {
             block_stats.retain(|block| block.timestamp_ms >= wall_clock.start_unix_ms());
         }
         if let Some(end_ms) = measurement_end_unix_ms {
@@ -375,22 +389,16 @@ async fn execute_source<S: TxSource>(
             let end_offset_ms = cutoff_ms.saturating_sub(wall_clock.start_unix_ms());
             trim_report(&mut report, &clock, end_offset_ms);
         }
-        tracing::info!(cutoff_ms = ?cutoff_ms, "Report trimmed");
 
         reporting.on_blocks(&block_stats)?;
-        tracing::info!(blocks = block_stats.len(), "Block reporter events emitted");
 
         report.run_stats = Some(match (measurement_end_unix_ms, args.duration) {
             (Some(_), Some(duration)) => RunStats::from_blocks_wall_time(&block_stats, duration),
             _ => RunStats::from_blocks_chain_time(&block_stats),
         });
-        tracing::info!("Run stats built");
         report.blocks = block_stats;
     } else {
-        tracing::info!(reason = "no new blocks", "Skipped block stats collection");
-        tracing::info!(reason = "no block stats", "Skipped report trim");
-        tracing::info!(reason = "no block stats", "Skipped block reporter events");
-        tracing::info!(reason = "no block stats", "Skipped run stats build");
+        tracing::info!("No new blocks; skipped block stats");
     }
 
     if args.collect_receipt_metrics {
@@ -416,28 +424,10 @@ async fn execute_source<S: TxSource>(
 async fn run_setup_phase<S: TxSource>(
     args: &SendArgs,
     source: &mut S,
-    endpoints: &[RpcEndpoint],
-    request_auth: Option<Arc<dyn RequestAuthProvider>>,
-    late_signer: Option<Arc<dyn LateSigner>>,
-    config: &SenderConfig,
-    receipt_tracker: ReceiptTracker,
+    senders: &SenderFactory,
 ) -> Result<Option<GeneratedTx>> {
-    let setup_clock = RunClock::new();
-    let setup_metrics = MetricsCollector::new_with_latencies(setup_clock, false);
-    let mut setup_sender = Sender::new_with_request_auth(
-        endpoints.to_vec(),
-        config.clone(),
-        setup_metrics.clone(),
-        request_auth,
-    )
-    .with_receipt_tracker(receipt_tracker)
-    .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
-    if let Some(late_signer) = late_signer {
-        setup_sender = setup_sender.with_late_signer(late_signer);
-    }
-    if let Some(limit) = args.pending_limit()? {
-        setup_sender = setup_sender.with_max_pending(limit);
-    }
+    let setup_metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
+    let mut setup_sender = senders.build(setup_metrics.clone())?;
     let mut setup_seen = 0u64;
     let mut setup = Vec::new();
 
@@ -541,20 +531,18 @@ async fn send_workload_from_source<S: TxSource>(
     // keeps the post-reset ramp-up outside the full requested duration.
     let start_unix_ms = metrics.clock().unix_ms();
     let deadline = interval.duration.map(|duration| tokio::time::Instant::now() + duration);
-    if let Some(tx) = interval.first_workload {
-        send_workload_tx(tx, sender, metrics, config, reporters).await?;
-    }
+    let mut pending = interval.first_workload;
     loop {
         let next = if let Some(deadline) = deadline {
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
-            match tokio::time::timeout_at(deadline, source.next_tx()).await {
+            match tokio::time::timeout_at(deadline, next_workload_tx(source, &mut pending)).await {
                 Ok(next) => next?,
                 Err(_) => break,
             }
         } else {
-            source.next_tx().await?
+            next_workload_tx(source, &mut pending).await?
         };
         let Some(tx) = next else {
             if deadline.is_some_and(|deadline| tokio::time::Instant::now() < deadline) {
@@ -564,9 +552,6 @@ async fn send_workload_from_source<S: TxSource>(
         };
         if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             break;
-        }
-        if tx.phase == TxPhase::Setup {
-            bail!("setup transaction appeared after workload started");
         }
         send_workload_tx(tx, sender, metrics, config, reporters).await?;
     }
@@ -580,6 +565,21 @@ fn trim_report(report: &mut FinalReport, clock: &RunClock, end_offset_ms: u64) {
         ts.latencies.retain(|l| l.offset_ms <= end_offset_ms);
         ts.throughput.retain(|t| t.second * 1000 <= end_offset_ms);
     }
+}
+
+/// Take `pending` or read the next transaction, rejecting setup transactions.
+pub(crate) async fn next_workload_tx<S: TxSource>(
+    source: &mut S,
+    pending: &mut Option<GeneratedTx>,
+) -> Result<Option<GeneratedTx>> {
+    let tx = match pending.take() {
+        Some(tx) => Some(tx),
+        None => source.next_tx().await?,
+    };
+    if tx.as_ref().is_some_and(|tx| tx.phase == TxPhase::Setup) {
+        bail!("setup transaction appeared after workload started");
+    }
+    Ok(tx)
 }
 
 async fn send_workload_tx(
