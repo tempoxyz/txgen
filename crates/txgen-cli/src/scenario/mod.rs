@@ -23,6 +23,7 @@ mod wait;
 pub use engine::{
     execute_scenario, validate_scenario_offline, FailurePolicy, ScenarioExecutionConfig,
 };
+pub use error::ScenarioActionDiagnostic;
 pub use report::{
     CausalEdgeReport, ChainReportConfig, FailureReport, InstanceLifecycle, LatencyDistribution,
     LifecycleStep, ProtocolMilestone, ScenarioReport, ScenarioReportConfig, StepReport,

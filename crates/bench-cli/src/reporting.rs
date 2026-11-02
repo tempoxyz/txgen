@@ -45,7 +45,8 @@ impl Reporting {
             reporters.push(Box::new(ConsoleReporter::stderr(console_progress)));
         }
         let store = SampleStore::with_labels(metadata.clone())?;
-        let forwarder = build_metrics_forwarder(args.metrics_forward.as_deref(), metadata)?;
+        let forwarder =
+            build_metrics_forwarder(args.metrics_forward.as_deref(), metadata, scraper_configs)?;
         let scrapers = if scraper_configs.is_empty() {
             Vec::new()
         } else {

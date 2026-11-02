@@ -418,7 +418,7 @@ fn sender(
     let metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
     Sender::new_with_request_auth(
         vec![endpoint],
-        SenderConfig { rate_limit: 0, max_concurrent },
+        SenderConfig { rate_limit: 0, max_concurrent, rate_schedule: Vec::new() },
         metrics,
         request_auth,
     )
