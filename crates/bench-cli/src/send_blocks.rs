@@ -168,61 +168,29 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     });
     let start = Instant::now();
 
-    if let Some(ref path) = args.input {
-        let file = std::fs::File::open(path).wrap_err("failed to open input file")?;
-        let reader = std::io::BufReader::new(file);
-
-        for line in reader.lines() {
-            let line = line.wrap_err("failed to read line")?;
-            let input = parse_input_line(&line)?;
-
-            process_input_and_wait(
-                &provider,
-                &testing_provider,
-                input,
-                ProcessingState {
-                    collector: &mut collector,
-                    reorg_state: reorg_state.as_mut(),
-                    mempool: mempool.as_mut(),
-                    persistence_policy,
-                },
-                args.wait_time,
-                start,
-                &mut reporting.reporters,
-            )
-            .await?;
-        }
-    } else {
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin);
-        let mut line_buf = String::new();
-
-        loop {
-            line_buf.clear();
-            let bytes_read =
-                reader.read_line(&mut line_buf).await.wrap_err("failed to read from stdin")?;
-            if bytes_read == 0 {
-                break;
-            }
-
-            let input = parse_input_line(&line_buf)?;
-
-            process_input_and_wait(
-                &provider,
-                &testing_provider,
-                input,
-                ProcessingState {
-                    collector: &mut collector,
-                    reorg_state: reorg_state.as_mut(),
-                    mempool: mempool.as_mut(),
-                    persistence_policy,
-                },
-                args.wait_time,
-                start,
-                &mut reporting.reporters,
-            )
-            .await?;
-        }
+    let reader: Box<dyn AsyncBufRead + Unpin> = match &args.input {
+        Some(path) => Box::new(BufReader::new(
+            tokio::fs::File::open(path).await.wrap_err("failed to open input file")?,
+        )),
+        None => Box::new(BufReader::new(tokio::io::stdin())),
+    };
+    let mut lines = reader.lines();
+    while let Some(line) = lines.next_line().await.wrap_err("failed to read input line")? {
+        process_input_and_wait(
+            &provider,
+            &testing_provider,
+            parse_input_line(&line)?,
+            ProcessingState {
+                collector: &mut collector,
+                reorg_state: reorg_state.as_mut(),
+                mempool: mempool.as_mut(),
+                persistence_policy,
+            },
+            args.wait_time,
+            start,
+            &mut reporting.reporters,
+        )
+        .await?;
     }
 
     if let Some(reorg_state) = reorg_state.as_mut() {
