@@ -8,6 +8,7 @@
 use alloy_primitives::{keccak256, Address, B256, U256};
 use alloy_provider::{network::Ethereum, Provider};
 use eyre::{Result, WrapErr};
+use futures::{stream, FutureExt, StreamExt};
 use tempo_primitives::transaction::TEMPO_EXPIRING_NONCE_KEY;
 
 /// Tempo nonce precompile address (ASCII hex for "NONCE")
@@ -15,6 +16,9 @@ pub const NONCE_PRECOMPILE: Address = Address::new([
     0x4E, 0x4F, 0x4E, 0x43, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00,
 ]);
+
+/// Maximum in-flight storage reads while prefetching parallel lane nonces.
+const LANE_NONCE_FETCH_CONCURRENCY: usize = 32;
 
 /// Prefetch parallel lane nonces for all (account, nonce_key) pairs found in templates.
 ///
@@ -59,21 +63,40 @@ async fn prefetch_parallel_nonces_with_state<P: Provider<Ethereum> + Clone + Sen
 
     eprintln!("prefetching nonces for {} parallel lane(s)...", nonce_keys.len());
 
+    // Boxing each fetch avoids rust-lang/rust#100013 in the adapter's `Send` futures.
+    let nonce_keys = &nonce_keys;
+    let fetches: Vec<_> = accounts
+        .all_addresses()
+        .flat_map(|(pool_name, addresses)| {
+            addresses.into_iter().flat_map(move |address| {
+                nonce_keys.iter().map(move |&nonce_key| {
+                    async move {
+                        let nonce =
+                            fetch_parallel_lane_nonce(provider, address, nonce_key, pending)
+                                .await
+                                .wrap_err_with(|| {
+                                    format!("pool {pool_name} lane {nonce_key} ({address})")
+                                })?;
+                        Ok::<_, eyre::Report>((
+                            compute_parallel_scheduling_key(address, nonce_key),
+                            nonce,
+                        ))
+                    }
+                    .boxed()
+                })
+            })
+        })
+        .collect();
+    let mut fetches = stream::iter(fetches).buffer_unordered(LANE_NONCE_FETCH_CONCURRENCY);
+
     // Count instead of per-lane eprintln: the cross product of accounts ×
     // lanes can be in the thousands, and one `eprintln!` per pair would
     // serialize on the global stderr lock and dominate the loop.
     let mut fetched = 0usize;
-    for (pool_name, addresses) in accounts.all_addresses() {
-        for address in addresses {
-            for &nonce_key in &nonce_keys {
-                let nonce = fetch_parallel_lane_nonce(provider, address, nonce_key, pending)
-                    .await
-                    .wrap_err_with(|| format!("pool {pool_name} lane {nonce_key} ({address})"))?;
-                let scheduling_key = compute_parallel_scheduling_key(address, nonce_key);
-                nonces.reset(scheduling_key, nonce);
-                fetched += 1;
-            }
-        }
+    while let Some(result) = fetches.next().await {
+        let (scheduling_key, nonce) = result?;
+        nonces.reset(scheduling_key, nonce);
+        fetched += 1;
     }
     eprintln!("prefetched {fetched} (account, lane) nonce(s)");
 
@@ -257,6 +280,56 @@ mod tests {
         let expected: U256 =
             "0x2028c9f493f53a125e5a3e03d423a869339e3d2dd8a77340dd393eab48750b1c".parse().unwrap();
         assert_eq!(compute_nonce_storage_key(address, nonce_key), expected);
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_parallel_nonces_fetches_every_account_lane() {
+        let spec = WorkloadSpec::parse(
+            r#"
+chain_id: 1
+accounts:
+  users:
+    mnemonic: "test test test test test test test test test test test junk"
+    range: [0, 3]
+templates:
+  lane_1:
+    type: tempo
+    from: { pool: users, select: random }
+    to: "0x0000000000000000000000000000000000000001"
+    gas_limit: 21000
+    nonce_key: "1"
+  lane_2:
+    type: tempo
+    from: { pool: users, select: random }
+    to: "0x0000000000000000000000000000000000000001"
+    gas_limit: 21000
+    nonce_key: "2"
+mix:
+  - template: lane_1
+    weight: 1
+  - template: lane_2
+    weight: 1
+"#,
+        )
+        .unwrap();
+        let accounts = txgen_core::AccountManager::from_spec(&spec.accounts).unwrap();
+        let asserter = alloy_transport::mock::Asserter::new();
+        for _ in 0..6 {
+            asserter.push_success(&U256::from(5));
+        }
+        let provider = alloy_provider::ProviderBuilder::<_, _, Ethereum>::new()
+            .connect_mocked_client(asserter);
+
+        let mut nonces = txgen_core::NonceTracker::new();
+        prefetch_parallel_nonces(&provider, &accounts, &spec, &mut nonces).await.unwrap();
+
+        for address in accounts.all_addresses().flat_map(|(_, addresses)| addresses) {
+            for nonce_key in [U256::from(1), U256::from(2)] {
+                let key = crate::compute_parallel_scheduling_key(address, nonce_key);
+                assert!(nonces.contains(&key));
+                assert_eq!(nonces.current(&key), 5);
+            }
+        }
     }
 
     #[test]
