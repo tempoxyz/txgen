@@ -2,17 +2,12 @@ use bench_core::{
     PrometheusConfig, PrometheusForwarder, PrometheusForwarderHandle, Sample, SampleStore,
 };
 use eyre::{Context, Result};
-use std::collections::HashMap;
-
-pub(crate) fn build_metrics_forwarder(
-    url: Option<&str>,
-    metadata: &HashMap<String, String>,
-) -> Result<Option<PrometheusForwarder>> {
+pub(crate) fn build_metrics_forwarder(url: Option<&str>) -> Result<Option<PrometheusForwarder>> {
     let Some(url) = url else {
         return Ok(None);
     };
 
-    let config = PrometheusConfig::from_metadata(url, metadata)?;
+    let config = PrometheusConfig::from_env(url)?;
     PrometheusForwarder::spawn(config).map(Some).wrap_err("failed to create metrics forwarder")
 }
 
