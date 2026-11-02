@@ -14,6 +14,7 @@ path = "src/bin/main.rs"
 bench-core.workspace = true
 txgen-core.workspace = true
 txgen-cli.workspace = true
+txgen-ethereum.workspace = true
 
 # serde
 serde.workspace = true
@@ -42,6 +43,7 @@ k256.workspace = true
 sha2.workspace = true
 
 # misc
+futures.workspace = true
 rand.workspace = true
 rustix.workspace = true
 eyre.workspace = true
@@ -52,3 +54,4 @@ zeroize.workspace = true
 [dev-dependencies]
 alloy-transport = "2"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tempfile = "3"

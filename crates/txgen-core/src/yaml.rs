@@ -28,8 +28,8 @@ pub fn parse_yaml(yaml: &str) -> Result<serde_yaml::Value> {
 
 /// Deep-merge a YAML overlay into a base value.
 ///
-/// Mapping values are merged recursively, except variable references of the
-/// form `{ var: ... }`, which replace the base value atomically. All other
+/// Mapping values are merged recursively, except when either value is a variable
+/// reference of the form `{ var: ... }`, which is replaced atomically. All other
 /// overlay values replace the base value. A `null` overlay is treated as no-op
 /// so omitted `with` blocks do not erase the referenced template.
 pub fn merge_yaml(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
@@ -38,13 +38,15 @@ pub fn merge_yaml(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
     }
 
     // Variable references are scalar leaves even though their YAML encoding is
-    // a mapping. Replacing a mapping field with `{ var: ... }` must discard the
-    // original mapping instead of retaining its keys alongside `var`.
-    if matches!(
-        &overlay,
-        serde_yaml::Value::Mapping(mapping)
-            if mapping.len() == 1 && mapping.contains_key("var")
-    ) {
+    // a mapping. Replacing either side must discard the original mapping instead
+    // of retaining its keys alongside `var`.
+    if [&*base, &overlay].into_iter().any(|value| {
+        matches!(
+            value,
+            serde_yaml::Value::Mapping(mapping)
+                if mapping.len() == 1 && mapping.contains_key("var")
+        )
+    }) {
         *base = overlay;
         return;
     }
@@ -344,7 +346,9 @@ fn normalize_path_string(path: &str, base_dir: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_yaml;
+    use super::*;
+
+    use crate::{AccountRef, SelectMode};
 
     #[test]
     fn variable_reference_replaces_mapping_atomically() {
@@ -408,5 +412,20 @@ call:
         )
         .unwrap();
         assert_eq!(base, expected);
+    }
+
+    #[test]
+    fn resolved_account_replaces_variable_reference_atomically() {
+        let mut base = serde_yaml::from_str("from: { var: account.ref }").unwrap();
+        let overlay = serde_yaml::from_str("from: { pool: users, select: { index: 0 } }").unwrap();
+
+        merge_yaml(&mut base, overlay);
+
+        let expected: serde_yaml::Value =
+            serde_yaml::from_str("from: { pool: users, select: { index: 0 } }").unwrap();
+        assert_eq!(base, expected);
+        let account = serde_yaml::from_value::<AccountRef>(base["from"].clone()).unwrap();
+        assert_eq!(account.pool, "users");
+        assert!(matches!(account.select, SelectMode::Index(0)));
     }
 }
