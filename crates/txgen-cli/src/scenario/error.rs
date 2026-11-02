@@ -2,6 +2,54 @@ use super::report::ProtocolMilestone;
 use alloy_transport::{RpcError, TransportError};
 use std::fmt;
 
+/// Reported category of a scenario-step failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StepErrorKind {
+    Timeout,
+    Rpc,
+    Expression,
+    Abi,
+    MissingData,
+    Context,
+    Binding,
+    Configuration,
+    UnsafeParallelNonce,
+    NonceStateAmbiguous,
+    NonceRecovery,
+    RpcHashMismatch,
+    RevertedReceipt,
+    Invoke,
+    Materialization,
+    Template,
+    SubmissionAmbiguous,
+    SubmissionRejected,
+}
+
+impl StepErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Rpc => "rpc_error",
+            Self::Expression => "expression_error",
+            Self::Abi => "abi_error",
+            Self::MissingData => "missing_data",
+            Self::Context => "context_error",
+            Self::Binding => "binding_error",
+            Self::Configuration => "configuration_error",
+            Self::UnsafeParallelNonce => "unsafe_parallel_nonce",
+            Self::NonceStateAmbiguous => "nonce_state_ambiguous",
+            Self::NonceRecovery => "nonce_recovery_error",
+            Self::RpcHashMismatch => "rpc_hash_mismatch",
+            Self::RevertedReceipt => "reverted_receipt",
+            Self::Invoke => "invoke_error",
+            Self::Materialization => "materialization_error",
+            Self::Template => "template_error",
+            Self::SubmissionAmbiguous => "submission_ambiguous",
+            Self::SubmissionRejected => "submission_rejected",
+        }
+    }
+}
+
 /// Sanitizable scenario-step failure.
 ///
 /// Reports always include `classification`. Only bounded diagnostics from a
@@ -9,14 +57,14 @@ use std::fmt;
 /// are serialized.
 #[derive(Debug)]
 pub(crate) struct StepError {
-    pub classification: &'static str,
+    pub classification: StepErrorKind,
     diagnostic: String,
     milestones: Vec<ProtocolMilestone>,
     invoke_detail: Option<String>,
 }
 
 impl StepError {
-    pub fn new(classification: &'static str, diagnostic: impl Into<String>) -> Self {
+    pub fn new(classification: StepErrorKind, diagnostic: impl Into<String>) -> Self {
         Self {
             classification,
             diagnostic: diagnostic.into(),
@@ -26,23 +74,23 @@ impl StepError {
     }
 
     pub fn timeout() -> Self {
-        Self::new("timeout", "step timeout elapsed")
+        Self::new(StepErrorKind::Timeout, "step timeout elapsed")
     }
 
     pub fn rpc(error: impl fmt::Display) -> Self {
-        Self::new("rpc_error", error.to_string())
+        Self::new(StepErrorKind::Rpc, error.to_string())
     }
 
     pub fn expression(error: impl fmt::Display) -> Self {
-        Self::new("expression_error", error.to_string())
+        Self::new(StepErrorKind::Expression, error.to_string())
     }
 
     pub fn abi(error: impl fmt::Display) -> Self {
-        Self::new("abi_error", error.to_string())
+        Self::new(StepErrorKind::Abi, error.to_string())
     }
 
     pub fn missing(diagnostic: impl Into<String>) -> Self {
-        Self::new("missing_data", diagnostic)
+        Self::new(StepErrorKind::MissingData, diagnostic)
     }
 
     pub fn with_milestones(mut self, milestones: Vec<ProtocolMilestone>) -> Self {
@@ -60,30 +108,16 @@ impl StepError {
         if let Some(detail) = &self.invoke_detail {
             return Some(bounded_detail(detail));
         }
-        let fixed = match self.classification {
+        use StepErrorKind::*;
+        match self.classification {
             // These diagnostics can include the runtime value that failed
             // evaluation or coercion, so reports expose only fixed text.
-            "expression_error" => Some("expression evaluation failed"),
-            "abi_error" => Some("ABI operation failed"),
-            _ => None,
-        };
-        if let Some(detail) = fixed {
-            return Some(detail.to_string());
-        }
-        if !matches!(
-            self.classification,
-            "timeout" |
-                "missing_data" |
-                "context_error" |
-                "binding_error" |
-                "configuration_error" |
-                "unsafe_parallel_nonce" |
-                "nonce_state_ambiguous" |
-                "nonce_recovery_error" |
-                "rpc_hash_mismatch" |
-                "reverted_receipt"
-        ) {
-            return None;
+            Expression => return Some("expression evaluation failed".to_string()),
+            Abi => return Some("ABI operation failed".to_string()),
+            Rpc | Invoke | Materialization | Template | SubmissionAmbiguous |
+            SubmissionRejected => return None,
+            Timeout | MissingData | Context | Binding | Configuration | UnsafeParallelNonce |
+            NonceStateAmbiguous | NonceRecovery | RpcHashMismatch | RevertedReceipt => {}
         }
         Some(bounded_detail(&self.diagnostic))
     }
@@ -112,7 +146,7 @@ impl StepError {
             details.push("adapter invocation failed; no safe diagnostic provided");
         }
         let detail = bounded_detail(&details.join(": "));
-        let mut step_error = Self::new("invoke_error", detail.clone());
+        let mut step_error = Self::new(StepErrorKind::Invoke, detail.clone());
         step_error.invoke_detail = Some(detail);
         step_error
     }

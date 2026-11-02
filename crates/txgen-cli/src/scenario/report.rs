@@ -1401,7 +1401,7 @@ scenario:
                 step_index: 0,
                 step_name: "redeem_encryption".into(),
                 failure_provenance: None,
-                classification: error.classification.into(),
+                classification: error.classification.as_str().into(),
                 timed_out: false,
                 detail: error.sanitized_detail(),
             }),

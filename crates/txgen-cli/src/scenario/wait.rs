@@ -1,5 +1,5 @@
 use super::{
-    error::StepError,
+    error::{StepError, StepErrorKind},
     log_hub::{LogInterest, LogPollHub, LogWindowSubscription},
     report::unix_ms,
     schema::{ObservationDef, ObservationMode, WaitLogStep},
@@ -102,7 +102,7 @@ impl ObservationRuntime {
                     Ok(provider) => Some(provider.erased()),
                     Err(_) if behavior == SubscriptionBehavior::Require => {
                         return Err(StepError::new(
-                            "configuration_error",
+                            StepErrorKind::Configuration,
                             "failed to connect configured observation WebSocket",
                         ));
                     }
@@ -111,7 +111,7 @@ impl ObservationRuntime {
             }
             (SubscriptionBehavior::Require, None) => {
                 return Err(StepError::new(
-                    "configuration_error",
+                    StepErrorKind::Configuration,
                     "subscription observation mode requires a websocket_url",
                 ));
             }
