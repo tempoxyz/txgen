@@ -13,6 +13,7 @@ pub enum EthTxType {
 
 /// Template for Ethereum transactions.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EthereumTemplate {
     /// Transaction type.
     #[serde(rename = "type")]

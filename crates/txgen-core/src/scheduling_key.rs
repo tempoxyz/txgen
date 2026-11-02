@@ -10,16 +10,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub struct SchedulingKey([u8; 20]);
 
 impl SchedulingKey {
-    /// Create a scheduling key from raw bytes.
-    pub const fn new(bytes: [u8; 20]) -> Self {
-        Self(bytes)
-    }
-
-    /// Return the raw key bytes.
-    pub const fn as_bytes(&self) -> &[u8; 20] {
-        &self.0
-    }
-
     /// Consume the key and return the raw bytes.
     pub const fn into_inner(self) -> [u8; 20] {
         self.0
@@ -28,19 +18,13 @@ impl SchedulingKey {
 
 impl From<[u8; 20]> for SchedulingKey {
     fn from(bytes: [u8; 20]) -> Self {
-        Self::new(bytes)
+        Self(bytes)
     }
 }
 
 impl From<SchedulingKey> for [u8; 20] {
     fn from(key: SchedulingKey) -> Self {
         key.into_inner()
-    }
-}
-
-impl AsRef<[u8; 20]> for SchedulingKey {
-    fn as_ref(&self) -> &[u8; 20] {
-        self.as_bytes()
     }
 }
 
@@ -69,7 +53,7 @@ impl<'de> Deserialize<'de> for SchedulingKey {
     where
         D: Deserializer<'de>,
     {
-        FixedBytes::<20>::deserialize(deserializer).map(|bytes| Self::new(bytes.0))
+        FixedBytes::<20>::deserialize(deserializer).map(|bytes| Self(bytes.0))
     }
 }
 

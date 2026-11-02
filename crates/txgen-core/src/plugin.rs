@@ -1,6 +1,6 @@
 use alloy_primitives::{Address, TxKind};
-use eyre::Result;
-use rand::rngs::StdRng;
+use eyre::{ensure, Result};
+use rand::{rngs::StdRng, Rng};
 use std::sync::OnceLock;
 
 use crate::{
@@ -206,24 +206,16 @@ impl<'a> BuildContext<'a> {
 
     /// Select a signer from a pool based on the account reference.
     pub fn select_signer(&mut self, from: &AccountRef) -> Result<SelectedSigner> {
-        match from.select {
+        let index = match from.select {
             SelectMode::Random => {
-                let signer = self.accounts.get_random(&from.pool, self.rng)?;
-                let addr = signer.address();
-                let pool = self.accounts.get_pool(&from.pool)?;
-                // SAFETY: the signer came from this pool, so it must be present
-                let idx = pool.iter().position(|s| s.address() == addr).unwrap_or(0);
-                Ok(SelectedSigner { address: addr, pool: from.pool.clone(), index: idx })
+                let len = self.accounts.get_pool(&from.pool)?.len();
+                ensure!(len > 0, "account pool '{}' is empty", from.pool);
+                self.rng.random_range(0..len)
             }
-            SelectMode::Index(idx) => {
-                let signer = self.accounts.get_by_index(&from.pool, idx)?;
-                Ok(SelectedSigner {
-                    address: signer.address(),
-                    pool: from.pool.clone(),
-                    index: idx,
-                })
-            }
-        }
+            SelectMode::Index(idx) => idx,
+        };
+        let address = self.accounts.get_by_index(&from.pool, index)?.address();
+        Ok(SelectedSigner { address, pool: from.pool.clone(), index })
     }
 
     /// Encode a contract call definition into calldata.

@@ -1,5 +1,5 @@
-use clap::Args;
-use eyre::{bail, Result, WrapErr};
+use clap::{Args, ValueEnum};
+use eyre::{Result, WrapErr};
 use std::path::PathBuf;
 use txgen_core::{AccountManager, WorkloadSpec};
 
@@ -9,9 +9,20 @@ pub struct AddressesArgs {
     #[arg(short, long)]
     pub spec: PathBuf,
 
-    /// Output format: plain (one per line), json, or shell (for xargs)
-    #[arg(short, long, default_value = "plain")]
-    pub format: String,
+    /// Output format
+    #[arg(short, long, value_enum, default_value_t = AddressesFormat::Plain)]
+    pub format: AddressesFormat,
+}
+
+/// Output format of the `addresses` subcommand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum AddressesFormat {
+    /// One address per line
+    Plain,
+    /// A JSON array
+    Json,
+    /// Space-separated on one line, for xargs
+    Shell,
 }
 
 // ---------------------------------------------------------------------------
@@ -26,22 +37,19 @@ pub(crate) fn run_addresses(args: AddressesArgs) -> Result<()> {
 
     let all_addresses: Vec<_> = accounts.all_addresses().flat_map(|(_, addrs)| addrs).collect();
 
-    match args.format.as_str() {
-        "plain" => {
+    match args.format {
+        AddressesFormat::Plain => {
             for addr in &all_addresses {
                 println!("{addr}");
             }
         }
-        "json" => {
+        AddressesFormat::Json => {
             let json = serde_json::to_string_pretty(&all_addresses)?;
             println!("{json}");
         }
-        "shell" => {
+        AddressesFormat::Shell => {
             let line: Vec<_> = all_addresses.iter().map(|a| a.to_string()).collect();
             println!("{}", line.join(" "));
-        }
-        other => {
-            bail!("unknown format: {}", other);
         }
     }
 

@@ -24,6 +24,55 @@ mod send_blocks;
 mod view;
 mod wait_for_persistence;
 
+/// Report and metrics arguments shared by `send`, `send-blocks` and `call`.
+#[derive(Args)]
+pub struct ReportArgs {
+    /// Report output destinations
+    #[arg(long = "report", value_name = "FORMAT")]
+    pub reports: Vec<String>,
+
+    /// Metadata key=value pairs to include in the report.
+    ///
+    /// Can be specified multiple times. Example:
+    ///   --metadata build-sha=abcdef --metadata build-profile=perf
+    #[arg(short = 'm', long = "metadata", value_name = "KEY=VALUE")]
+    pub metadata: Vec<String>,
+
+    /// Prometheus metrics endpoint(s) to scrape during the benchmark.
+    ///
+    /// Use a single URL, comma-separated `node:URL` entries, or rich
+    /// `key=value;key=value@URL` entries. Labels are added to scraped samples.
+    #[arg(
+        long,
+        value_name = "URL|NODE:URL|LABELS@URL",
+        value_delimiter = ',',
+        value_parser = parse_metrics_url
+    )]
+    pub metrics_url: Vec<MetricsURL>,
+
+    /// File containing metric names to publish to ClickHouse, one per line.
+    #[arg(long, value_name = "PATH")]
+    pub clickhouse_metrics_file: Option<PathBuf>,
+
+    /// Scrape interval in milliseconds for the metrics scraper.
+    #[arg(long, default_value = "500")]
+    pub scrape_interval_ms: u64,
+
+    /// Align exported metric timestamps to this benchmark-start Unix timestamp.
+    ///
+    /// Accepts Unix seconds or milliseconds. Exported samples keep their
+    /// original offset within the run.
+    #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
+    pub metrics_align: Option<u64>,
+
+    /// Forward scraped samples in real time via Prometheus remote write.
+    ///
+    /// Uses `/api/v1/write` and the same PROMETHEUS_* environment variables
+    /// as `--report prometheus:<url>`. Requires `--metrics-url`.
+    #[arg(long = "metrics-forward", value_name = "URL")]
+    pub metrics_forward: Option<String>,
+}
+
 /// Arguments for the `send` subcommand.
 #[derive(Args)]
 pub struct SendArgs {
@@ -109,6 +158,16 @@ pub struct SendArgs {
     #[arg(long, default_value = "0")]
     pub tps: u64,
 
+    /// Step-load schedule replacing --tps over time, e.g. "200:30s,2000:10s,200:60s".
+    ///
+    /// Each TPS:DURATION step holds its rate for its duration, starting when
+    /// measurement starts (warmup runs at the first step's rate); the last
+    /// step's rate holds afterwards. Use it to measure how a burst queues and
+    /// how long the backlog takes to drain. Overrides --tps when set, so
+    /// harnesses that always pass --tps can set BENCH_TPS_SCHEDULE instead.
+    #[arg(long, env = "BENCH_TPS_SCHEDULE")]
+    pub tps_schedule: Option<String>,
+
     /// Maximum number of RPC requests in flight simultaneously.
     ///
     /// Controls parallelism independently of --tps. Limits how many
@@ -136,50 +195,8 @@ pub struct SendArgs {
     #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
     pub timeout: Duration,
 
-    /// Report output destinations
-    #[arg(long = "report", value_name = "FORMAT")]
-    pub reports: Vec<String>,
-
-    /// Metadata key=value pairs to include in the report.
-    ///
-    /// Can be specified multiple times. Example:
-    ///   --metadata build-sha=abcdef --metadata build-profile=perf
-    #[arg(short = 'm', long = "metadata", value_name = "KEY=VALUE")]
-    pub metadata: Vec<String>,
-
-    /// Prometheus metrics endpoint(s) to scrape during the benchmark.
-    ///
-    /// Use a single URL, comma-separated `node:URL` entries, or rich
-    /// `key=value;key=value@URL` entries. Labels are added to scraped samples.
-    #[arg(
-        long,
-        value_name = "URL|NODE:URL|LABELS@URL",
-        value_delimiter = ',',
-        value_parser = parse_metrics_url
-    )]
-    pub metrics_url: Vec<MetricsURL>,
-
-    /// File containing metric names to publish to ClickHouse, one per line.
-    #[arg(long, value_name = "PATH")]
-    pub clickhouse_metrics_file: Option<PathBuf>,
-
-    /// Scrape interval in milliseconds for the metrics scraper.
-    #[arg(long, default_value = "500")]
-    pub scrape_interval_ms: u64,
-
-    /// Align exported metric timestamps to this benchmark-start Unix timestamp.
-    ///
-    /// Accepts Unix seconds or milliseconds. Exported samples keep their
-    /// original offset within the run.
-    #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
-    pub metrics_align: Option<u64>,
-
-    /// Forward scraped samples in real time via Prometheus remote write.
-    ///
-    /// Uses `/api/v1/write` and the same PROMETHEUS_* environment variables
-    /// as `--report prometheus:<url>`. Requires `--metrics-url`.
-    #[arg(long = "metrics-forward", value_name = "URL")]
-    pub metrics_forward: Option<String>,
+    #[command(flatten)]
+    pub reporting: ReportArgs,
 
     /// Collect and report latency metrics.
     ///
@@ -211,9 +228,29 @@ pub struct SendArgs {
 }
 
 impl SendArgs {
+    /// The parsed --tps-schedule, or empty for a constant --tps.
+    fn rate_schedule(&self) -> Result<Vec<bench_core::RateStep>> {
+        match self.tps_schedule.as_deref().map(str::trim) {
+            // A set-but-empty BENCH_TPS_SCHEDULE means no schedule.
+            Some(schedule) if !schedule.is_empty() => {
+                bench_core::RateStep::parse_schedule(schedule)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Peak submission rate: the schedule's highest step, otherwise --tps.
+    fn effective_tps(&self) -> Result<u64> {
+        Ok(self.rate_schedule()?.iter().map(|step| step.tps).max().unwrap_or(self.tps))
+    }
+
     fn pending_limit(&self) -> Result<Option<NonZeroUsize>> {
-        let limit = usize::try_from(self.max_pending.unwrap_or(self.tps))
-            .context("pending limit exceeds this platform's capacity")?;
+        let limit = match self.max_pending {
+            Some(limit) => limit,
+            None => self.effective_tps()?,
+        };
+        let limit =
+            usize::try_from(limit).context("pending limit exceeds this platform's capacity")?;
         Ok(NonZeroUsize::new(limit))
     }
 }
@@ -248,47 +285,8 @@ pub struct SendBlocksArgs {
     #[arg(long, value_name = "WAIT_TIME", value_parser = parse_duration_millis_fallback)]
     pub wait_time: Option<Duration>,
 
-    /// Report output destinations
-    #[arg(long = "report", value_name = "FORMAT")]
-    pub reports: Vec<String>,
-
-    /// Metadata key=value pairs to include in the report.
-    #[arg(short = 'm', long = "metadata", value_name = "KEY=VALUE")]
-    pub metadata: Vec<String>,
-
-    /// Prometheus metrics endpoint(s) to scrape during the benchmark.
-    ///
-    /// Use a single URL, comma-separated `node:URL` entries, or rich
-    /// `key=value;key=value@URL` entries. Labels are added to scraped samples.
-    #[arg(
-        long,
-        value_name = "URL|NODE:URL|LABELS@URL",
-        value_delimiter = ',',
-        value_parser = parse_metrics_url
-    )]
-    pub metrics_url: Vec<MetricsURL>,
-
-    /// File containing metric names to publish to ClickHouse, one per line.
-    #[arg(long, value_name = "PATH")]
-    pub clickhouse_metrics_file: Option<PathBuf>,
-
-    /// Scrape interval in milliseconds for the metrics scraper.
-    #[arg(long, default_value = "500")]
-    pub scrape_interval_ms: u64,
-
-    /// Align exported metric timestamps to this benchmark-start Unix timestamp.
-    ///
-    /// Accepts Unix seconds or milliseconds. Exported samples keep their
-    /// original offset within the run.
-    #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
-    pub metrics_align: Option<u64>,
-
-    /// Forward scraped samples in real time via Prometheus remote write.
-    ///
-    /// Uses `/api/v1/write` and the same PROMETHEUS_* environment variables
-    /// as `--report prometheus:<url>`. Requires `--metrics-url`.
-    #[arg(long = "metrics-forward", value_name = "URL")]
-    pub metrics_forward: Option<String>,
+    #[command(flatten)]
+    pub reporting: ReportArgs,
 
     /// Build a synthetic side fork and alternate forkchoice updates.
     #[arg(
@@ -304,7 +302,7 @@ pub struct SendBlocksArgs {
     #[arg(long, value_name = "BLOCKS", default_value_t = 0, requires = "reorg")]
     pub reorg_gap: usize,
 
-    /// Regular HTTP RPC URL for testing_buildBlockV1.
+    /// Regular HTTP RPC URL for testing_buildBlockV1 and --mempool.
     #[arg(
         long = "rpc",
         alias = "rpc-url",
@@ -312,6 +310,35 @@ pub struct SendBlocksArgs {
         default_value = "http://localhost:8545"
     )]
     pub rpc: String,
+
+    /// Submit each block's transactions to --rpc via eth_sendRawTransaction before its
+    /// reth_newPayload, once the node's head is the block's parent.
+    ///
+    /// Blob transactions are skipped because blocks carry no sidecars.
+    #[arg(long, conflicts_with = "reorg")]
+    pub mempool: bool,
+
+    /// Delay between submitting a block's transactions and its reth_newPayload.
+    ///
+    /// Bare integers are treated as milliseconds.
+    #[arg(
+        long,
+        value_name = "DELAY",
+        default_value = "200ms",
+        value_parser = parse_duration_millis_fallback,
+        requires = "mempool"
+    )]
+    pub mempool_delay: Duration,
+
+    /// Fraction of each block's non-blob transactions to submit, selected by transaction hash.
+    #[arg(
+        long,
+        value_name = "FRACTION",
+        default_value_t = 1.0,
+        value_parser = parse_fraction,
+        requires = "mempool"
+    )]
+    pub mempool_fraction: f64,
 }
 
 /// Arguments for the `call` subcommand.
@@ -396,47 +423,8 @@ pub struct CallArgs {
     #[arg(long, default_value_t = 1.0, value_name = "PERCENT")]
     pub max_fail_rate_pct: f64,
 
-    /// Report output destinations
-    #[arg(long = "report", value_name = "FORMAT")]
-    pub reports: Vec<String>,
-
-    /// Metadata key=value pairs to include in the report.
-    #[arg(short = 'm', long = "metadata", value_name = "KEY=VALUE")]
-    pub metadata: Vec<String>,
-
-    /// Prometheus metrics endpoint(s) to scrape during the benchmark.
-    ///
-    /// Use a single URL, comma-separated `node:URL` entries, or rich
-    /// `key=value;key=value@URL` entries. Labels are added to scraped samples.
-    #[arg(
-        long,
-        value_name = "URL|NODE:URL|LABELS@URL",
-        value_delimiter = ',',
-        value_parser = parse_metrics_url
-    )]
-    pub metrics_url: Vec<MetricsURL>,
-
-    /// File containing metric names to publish to ClickHouse, one per line.
-    #[arg(long, value_name = "PATH")]
-    pub clickhouse_metrics_file: Option<PathBuf>,
-
-    /// Scrape interval in milliseconds for the metrics scraper.
-    #[arg(long, default_value = "500")]
-    pub scrape_interval_ms: u64,
-
-    /// Align exported metric timestamps to this benchmark-start Unix timestamp.
-    ///
-    /// Accepts Unix seconds or milliseconds. Exported samples keep their
-    /// original offset within the run.
-    #[arg(long = "metrics-align", value_name = "TIMESTAMP", value_parser = parse_unix_timestamp_ms)]
-    pub metrics_align: Option<u64>,
-
-    /// Forward scraped samples in real time via Prometheus remote write.
-    ///
-    /// Uses `/api/v1/write` and the same PROMETHEUS_* environment variables
-    /// as `--report prometheus:<url>`. Requires `--metrics-url`.
-    #[arg(long = "metrics-forward", value_name = "URL")]
-    pub metrics_forward: Option<String>,
+    #[command(flatten)]
+    pub reporting: ReportArgs,
 }
 
 /// Which phase of a corpus replay to run.
@@ -525,6 +513,14 @@ fn parse_reorg_depth(s: &str) -> Result<usize, String> {
     Ok(depth)
 }
 
+fn parse_fraction(s: &str) -> Result<f64, String> {
+    let fraction = s.trim().parse::<f64>().map_err(|e| format!("invalid fraction {s:?}: {e}"))?;
+    if !(fraction > 0.0 && fraction <= 1.0) {
+        return Err(format!("{s:?} must be in (0, 1]"));
+    }
+    Ok(fraction)
+}
+
 fn parse_wait_for_persistence(s: &str) -> Result<WaitForPersistence, String> {
     match s {
         "always" => Ok(WaitForPersistence::Always),
@@ -562,8 +558,9 @@ fn load_metric_names(path: Option<&PathBuf>) -> Result<Option<HashSet<String>>> 
     Ok(Some(names))
 }
 
-fn tracing_env_filter() -> tracing_subscriber::EnvFilter {
-    tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into())
+/// Log at INFO by default; `RUST_LOG` directives, including a bare level, take precedence.
+fn tracing_env_filter(rust_log: &str) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::builder().parse_lossy(format!("info,{rust_log}"))
 }
 
 fn allow_diagnostic_event(metadata: &tracing::Metadata<'_>) -> bool {
@@ -590,7 +587,8 @@ fn init_tracing() {
         Layer,
     };
 
-    let filter = tracing_env_filter().and(filter_fn(allow_diagnostic_event));
+    let rust_log = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).unwrap_or_default();
+    let filter = tracing_env_filter(&rust_log).and(filter_fn(allow_diagnostic_event));
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_filter(filter))
         .init();
@@ -672,6 +670,44 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_fraction() {
+        assert_eq!(parse_fraction("1"), Ok(1.0));
+        assert_eq!(parse_fraction("0.25"), Ok(0.25));
+        for invalid in ["0", "-0.5", "1.01", "NaN", "abc"] {
+            assert!(parse_fraction(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn test_send_blocks_mempool_flags() {
+        let parse = |flags: &[&str]| {
+            Cli::try_parse_from(
+                [
+                    "bench",
+                    "send-blocks",
+                    "--engine=http://localhost:8551",
+                    "--jwt-secret=/tmp/jwt.hex",
+                ]
+                .into_iter()
+                .chain(flags.iter().copied()),
+            )
+        };
+
+        let Command::SendBlocks(args) =
+            parse(&["--mempool", "--mempool-delay=50", "--mempool-fraction=0.5"]).unwrap().command
+        else {
+            panic!("expected send-blocks");
+        };
+        assert!(args.mempool);
+        assert_eq!(args.mempool_delay, Duration::from_millis(50));
+        assert_eq!(args.mempool_fraction, 0.5);
+
+        assert!(parse(&["--mempool-delay=50"]).is_err());
+        assert!(parse(&["--mempool-fraction=0.5"]).is_err());
+        assert!(parse(&["--mempool", "--reorg"]).is_err());
+    }
+
+    #[test]
     fn test_send_pending_limit_defaults_and_overrides() {
         for (flags, expected) in [
             (vec![], None),
@@ -680,6 +716,10 @@ mod tests {
             (vec!["--tps", "50000", "--max-pending", "0"], None),
             (vec!["--tps", "50000", "--max-pending", "10000"], Some(10000)),
             (vec!["--max-pending", "10000"], Some(10000)),
+            (vec!["--tps-schedule", "200:30s,2000:10s,200:60s"], Some(2000)),
+            (vec!["--tps-schedule", "200:30s,2000:10s", "--max-pending", "0"], None),
+            (vec!["--tps", "50000", "--tps-schedule", "200:30s,2000:10s"], Some(2000)),
+            (vec!["--tps", "50000", "--tps-schedule", " "], Some(50000)),
         ] {
             let cli = Cli::try_parse_from(["bench", "send"].into_iter().chain(flags)).unwrap();
             let Command::Send(args) = cli.command else {
@@ -780,7 +820,7 @@ mod tests {
         };
 
         assert_eq!(
-            args.metrics_url,
+            args.reporting.metrics_url,
             vec![MetricsURL::Unlabeled("http://127.0.0.1:9001/metrics".to_string())]
         );
     }
@@ -799,9 +839,9 @@ mod tests {
             panic!("expected send command");
         };
 
-        assert_eq!(args.metrics_url.len(), 1);
+        assert_eq!(args.reporting.metrics_url.len(), 1);
         assert_eq!(
-            args.metrics_url[0],
+            args.reporting.metrics_url[0],
             MetricsURL::Labeled {
                 labels: std::collections::BTreeMap::from([
                     ("region".to_string(), "us-east-1".to_string()),
@@ -828,7 +868,7 @@ mod tests {
             panic!("expected send command");
         };
 
-        assert_eq!(args.metrics_forward, Some("http://victoriametrics:8428".to_string()));
+        assert_eq!(args.reporting.metrics_forward, Some("http://victoriametrics:8428".to_string()));
     }
 
     #[test]
@@ -851,7 +891,7 @@ mod tests {
             panic!("expected send-blocks command");
         };
 
-        assert_eq!(args.metrics_forward, Some("http://prometheus:9090".to_string()));
+        assert_eq!(args.reporting.metrics_forward, Some("http://prometheus:9090".to_string()));
     }
 
     #[test]
@@ -873,7 +913,7 @@ mod tests {
         };
 
         assert_eq!(
-            args.metrics_url,
+            args.reporting.metrics_url,
             vec![
                 MetricsURL::Labeled {
                     labels: std::collections::BTreeMap::from([(
@@ -945,6 +985,13 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["bench", "call", "-i", "c.jsonl", "--max-concurrent", "0"])
             .is_err());
+    }
+
+    #[test]
+    fn tracing_env_filter_defaults_to_info_and_honors_rust_log() {
+        assert_eq!(tracing_env_filter("").to_string(), "info");
+        assert_eq!(tracing_env_filter("debug").to_string(), "debug");
+        assert_eq!(tracing_env_filter("alloy=trace").to_string(), "alloy=trace,info");
     }
 
     #[test]
