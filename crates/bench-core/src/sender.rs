@@ -854,12 +854,7 @@ impl Sender {
         config: SenderConfig,
         metrics: Arc<MetricsCollector>,
     ) -> Result<Self> {
-        let endpoints = providers
-            .into_iter()
-            .enumerate()
-            .map(|(index, provider)| RpcEndpoint::new(format!("rpc-{index}"), provider))
-            .collect();
-        Self::new_with_request_auth(endpoints, config, metrics, None)
+        Self::new_with_request_auth(RpcEndpoint::indexed(providers), config, metrics, None)
     }
 
     /// Create a sender with request-scoped authentication.
