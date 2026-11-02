@@ -59,7 +59,7 @@ pub async fn execute(args: CallArgs) -> Result<()> {
         head_hash = %identity.head_hash,
         "Node identity"
     );
-    replay.prime(args.concurrency).await?;
+    replay.prime(args.concurrency.get()).await?;
 
     let clock = match args.reporting.metrics_align {
         Some(start) => RunClock::new_with_start_unix_ms(start),

@@ -861,7 +861,7 @@ impl Sender {
         providers: Vec<DynProvider<AnyNetwork>>,
         config: SenderConfig,
         metrics: Arc<MetricsCollector>,
-    ) -> Self {
+    ) -> Result<Self> {
         let endpoints = providers
             .into_iter()
             .enumerate()
@@ -876,8 +876,11 @@ impl Sender {
         config: SenderConfig,
         metrics: Arc<MetricsCollector>,
         request_auth: Option<Arc<dyn RequestAuthProvider>>,
-    ) -> Self {
-        assert!(!endpoints.is_empty(), "sender requires at least one RPC endpoint");
+    ) -> Result<Self> {
+        if endpoints.is_empty() {
+            eyre::bail!("at least one RPC provider is required");
+        }
+        config.validate()?;
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
 
         let rate_limiter = config.rate_limiter();
@@ -886,7 +889,7 @@ impl Sender {
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
 
         let receipt_tracker = ReceiptTracker::new(endpoints[0].provider().clone());
-        Self {
+        Ok(Self {
             max_pending: None,
             transaction_expiry: None,
             in_flight_pending: 0,
@@ -911,7 +914,7 @@ impl Sender {
             deferred_error: None,
             receipt_collector: None,
             late_signer: None,
-        }
+        })
     }
 
     /// Register the signer used for deferred transactions.
@@ -1814,7 +1817,8 @@ mod tests {
             vec![mocked_provider(asserter)],
             SenderConfig { rate_limit: 0, max_concurrent: 2, rate_schedule: Vec::new() },
             warmup.clone(),
-        );
+        )
+        .unwrap();
         for key in 1..=2 {
             if key == 2 {
                 sender.set_metrics(measured.clone());
@@ -1847,6 +1851,7 @@ mod tests {
         let metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
         let mut sender =
             Sender::new(vec![mocked_provider(asserter)], SenderConfig::default(), metrics.clone())
+                .unwrap()
                 .with_max_pending(1.try_into().unwrap());
         for key in 1..=2 {
             sender
@@ -1873,6 +1878,7 @@ mod tests {
         let metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
         let mut sender =
             Sender::new(vec![mocked_provider(Asserter::new())], SenderConfig::default(), metrics)
+                .unwrap()
                 .with_max_pending(1.try_into().unwrap());
         sender
             .send(GeneratedTx {
@@ -1965,8 +1971,9 @@ mod tests {
             1,
         );
         let metrics = MetricsCollector::new(RunClock::new());
-        let mut sender =
-            Sender::new(vec![provider], config, metrics).with_receipt_collector(collector.handle());
+        let mut sender = Sender::new(vec![provider], config, metrics)
+            .unwrap()
+            .with_receipt_collector(collector.handle());
 
         sender
             .send(GeneratedTx {
@@ -2005,19 +2012,23 @@ mod tests {
         assert!(config.validate().is_ok());
     }
 
-    #[test]
-    fn test_sender_config_rejects_zero_concurrency() {
+    #[tokio::test]
+    async fn test_sender_config_rejects_zero_concurrency() {
         let config = SenderConfig { rate_limit: 0, max_concurrent: 0, rate_schedule: Vec::new() };
         assert!(config.validate().is_err());
 
         let provider = mocked_provider(Asserter::new());
-        assert!(RpcSubmitter::new(vec![provider], config).is_err());
+        assert!(RpcSubmitter::new(vec![provider.clone()], config.clone()).is_err());
+        let metrics = MetricsCollector::new(RunClock::new());
+        assert!(Sender::new(vec![provider], config, metrics).is_err());
     }
 
-    #[test]
-    fn test_rpc_submitter_rejects_empty_provider_list() {
+    #[tokio::test]
+    async fn test_rpc_submitter_rejects_empty_provider_list() {
         let result = RpcSubmitter::new(Vec::new(), SenderConfig::default());
         assert!(result.is_err());
+        let metrics = MetricsCollector::new(RunClock::new());
+        assert!(Sender::new(Vec::new(), SenderConfig::default(), metrics).is_err());
     }
 
     #[test]
@@ -2133,6 +2144,7 @@ mod tests {
             SenderConfig { rate_limit: 0, max_concurrent: 1, rate_schedule: Vec::new() },
             metrics,
         )
+        .unwrap()
         .with_late_signer(signer.clone());
 
         sender
