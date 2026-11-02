@@ -38,6 +38,9 @@ pub struct BenchMetrics {
     pub success: u64,
     /// Failed transactions (rejected by RPC or network error).
     pub failed: u64,
+    /// Accepted transactions that reverted, expired, or whose inclusion could not be confirmed.
+    #[serde(default)]
+    pub inclusion_failed: u64,
     /// Total elapsed time.
     pub elapsed: Duration,
     /// Latency statistics, when latency collection is enabled.
@@ -488,6 +491,7 @@ pub struct MetricsCollector {
     sent: AtomicU64,
     success: AtomicU64,
     failed: AtomicU64,
+    inclusion_failed: AtomicU64,
     clock: RunClock,
     collect_latencies: bool,
     latency_tx: mpsc::UnboundedSender<TimestampedLatency>,
@@ -533,6 +537,7 @@ impl MetricsCollector {
             sent: AtomicU64::new(0),
             success: AtomicU64::new(0),
             failed: AtomicU64::new(0),
+            inclusion_failed: AtomicU64::new(0),
             clock,
             collect_latencies,
             latency_tx,
@@ -577,6 +582,11 @@ impl MetricsCollector {
         let _ = self.event_tx.send(TimestampedEvent { offset, event: TxEvent::Failed });
     }
 
+    /// Record an accepted transaction that reverted, expired, or was not confirmed included.
+    pub fn record_inclusion_failure(&self) {
+        self.inclusion_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Get the current counts (sent, success, failed).
     pub fn counts(&self) -> (u64, u64, u64) {
         (
@@ -594,6 +604,7 @@ impl MetricsCollector {
         let sent = self.sent.load(Ordering::Relaxed);
         let success = self.success.load(Ordering::Relaxed);
         let failed = self.failed.load(Ordering::Relaxed);
+        let inclusion_failed = self.inclusion_failed.load(Ordering::Relaxed);
         let inflight = sent.saturating_sub(success + failed);
         let offset_ms = self.clock.offset_ms();
         let unix_ms = self.clock.unix_ms();
@@ -618,6 +629,13 @@ impl MetricsCollector {
                 name: "txgen_transactions_failed_total".to_string(),
                 labels: labels.clone(),
                 value: failed as f64,
+                offset_ms,
+                unix_ms,
+            },
+            Sample {
+                name: "txgen_transactions_inclusion_failed_total".to_string(),
+                labels: labels.clone(),
+                value: inclusion_failed as f64,
                 offset_ms,
                 unix_ms,
             },
@@ -662,6 +680,7 @@ impl MetricsCollector {
             sent: self.sent.load(Ordering::Relaxed),
             success: self.success.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
+            inclusion_failed: self.inclusion_failed.load(Ordering::Relaxed),
             elapsed,
             latency,
         }
@@ -723,9 +742,10 @@ mod tests {
         collector.record_sent();
         collector.record_success(Duration::from_millis(5));
         collector.record_failure();
+        collector.record_inclusion_failure();
 
         let samples = collector.snapshot_samples();
-        assert_eq!(samples.len(), 4);
+        assert_eq!(samples.len(), 5);
 
         let by_name: std::collections::HashMap<&str, f64> =
             samples.iter().map(|s| (s.name.as_str(), s.value)).collect();
@@ -733,6 +753,7 @@ mod tests {
         assert_eq!(by_name["txgen_transactions_sent_total"], 3.0);
         assert_eq!(by_name["txgen_transactions_success_total"], 1.0);
         assert_eq!(by_name["txgen_transactions_failed_total"], 1.0);
+        assert_eq!(by_name["txgen_transactions_inclusion_failed_total"], 1.0);
         assert_eq!(by_name["txgen_transactions_inflight"], 1.0);
 
         // All samples share the same timestamp.
@@ -761,6 +782,7 @@ mod tests {
             sent: 100,
             success: 90,
             failed: 10,
+            inclusion_failed: 0,
             elapsed: Duration::from_secs(10),
             latency: None,
         };
@@ -888,6 +910,7 @@ mod tests {
             sent: 100,
             success: 90,
             failed: 10,
+            inclusion_failed: 0,
             elapsed: Duration::from_millis(1500),
             latency: Some(LatencyStats {
                 min: Duration::from_millis(5),
