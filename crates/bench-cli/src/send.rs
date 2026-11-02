@@ -23,10 +23,23 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         bail!("--duration must be positive");
     }
     let max_pending = args.pending_limit()?;
+    let rate_schedule = args.rate_schedule()?;
+    if !rate_schedule.is_empty() {
+        let schedule = args.tps_schedule.as_deref().unwrap_or_default();
+        if args.tps > 0 {
+            tracing::warn!(
+                schedule,
+                ignored_tps = args.tps,
+                "--tps-schedule (or BENCH_TPS_SCHEDULE) overrides --tps"
+            );
+        } else {
+            tracing::info!(schedule, "Using step-load rate schedule");
+        }
+    }
     tracing::info!(
         input = args.input.as_ref().map(|p| p.display().to_string()).as_deref().unwrap_or("stdin"),
         rpc_urls = ?args.rpc_urls,
-        tps = args.tps,
+        tps = args.effective_tps()?,
         max_pending = max_pending.map_or(0, |limit| limit.get()),
         skip_setup = args.skip_setup,
         collect_latencies = args.collect_latencies,
@@ -75,7 +88,11 @@ pub async fn execute(args: SendArgs) -> Result<()> {
 
     let senders = SenderFactory {
         endpoints,
-        config: SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent },
+        config: SenderConfig {
+            rate_limit: args.effective_tps()?,
+            max_concurrent: args.max_concurrent,
+            rate_schedule,
+        },
         request_auth,
         late_signer,
         max_pending,
@@ -107,13 +124,13 @@ struct SenderFactory {
 }
 
 impl SenderFactory {
-    fn build(&self, metrics: Arc<MetricsCollector>) -> Sender {
+    fn build(&self, metrics: Arc<MetricsCollector>) -> Result<Sender> {
         let mut sender = Sender::new_with_request_auth(
             self.endpoints.clone(),
             self.config.clone(),
             metrics,
             self.request_auth.clone(),
-        )
+        )?
         .with_receipt_tracker(self.receipt_tracker.clone())
         .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
         if let Some(limit) = self.max_pending {
@@ -122,7 +139,7 @@ impl SenderFactory {
         if let Some(late_signer) = &self.late_signer {
             sender = sender.with_late_signer(late_signer.clone());
         }
-        sender
+        Ok(sender)
     }
 }
 
@@ -163,7 +180,7 @@ async fn execute_source<S: TxSource>(
 
     // Keep one sender across warmup and measurement, including its pending work,
     // nonce ordering, rate limiter and HTTP connection pool.
-    let mut sender = senders.build(MetricsCollector::new_with_latencies(RunClock::new(), false));
+    let mut sender = senders.build(MetricsCollector::new_with_latencies(RunClock::new(), false))?;
     let mut start_block =
         query_provider.get_block_number().await.wrap_err("failed to get starting block number")?;
     let prepared =
@@ -183,6 +200,9 @@ async fn execute_source<S: TxSource>(
     };
     let metrics = MetricsCollector::new_with_latencies(clock.clone(), args.collect_latencies);
     sender.set_metrics(metrics.clone());
+    // Warmup shares this sender and holds the schedule's first step; start the
+    // step-load schedule with the measurement.
+    sender.start_rate_schedule();
     let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
     if let Some(collector) = &receipt_collector {
         sender = sender.with_receipt_collector(collector.handle());
@@ -407,7 +427,7 @@ async fn run_setup_phase<S: TxSource>(
     senders: &SenderFactory,
 ) -> Result<Option<GeneratedTx>> {
     let setup_metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
-    let mut setup_sender = senders.build(setup_metrics.clone());
+    let mut setup_sender = senders.build(setup_metrics.clone())?;
     let mut setup_seen = 0u64;
     let mut setup = Vec::new();
 
