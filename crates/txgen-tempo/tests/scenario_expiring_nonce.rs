@@ -8,12 +8,12 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Condvar, LazyLock, Mutex,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tempo_alloy::{rpc::TempoTransactionRequest, TempoNetwork};
 use tempo_primitives::{transaction::TEMPO_EXPIRING_NONCE_KEY, TempoTxEnvelope};
@@ -156,35 +156,12 @@ struct RpcState {
     max_active_submissions: Arc<AtomicUsize>,
 }
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let suffix =
-            SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after epoch").as_nanos();
-        let path = std::env::temp_dir()
-            .join(format!("txgen-tempo-expiring-scenario-{}-{suffix}", std::process::id()));
-        fs::create_dir_all(&path).expect("create temporary test directory");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dag_submits_distinct_expiring_nonce_transactions_concurrently() {
     ACTIVE_SIGNERS.store(0, Ordering::SeqCst);
     MAX_ACTIVE_SIGNERS.store(0, Ordering::SeqCst);
     *SIGN_RENDEZVOUS.0.lock().expect("sign rendezvous lock") = SignRendezvous::default();
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     let (state, report) = execute_fixture(directory.path()).await;
 
     assert_eq!(report.completed, 1);

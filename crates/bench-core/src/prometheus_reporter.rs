@@ -235,8 +235,7 @@ impl PrometheusReporter {
 
     /// Push final-report samples with parallel encode/compress workers and ordered upload.
     fn push_report(&self, report: &FinalReport) -> Result<usize> {
-        let rt = tokio::runtime::Handle::current();
-        tokio::task::block_in_place(|| rt.block_on(self.push_report_async(report)))
+        crate::block_on(self.push_report_async(report))?
     }
 
     async fn push_report_async(&self, report: &FinalReport) -> Result<usize> {

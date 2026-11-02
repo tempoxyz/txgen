@@ -8,23 +8,16 @@
 //! Every response is digested as it streams in so two runs can be compared byte
 //! for byte without any output ever carrying a request or response body.
 
-use crate::{
-    load_metric_names,
-    metrics_forwarder::{build_metrics_forwarder, finish_metrics_forwarder},
-    metrics_url::metrics_scraper_configs,
-    send::parse_metadata,
-    CallArgs, CallPhase,
-};
+use crate::{reporting::Reporting, CallArgs, CallPhase};
 use bench_core::{
-    digest_response, parse_reporters, start_scrapers, CallMethod, CallReport, CallRunConfig,
-    ConsoleReporter, Corpus, CorpusOptions, FinalReport, NodeIdentity, ReplayRecorder,
-    ReplayResults, RequestOutcome, RequestStatus, ResponseKind, ResponseSummary, RunClock,
-    SampleStore,
+    digest_response, parse_metadata, CallMethod, CallReport, CallRunConfig, Corpus, CorpusOptions,
+    FinalReport, NodeIdentity, ReplayRecorder, ReplayResults, RequestOutcome, RequestStatus,
+    ResponseKind, ResponseSummary, RunClock,
 };
 use eyre::{bail, Context, Result};
 use rand::{Rng, SeedableRng};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     io::{BufWriter, Write},
     path::Path,
     sync::{
@@ -55,9 +48,8 @@ pub async fn execute(args: CallArgs) -> Result<()> {
         "Starting RPC corpus replay"
     );
 
-    let metadata = parse_metadata(&args.metadata)?;
-    let scraper_configs =
-        metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
+    let metadata: HashMap<_, _> = parse_metadata(&args.reporting.metadata)?;
+    let scraper_configs = args.reporting.scraper_configs()?;
 
     let replay = Replay::new(&args, corpus.clone())?;
     let identity = replay.identity().await?;
@@ -69,31 +61,19 @@ pub async fn execute(args: CallArgs) -> Result<()> {
     );
     replay.prime(args.concurrency).await?;
 
-    let clickhouse_metric_names = load_metric_names(args.clickhouse_metrics_file.as_ref())?;
-    let mut reporters = parse_reporters(&args.reports, "call", &metadata, clickhouse_metric_names)?;
-    if reporters.is_empty() {
-        reporters.push(Box::new(ConsoleReporter::stderr(false)));
-    }
-
-    let clock = match args.metrics_align {
+    let clock = match args.reporting.metrics_align {
         Some(start) => RunClock::new_with_start_unix_ms(start),
         None => RunClock::new(),
     };
-    let store = SampleStore::with_labels(metadata.clone())?;
-    let metrics_forwarder =
-        build_metrics_forwarder(args.metrics_forward.as_deref(), &metadata, &scraper_configs)?;
-    let scraper_handles = if scraper_configs.is_empty() {
-        Vec::new()
-    } else {
-        let callback: bench_core::SampleCallback = Arc::new(Vec::new);
-        start_scrapers(
-            &scraper_configs,
-            clock.clone(),
-            store.clone(),
-            callback,
-            metrics_forwarder.as_ref().map(|forwarder| forwarder.handle()),
-        )
-    };
+    let mut reporting = Reporting::start(
+        &args.reporting,
+        "call",
+        &metadata,
+        &scraper_configs,
+        &clock,
+        Arc::new(Vec::new),
+        false,
+    )?;
 
     let open_loop_secs = replay.run_open_loop(&args, &clock).await?;
     let closed_loop_secs = match args.phase {
@@ -101,14 +81,7 @@ pub async fn execute(args: CallArgs) -> Result<()> {
         CallPhase::Measure => replay.run_closed_loop(&args).await?,
     };
 
-    if !scraper_handles.is_empty() {
-        let scrapes = scraper_handles.iter().map(|handle| handle.scrape_count()).sum::<u64>();
-        let errors = scraper_handles.iter().map(|handle| handle.error_count()).sum::<u64>();
-        for handle in scraper_handles {
-            handle.stop().await;
-        }
-        tracing::info!(scrapes, errors, "Metrics scrapers stopped");
-    }
+    reporting.stop_scrapers().await;
 
     let results = replay.recorder.finish();
     if args.phase == CallPhase::Measure {
@@ -140,21 +113,12 @@ pub async fn execute(args: CallArgs) -> Result<()> {
 
     let report = FinalReport {
         metadata,
-        sample_archive: Some(store.finish().await?),
+        sample_archive: Some(reporting.store.finish().await?),
         call: Some(call),
         ..Default::default()
     };
 
-    let mut finalize_result = Ok(());
-    for reporter in &mut reporters {
-        if let Err(err) = reporter.finalize(&report) {
-            finalize_result = Err(err);
-            break;
-        }
-    }
-    let forwarder_result = finish_metrics_forwarder(metrics_forwarder).await;
-    finalize_result?;
-    forwarder_result?;
+    reporting.finish(&report).await?;
 
     if failure_rate_pct > args.max_fail_rate_pct {
         bail!(
@@ -539,6 +503,7 @@ fn status_of(summary: &ResponseSummary) -> RequestStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReportArgs;
     use std::{
         collections::HashMap,
         io::{BufRead, BufReader as StdBufReader, Read},
@@ -732,13 +697,15 @@ mod tests {
             record_csv: None,
             requests_csv: None,
             max_fail_rate_pct: 100.0,
-            reports: Vec::new(),
-            metadata: Vec::new(),
-            metrics_url: Vec::new(),
-            clickhouse_metrics_file: None,
-            scrape_interval_ms: 500,
-            metrics_align: None,
-            metrics_forward: None,
+            reporting: ReportArgs {
+                reports: Vec::new(),
+                metadata: Vec::new(),
+                metrics_url: Vec::new(),
+                clickhouse_metrics_file: None,
+                scrape_interval_ms: 500,
+                metrics_align: None,
+                metrics_forward: None,
+            },
         }
     }
 

@@ -1,21 +1,16 @@
 //! `bench send` - Send transactions from file or stdin
 
-use crate::{
-    load_metric_names,
-    metrics_forwarder::{build_metrics_forwarder, finish_metrics_forwarder},
-    metrics_url::metrics_scraper_configs,
-    SendArgs,
-};
+use crate::{reporting::Reporting, SendArgs};
 use alloy_network::AnyNetwork;
 use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
-    block_composition, collect_block_stats, parse_reporters, start_scrapers, total_fees_paid,
-    trim_trailing_empty_blocks, BlockReceiptCollector, ConsoleReporter, FileSource, FinalReport,
-    GeneratedTx, LateSigner, MetricsCollector, ProgressState, ReceiptCollection, ReceiptTracker,
-    Reporter, RequestAuthProvider, RpcEndpoint, RunClock, RunStats, SampleStore, ScraperConfig,
-    ScraperHandle, Sender, SenderConfig, SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
+    block_composition, collect_block_stats, parse_metadata, total_fees_paid,
+    trim_trailing_empty_blocks, BlockReceiptCollector, FileSource, FinalReport, GeneratedTx,
+    LateSigner, MetricsCollector, ProgressState, ReceiptCollection, ReceiptTracker, Reporter,
+    RequestAuthProvider, RpcEndpoint, RunClock, RunStats, ScraperConfig, Sender, SenderConfig,
+    SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -28,10 +23,23 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         bail!("--duration must be positive");
     }
     let max_pending = args.pending_limit()?;
+    let rate_schedule = args.rate_schedule()?;
+    if !rate_schedule.is_empty() {
+        let schedule = args.tps_schedule.as_deref().unwrap_or_default();
+        if args.tps > 0 {
+            tracing::warn!(
+                schedule,
+                ignored_tps = args.tps,
+                "--tps-schedule (or BENCH_TPS_SCHEDULE) overrides --tps"
+            );
+        } else {
+            tracing::info!(schedule, "Using step-load rate schedule");
+        }
+    }
     tracing::info!(
         input = args.input.as_ref().map(|p| p.display().to_string()).as_deref().unwrap_or("stdin"),
         rpc_urls = ?args.rpc_urls,
-        tps = args.tps,
+        tps = args.effective_tps()?,
         max_pending = max_pending.map_or(0, |limit| limit.get()),
         skip_setup = args.skip_setup,
         collect_latencies = args.collect_latencies,
@@ -40,11 +48,10 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         "Starting send"
     );
 
-    let mut metadata = parse_metadata(&args.metadata)?;
+    let mut metadata: HashMap<_, _> = parse_metadata(&args.reporting.metadata)?;
     metadata
         .insert("max_pending".to_string(), max_pending.map_or(0, |limit| limit.get()).to_string());
-    let scraper_configs =
-        metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
+    let scraper_configs = args.reporting.scraper_configs()?;
 
     // CU/s set to u64::MAX to disable the layer's built-in rate limiting
     // while keeping retry-on-429 behavior. The benchmarking tool has its own
@@ -147,7 +154,9 @@ async fn execute_source<S: TxSource>(
     source: &mut S,
     scraper_configs: &[ScraperConfig],
 ) -> Result<()> {
-    let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
+    let rate_schedule = args.rate_schedule()?;
+    let rate_limit = args.effective_tps()?;
+    let config = SenderConfig { rate_limit, max_concurrent: args.max_concurrent, rate_schedule };
 
     let receipt_tracker = ReceiptTracker::new(query_provider.clone());
     let first_workload = run_setup_phase(
@@ -184,13 +193,18 @@ async fn execute_source<S: TxSource>(
         start_block = query_provider.get_block_number().await?;
     }
 
-    let clock = if let Some(start) = args.metrics_align {
-        RunClock::new_with_start_unix_ms(start)
-    } else {
-        RunClock::new()
+    // Block timestamps are wall-clock times, while --metrics-align shifts the
+    // run clock that stamps samples.
+    let wall_clock = RunClock::new();
+    let clock = match args.reporting.metrics_align {
+        Some(start) => RunClock::new_with_start_unix_ms(start),
+        None => wall_clock.clone(),
     };
     let metrics = MetricsCollector::new_with_latencies(clock.clone(), args.collect_latencies);
     sender.set_metrics(metrics.clone());
+    // Warmup shares this sender and holds the schedule's first step; start the
+    // step-load schedule with the measurement.
+    sender.start_rate_schedule();
     let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
     if let Some(collector) = &receipt_collector {
         sender = sender.with_receipt_collector(collector.handle());
@@ -201,35 +215,25 @@ async fn execute_source<S: TxSource>(
     }
     metadata.insert("measurement_start_unix_ms".into(), clock.start_unix_ms().to_string());
     let metadata = &metadata;
-    let store = SampleStore::with_labels(metadata.clone())?;
-    let metrics_forwarder =
-        build_metrics_forwarder(args.metrics_forward.as_deref(), metadata, scraper_configs)?;
 
-    // Start background scraper + internal snapshotter after setup so setup is
-    // excluded from benchmark metrics.
-    let mut scraper_handles = if !scraper_configs.is_empty() {
-        let snap_metrics = metrics.clone();
-        let callback: bench_core::SampleCallback =
-            std::sync::Arc::new(move || snap_metrics.snapshot_samples());
-        let forwarder_handle = metrics_forwarder.as_ref().map(|f| f.handle());
-
-        start_scrapers(scraper_configs, clock.clone(), store.clone(), callback, forwarder_handle)
-    } else {
-        Vec::new()
-    };
-
-    let clickhouse_metric_names = load_metric_names(args.clickhouse_metrics_file.as_ref())?;
-    let mut reporters = parse_reporters(&args.reports, "send", metadata, clickhouse_metric_names)?;
-    if reporters.is_empty() {
-        reporters.push(Box::new(ConsoleReporter::stderr(true)));
-    }
+    // Start scraping after setup so setup is excluded from benchmark metrics.
+    let snap_metrics = metrics.clone();
+    let mut reporting = Reporting::start(
+        &args.reporting,
+        "send",
+        metadata,
+        scraper_configs,
+        &clock,
+        Arc::new(move || snap_metrics.snapshot_samples()),
+        true,
+    )?;
 
     let measurement_send_start_unix_ms = send_workload_from_source(
         source,
         &mut sender,
         &metrics,
         &config,
-        &mut reporters,
+        &mut reporting.reporters,
         SendInterval {
             first_workload: prepared.first_workload,
             duration: args.duration,
@@ -268,13 +272,16 @@ async fn execute_source<S: TxSource>(
                     name: "post-measurement tail",
                 },
             ),
-            stop_scrapers(std::mem::take(&mut scraper_handles)),
+            reporting.stop_scrapers(),
         );
         tail?;
     }
 
     sender.flush().await?;
     drop(sender);
+    // Freeze the duration before the drain wait, receipt RPCs and aggregation
+    // add post-run latency.
+    let measured_elapsed = args.duration.unwrap_or_else(|| metrics.elapsed_since_start());
 
     let (sent, success, failed) = metrics.counts();
     if (!args.warmup.is_zero() || args.warmup_validators.is_some()) && sent == 0 {
@@ -301,9 +308,6 @@ async fn execute_source<S: TxSource>(
     };
     tracing::info!(end_block, "Ending block fetched");
 
-    // Freeze the duration before receipt RPCs and aggregation add post-run latency.
-    let measured_elapsed = args.duration.unwrap_or_else(|| metrics.elapsed_since_start());
-
     let receipt_collection = match receipt_collector {
         Some(collector) => {
             let collection = collector
@@ -328,7 +332,7 @@ async fn execute_source<S: TxSource>(
     let receipt_records = receipt_collection.records;
 
     // Stop the scraper before finalizing.
-    stop_scrapers(scraper_handles).await;
+    reporting.stop_scrapers().await;
 
     let mut final_metrics = metrics.finalize().await;
     final_metrics.elapsed = measured_elapsed;
@@ -338,7 +342,7 @@ async fn execute_source<S: TxSource>(
     tracing::info!("Time series built");
 
     // Finalize the sample archive before reporters read it.
-    let sample_archive = store.finish().await?;
+    let sample_archive = reporting.store.finish().await?;
     tracing::info!("Sample archive finalized");
 
     // Collect per-block stats from the chain. The range starts one block after
@@ -361,12 +365,7 @@ async fn execute_source<S: TxSource>(
     );
     if let Some(end_ms) = measurement_end_unix_ms {
         report.metadata.insert("measurement_end_unix_ms".into(), end_ms.to_string());
-        report.retain_samples_until(end_ms)?;
-        if let Some(ts) = report.time_series.as_mut() {
-            let end_offset_ms = end_ms.saturating_sub(clock.start_unix_ms());
-            ts.latencies.retain(|l| l.offset_ms <= end_offset_ms);
-            ts.throughput.retain(|t| t.second * 1000 <= end_offset_ms);
-        }
+        trim_report(&mut report, &clock, end_ms.saturating_sub(clock.start_unix_ms()));
     }
 
     if end_block > start_block {
@@ -381,7 +380,7 @@ async fn execute_source<S: TxSource>(
         );
 
         if !args.warmup.is_zero() || args.warmup_validators.is_some() {
-            block_stats.retain(|block| block.timestamp_ms >= clock.start_unix_ms());
+            block_stats.retain(|block| block.timestamp_ms >= wall_clock.start_unix_ms());
         }
         if let Some(end_ms) = measurement_end_unix_ms {
             block_stats.retain(|block| block.timestamp_ms <= end_ms);
@@ -392,21 +391,12 @@ async fn execute_source<S: TxSource>(
         // samples captured after the last real block.
         let cutoff_ms = trim_trailing_empty_blocks(&mut block_stats);
         if let Some(cutoff_ms) = cutoff_ms {
-            report.retain_samples_until(cutoff_ms)?;
-            if let Some(ts) = report.time_series.as_mut() {
-                ts.latencies
-                    .retain(|l| l.offset_ms <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
-                ts.throughput
-                    .retain(|t| t.second * 1000 <= cutoff_ms.saturating_sub(clock.start_unix_ms()));
-            }
+            let end_offset_ms = cutoff_ms.saturating_sub(wall_clock.start_unix_ms());
+            trim_report(&mut report, &clock, end_offset_ms);
         }
         tracing::info!(cutoff_ms = ?cutoff_ms, "Report trimmed");
 
-        for block in &block_stats {
-            for reporter in reporters.iter_mut() {
-                reporter.on_block(block)?;
-            }
-        }
+        reporting.on_blocks(&block_stats)?;
         tracing::info!(blocks = block_stats.len(), "Block reporter events emitted");
 
         report.run_stats = Some(match (measurement_end_unix_ms, args.duration) {
@@ -437,21 +427,8 @@ async fn execute_source<S: TxSource>(
         report.receipt_metrics = ReceiptCollection::metrics_for_records(&report.receipt_records);
     }
 
-    let mut finalize_result = Ok(());
-    for reporter in &mut reporters {
-        if let Err(err) = reporter.finalize(&report) {
-            finalize_result = Err(err);
-            break;
-        }
-    }
-    tracing::info!("Reporters finalized");
-
+    reporting.finish(&report).await?;
     tracing::info!("Post-processing completed");
-
-    let forwarder_result = finish_metrics_forwarder(metrics_forwarder).await;
-
-    finalize_result?;
-    forwarder_result?;
     Ok(())
 }
 
@@ -565,20 +542,6 @@ async fn finish_setup_phase(
     Ok(())
 }
 
-/// Parse `key=value` metadata strings into a HashMap.
-pub(crate) fn parse_metadata(args: &[String]) -> Result<HashMap<String, String>> {
-    let mut map = HashMap::new();
-    for arg in args {
-        let (key, value) =
-            arg.split_once('=').ok_or_else(|| eyre::eyre!("invalid metadata format: {arg}"))?;
-        if key.is_empty() {
-            bail!("metadata key cannot be empty: {arg}");
-        }
-        map.insert(key.to_string(), value.to_string());
-    }
-    Ok(map)
-}
-
 struct SendInterval {
     first_workload: Option<GeneratedTx>,
     duration: Option<Duration>,
@@ -629,17 +592,13 @@ async fn send_workload_from_source<S: TxSource>(
     Ok(start_unix_ms)
 }
 
-async fn stop_scrapers(scraper_handles: Vec<ScraperHandle>) {
-    if scraper_handles.is_empty() {
-        return;
+/// Drop samples, latencies and throughput recorded after `end_offset_ms` into the run.
+fn trim_report(report: &mut FinalReport, clock: &RunClock, end_offset_ms: u64) {
+    report.retain_samples_until(clock.start_unix_ms().saturating_add(end_offset_ms));
+    if let Some(ts) = report.time_series.as_mut() {
+        ts.latencies.retain(|l| l.offset_ms <= end_offset_ms);
+        ts.throughput.retain(|t| t.second * 1000 <= end_offset_ms);
     }
-    let scrapers = scraper_handles.len();
-    let scrapes = scraper_handles.iter().map(|h| h.scrape_count()).sum::<u64>();
-    let errors = scraper_handles.iter().map(|h| h.error_count()).sum::<u64>();
-    for handle in scraper_handles {
-        handle.stop().await;
-    }
-    tracing::info!(scrapers, scrapes, errors, "Metrics scrapers stopped");
 }
 
 async fn send_workload_tx(
@@ -706,5 +665,34 @@ async fn wait_for_pool_drain<P: TxPoolApi<AnyNetwork>>(
             zero_count = 0;
             tracing::debug!(pending, "Txpool still draining...");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bench_core::{Sample, SampleStore};
+
+    #[tokio::test]
+    async fn trim_report_keeps_aligned_samples_up_to_the_offset() {
+        let clock = RunClock::new_with_start_unix_ms(1_000_000);
+        let store = SampleStore::new().unwrap();
+        let samples = [500, 1_500].map(|offset_ms| Sample {
+            name: "m".to_string(),
+            labels: Default::default(),
+            value: 1.0,
+            offset_ms,
+            unix_ms: clock.start_unix_ms() + offset_ms,
+        });
+        store.push_batch(samples.to_vec()).await.unwrap();
+        let mut report = FinalReport {
+            sample_archive: Some(store.finish().await.unwrap()),
+            ..Default::default()
+        };
+
+        trim_report(&mut report, &clock, 1_000);
+
+        let kept = report.sample_archive.unwrap().iter().unwrap().collect::<Result<Vec<_>>>();
+        assert_eq!(kept.unwrap().iter().map(|s| s.offset_ms).collect::<Vec<_>>(), [500]);
     }
 }
