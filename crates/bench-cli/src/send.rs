@@ -23,10 +23,23 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         bail!("--duration must be positive");
     }
     let max_pending = args.pending_limit()?;
+    let rate_schedule = args.rate_schedule()?;
+    if !rate_schedule.is_empty() {
+        let schedule = args.tps_schedule.as_deref().unwrap_or_default();
+        if args.tps > 0 {
+            tracing::warn!(
+                schedule,
+                ignored_tps = args.tps,
+                "--tps-schedule (or BENCH_TPS_SCHEDULE) overrides --tps"
+            );
+        } else {
+            tracing::info!(schedule, "Using step-load rate schedule");
+        }
+    }
     tracing::info!(
         input = args.input.as_ref().map(|p| p.display().to_string()).as_deref().unwrap_or("stdin"),
         rpc_urls = ?args.rpc_urls,
-        tps = args.tps,
+        tps = args.effective_tps()?,
         max_pending = max_pending.map_or(0, |limit| limit.get()),
         skip_setup = args.skip_setup,
         collect_latencies = args.collect_latencies,
@@ -140,7 +153,9 @@ async fn execute_source<S: TxSource>(
     source: &mut S,
     scraper_configs: &[ScraperConfig],
 ) -> Result<()> {
-    let config = SenderConfig { rate_limit: args.tps, max_concurrent: args.max_concurrent };
+    let rate_schedule = args.rate_schedule()?;
+    let rate_limit = args.effective_tps()?;
+    let config = SenderConfig { rate_limit, max_concurrent: args.max_concurrent, rate_schedule };
 
     let receipt_tracker = ReceiptTracker::new(query_provider.clone());
     let first_workload = run_setup_phase(
@@ -158,7 +173,7 @@ async fn execute_source<S: TxSource>(
     // nonce ordering, rate limiter and HTTP connection pool.
     let warmup_metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
     let mut sender =
-        Sender::new_with_request_auth(endpoints, config.clone(), warmup_metrics, request_auth)
+        Sender::new_with_request_auth(endpoints, config.clone(), warmup_metrics, request_auth)?
             .with_receipt_tracker(receipt_tracker)
             .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
     if let Some(limit) = args.pending_limit()? {
@@ -186,6 +201,9 @@ async fn execute_source<S: TxSource>(
     };
     let metrics = MetricsCollector::new_with_latencies(clock.clone(), args.collect_latencies);
     sender.set_metrics(metrics.clone());
+    // Warmup shares this sender and holds the schedule's first step; start the
+    // step-load schedule with the measurement.
+    sender.start_rate_schedule();
     let receipt_collector = args.collect_receipt_metrics.then(BlockReceiptCollector::start);
     if let Some(collector) = &receipt_collector {
         sender = sender.with_receipt_collector(collector.handle());
@@ -429,7 +447,7 @@ async fn run_setup_phase<S: TxSource>(
         config.clone(),
         setup_metrics.clone(),
         request_auth,
-    )
+    )?
     .with_receipt_tracker(receipt_tracker)
     .with_transaction_expiry(Arc::new(txgen_tempo::transaction_expiry));
     if let Some(late_signer) = late_signer {
