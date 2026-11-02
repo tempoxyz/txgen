@@ -42,6 +42,7 @@ k256.workspace = true
 sha2.workspace = true
 
 # misc
+futures.workspace = true
 rand.workspace = true
 rustix.workspace = true
 eyre.workspace = true
