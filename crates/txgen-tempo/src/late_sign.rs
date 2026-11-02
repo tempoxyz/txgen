@@ -10,12 +10,18 @@ use serde::{Deserialize, Serialize};
 use std::{
     num::NonZeroU64,
     path::Path,
-    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tempo_alloy::rpc::TempoTransactionRequest;
-use tempo_primitives::{transaction::TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS, TempoTxEnvelope};
+use tempo_primitives::TempoTxEnvelope;
 use txgen_core::{AccountManager, LateSignSpec, WorkloadSpec};
+
+/// Longest expiring-nonce validity window accepted on every Tempo hardfork.
+///
+/// tempo-primitives no longer exports this limit: it is hardfork-dependent
+/// (`TempoHardfork::expiring_nonce_max_expiry_secs`, 300s from T11). Keep the
+/// pre-T11 bound so signed payloads stay valid on any network.
+const TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS: u64 = 30;
 
 /// Discriminator for relative Tempo expiring-nonce signing.
 pub const FORMAT_TEMPO_EXPIRING_RELATIVE: &str = "tempo_expiring_relative";
@@ -66,13 +72,13 @@ impl TempoExpiringPayload {
 
 /// Signer used by bench for deferred Tempo transactions.
 pub struct TempoLateSigner {
-    accounts: Arc<AccountManager>,
+    accounts: AccountManager,
 }
 
 impl TempoLateSigner {
     /// Build a signer from a loaded workload specification.
     pub fn from_spec(spec: &WorkloadSpec) -> Result<Self> {
-        Ok(Self { accounts: Arc::new(AccountManager::from_spec(&spec.accounts)?) })
+        Ok(Self { accounts: AccountManager::from_spec(&spec.accounts)? })
     }
 
     /// Build a signer from a workload YAML file.
@@ -94,25 +100,8 @@ pub fn sign_tempo_expiring(
     payload: &TempoExpiringPayload,
     accounts: &AccountManager,
 ) -> Result<Bytes> {
-    if payload.valid_for_secs == 0 || payload.valid_for_secs > TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS
-    {
-        bail!(
-            "Tempo expiring transactions require `valid_for_secs` in the range 1..={TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS}"
-        );
-    }
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .wrap_err("system clock is before the Unix epoch")?
-        .as_secs();
-    let valid_before = now
-        .checked_add(payload.valid_for_secs)
-        .ok_or_else(|| eyre::eyre!("Tempo expiring `valid_before` overflowed Unix time"))?;
-    let valid_before = NonZeroU64::new(valid_before)
-        .ok_or_else(|| eyre::eyre!("Tempo expiring `valid_before` must be greater than zero"))?;
-
     let mut request = payload.request.clone();
-    request.set_valid_before(valid_before);
+    request.set_valid_before(valid_before_from_now(payload.valid_for_secs)?);
 
     let signer = accounts.get_by_index(&payload.signer.pool, payload.signer.index)?;
     let sender = signer.address();
@@ -135,4 +124,25 @@ pub fn sign_tempo_expiring(
         .map_err(|error| eyre::eyre!("failed to sign Tempo tx: {error}"))?;
     let envelope = TempoTxEnvelope::from(unsigned.into_signed(signature));
     Ok(Bytes::from(envelope.encoded_2718()))
+}
+
+pub(crate) fn validate_valid_for_secs(valid_for_secs: u64) -> Result<()> {
+    if valid_for_secs == 0 || valid_for_secs > TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS {
+        bail!(
+            "Tempo expiring transactions require `valid_for_secs` in the range 1..={TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS}"
+        );
+    }
+    Ok(())
+}
+
+/// Validate `valid_for_secs` and add it to the current Unix time.
+pub(crate) fn valid_before_from_now(valid_for_secs: u64) -> Result<NonZeroU64> {
+    validate_valid_for_secs(valid_for_secs)?;
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .wrap_err("system clock is before the Unix epoch")?
+        .as_secs()
+        .checked_add(valid_for_secs)
+        .and_then(NonZeroU64::new)
+        .ok_or_else(|| eyre::eyre!("Tempo expiring `valid_before` overflowed Unix time"))
 }
