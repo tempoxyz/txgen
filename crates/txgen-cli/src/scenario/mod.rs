@@ -3,7 +3,7 @@
 use alloy_consensus::{SignableTransaction, Signed};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_network::Network;
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{Args, Subcommand};
 use eyre::{bail, Result, WrapErr};
 use rand::Rng;
 use std::{collections::BTreeMap, io::Write, path::PathBuf, time::Duration};
@@ -23,6 +23,7 @@ mod wait;
 pub use engine::{
     execute_scenario, validate_scenario_offline, FailurePolicy, ScenarioExecutionConfig,
 };
+pub use error::ScenarioActionDiagnostic;
 pub use report::{
     CausalEdgeReport, ChainReportConfig, FailureReport, InstanceLifecycle, LatencyDistribution,
     LifecycleStep, ProtocolMilestone, ScenarioReport, ScenarioReportConfig, StepReport,
@@ -102,8 +103,8 @@ pub struct ScenarioRunArgs {
     pub seed: Option<u64>,
 
     /// Behavior after an instance fails.
-    #[arg(long, value_enum, default_value_t = FailurePolicyArg::Continue)]
-    failure_policy: FailurePolicyArg,
+    #[arg(long, value_enum, default_value_t = FailurePolicy::Continue)]
+    failure_policy: FailurePolicy,
 
     /// Maximum transaction submissions per second on each chain (0 = unlimited).
     #[arg(long, default_value_t = 0)]
@@ -124,21 +125,6 @@ pub struct ScenarioRunArgs {
     /// Include the first N individual lifecycle records in the report.
     #[arg(long, default_value_t = 0)]
     pub sample_instances: usize,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum FailurePolicyArg {
-    FailFast,
-    Continue,
-}
-
-impl From<FailurePolicyArg> for FailurePolicy {
-    fn from(value: FailurePolicyArg) -> Self {
-        match value {
-            FailurePolicyArg::FailFast => Self::FailFast,
-            FailurePolicyArg::Continue => Self::Continue,
-        }
-    }
 }
 
 pub(crate) async fn run_scenario_command<A>(args: ScenarioArgs) -> Result<()>
@@ -204,11 +190,8 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    if args.count == Some(0) {
-        bail!("--count must be greater than zero");
-    }
     let destinations = ScenarioReportDestinations::parse(&args.reports)?;
-    let metadata = parse_metadata(&args.metadata)?;
+    let metadata: BTreeMap<_, _> = bench_core::parse_metadata(&args.metadata)?;
     let spec = ScenarioSpec::load(&args.scenario)?;
     let clickhouse_reporters = destinations
         .clickhouse_urls
@@ -228,7 +211,7 @@ where
             max_in_flight: args.max_in_flight,
             step_timeout: args.step_timeout,
             seed,
-            failure_policy: args.failure_policy.into(),
+            failure_policy: args.failure_policy,
             transaction_rate: args.tx_rate,
             max_rpc_in_flight: args.max_rpc_in_flight,
             sample_instances: args.sample_instances,
@@ -280,35 +263,9 @@ impl ScenarioReportDestinations {
 }
 
 fn canonical_clickhouse_url(value: &str) -> Result<String> {
-    let mut url = url::Url::parse(value).wrap_err("invalid scenario ClickHouse report URL")?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        bail!("scenario ClickHouse report URL must use HTTP or HTTPS");
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        bail!(
-            "scenario ClickHouse report URL must not contain credentials; use CLICKHOUSE_USER and CLICKHOUSE_PASSWORD"
-        );
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        bail!("scenario ClickHouse report URL must not contain a query string or fragment");
-    }
-    let path = url.path().trim_end_matches('/').to_string();
-    url.set_path(if path.is_empty() { "/" } else { &path });
+    let url = bench_core::clickhouse::parse_endpoint(value)
+        .wrap_err("invalid scenario ClickHouse report URL")?;
     Ok(url.as_str().trim_end_matches('/').to_string())
-}
-
-fn parse_metadata(values: &[String]) -> Result<BTreeMap<String, String>> {
-    let mut metadata = BTreeMap::new();
-    for value in values {
-        let (key, value) = value
-            .split_once('=')
-            .ok_or_else(|| eyre::eyre!("invalid metadata format '{value}'; expected key=value"))?;
-        if key.is_empty() {
-            bail!("metadata key cannot be empty");
-        }
-        metadata.insert(key.to_string(), value.to_string());
-    }
-    Ok(metadata)
 }
 
 fn finalize_scenario_reports(
@@ -547,16 +504,6 @@ mod tests {
             "clickhouse:https://clickhouse.example/".into(),
         ])
         .is_err());
-    }
-
-    #[test]
-    fn parses_metadata_and_rejects_malformed_values() {
-        let metadata =
-            parse_metadata(&["git-sha=abc".into(), "phase=nightly=zones".into()]).unwrap();
-        assert_eq!(metadata["git-sha"], "abc");
-        assert_eq!(metadata["phase"], "nightly=zones");
-        assert!(parse_metadata(&["missing-separator".into()]).is_err());
-        assert!(parse_metadata(&["=value".into()]).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]

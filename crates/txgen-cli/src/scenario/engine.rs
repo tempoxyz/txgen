@@ -1,17 +1,15 @@
 use super::{
-    error::StepError,
+    error::{ScenarioActionDiagnostic, StepError},
     report::{
-        unix_ms, ChainReportConfig, InstanceFailure, InstanceOutcome, ProtocolMilestone,
-        ScenarioAccumulator, ScenarioReport, ScenarioReportConfig, StepOutcome,
+        duration_ms, unix_ms, ChainReportConfig, InstanceFailure, InstanceOutcome,
+        ProtocolMilestone, ScenarioAccumulator, ScenarioReport, ScenarioReportConfig, StepOutcome,
     },
     schema::{
         AccountSelection, BindingDef, ChainDef, ChainId, ObservationMode, ScenarioExecutionMode,
         ScenarioSpec, StepAction, StepDef, SubmitAwait, SubmitStep,
     },
-    value::{
-        collect_variable_paths, eval_expression, materialize_yaml, RuntimeContext, RuntimeValue,
-    },
-    wait::{self, DEFAULT_POLL_INTERVAL},
+    value::{collect_variable_paths, materialize_yaml, RuntimeContext, RuntimeValue},
+    wait::{self, expression_hash, object, DEFAULT_POLL_INTERVAL},
 };
 use crate::{
     generate::{
@@ -21,7 +19,6 @@ use crate::{
     NetworkAdapter, ScenarioActionContext,
 };
 use alloy_consensus::{SignableTransaction, Signed};
-use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_eips::{eip2718::Encodable2718, BlockNumberOrTag};
 use alloy_network::{
     primitives::{BlockResponse, HeaderResponse},
@@ -50,14 +47,14 @@ use tokio::{
 };
 use txgen_core::{
     merge_yaml, AccountManager, AddressPoolManager, ArtifactManager, BuildContext,
-    NonceReservationKind, NonceTracker, SignerExt, TxPhase, WorkloadSpec,
+    NonceReservation, NonceReservationKind, NonceTracker, SignerExt, TxPhase, WorkloadSpec,
 };
 
 const FALLBACK_STEP_TIMEOUT: Duration = Duration::from_secs(300);
 const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Failure behavior after one scenario instance fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum FailurePolicy {
     /// Stop starting new instances; allow already-started instances to finish.
     FailFast,
@@ -380,12 +377,8 @@ where
                             _ = tokio::time::sleep(delay) => {}
                             joined = tasks.join_next() => {
                                 if let Some(joined) = joined {
-                                    let outcome = joined.wrap_err("scenario instance task failed")?;
                                     in_flight -= 1;
-                                    if outcome.failure.is_some() && config.failure_policy == FailurePolicy::FailFast {
-                                        stop_starting = true;
-                                    }
-                                    outcomes.record(outcome);
+                                    stop_starting |= record_instance(joined, config.failure_policy, &mut outcomes)?;
                                 }
                             }
                         }
@@ -419,12 +412,8 @@ where
             tokio::select! {
                 joined = tasks.join_next() => {
                     if let Some(joined) = joined {
-                        let outcome = joined.wrap_err("scenario instance task failed")?;
                         in_flight -= 1;
-                        if outcome.failure.is_some() && config.failure_policy == FailurePolicy::FailFast {
-                            stop_starting = true;
-                        }
-                        outcomes.record(outcome);
+                        stop_starting |= record_instance(joined, config.failure_policy, &mut outcomes)?;
                     }
                 }
                 _ = tokio::time::sleep(PROGRESS_LOG_INTERVAL.saturating_sub(last_progress.elapsed())) => {
@@ -465,19 +454,12 @@ where
             .iter()
             .enumerate()
             .map(|(index, step)| {
-                let dependencies = match self.spec.scenario.execution {
-                    ScenarioExecutionMode::Sequential if index > 0 => {
-                        vec![self.spec.scenario.steps[index - 1].effective_id(index - 1)]
-                    }
-                    ScenarioExecutionMode::Sequential => Vec::new(),
-                    ScenarioExecutionMode::Dag => step.depends_on.clone(),
-                };
                 (
                     step.effective_id(index),
                     step_name(index, step),
                     step.action.chain().to_string(),
                     step.action.name().to_string(),
-                    dependencies,
+                    self.step_dependencies(index),
                     step.provenance.clone(),
                 )
             })
@@ -491,23 +473,17 @@ where
                 chain_id: chain.chain_id,
                 workload: chain.workload_path.display().to_string(),
                 observation_mode: observation_mode_name(chain.observation_mode).to_string(),
-                observation_poll_interval_ms: u64::try_from(
-                    chain.observation_poll_interval.as_millis(),
-                )
-                .unwrap_or(u64::MAX),
+                observation_poll_interval_ms: duration_ms(chain.observation_poll_interval),
                 subscription_configured: chain.observation_subscription_configured,
             })
             .collect();
         let report_configuration = ScenarioReportConfig {
             chains: chain_configuration,
             requested_instances: config.count,
-            run_duration_ms: config
-                .duration
-                .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+            run_duration_ms: config.duration.map(duration_ms),
             starts_per_second: config.starts_per_second,
             maximum_in_flight: config.max_in_flight,
-            default_step_timeout_ms: u64::try_from(self.default_step_timeout.as_millis())
-                .unwrap_or(u64::MAX),
+            default_step_timeout_ms: duration_ms(self.default_step_timeout),
             transaction_rate_per_chain: config.transaction_rate,
             maximum_rpc_in_flight_per_chain: config.max_rpc_in_flight,
             seed: config.seed,
@@ -554,22 +530,15 @@ where
         let (mut context, _leases) = match self.bind_instance(instance, &mut rng).await {
             Ok(binding) => binding,
             Err(error) => {
-                let detail = error.sanitized_detail();
-                return InstanceOutcome {
-                    instance,
-                    started_at_unix_ms: unix_ms(started_at),
-                    finished_at_unix_ms: unix_ms(SystemTime::now()),
-                    elapsed: started.elapsed(),
-                    steps: Vec::new(),
-                    failure: Some(InstanceFailure {
-                        step_index: 0,
-                        step_name: "bindings".to_string(),
-                        failure_provenance: None,
-                        classification: error.classification.to_string(),
-                        timed_out: false,
-                        detail,
-                    }),
+                let failure = InstanceFailure {
+                    step_index: 0,
+                    step_name: "bindings".to_string(),
+                    failure_provenance: None,
+                    classification: error.classification.to_string(),
+                    timed_out: false,
+                    detail: error.sanitized_detail(),
                 };
+                return instance_outcome(instance, started_at, started, Vec::new(), Some(failure));
             }
         };
 
@@ -604,13 +573,8 @@ where
         let mut step_outcomes = Vec::new();
 
         for (index, step) in self.spec.scenario.steps.iter().enumerate() {
-            let dependencies = (index > 0)
-                .then(|| self.spec.scenario.steps[index - 1].effective_id(index - 1))
-                .into_iter()
-                .collect();
-            let (result, outcome) = self
-                .execute_one_step(instance, index, step, dependencies, context, rng, clock)
-                .await;
+            let (result, outcome) =
+                self.execute_one_step(instance, index, step, context, rng, clock).await;
 
             match result {
                 Ok(value) => {
@@ -647,14 +611,7 @@ where
             }
         }
 
-        InstanceOutcome {
-            instance,
-            started_at_unix_ms: unix_ms(started_at),
-            finished_at_unix_ms: unix_ms(SystemTime::now()),
-            elapsed: started.elapsed(),
-            steps: step_outcomes,
-            failure: None,
-        }
+        instance_outcome(instance, started_at, started, step_outcomes, None)
     }
 
     async fn run_dag_instance(
@@ -702,13 +659,11 @@ where
                 );
                 running.push(async move {
                     let mut rng = StdRng::seed_from_u64(step_seed);
-                    let dependencies = step.depends_on.clone();
                     let (result, outcome) = engine
                         .execute_one_step(
                             instance,
                             index,
                             &step,
-                            dependencies,
                             &step_context,
                             &mut rng,
                             &step_clock,
@@ -753,23 +708,26 @@ where
             return failed_outcome(instance, started_at, started, outcomes, index, &step, error);
         }
 
-        InstanceOutcome {
-            instance,
-            started_at_unix_ms: unix_ms(started_at),
-            finished_at_unix_ms: unix_ms(SystemTime::now()),
-            elapsed: started.elapsed(),
-            steps: outcomes,
-            failure: None,
+        instance_outcome(instance, started_at, started, outcomes, None)
+    }
+
+    /// Steps that must finish before `index` starts.
+    fn step_dependencies(&self, index: usize) -> Vec<String> {
+        let steps = &self.spec.scenario.steps;
+        match self.spec.scenario.execution {
+            ScenarioExecutionMode::Sequential if index > 0 => {
+                vec![steps[index - 1].effective_id(index - 1)]
+            }
+            ScenarioExecutionMode::Sequential => Vec::new(),
+            ScenarioExecutionMode::Dag => steps[index].depends_on.clone(),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn execute_one_step(
         &self,
         instance: u64,
         index: usize,
         step: &StepDef,
-        depends_on: Vec<String>,
         context: &RuntimeContext,
         rng: &mut StdRng,
         clock: &RunClock,
@@ -807,7 +765,7 @@ where
             id,
             name,
             kind,
-            depends_on,
+            depends_on: self.step_dependencies(index),
             provenance: step.provenance.clone(),
             success: result.is_ok(),
             latency: step_started.elapsed(),
@@ -919,21 +877,23 @@ where
                         },
                     )
                     .await
-                    .map_err(|error| StepError::new("invoke_error", error.to_string()))?;
-                let RuntimeValue::Object(mut output) = RuntimeValue::from_yaml(&output)
-                    .map_err(|error| StepError::new("invoke_error", error.to_string()))?
+                    .map_err(StepError::invoke)?;
+                let RuntimeValue::Object(mut output) =
+                    RuntimeValue::from_yaml(&output).map_err(|error| {
+                        StepError::invoke(
+                            error.wrap_err(ScenarioActionDiagnostic("invalid action output")),
+                        )
+                    })?
                 else {
-                    return Err(StepError::new(
-                        "invoke_error",
+                    return Err(StepError::invoke(eyre::Report::new(ScenarioActionDiagnostic(
                         "scenario action returned a non-object value",
-                    ));
+                    ))));
                 };
                 output.insert("chain".to_string(), RuntimeValue::String(chain.name.clone()));
                 output.insert("action".to_string(), RuntimeValue::String(invoke.action.clone()));
                 Ok(StepExecution { value: RuntimeValue::Object(output), milestones: Vec::new() })
             }
             StepAction::Submit(submit) => {
-                let submit_rng = rng.clone();
                 let ordered_predecessors = self.ordered_predecessor_ids(step_index);
                 let step_id = step.effective_id(step_index);
                 let submit_rank = self.spec.scenario.steps[..step_index]
@@ -975,7 +935,7 @@ where
                     })?;
                 let dense_unique_nonce_hint =
                     self.dense_unique_nonce_hint(chain, instance, step_index, submit)?;
-                let (value, next_rng) = chain
+                chain
                     .execute_submit(
                         instance,
                         step_name,
@@ -983,15 +943,13 @@ where
                         unique_nonce_hint,
                         dense_unique_nonce_hint,
                         &ordered_predecessors,
-                        submit.clone(),
-                        context.clone(),
-                        submit_rng,
+                        submit,
+                        context,
+                        rng,
                         deadline,
                         clock,
                     )
-                    .await?;
-                *rng = next_rng;
-                Ok(value)
+                    .await
             }
             StepAction::WaitReceipt(wait_receipt) => {
                 let hash = expression_hash(&wait_receipt.transaction_hash, context)
@@ -1212,22 +1170,44 @@ fn failed_outcome(
     step: &StepDef,
     error: StepError,
 ) -> InstanceOutcome {
-    let detail = error.sanitized_detail();
+    let failure = InstanceFailure {
+        step_index,
+        step_name: step_name(step_index, step),
+        failure_provenance: step.provenance.clone(),
+        classification: error.classification.to_string(),
+        timed_out: error.classification == "timeout",
+        detail: error.sanitized_detail(),
+    };
+    instance_outcome(instance, started_at, started, steps, Some(failure))
+}
+
+fn instance_outcome(
+    instance: u64,
+    started_at: SystemTime,
+    started: Instant,
+    steps: Vec<StepOutcome>,
+    failure: Option<InstanceFailure>,
+) -> InstanceOutcome {
     InstanceOutcome {
         instance,
         started_at_unix_ms: unix_ms(started_at),
         finished_at_unix_ms: unix_ms(SystemTime::now()),
         elapsed: started.elapsed(),
         steps,
-        failure: Some(InstanceFailure {
-            step_index,
-            step_name: step_name(step_index, step),
-            failure_provenance: step.provenance.clone(),
-            classification: error.classification.to_string(),
-            timed_out: error.classification == "timeout",
-            detail,
-        }),
+        failure,
     }
+}
+
+/// Record a finished instance and return whether it stops further starts.
+fn record_instance(
+    joined: Result<InstanceOutcome, tokio::task::JoinError>,
+    failure_policy: FailurePolicy,
+    outcomes: &mut ScenarioAccumulator,
+) -> Result<bool> {
+    let outcome = joined.wrap_err("scenario instance task failed")?;
+    let stop = outcome.failure.is_some() && failure_policy == FailurePolicy::FailFast;
+    outcomes.record(outcome);
+    Ok(stop)
 }
 
 struct ChainRuntime<A: NetworkAdapter> {
@@ -1284,57 +1264,60 @@ struct PreparedChain<A: NetworkAdapter> {
 
 #[derive(Default)]
 struct SubmissionLanes {
-    active: StdMutex<BTreeMap<[u8; 20], SubmissionLaneOwner>>,
-    ambiguous: StdMutex<BTreeSet<[u8; 20]>>,
-    seen_by_instance: StdMutex<BTreeMap<(u64, [u8; 20]), String>>,
+    state: StdMutex<SubmissionLaneState>,
     notify: tokio::sync::Notify,
 }
 
+#[derive(Default)]
+struct SubmissionLaneState {
+    active: BTreeMap<[u8; 20], SubmissionLaneOwner>,
+    ambiguous: BTreeSet<[u8; 20]>,
+    seen_by_instance: BTreeMap<(u64, [u8; 20]), String>,
+}
+
 impl SubmissionLanes {
+    fn state(&self) -> std::sync::MutexGuard<'_, SubmissionLaneState> {
+        self.state.lock().expect("submission lane mutex poisoned")
+    }
+
     fn try_acquire(
         self: &Arc<Self>,
         keys: BTreeSet<[u8; 20]>,
         owner: SubmissionLaneOwner,
         ordered_predecessors: &BTreeSet<String>,
     ) -> SubmissionLaneAcquire {
-        {
-            let seen =
-                self.seen_by_instance.lock().expect("submission lane history mutex poisoned");
-            if keys.iter().any(|key| {
-                seen.get(&(owner.instance, *key)).is_some_and(|previous| {
-                    previous != &owner.step && !ordered_predecessors.contains(previous)
-                })
-            }) {
-                return SubmissionLaneAcquire::UnsafeSameInstance;
-            }
+        let mut state = self.state();
+        if keys.iter().any(|key| {
+            state.seen_by_instance.get(&(owner.instance, *key)).is_some_and(|previous| {
+                previous != &owner.step && !ordered_predecessors.contains(previous)
+            })
+        }) {
+            return SubmissionLaneAcquire::UnsafeSameInstance;
         }
-        let mut active = self.active.lock().expect("submission lane mutex poisoned");
-        if active
+        if state
+            .active
             .iter()
             .any(|(key, existing)| keys.contains(key) && existing.instance == owner.instance)
         {
             return SubmissionLaneAcquire::UnsafeSameInstance;
         }
-        if keys.iter().any(|key| active.contains_key(key)) {
+        if keys.iter().any(|key| state.active.contains_key(key)) {
             return SubmissionLaneAcquire::Busy;
         }
-        active.extend(keys.iter().copied().map(|key| (key, owner.clone())));
-        self.seen_by_instance
-            .lock()
-            .expect("submission lane history mutex poisoned")
+        state.active.extend(keys.iter().copied().map(|key| (key, owner.clone())));
+        state
+            .seen_by_instance
             .extend(keys.iter().copied().map(|key| ((owner.instance, key), owner.step.clone())));
+        drop(state);
         SubmissionLaneAcquire::Acquired(SubmissionLaneGuard { lanes: self.clone(), keys, owner })
     }
 
     fn release_instance(&self, instance: u64) {
-        self.seen_by_instance
-            .lock()
-            .expect("submission lane history mutex poisoned")
-            .retain(|(seen_instance, _), _| *seen_instance != instance);
+        self.state().seen_by_instance.retain(|(seen_instance, _), _| *seen_instance != instance);
     }
 
     fn mark_ambiguous(&self, keys: &BTreeSet<[u8; 20]>) {
-        self.ambiguous.lock().expect("submission lane ambiguity mutex poisoned").extend(keys);
+        self.state().ambiguous.extend(keys);
     }
 
     fn has_ambiguous_ordered_lane(
@@ -1342,12 +1325,7 @@ impl SubmissionLanes {
         has_ordered_nonces: bool,
         keys: &BTreeSet<[u8; 20]>,
     ) -> bool {
-        has_ordered_nonces &&
-            self.ambiguous
-                .lock()
-                .expect("submission lane ambiguity mutex poisoned")
-                .iter()
-                .any(|key| keys.contains(key))
+        has_ordered_nonces && self.state().ambiguous.iter().any(|key| keys.contains(key))
     }
 }
 
@@ -1384,13 +1362,13 @@ impl Drop for InstanceSubmissionScope {
 
 impl Drop for SubmissionLaneGuard {
     fn drop(&mut self) {
-        let mut active = self.lanes.active.lock().expect("submission lane mutex poisoned");
+        let mut state = self.lanes.state();
         for key in &self.keys {
-            if active.get(key) == Some(&self.owner) {
-                active.remove(key);
+            if state.active.get(key) == Some(&self.owner) {
+                state.active.remove(key);
             }
         }
-        drop(active);
+        drop(state);
         self.lanes.notify.notify_waiters();
     }
 }
@@ -1494,6 +1472,7 @@ where
             &mut nonces,
             &mut rng,
         );
+        crate::generate::ensure_createx_code(&self.spec, &self.query_provider).await?;
         let submitter = self.submitter.clone();
         let setup = materialize_setup_online(
             &mut adapter,
@@ -1595,6 +1574,7 @@ where
             observation_subscription_configured,
             submitter,
         } = self;
+        crate::generate::ensure_createx_code(&spec, &query_provider).await?;
         let setup = {
             let mut rng = StdRng::seed_from_u64(setup_seed);
             let mut context = BuildContext::new_with_address_pools(
@@ -1732,7 +1712,11 @@ where
             .wrap_err_with(|| format!("failed to configure late signing for chain '{name}'"))?;
         let mut submitter = RpcSubmitter::new_with_request_auth(
             vec![RpcEndpoint::new(format!("{name}-submission"), submission_provider)],
-            SenderConfig { rate_limit: transaction_rate, max_concurrent: max_rpc_in_flight },
+            SenderConfig {
+                rate_limit: transaction_rate,
+                max_concurrent: max_rpc_in_flight,
+                rate_schedule: Vec::new(),
+            },
             request_auth,
         )?
         .with_receipt_tracker(bench_core::ReceiptTracker::new(query_provider.clone()));
@@ -1768,12 +1752,12 @@ where
         unique_nonce_hint: u64,
         dense_unique_nonce_hint: Option<u64>,
         ordered_predecessors: &BTreeSet<String>,
-        submit: SubmitStep,
-        context: RuntimeContext,
-        mut rng: StdRng,
+        submit: &SubmitStep,
+        context: &RuntimeContext,
+        rng: &mut StdRng,
         deadline: TokioInstant,
         clock: &RunClock,
-    ) -> Result<(StepExecution, StdRng), StepError> {
+    ) -> Result<StepExecution, StepError> {
         let (materialized, submission_lanes) = self
             .prepare_submission(
                 instance,
@@ -1783,40 +1767,12 @@ where
                 &submit.template,
                 &submit.with_value,
                 ordered_predecessors,
-                &context,
-                &mut rng,
+                context,
+                rng,
                 deadline,
             )
             .await?;
-        let has_ordered_nonces = materialized
-            .nonce_reservations
-            .iter()
-            .any(|reservation| reservation.kind == NonceReservationKind::Ordered);
-        if self
-            .submission_lanes
-            .has_ambiguous_ordered_lane(has_ordered_nonces, &submission_lanes.keys)
-        {
-            drop(submission_lanes);
-            match self.rollback_submitted_nonces(&materialized, deadline).await {
-                Some(true) => {}
-                Some(false) => {
-                    return Err(StepError::new(
-                        "nonce_recovery_error",
-                        "failed to restore nonce state after the affected nonce lane was disabled",
-                    ));
-                }
-                None => {
-                    return Err(StepError::new(
-                        "timeout",
-                        "step timed out while aborting after the affected nonce lane was disabled",
-                    ));
-                }
-            }
-            return Err(StepError::new(
-                "nonce_state_ambiguous",
-                "an earlier submission on this nonce lane had an unknown acceptance outcome",
-            ));
-        }
+        let has_ordered_nonces = has_ordered(&materialized.nonce_reservations);
         let attempt_started_at = SystemTime::now();
         let attempt_started = Instant::now();
         let prepared_hash = (materialized.tx_hash != B256::ZERO).then_some(materialized.tx_hash);
@@ -2006,31 +1962,22 @@ where
         let mut milestones = vec![submit_milestone];
         milestones.extend(receipt_milestone);
 
-        Ok((
-            StepExecution {
-                value: object([
-                    ("chain", RuntimeValue::String(self.name.clone())),
-                    ("template", RuntimeValue::String(submit.template.clone())),
-                    ("id", RuntimeValue::String(submit.template)),
-                    ("sender", RuntimeValue::Address(materialized.sender)),
-                    ("tx_hash", RuntimeValue::Bytes32(submission.tx_hash)),
-                    (
-                        "submitted_at",
-                        RuntimeValue::Uint(U256::from(unix_ms(submission.submitted_at))),
-                    ),
-                    (
-                        "acceptance_latency",
-                        RuntimeValue::Uint(U256::from(
-                            u64::try_from(submission.acceptance_latency.as_millis())
-                                .unwrap_or(u64::MAX),
-                        )),
-                    ),
-                    ("receipt", receipt),
-                ]),
-                milestones,
-            },
-            rng,
-        ))
+        Ok(StepExecution {
+            value: object([
+                ("chain", RuntimeValue::String(self.name.clone())),
+                ("template", RuntimeValue::String(submit.template.clone())),
+                ("id", RuntimeValue::String(submit.template.clone())),
+                ("sender", RuntimeValue::Address(materialized.sender)),
+                ("tx_hash", RuntimeValue::Bytes32(submission.tx_hash)),
+                ("submitted_at", RuntimeValue::Uint(U256::from(unix_ms(submission.submitted_at)))),
+                (
+                    "acceptance_latency",
+                    RuntimeValue::Uint(U256::from(duration_ms(submission.acceptance_latency))),
+                ),
+                ("receipt", receipt),
+            ]),
+            milestones,
+        })
     }
 
     async fn finish_receipts(&self) -> ReceiptCollection {
@@ -2102,19 +2049,11 @@ where
                 )
                 .await?;
             let reservations = prepared.nonce_reservations().to_vec();
-            let has_ordered_nonces = reservations
-                .iter()
-                .any(|reservation| reservation.kind == NonceReservationKind::Ordered);
-            let keys = reservations
-                .iter()
-                .filter(|reservation| reservation.kind == NonceReservationKind::Ordered)
-                .map(|reservation| reservation.key)
+            let has_ordered_nonces = has_ordered(&reservations);
+            let keys = ordered_keys(&reservations)
                 .chain(prepared.scheduling_keys())
                 .collect::<BTreeSet<_>>();
             if keys.is_empty() {
-                if !self.rollback_nonce_reservations(&reservations).await {
-                    self.submission_lanes.mark_ambiguous(&keys);
-                }
                 return Err(StepError::new(
                     "materialization_error",
                     "materialized transaction has no scheduling key",
@@ -2128,10 +2067,7 @@ where
                         "failed to restore nonce state after detecting an ambiguous nonce lane",
                     ));
                 }
-                return Err(StepError::new(
-                    "nonce_state_ambiguous",
-                    "an earlier submission on this nonce lane had an unknown acceptance outcome",
-                ));
+                return Err(nonce_state_ambiguous());
             }
 
             let notified = self.submission_lanes.notify.notified();
@@ -2173,10 +2109,7 @@ where
                             "failed to restore nonce state after detecting unsafe parallel submission",
                         ));
                     }
-                    return Err(StepError::new(
-                        "unsafe_parallel_nonce",
-                        "parallel steps in one scenario instance use the same ordered nonce lane; add an explicit dependency",
-                    ));
+                    return Err(unsafe_parallel_nonce());
                 }
                 SubmissionLaneAcquire::Busy if !has_ordered_nonces => {
                     *rng = attempt_rng;
@@ -2220,12 +2153,7 @@ where
                 ordered_predecessors,
             ) {
                 SubmissionLaneAcquire::Acquired(lanes) => return Ok(lanes),
-                SubmissionLaneAcquire::UnsafeSameInstance => {
-                    return Err(StepError::new(
-                        "unsafe_parallel_nonce",
-                        "parallel steps in one scenario instance use the same ordered nonce lane; add an explicit dependency",
-                    ));
-                }
+                SubmissionLaneAcquire::UnsafeSameInstance => return Err(unsafe_parallel_nonce()),
                 SubmissionLaneAcquire::Busy => {
                     tokio::time::timeout_at(deadline, notified)
                         .await
@@ -2240,24 +2168,18 @@ where
         transaction: MaterializedTx,
         lanes: SubmissionLaneGuard,
     ) -> Result<(MaterializedTx, SubmissionLaneGuard), StepError> {
-        let has_ordered_nonces = transaction
-            .nonce_reservations
-            .iter()
-            .any(|reservation| reservation.kind == NonceReservationKind::Ordered);
+        let has_ordered_nonces = has_ordered(&transaction.nonce_reservations);
         if !self.submission_lanes.has_ambiguous_ordered_lane(has_ordered_nonces, &lanes.keys) {
             return Ok((transaction, lanes));
         }
         drop(lanes);
-        if !self.rollback_reserved_nonces(&transaction).await {
+        if !self.rollback_nonce_reservations(&transaction.nonce_reservations).await {
             return Err(StepError::new(
                 "nonce_recovery_error",
                 "failed to restore nonce state after the affected nonce lane was disabled",
             ));
         }
-        Err(StepError::new(
-            "nonce_state_ambiguous",
-            "an earlier submission on this nonce lane had an unknown acceptance outcome",
-        ))
+        Err(nonce_state_ambiguous())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2311,16 +2233,8 @@ where
         };
         if let Some(error) = preparation_error {
             let reservations = build_context.take_nonce_reservations();
-            let mut restored = true;
-            let mut ordered_keys = BTreeSet::new();
-            for reservation in reservations.iter().rev() {
-                if reservation.kind == NonceReservationKind::Ordered {
-                    ordered_keys.insert(reservation.key);
-                    restored &= build_context.nonces.rewind(reservation.key, reservation.nonce);
-                }
-            }
-            if !restored {
-                self.submission_lanes.mark_ambiguous(&ordered_keys);
+            if !rewind_ordered(build_context.nonces, &reservations) {
+                self.submission_lanes.mark_ambiguous(&ordered_keys(&reservations).collect());
                 return Err(StepError::new(
                     "nonce_recovery_error",
                     "failed to restore nonce state after transaction preparation failed",
@@ -2339,22 +2253,8 @@ where
         .map_err(|error| StepError::new("materialization_error", error.to_string()))
     }
 
-    async fn rollback_nonce_reservations(
-        &self,
-        reservations: &[txgen_core::NonceReservation],
-    ) -> bool {
-        let mut nonces = self.nonces.lock().await;
-        let mut restored = true;
-        for reservation in reservations.iter().rev() {
-            if reservation.kind == NonceReservationKind::Ordered {
-                restored &= nonces.rewind(reservation.key, reservation.nonce);
-            }
-        }
-        restored
-    }
-
-    async fn rollback_reserved_nonces(&self, transaction: &MaterializedTx) -> bool {
-        self.rollback_nonce_reservations(&transaction.nonce_reservations).await
+    async fn rollback_nonce_reservations(&self, reservations: &[NonceReservation]) -> bool {
+        rewind_ordered(&mut *self.nonces.lock().await, reservations)
     }
 
     async fn rollback_submitted_nonces(
@@ -2362,17 +2262,13 @@ where
         transaction: &MaterializedTx,
         deadline: TokioInstant,
     ) -> Option<bool> {
-        if !transaction
-            .nonce_reservations
-            .iter()
-            .any(|reservation| reservation.kind == NonceReservationKind::Ordered)
-        {
+        if !has_ordered(&transaction.nonce_reservations) {
             return Some(true);
         }
         // Exclude speculative materialization while proving that this accepted
         // reservation is still the newest value on every affected lane.
         let _prepare_gate = lock_before_deadline(&self.submit_prepare_gate, deadline).await?;
-        Some(self.rollback_reserved_nonces(transaction).await)
+        Some(self.rollback_nonce_reservations(&transaction.nonce_reservations).await)
     }
 
     async fn checkpoint(&self) -> Result<RuntimeValue, StepError> {
@@ -2419,6 +2315,42 @@ where
             Err(StepError::timeout())
         }
     }
+}
+
+fn has_ordered(reservations: &[NonceReservation]) -> bool {
+    reservations.iter().any(|reservation| reservation.kind == NonceReservationKind::Ordered)
+}
+
+fn ordered_keys(reservations: &[NonceReservation]) -> impl Iterator<Item = [u8; 20]> + '_ {
+    reservations
+        .iter()
+        .filter(|reservation| reservation.kind == NonceReservationKind::Ordered)
+        .map(|reservation| reservation.key)
+}
+
+/// Rewind ordered reservations newest first; returns whether every lane was restored.
+fn rewind_ordered(nonces: &mut NonceTracker, reservations: &[NonceReservation]) -> bool {
+    let mut restored = true;
+    for reservation in reservations.iter().rev() {
+        if reservation.kind == NonceReservationKind::Ordered {
+            restored &= nonces.rewind(reservation.key, reservation.nonce);
+        }
+    }
+    restored
+}
+
+fn nonce_state_ambiguous() -> StepError {
+    StepError::new(
+        "nonce_state_ambiguous",
+        "an earlier submission on this nonce lane had an unknown acceptance outcome",
+    )
+}
+
+fn unsafe_parallel_nonce() -> StepError {
+    StepError::new(
+        "unsafe_parallel_nonce",
+        "parallel steps in one scenario instance use the same ordered nonce lane; add an explicit dependency",
+    )
 }
 
 async fn lock_before_deadline<T>(
@@ -2822,17 +2754,6 @@ fn account_binding_value(pool: &str, index: usize, address: Address) -> RuntimeV
     ])
 }
 
-fn expression_hash(value: &serde_yaml::Value, context: &RuntimeContext) -> Result<TxHash> {
-    match eval_expression(value, context)?.coerce_dyn_sol(&DynSolType::FixedBytes(32))? {
-        DynSolValue::FixedBytes(value, 32) => Ok(value),
-        _ => unreachable!("bytes32 coercion returned another type"),
-    }
-}
-
-fn object<const N: usize>(values: [(&str, RuntimeValue); N]) -> RuntimeValue {
-    RuntimeValue::Object(values.into_iter().map(|(key, value)| (key.to_string(), value)).collect())
-}
-
 fn step_name(index: usize, step: &StepDef) -> String {
     step.save.clone().unwrap_or_else(|| format!("step_{}_{}", index + 1, step.action.name()))
 }
@@ -2853,9 +2774,7 @@ fn observation_milestone(
     clock: &RunClock,
 ) -> ProtocolMilestone {
     let since_first = observation.first_observed.monotonic.elapsed();
-    let first_offset_ms = clock
-        .offset_ms()
-        .saturating_sub(u64::try_from(since_first.as_millis()).unwrap_or(u64::MAX));
+    let first_offset_ms = clock.offset_ms().saturating_sub(duration_ms(since_first));
     ProtocolMilestone {
         kind: kind.to_string(),
         chain: chain.to_string(),
