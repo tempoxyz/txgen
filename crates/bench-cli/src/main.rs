@@ -19,6 +19,7 @@ mod call;
 mod metrics_forwarder;
 mod metrics_url;
 mod preparation;
+mod reporting;
 mod send;
 mod send_blocks;
 mod view;
