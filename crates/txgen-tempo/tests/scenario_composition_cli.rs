@@ -3,15 +3,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
 };
-
-static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn validates_and_deterministically_renders_composed_scenario() {
-    let directory = TestDirectory::new("render");
+    let directory = tempfile::tempdir().expect("create scenario composition test directory");
     let scenario = write_valid_fixture(directory.path());
 
     let validation = scenario_command("validate", &scenario, None);
@@ -60,7 +56,7 @@ fn validates_and_deterministically_renders_composed_scenario() {
 
 #[test]
 fn validate_reports_fragment_use_context() {
-    let directory = TestDirectory::new("invalid");
+    let directory = tempfile::tempdir().expect("create scenario composition test directory");
     fs::write(directory.path().join("workload.yaml"), "chain_id: 1\n").unwrap();
     let scenario = directory.path().join("malformed.yaml");
     fs::write(
@@ -152,7 +148,7 @@ fn validate_rejects_static_errors_after_fragment_expansion() {
     ];
 
     for (name, workload, artifact, fragment_step, expected) in cases {
-        let directory = TestDirectory::new(name);
+        let directory = tempfile::tempdir().expect("create scenario composition test directory");
         let scenario =
             write_static_error_fixture(directory.path(), workload, artifact, fragment_step);
         let output = scenario_command("validate", &scenario, None);
@@ -275,32 +271,5 @@ fn assert_no_composition_structure(value: &Value) {
             !step.as_mapping().is_some_and(|step| step.contains_key("use")),
             "rendered scenario retained a fragment use"
         );
-    }
-}
-
-struct TestDirectory {
-    path: PathBuf,
-}
-
-impl TestDirectory {
-    fn new(name: &str) -> Self {
-        let unique = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "txgen-scenario-composition-{name}-{}-{timestamp}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir(&path).expect("create scenario composition test directory");
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TestDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
     }
 }

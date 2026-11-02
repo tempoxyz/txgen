@@ -1,8 +1,8 @@
 use alloy_primitives::{Address, Bytes, Selector, B256, U256};
-use eyre::{bail, Result};
 use serde::{Deserialize, Deserializer};
-use tempo_primitives::transaction::{CallScope, SelectorRule, TokenLimit};
-use txgen_core::{AccountPoolDef, AccountRef, CallDef, GenValue};
+use tempo_primitives::transaction::{CallScope, SelectorRule};
+use txgen_core::{AccountRef, CallDef, GenValue};
+use txgen_ethereum::EthTxType;
 
 /// Tempo transaction type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -14,12 +14,25 @@ pub enum TempoTxType {
     Tempo,
 }
 
+impl TempoTxType {
+    /// The equivalent Ethereum transaction type, or `None` for `tempo`.
+    pub(crate) fn evm_type(self) -> Option<EthTxType> {
+        match self {
+            Self::Legacy => Some(EthTxType::Legacy),
+            Self::Eip2930 => Some(EthTxType::Eip2930),
+            Self::Eip1559 => Some(EthTxType::Eip1559),
+            Self::Tempo => None,
+        }
+    }
+}
+
 /// Template for Tempo transactions.
 ///
 /// Supports all EVM transaction types (legacy, eip2930, eip1559) plus
 /// Tempo native 0x76 transactions with parallel nonces, sponsorship,
 /// fee tokens, and batched calls.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TempoTemplate {
     /// Transaction type.
     #[serde(rename = "type")]
@@ -117,6 +130,7 @@ pub struct TempoTemplate {
 
 /// Tempo account-keychain auth mode.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TempoAuthDef {
     /// Authentication mode.
     pub mode: TempoAuthMode,
@@ -165,6 +179,7 @@ pub enum KeyTypeDef {
 
 /// Access-key selection or derivation config.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessKeyDef {
     /// Setup step id to pair from.
     #[serde(default)]
@@ -190,27 +205,6 @@ pub struct AccessKeyDef {
 }
 
 impl AccessKeyDef {
-    pub(crate) fn inline_source(&self) -> Result<Option<AccountPoolDef>> {
-        let has_index = self.index.is_some();
-        let has_range = self.range.is_some();
-        if has_index && has_range {
-            bail!("inline access_key must set at most one of `index` or `range`");
-        }
-
-        let Some(mnemonic) = &self.mnemonic else {
-            if has_index || has_range {
-                bail!("inline access_key `index` or `range` requires `mnemonic`");
-            }
-            return Ok(None);
-        };
-
-        Ok(Some(AccountPoolDef {
-            mnemonic: mnemonic.clone(),
-            index: self.index,
-            range: self.range,
-        }))
-    }
-
     pub(crate) fn has_inline_source_fields(&self) -> bool {
         self.mnemonic.is_some() || self.index.is_some() || self.range.is_some()
     }
@@ -232,6 +226,7 @@ pub enum AccessKeyDeriveMode {
 
 /// YAML token spending limit.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenLimitDef {
     /// TIP20 token address.
     pub token: Address,
@@ -258,6 +253,7 @@ pub enum AllowedCallsDef {
 
 /// Per-target allowed call scope.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CallScopeDef {
     /// Target contract.
     pub target: Address,
@@ -269,6 +265,7 @@ pub struct CallScopeDef {
 
 /// Selector-level allowed call scope.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SelectorRuleDef {
     /// 4-byte selector as `0x`-prefixed hex.
     pub selector: Selector,
@@ -310,16 +307,6 @@ impl KeyTypeDef {
     }
 }
 
-impl AllowedCallsDef {
-    pub(crate) fn resolve(&self) -> Vec<CallScope> {
-        match self {
-            Self::Unrestricted => Vec::new(),
-            Self::DenyAll => Vec::new(),
-            Self::Scopes(scopes) => scopes.iter().map(CallScopeDef::resolve).collect(),
-        }
-    }
-}
-
 impl CallScopeDef {
     fn resolve(&self) -> CallScope {
         CallScope {
@@ -335,13 +322,11 @@ impl SelectorRuleDef {
     }
 }
 
+/// Resolve call scopes. `None` means unrestricted; an empty list denies all calls.
 pub(crate) fn resolve_allowed_calls(def: &Option<AllowedCallsDef>) -> Option<Vec<CallScope>> {
-    match def {
-        None | Some(AllowedCallsDef::Unrestricted) => None,
-        Some(allowed_calls) => Some(allowed_calls.resolve()),
+    match def.as_ref()? {
+        AllowedCallsDef::Unrestricted => None,
+        AllowedCallsDef::DenyAll => Some(Vec::new()),
+        AllowedCallsDef::Scopes(scopes) => Some(scopes.iter().map(CallScopeDef::resolve).collect()),
     }
-}
-
-pub(crate) fn token_limit(token: Address, limit: U256, period: u64) -> TokenLimit {
-    TokenLimit { token, limit, period }
 }

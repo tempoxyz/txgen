@@ -3,16 +3,19 @@ use axum::{extract::State, routing::post, Json, Router};
 use serde_json::{json, Value};
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::task::JoinHandle;
 use txgen_cli::scenario::{execute_scenario, FailurePolicy, ScenarioExecutionConfig, ScenarioSpec};
 use txgen_ethereum::EthereumAdapter;
+
+mod common;
+use common::{block_value, quantity, receipt_value};
 
 const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
 const EVENT_ADDRESS: Address = Address::repeat_byte(0x42);
@@ -101,35 +104,12 @@ impl BridgeState {
     }
 }
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let suffix =
-            SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after epoch").as_nanos();
-        let path = std::env::temp_dir()
-            .join(format!("txgen-two-chain-scenario-{}-{suffix}", std::process::id()));
-        fs::create_dir_all(&path).expect("create temporary test directory");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn executes_two_chain_roundtrip_with_backfilled_events() {
     let bridge = Arc::new(Mutex::new(BridgeState::default()));
     let (x_url, x_server) = spawn_rpc(MockChain::X, 1_001, bridge.clone()).await;
     let (y_url, y_server) = spawn_rpc(MockChain::Y, 1_002, bridge.clone()).await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
 
     write_fixture_files(directory.path(), &x_url, &y_url);
     let scenario = ScenarioSpec::load(&directory.path().join("scenario.yaml"))
@@ -209,7 +189,7 @@ async fn dag_runs_independent_delayed_branches_concurrently_before_join() {
         checkpoint_max_active.clone(),
     )
     .await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     write_fixture_files(directory.path(), &x_url, &y_url);
     fs::write(
         directory.path().join("dag-branches.yaml"),
@@ -282,7 +262,7 @@ scenario:
 async fn dag_rejects_unordered_regular_nonce_submissions_from_one_account() {
     let bridge = Arc::new(Mutex::new(BridgeState::default()));
     let (rpc_url, server) = spawn_rpc(MockChain::X, 1_001, bridge.clone()).await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     write_fixture_files(directory.path(), &rpc_url, &rpc_url);
     fs::write(
         directory.path().join("dag-regular-nonce.yaml"),
@@ -346,7 +326,7 @@ async fn execute_seeded_roundtrip(seed: u64) -> (Vec<Bytes>, Vec<Bytes>) {
     let bridge = Arc::new(Mutex::new(BridgeState::default()));
     let (x_url, x_server) = spawn_rpc(MockChain::X, 1_001, bridge.clone()).await;
     let (y_url, y_server) = spawn_rpc(MockChain::Y, 1_002, bridge.clone()).await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     write_fixture_files(directory.path(), &x_url, &y_url);
     let scenario = ScenarioSpec::load(&directory.path().join("scenario.yaml")).unwrap();
     let report = execute_scenario::<EthereumAdapter>(
@@ -377,7 +357,7 @@ async fn execute_seeded_roundtrip(seed: u64) -> (Vec<Bytes>, Vec<Bytes>) {
 async fn releases_account_lease_after_instance_timeout() {
     let bridge = Arc::new(Mutex::new(BridgeState::default()));
     let (rpc_url, server) = spawn_rpc(MockChain::X, 1_001, bridge).await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     write_fixture_files(directory.path(), &rpc_url, &rpc_url);
     fs::write(
         directory.path().join("lease-timeout.yaml"),
@@ -450,7 +430,7 @@ scenario:
 async fn handles_reverted_receipts_according_to_step_policy() {
     let bridge = Arc::new(Mutex::new(BridgeState::default()));
     let (rpc_url, server) = spawn_rpc_with_receipt_status(MockChain::X, 1_001, false, bridge).await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     write_fixture_files(directory.path(), &rpc_url, &rpc_url);
     fs::write(
         directory.path().join("reverted-submit.yaml"),
@@ -543,7 +523,7 @@ scenario:
 async fn rejects_invalid_literal_overlay_before_submission() {
     let bridge = Arc::new(Mutex::new(BridgeState::default()));
     let (rpc_url, server) = spawn_rpc(MockChain::X, 1_001, bridge.clone()).await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     write_fixture_files(directory.path(), &rpc_url, &rpc_url);
     fs::write(
         directory.path().join("invalid-overlay.yaml"),
@@ -647,8 +627,6 @@ async fn spawn_delayed_rpc_with_receipt_status(
     checkpoint_active: Arc<AtomicUsize>,
     checkpoint_max_active: Arc<AtomicUsize>,
 ) -> (String, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock RPC");
-    let address = listener.local_addr().expect("mock RPC address");
     let app = Router::new().route("/", post(handle_rpc)).with_state(RpcState {
         chain,
         chain_id,
@@ -658,10 +636,7 @@ async fn spawn_delayed_rpc_with_receipt_status(
         checkpoint_max_active,
         bridge,
     });
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve mock RPC");
-    });
-    (format!("http://{address}"), server)
+    common::serve(app).await
 }
 
 async fn handle_rpc(State(state): State<RpcState>, Json(request): Json<Value>) -> Json<Value> {
@@ -719,7 +694,7 @@ async fn handle_rpc(State(state): State<RpcState>, Json(request): Json<Value>) -
                 .and_then(Value::as_str)
                 .and_then(|value| value.parse::<B256>().ok())
                 .expect("transaction hash parameter");
-            receipt_value(tx_hash, state.receipt_status)
+            receipt_value(tx_hash, Address::repeat_byte(0x11), START_BLOCK, state.receipt_status)
         }
         "eth_getLogs" => {
             let filter = params.get(0).expect("eth_getLogs filter");
@@ -753,49 +728,6 @@ async fn handle_rpc(State(state): State<RpcState>, Json(request): Json<Value>) -
     Json(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
-fn receipt_value(transaction_hash: B256, status: bool) -> Value {
-    json!({
-        "status": if status { "0x1" } else { "0x0" },
-        "cumulativeGasUsed": "0x5208",
-        "logs": [],
-        "logsBloom": format!("0x{}", "00".repeat(256)),
-        "type": "0x2",
-        "transactionHash": transaction_hash,
-        "transactionIndex": "0x0",
-        "blockHash": B256::repeat_byte(0x55),
-        "blockNumber": quantity(START_BLOCK),
-        "gasUsed": "0x5208",
-        "effectiveGasPrice": "0x1",
-        "from": Address::repeat_byte(0x11),
-        "to": Address::repeat_byte(0x22),
-        "contractAddress": null
-    })
-}
-
-fn block_value(number: u64, hash: B256) -> Value {
-    json!({
-        "hash": hash,
-        "parentHash": B256::ZERO,
-        "sha3Uncles": B256::ZERO,
-        "miner": Address::ZERO,
-        "stateRoot": B256::ZERO,
-        "transactionsRoot": B256::ZERO,
-        "receiptsRoot": B256::ZERO,
-        "logsBloom": format!("0x{}", "00".repeat(256)),
-        "difficulty": "0x0",
-        "number": quantity(number),
-        "gasLimit": "0x1c9c380",
-        "gasUsed": "0x0",
-        "timestamp": "0x0",
-        "extraData": "0x",
-        "mixHash": B256::ZERO,
-        "nonce": "0x0000000000000000",
-        "baseFeePerGas": "0x0",
-        "transactions": [],
-        "uncles": []
-    })
-}
-
 fn event_log(signature: &str, request_id: B256, transaction_byte: u8) -> Value {
     json!({
         "address": EVENT_ADDRESS,
@@ -808,10 +740,6 @@ fn event_log(signature: &str, request_id: B256, transaction_byte: u8) -> Value {
         "logIndex": "0x0",
         "removed": false
     })
-}
-
-fn quantity(value: u64) -> String {
-    format!("0x{value:x}")
 }
 
 fn parse_quantity(value: &Value) -> Option<u64> {

@@ -7,7 +7,7 @@
 use alloy_primitives::{Address, Bytes};
 use eyre::{Context, Result};
 use std::{io::BufRead, path::Path};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use txgen_core::{dedup_scheduling_keys, GeneratedTx, LateSignSpec, SchedulingKey, TxPhase};
 
 /// A transaction read from a source.
@@ -116,14 +116,13 @@ impl TxSource for FileSource {
 
 /// Source that reads transactions from stdin.
 pub struct StdinSource {
-    reader: BufReader<tokio::io::Stdin>,
-    line_buf: String,
+    lines: Lines<BufReader<tokio::io::Stdin>>,
 }
 
 impl StdinSource {
     /// Create a new stdin source.
     pub fn new() -> Self {
-        Self { reader: BufReader::new(tokio::io::stdin()), line_buf: String::new() }
+        Self { lines: BufReader::new(tokio::io::stdin()).lines() }
     }
 }
 
@@ -135,19 +134,14 @@ impl Default for StdinSource {
 
 impl TxSource for StdinSource {
     async fn next_tx(&mut self) -> Result<Option<GeneratedTx>> {
-        self.line_buf.clear();
-        let bytes_read = self
-            .reader
-            .read_line(&mut self.line_buf)
-            .await
-            .context("failed to read line from stdin")?;
-
-        if bytes_read == 0 {
+        // `next_line` is cancellation safe, so callers may wrap this in a timeout.
+        let Some(line) = self.lines.next_line().await.context("failed to read line from stdin")?
+        else {
             return Ok(None);
-        }
+        };
 
         let source_tx: SourceTx =
-            serde_json::from_str(&self.line_buf).context("failed to parse NDJSON line")?;
+            serde_json::from_str(&line).context("failed to parse NDJSON line")?;
         Ok(Some(source_tx.into_generated_tx()?))
     }
 }
