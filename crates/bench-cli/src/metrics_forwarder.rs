@@ -1,20 +1,11 @@
 use bench_core::{
     PrometheusConfig, PrometheusForwarder, PrometheusForwarderHandle, Sample, SampleStore,
-    ScraperConfig,
 };
-use eyre::{bail, Context, Result};
-
-pub(crate) fn build_metrics_forwarder(
-    url: Option<&str>,
-    scraper_configs: &[ScraperConfig],
-) -> Result<Option<PrometheusForwarder>> {
+use eyre::{Context, Result};
+pub(crate) fn build_metrics_forwarder(url: Option<&str>) -> Result<Option<PrometheusForwarder>> {
     let Some(url) = url else {
         return Ok(None);
     };
-
-    if scraper_configs.is_empty() {
-        bail!("--metrics-forward requires at least one --metrics-url");
-    }
 
     let config = PrometheusConfig::from_env(url)?;
     PrometheusForwarder::spawn(config).map(Some).wrap_err("failed to create metrics forwarder")
