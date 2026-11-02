@@ -32,6 +32,7 @@ impl TempoTxType {
 /// Tempo native 0x76 transactions with parallel nonces, sponsorship,
 /// fee tokens, and batched calls.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TempoTemplate {
     /// Transaction type.
     #[serde(rename = "type")]
@@ -129,6 +130,7 @@ pub struct TempoTemplate {
 
 /// Tempo account-keychain auth mode.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TempoAuthDef {
     /// Authentication mode.
     pub mode: TempoAuthMode,
@@ -177,6 +179,7 @@ pub enum KeyTypeDef {
 
 /// Access-key selection or derivation config.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccessKeyDef {
     /// Setup step id to pair from.
     #[serde(default)]
@@ -223,6 +226,7 @@ pub enum AccessKeyDeriveMode {
 
 /// YAML token spending limit.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenLimitDef {
     /// TIP20 token address.
     pub token: Address,
@@ -249,6 +253,7 @@ pub enum AllowedCallsDef {
 
 /// Per-target allowed call scope.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CallScopeDef {
     /// Target contract.
     pub target: Address,
@@ -260,6 +265,7 @@ pub struct CallScopeDef {
 
 /// Selector-level allowed call scope.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SelectorRuleDef {
     /// 4-byte selector as `0x`-prefixed hex.
     pub selector: Selector,

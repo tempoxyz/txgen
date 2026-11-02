@@ -20,8 +20,8 @@ pub use plugin::{BuildContext, SelectedSigner};
 pub use scheduling_key::{dedup_scheduling_keys, SchedulingKey};
 pub use setup::setup_submission_order;
 pub use spec::{
-    AbiEncodePackedDef, AbiHashDef, GasConfig, MixEntry, MixItem, SequenceBinding, SequenceDef,
-    SequenceStep, SetupDef, SetupStep, WorkloadSpec,
+    AbiValuesDef, GasConfig, MixEntry, MixItem, SequenceBinding, SequenceDef, SequenceStep,
+    SetupDef, SetupStep, WorkloadSpec,
 };
 pub use value::{FromGenerator, GenValue, Generator, ValueResolver};
 pub use yaml::{append_yaml, expand_env_vars, merge_yaml};

@@ -10,12 +10,18 @@ use serde::{Deserialize, Serialize};
 use std::{
     num::NonZeroU64,
     path::Path,
-    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tempo_alloy::rpc::TempoTransactionRequest;
-use tempo_primitives::{transaction::TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS, TempoTxEnvelope};
+use tempo_primitives::TempoTxEnvelope;
 use txgen_core::{AccountManager, LateSignSpec, WorkloadSpec};
+
+/// Longest expiring-nonce validity window accepted on every Tempo hardfork.
+///
+/// tempo-primitives no longer exports this limit: it is hardfork-dependent
+/// (`TempoHardfork::expiring_nonce_max_expiry_secs`, 300s from T11). Keep the
+/// pre-T11 bound so signed payloads stay valid on any network.
+const TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS: u64 = 30;
 
 /// Discriminator for relative Tempo expiring-nonce signing.
 pub const FORMAT_TEMPO_EXPIRING_RELATIVE: &str = "tempo_expiring_relative";
@@ -66,13 +72,13 @@ impl TempoExpiringPayload {
 
 /// Signer used by bench for deferred Tempo transactions.
 pub struct TempoLateSigner {
-    accounts: Arc<AccountManager>,
+    accounts: AccountManager,
 }
 
 impl TempoLateSigner {
     /// Build a signer from a loaded workload specification.
     pub fn from_spec(spec: &WorkloadSpec) -> Result<Self> {
-        Ok(Self { accounts: Arc::new(AccountManager::from_spec(&spec.accounts)?) })
+        Ok(Self { accounts: AccountManager::from_spec(&spec.accounts)? })
     }
 
     /// Build a signer from a workload YAML file.

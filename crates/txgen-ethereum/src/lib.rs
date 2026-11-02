@@ -42,17 +42,6 @@ impl NetworkAdapter for EthereumAdapter {
             late_sign: None,
         })
     }
-
-    #[allow(clippy::manual_async_fn)]
-    fn prepare_nonces<'a>(
-        &'a self,
-        _spec: &'a txgen_core::WorkloadSpec,
-        accounts: &'a txgen_core::AccountManager,
-        nonces: &'a mut txgen_core::NonceTracker,
-        rpc: &'a str,
-    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
-        async move { txgen_cli::fetch_pending_protocol_nonces(accounts, nonces, rpc).await }
-    }
 }
 
 /// Build an unsigned legacy, EIP-2930 or EIP-1559 request from `template`.

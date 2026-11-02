@@ -49,27 +49,7 @@ impl ClickHouseClient {
         user: Option<String>,
         password: Option<String>,
     ) -> Result<Self> {
-        let url = url.into();
-        let trimmed_url = url.trim();
-        if trimmed_url.is_empty() {
-            bail!("ClickHouse endpoint must not be empty");
-        }
-
-        let mut parsed = reqwest::Url::parse(trimmed_url).context("invalid ClickHouse endpoint")?;
-        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-            bail!("ClickHouse endpoint must be an HTTP or HTTPS URL");
-        }
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            bail!(
-                "ClickHouse endpoint must not contain credentials; use CLICKHOUSE_USER and CLICKHOUSE_PASSWORD"
-            );
-        }
-        if parsed.query().is_some() || parsed.fragment().is_some() {
-            bail!("ClickHouse endpoint must not contain a query string or fragment");
-        }
-        let path = parsed.path().trim_end_matches('/').to_string();
-        parsed.set_path(if path.is_empty() { "/" } else { &path });
-
+        let parsed = parse_endpoint(&url.into())?;
         let database = database.into();
         validate_identifier("database", &database)?;
 
@@ -131,6 +111,30 @@ impl ClickHouseClient {
         tracing::info!(table, rows = rows.len(), "Inserted rows into ClickHouse");
         Ok(())
     }
+}
+
+/// Validate a credential-free HTTP(S) ClickHouse endpoint and drop any trailing slash.
+pub fn parse_endpoint(url: &str) -> Result<reqwest::Url> {
+    let trimmed_url = url.trim();
+    if trimmed_url.is_empty() {
+        bail!("ClickHouse endpoint must not be empty");
+    }
+
+    let mut parsed = reqwest::Url::parse(trimmed_url).context("invalid ClickHouse endpoint")?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        bail!("ClickHouse endpoint must be an HTTP or HTTPS URL");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!(
+            "ClickHouse endpoint must not contain credentials; use CLICKHOUSE_USER and CLICKHOUSE_PASSWORD"
+        );
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        bail!("ClickHouse endpoint must not contain a query string or fragment");
+    }
+    let path = parsed.path().trim_end_matches('/').to_string();
+    parsed.set_path(if path.is_empty() { "/" } else { &path });
+    Ok(parsed)
 }
 
 fn validate_identifier(kind: &str, value: &str) -> Result<()> {

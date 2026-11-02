@@ -1,4 +1,7 @@
-use super::schema::{ScenarioSpec, StepProvenance};
+use super::{
+    schema::{ScenarioSpec, StepProvenance},
+    value::{validate_component, validate_name, validate_path},
+};
 use eyre::{bail, Result, WrapErr};
 use serde::Deserialize;
 use std::{
@@ -278,7 +281,7 @@ impl ScenarioResolver {
 
     fn register_fragments(&mut self, document: &LocatedDocument) -> Result<()> {
         for (name, definition) in &document.document.fragments {
-            validate_nonempty_name(name, "fragment").wrap_err_with(|| {
+            validate_name(name, "fragment").wrap_err_with(|| {
                 format!("invalid fragment declaration in '{}'", document.source_file)
             })?;
             validate_fragment_definition(name, definition, &document.source_file)?;
@@ -841,7 +844,7 @@ fn parse_use(value: &serde_yaml::Value, label: &str) -> Result<Option<UseDef>> {
         .get(string_key("use"))
         .and_then(serde_yaml::Value::as_str)
         .ok_or_else(|| eyre::eyre!("{label} `use` must name a fragment with a string"))?;
-    validate_nonempty_name(fragment, "fragment").wrap_err_with(|| format!("invalid {label}"))?;
+    validate_name(fragment, "fragment").wrap_err_with(|| format!("invalid {label}"))?;
     let alias = mapping
         .get(string_key("as"))
         .and_then(serde_yaml::Value::as_str)
@@ -1172,29 +1175,6 @@ fn string_key(name: &str) -> serde_yaml::Value {
 
 fn join_path(prefix: Option<&str>, component: &str) -> String {
     prefix.map_or_else(|| component.to_string(), |prefix| format!("{prefix}.{component}"))
-}
-
-fn validate_nonempty_name(name: &str, context: &str) -> Result<()> {
-    if name.trim().is_empty() {
-        bail!("{context} name must not be empty");
-    }
-    Ok(())
-}
-
-fn validate_component(name: &str, context: &str) -> Result<()> {
-    validate_nonempty_name(name, context)?;
-    if name.contains('.') {
-        bail!("{context} '{name}' must be one name component and cannot contain '.'");
-    }
-    Ok(())
-}
-
-fn validate_path(path: &str, context: &str) -> Result<()> {
-    validate_nonempty_name(path, context)?;
-    if path.split('.').any(str::is_empty) {
-        bail!("{context} '{path}' contains an empty path component");
-    }
-    Ok(())
 }
 
 fn step_label(source_file: &str, local_step_index: usize) -> String {

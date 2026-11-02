@@ -34,6 +34,7 @@ alloy-transport = "2"
 alloy-transport-http = { version = "2", features = ["jwt-auth", "hyper"] }
 
 # async
+futures.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "io-std"] }
 
 # misc

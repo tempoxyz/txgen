@@ -1,6 +1,8 @@
 use super::{
     composition,
-    value::{collect_variable_paths, RuntimeValue},
+    value::{
+        collect_variable_paths, validate_component, validate_name, validate_path, RuntimeValue,
+    },
 };
 use alloy_dyn_abi::DynSolType;
 use alloy_primitives::{Address, B256, I256, U256};
@@ -586,7 +588,7 @@ impl ScenarioSpec {
         }
 
         for (name, binding) in &self.scenario.bindings {
-            validate_runtime_root(name, "binding")?;
+            validate_component(name, "binding")?;
             match binding {
                 BindingDef::Account(account) if account.pool.trim().is_empty() => {
                     bail!("account binding '{name}' has an empty pool");
@@ -606,7 +608,6 @@ impl ScenarioSpec {
         match self.scenario.execution {
             ScenarioExecutionMode::Sequential => {
                 self.validate_declared_step_ids(false)?;
-                let mut available = self.binding_roots();
                 for (index, step) in self.scenario.steps.iter().enumerate() {
                     if !step.depends_on.is_empty() {
                         bail!(
@@ -614,16 +615,13 @@ impl ScenarioSpec {
                             step.diagnostic_label(index)
                         );
                     }
-                    self.validate_step(index, step, &saves, &available, None)?;
-                    if let Some(save) = &step.save {
-                        available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
-                    }
+                    self.validate_step(index, step, &saves, &self.available_roots(0..index), None)?;
                 }
             }
             ScenarioExecutionMode::Dag => {
                 let graph = self.validate_dag_graph()?;
                 for (index, step) in self.scenario.steps.iter().enumerate() {
-                    let available = self.available_roots_for_ancestors(&graph.ancestors[index]);
+                    let available = self.available_roots(graph.ancestors[index].iter().copied());
                     self.validate_step(
                         index,
                         step,
@@ -638,34 +636,23 @@ impl ScenarioSpec {
         Ok(())
     }
 
-    fn binding_roots(&self) -> BTreeMap<String, AvailableRoot> {
-        self.scenario
-            .bindings
-            .iter()
-            .map(|(name, binding)| {
-                (
-                    name.clone(),
-                    match binding {
-                        BindingDef::Account(_) => AvailableRoot::AccountBinding,
-                        BindingDef::Bytes32(_) => AvailableRoot::Bytes32Binding,
-                    },
-                )
-            })
-            .collect()
-    }
-
-    fn available_roots_for_ancestors(
+    /// Bindings plus the saves of the given steps.
+    fn available_roots(
         &self,
-        ancestors: &BTreeSet<usize>,
+        steps: impl IntoIterator<Item = usize>,
     ) -> BTreeMap<String, AvailableRoot> {
-        let mut available = self.binding_roots();
-        for index in ancestors {
-            let step = &self.scenario.steps[*index];
-            if let Some(save) = &step.save {
-                available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
-            }
-        }
-        available
+        let bindings = self.scenario.bindings.iter().map(|(name, binding)| {
+            let root = match binding {
+                BindingDef::Account(_) => AvailableRoot::AccountBinding,
+                BindingDef::Bytes32(_) => AvailableRoot::Bytes32Binding,
+            };
+            (name.clone(), root)
+        });
+        let saves = steps.into_iter().filter_map(|index| {
+            let step = &self.scenario.steps[index];
+            Some((step.save.clone()?, AvailableRoot::Saved(step.saved_kind())))
+        });
+        bindings.chain(saves).collect()
     }
 
     fn validate_declared_step_ids(&self, require_all: bool) -> Result<BTreeMap<String, usize>> {
@@ -680,7 +667,7 @@ impl ScenarioSpec {
                 }
                 continue;
             };
-            validate_step_id(id).wrap_err_with(|| {
+            validate_path(id, "step ID").wrap_err_with(|| {
                 format!("{} has an invalid step ID", step.diagnostic_label(index))
             })?;
             if let Some(previous) = ids.insert(id.clone(), index) {
@@ -702,7 +689,7 @@ impl ScenarioSpec {
         for (index, step) in self.scenario.steps.iter().enumerate() {
             let mut seen = BTreeSet::new();
             for dependency in &step.depends_on {
-                validate_step_id(dependency).wrap_err_with(|| {
+                validate_path(dependency, "step ID").wrap_err_with(|| {
                     format!("{} has an invalid dependency ID", step.diagnostic_label(index))
                 })?;
                 if !seen.insert(dependency) {
@@ -761,7 +748,7 @@ impl ScenarioSpec {
         let mut saves = BTreeMap::new();
         for (index, step) in self.scenario.steps.iter().enumerate() {
             let Some(save) = &step.save else { continue };
-            validate_save_path(save)?;
+            validate_path(save, "save")?;
             let root = save.split('.').next().expect("validated save path");
             if self.scenario.bindings.contains_key(root) {
                 bail!(
@@ -800,20 +787,11 @@ impl ScenarioSpec {
         accepts_precomputed_hash: bool,
         filter_name: &str,
     ) -> Result<()> {
-        let mut available = self.binding_roots();
-        match self.scenario.execution {
-            ScenarioExecutionMode::Sequential => {
-                for step in self.scenario.steps.iter().take(step_index) {
-                    if let Some(save) = &step.save {
-                        available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
-                    }
-                }
-            }
-            ScenarioExecutionMode::Dag => {
-                let graph = self.validate_dag_graph()?;
-                available = self.available_roots_for_ancestors(&graph.ancestors[step_index]);
-            }
-        }
+        let available = match self.scenario.execution {
+            ScenarioExecutionMode::Sequential => self.available_roots(0..step_index),
+            ScenarioExecutionMode::Dag => self
+                .available_roots(self.validate_dag_graph()?.ancestors[step_index].iter().copied()),
+        };
 
         let Some(actual) = expression_static_type(expression, &available)? else {
             return Ok(());
@@ -838,26 +816,13 @@ impl ScenarioSpec {
         label: &str,
     ) -> Result<()> {
         let saves = self.collect_saves()?;
-        let mut available = self.binding_roots();
-        match self.scenario.execution {
-            ScenarioExecutionMode::Sequential => {
-                for step in self.scenario.steps.iter().take(step_index) {
-                    if let Some(save) = &step.save {
-                        available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
-                    }
-                }
-            }
-            ScenarioExecutionMode::Dag => {
-                // The expanded concrete steps validate every actual parameter use
-                // against its dependency ancestry. Retain all save shapes here so
-                // the fragment-boundary check can still determine the argument type.
-                for step in &self.scenario.steps {
-                    if let Some(save) = &step.save {
-                        available.insert(save.clone(), AvailableRoot::Saved(step.saved_kind()));
-                    }
-                }
-            }
-        }
+        let available = match self.scenario.execution {
+            ScenarioExecutionMode::Sequential => self.available_roots(0..step_index),
+            // The expanded concrete steps validate every actual parameter use
+            // against its dependency ancestry. Retain all save shapes here so
+            // the fragment-boundary check can still determine the argument type.
+            ScenarioExecutionMode::Dag => self.available_roots(0..self.scenario.steps.len()),
+        };
 
         let paths = collect_variable_paths(expression)
             .map_err(|error| eyre::eyre!("invalid {label}: {error}"))?;
@@ -969,7 +934,7 @@ impl ScenarioSpec {
                         );
                     }
                     for (event_id, event) in &wait.events {
-                        validate_runtime_root(event_id, "receipt event ID")
+                        validate_component(event_id, "receipt event ID")
                             .wrap_err_with(|| format!("{label} has an invalid event ID"))?;
                         if event.abi.trim().is_empty() {
                             bail!("{label} event '{event_id}' has an empty ABI name");
@@ -1265,91 +1230,22 @@ fn validate_account_path(root: &str, tail: Option<&str>) -> Result<()> {
 
 fn validate_saved_path(root: &str, kind: SavedKind, tail: Option<&str>) -> Result<()> {
     let Some(tail) = tail else { return Ok(()) };
-    let valid = match kind {
-        SavedKind::Checkpoint => {
-            matches!(tail, "chain" | "block_number" | "block_hash" | "captured_at")
-        }
+    if matches!(kind, SavedKind::Submit { receipt: false }) &&
+        (tail == "receipt" || tail.starts_with("receipt."))
+    {
+        bail!("saved submit result '{root}' has no receipt because the step does not await one");
+    }
+    // Invoke outputs and decoded event arguments have no static shape.
+    let dynamic = match kind {
         SavedKind::Invoke => true,
-        SavedKind::Submit { receipt } => {
-            if (tail == "receipt" || tail.starts_with("receipt.")) && !receipt {
-                bail!("saved submit result '{root}' has no receipt because the step does not await one");
-            }
-            matches!(
-                tail,
-                "chain" |
-                    "template" |
-                    "id" |
-                    "sender" |
-                    "tx_hash" |
-                    "submitted_at" |
-                    "acceptance_latency" |
-                    "receipt" |
-                    "receipt.chain" |
-                    "receipt.transaction_hash" |
-                    "receipt.tx_hash" |
-                    "receipt.block_hash" |
-                    "receipt.block_number" |
-                    "receipt.transaction_index" |
-                    "receipt.block_timestamp_ms" |
-                    "receipt.first_observed_at" |
-                    "receipt.confirmed_at" |
-                    "receipt.confirmation_depth" |
-                    "receipt.status" |
-                    "receipt.gas_used" |
-                    "receipt.observed_at"
-            )
-        }
-        SavedKind::Receipt => {
-            matches!(
-                tail,
-                "chain" |
-                    "transaction_hash" |
-                    "tx_hash" |
-                    "block_hash" |
-                    "block_number" |
-                    "transaction_index" |
-                    "block_timestamp_ms" |
-                    "first_observed_at" |
-                    "confirmed_at" |
-                    "confirmation_depth" |
-                    "status" |
-                    "gas_used" |
-                    "observed_at"
-            )
-        }
-        SavedKind::Log { grouped } => {
-            matches!(
-                tail,
-                "chain" |
-                    "transaction_hash" |
-                    "tx_hash" |
-                    "block_hash" |
-                    "block_number" |
-                    "transaction_index" |
-                    "block_timestamp_ms" |
-                    "first_observed_at" |
-                    "observed_at" |
-                    "confirmed_at" |
-                    "confirmation_depth"
-            ) || if grouped {
-                tail == "events" ||
-                    tail.starts_with("events.") ||
-                    matches!(tail, "status" | "gas_used")
-            } else {
-                tail == "args" ||
-                    tail.starts_with("args.") ||
-                    matches!(
-                        tail,
-                        "address" | "contract_address" | "log_index" | "event" | "event_name"
-                    )
-            }
-        }
+        SavedKind::Log { grouped: true } => tail.starts_with("events."),
+        SavedKind::Log { grouped: false } => tail.starts_with("args."),
+        _ => false,
     };
-    if valid {
-        Ok(())
-    } else {
+    if !dynamic && saved_field_type(kind, tail).is_none() {
         bail!("saved step result '{root}' has no field '{tail}'");
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1511,15 +1407,22 @@ fn static_reference_type(
             _ => None,
         },
         AvailableRoot::Bytes32Binding => tail.is_empty().then_some(StaticValueType::Bytes32),
-        AvailableRoot::Saved(SavedKind::Checkpoint) => match tail {
+        AvailableRoot::Saved(kind) => saved_field_type(*kind, tail),
+    }
+}
+
+/// Static type of a saved step result field; an empty tail is the result itself.
+fn saved_field_type(kind: SavedKind, tail: &str) -> Option<StaticValueType> {
+    match kind {
+        SavedKind::Checkpoint => match tail {
             "" => Some(StaticValueType::Object),
             "chain" => Some(StaticValueType::String),
             "block_number" | "captured_at" => Some(StaticValueType::Uint),
             "block_hash" => Some(StaticValueType::Bytes32),
             _ => None,
         },
-        AvailableRoot::Saved(SavedKind::Invoke) => None,
-        AvailableRoot::Saved(SavedKind::Submit { .. }) => match tail {
+        SavedKind::Invoke => None,
+        SavedKind::Submit { .. } => match tail {
             "" | "receipt" => Some(StaticValueType::Object),
             "chain" | "template" | "id" | "receipt.chain" => Some(StaticValueType::String),
             "sender" => Some(StaticValueType::Address),
@@ -1539,7 +1442,7 @@ fn static_reference_type(
             "receipt.status" => Some(StaticValueType::Bool),
             _ => None,
         },
-        AvailableRoot::Saved(SavedKind::Receipt) => match tail {
+        SavedKind::Receipt => match tail {
             "" => Some(StaticValueType::Object),
             "chain" => Some(StaticValueType::String),
             "transaction_hash" | "tx_hash" | "block_hash" => Some(StaticValueType::Bytes32),
@@ -1550,19 +1453,19 @@ fn static_reference_type(
             "status" => Some(StaticValueType::Bool),
             _ => None,
         },
-        AvailableRoot::Saved(SavedKind::Log { grouped }) => match tail {
+        SavedKind::Log { grouped } => match tail {
             "" => Some(StaticValueType::Object),
             "chain" => Some(StaticValueType::String),
             "transaction_hash" | "tx_hash" | "block_hash" => Some(StaticValueType::Bytes32),
             "block_number" | "transaction_index" | "block_timestamp_ms" | "first_observed_at" |
             "observed_at" | "confirmed_at" | "confirmation_depth" => Some(StaticValueType::Uint),
-            "events" if *grouped => Some(StaticValueType::Object),
-            "status" if *grouped => Some(StaticValueType::Bool),
-            "gas_used" if *grouped => Some(StaticValueType::Uint),
-            "args" if !*grouped => Some(StaticValueType::Object),
-            "event" | "event_name" if !*grouped => Some(StaticValueType::String),
-            "address" | "contract_address" if !*grouped => Some(StaticValueType::Address),
-            "log_index" if !*grouped => Some(StaticValueType::Uint),
+            "events" if grouped => Some(StaticValueType::Object),
+            "status" if grouped => Some(StaticValueType::Bool),
+            "gas_used" if grouped => Some(StaticValueType::Uint),
+            "args" if !grouped => Some(StaticValueType::Object),
+            "event" | "event_name" if !grouped => Some(StaticValueType::String),
+            "address" | "contract_address" if !grouped => Some(StaticValueType::Address),
+            "log_index" if !grouped => Some(StaticValueType::Uint),
             _ => None,
         },
     }
@@ -1578,37 +1481,6 @@ fn validate_optional_nonzero(value: Option<u64>, label: &str, field: &str) -> Re
 fn validate_optional_duration(value: Option<Duration>, label: &str, field: &str) -> Result<()> {
     if value == Some(Duration::ZERO) {
         bail!("{label} {field} must be greater than zero");
-    }
-    Ok(())
-}
-
-fn validate_name(name: &str, context: &str) -> Result<()> {
-    if name.trim().is_empty() {
-        bail!("{context} name must not be empty");
-    }
-    Ok(())
-}
-
-fn validate_runtime_root(name: &str, context: &str) -> Result<()> {
-    validate_name(name, context)?;
-    if name.contains('.') {
-        bail!("{context} name '{name}' must not contain '.'");
-    }
-    Ok(())
-}
-
-fn validate_save_path(path: &str) -> Result<()> {
-    validate_name(path, "save")?;
-    if path.split('.').any(str::is_empty) {
-        bail!("save path '{path}' contains an empty component");
-    }
-    Ok(())
-}
-
-fn validate_step_id(id: &str) -> Result<()> {
-    validate_name(id, "step ID")?;
-    if id.split('.').any(str::is_empty) {
-        bail!("step ID '{id}' contains an empty component");
     }
     Ok(())
 }

@@ -23,14 +23,15 @@ mod wait;
 pub use engine::{
     execute_scenario, validate_scenario_offline, FailurePolicy, ScenarioExecutionConfig,
 };
+pub use error::ScenarioActionDiagnostic;
 pub use report::{
     CausalEdgeReport, ChainReportConfig, FailureReport, InstanceLifecycle, LatencyDistribution,
     LifecycleStep, ProtocolMilestone, ScenarioReport, ScenarioReportConfig, StepReport,
 };
 pub use schema::*;
 pub use value::{
-    coerce_event_filter, collect_variable_paths, eval_expression, event_value_matches,
-    materialize_yaml, RuntimeContext, RuntimeValue,
+    coerce_event_filter, collect_variable_paths, eval_expression, materialize_yaml, RuntimeContext,
+    RuntimeValue,
 };
 
 /// Nested `scenario` command.
@@ -190,7 +191,7 @@ where
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
     let destinations = ScenarioReportDestinations::parse(&args.reports)?;
-    let metadata = parse_metadata(&args.metadata)?;
+    let metadata: BTreeMap<_, _> = bench_core::parse_metadata(&args.metadata)?;
     let spec = ScenarioSpec::load(&args.scenario)?;
     let clickhouse_reporters = destinations
         .clickhouse_urls
@@ -262,35 +263,9 @@ impl ScenarioReportDestinations {
 }
 
 fn canonical_clickhouse_url(value: &str) -> Result<String> {
-    let mut url = url::Url::parse(value).wrap_err("invalid scenario ClickHouse report URL")?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        bail!("scenario ClickHouse report URL must use HTTP or HTTPS");
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        bail!(
-            "scenario ClickHouse report URL must not contain credentials; use CLICKHOUSE_USER and CLICKHOUSE_PASSWORD"
-        );
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        bail!("scenario ClickHouse report URL must not contain a query string or fragment");
-    }
-    let path = url.path().trim_end_matches('/').to_string();
-    url.set_path(if path.is_empty() { "/" } else { &path });
+    let url = bench_core::clickhouse::parse_endpoint(value)
+        .wrap_err("invalid scenario ClickHouse report URL")?;
     Ok(url.as_str().trim_end_matches('/').to_string())
-}
-
-fn parse_metadata(values: &[String]) -> Result<BTreeMap<String, String>> {
-    let mut metadata = BTreeMap::new();
-    for value in values {
-        let (key, value) = value
-            .split_once('=')
-            .ok_or_else(|| eyre::eyre!("invalid metadata format '{value}'; expected key=value"))?;
-        if key.is_empty() {
-            bail!("metadata key cannot be empty");
-        }
-        metadata.insert(key.to_string(), value.to_string());
-    }
-    Ok(metadata)
 }
 
 fn finalize_scenario_reports(
@@ -529,16 +504,6 @@ mod tests {
             "clickhouse:https://clickhouse.example/".into(),
         ])
         .is_err());
-    }
-
-    #[test]
-    fn parses_metadata_and_rejects_malformed_values() {
-        let metadata =
-            parse_metadata(&["git-sha=abc".into(), "phase=nightly=zones".into()]).unwrap();
-        assert_eq!(metadata["git-sha"], "abc");
-        assert_eq!(metadata["phase"], "nightly=zones");
-        assert!(parse_metadata(&["missing-separator".into()]).is_err());
-        assert!(parse_metadata(&["=value".into()]).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]
