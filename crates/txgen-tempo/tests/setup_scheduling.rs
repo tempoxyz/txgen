@@ -1,21 +1,12 @@
 use serde_json::Value;
-use std::{
-    fs,
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{fs, process::Command};
 
 const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
 
 fn generate(spec: &str) -> (std::process::Output, Vec<Value>) {
-    let test_dir = std::env::temp_dir().join(format!(
-        "txgen-setup-order-{}-{}",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
-    ));
-    fs::create_dir_all(&test_dir).unwrap();
-    let spec_path = test_dir.join("spec.yaml");
-    let output_path = test_dir.join("generated.ndjson");
+    let test_dir = tempfile::tempdir().unwrap();
+    let spec_path = test_dir.path().join("spec.yaml");
+    let output_path = test_dir.path().join("generated.ndjson");
     fs::write(&spec_path, spec).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_txgen-tempo"))
         .args(["generate", "--spec"])
@@ -29,7 +20,6 @@ fn generate(spec: &str) -> (std::process::Output, Vec<Value>) {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    fs::remove_dir_all(test_dir).unwrap();
     (output, txs)
 }
 

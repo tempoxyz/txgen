@@ -30,8 +30,6 @@ pub type SampleCallback = Arc<dyn Fn() -> Vec<Sample> + Send + Sync>;
 pub struct ScraperConfig {
     /// URL of the Prometheus metrics endpoint (e.g. `http://127.0.0.1:9001/metrics`).
     pub url: String,
-    /// Optional node label to add to scraped Prometheus samples.
-    pub node_label: Option<String>,
     /// Additional labels to add to scraped Prometheus samples.
     pub labels: BTreeMap<String, String>,
     /// Scrape interval.
@@ -45,17 +43,10 @@ impl ScraperConfig {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
-            node_label: None,
             labels: BTreeMap::new(),
             interval: Duration::from_millis(500),
             timeout: Duration::from_secs(2),
         }
-    }
-
-    /// Set the `node` label applied to scraped Prometheus samples.
-    pub fn with_node_label(mut self, label: impl Into<String>) -> Self {
-        self.node_label = Some(label.into());
-        self
     }
 
     /// Set labels applied to scraped Prometheus samples.
@@ -69,26 +60,19 @@ impl ScraperConfig {
         self.interval = interval;
         self
     }
-
-    /// Set the HTTP timeout.
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
 }
 
-/// Handle returned by [`start_scraper`]. Stops the scraper on drop.
+/// Handle to a single scraper task returned by [`start_scrapers`].
 pub struct ScraperHandle {
     stop_tx: watch::Sender<bool>,
     handle: tokio::task::JoinHandle<()>,
-    scrape_count: Arc<AtomicU64>,
-    error_count: Arc<AtomicU64>,
+    counters: Arc<ScraperCounters>,
 }
 
-#[derive(Clone)]
+#[derive(Default)]
 struct ScraperCounters {
-    scrape_count: Arc<AtomicU64>,
-    error_count: Arc<AtomicU64>,
+    scrape_count: AtomicU64,
+    error_count: AtomicU64,
 }
 
 impl ScraperHandle {
@@ -100,12 +84,12 @@ impl ScraperHandle {
 
     /// Number of successful scrapes so far.
     pub fn scrape_count(&self) -> u64 {
-        self.scrape_count.load(Ordering::Relaxed)
+        self.counters.scrape_count.load(Ordering::Relaxed)
     }
 
     /// Number of failed scrapes so far.
     pub fn error_count(&self) -> u64 {
-        self.error_count.load(Ordering::Relaxed)
+        self.counters.error_count.load(Ordering::Relaxed)
     }
 }
 
@@ -125,33 +109,23 @@ pub fn start_scrapers(
     callback: SampleCallback,
     forwarder: Option<PrometheusForwarderHandle>,
 ) -> Vec<ScraperHandle> {
-    let (stop_tx, stop_rx) = watch::channel(false);
-    let counters = ScraperCounters {
-        scrape_count: Arc::new(AtomicU64::new(0)),
-        error_count: Arc::new(AtomicU64::new(0)),
-    };
-
     configs
         .iter()
         .enumerate()
         .map(|(idx, config)| {
-            let counters = counters.clone();
+            let (stop_tx, stop_rx) = watch::channel(false);
+            let counters = Arc::new(ScraperCounters::default());
             let handle = tokio::spawn(scraper_loop(
                 config.clone(),
                 clock.clone(),
                 store.clone(),
                 (idx == 0).then(|| callback.clone()),
                 forwarder.clone(),
-                stop_rx.clone(),
+                stop_rx,
                 counters.clone(),
             ));
 
-            ScraperHandle {
-                stop_tx: stop_tx.clone(),
-                handle,
-                scrape_count: counters.scrape_count.clone(),
-                error_count: counters.error_count.clone(),
-            }
+            ScraperHandle { stop_tx, handle, counters }
         })
         .collect()
 }
@@ -163,7 +137,7 @@ async fn scraper_loop(
     extra_samples: Option<SampleCallback>,
     forwarder: Option<PrometheusForwarderHandle>,
     mut stop_rx: watch::Receiver<bool>,
-    counters: ScraperCounters,
+    counters: Arc<ScraperCounters>,
 ) {
     let client = reqwest::Client::builder().timeout(config.timeout).build().unwrap_or_default();
 
@@ -199,7 +173,7 @@ async fn scraper_loop(
             Ok(resp) => match resp.text().await {
                 Ok(text) => {
                     let mut samples = parse_prometheus_text(&text, offset_ms, unix_ms);
-                    apply_labels(&mut samples, config.node_label.as_deref(), &config.labels);
+                    apply_labels(&mut samples, &config.labels);
                     if !samples.is_empty() &&
                         let Err(err) = push_samples(&store, forwarder.as_ref(), samples).await
                     {
@@ -235,17 +209,8 @@ async fn push_samples(
     Ok(())
 }
 
-fn apply_labels(
-    samples: &mut [Sample],
-    node_label: Option<&str>,
-    labels: &BTreeMap<String, String>,
-) {
-    if let Some(node_label) = node_label {
-        for sample in &mut *samples {
-            sample.labels.insert("node".to_string(), node_label.to_string());
-        }
-    }
-    for sample in &mut *samples {
+fn apply_labels(samples: &mut [Sample], labels: &BTreeMap<String, String>) {
+    for sample in samples {
         sample.labels.extend(labels.iter().map(|(key, value)| (key.clone(), value.clone())));
     }
 }
@@ -298,47 +263,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_node_label_adds_label_to_all_samples() {
-        let mut samples = vec![
-            Sample {
-                name: "reth_db_size".to_string(),
-                labels: BTreeMap::new(),
-                value: 1.0,
-                offset_ms: 10,
-                unix_ms: 1000,
-            },
-            Sample {
-                name: "reth_table_size".to_string(),
-                labels: BTreeMap::from([("table".to_string(), "Headers".to_string())]),
-                value: 2.0,
-                offset_ms: 10,
-                unix_ms: 1000,
-            },
-        ];
-
-        apply_labels(&mut samples, Some("a"), &BTreeMap::new());
-
-        assert_eq!(samples[0].labels["node"], "a");
-        assert_eq!(samples[1].labels["node"], "a");
-        assert_eq!(samples[1].labels["table"], "Headers");
-    }
-
-    #[test]
-    fn apply_node_label_overwrites_existing_node_label() {
-        let mut samples = vec![Sample {
-            name: "reth_db_size".to_string(),
-            labels: BTreeMap::from([("node".to_string(), "old".to_string())]),
-            value: 1.0,
-            offset_ms: 10,
-            unix_ms: 1000,
-        }];
-
-        apply_labels(&mut samples, Some("new"), &BTreeMap::new());
-
-        assert_eq!(samples[0].labels["node"], "new");
-    }
-
-    #[test]
     fn apply_labels_adds_validator_identity() {
         let mut samples = vec![Sample {
             name: "reth_db_size".to_string(),
@@ -352,9 +276,39 @@ mod tests {
             ("validator".to_string(), "v0".to_string()),
         ]);
 
-        apply_labels(&mut samples, None, &labels);
+        apply_labels(&mut samples, &labels);
 
         assert_eq!(samples[0].labels["validator"], "v0");
         assert_eq!(samples[0].labels["region"], "us-east-1");
+    }
+
+    #[tokio::test]
+    async fn scraper_handles_have_independent_counters_and_stop() {
+        let unreachable = "http://127.0.0.1:1/metrics";
+        let configs = [
+            ScraperConfig::new(unreachable).with_interval(Duration::from_millis(5)),
+            ScraperConfig::new(unreachable).with_interval(Duration::from_secs(3600)),
+        ];
+        let mut handles = start_scrapers(
+            &configs,
+            RunClock::new(),
+            SampleStore::new().unwrap(),
+            Arc::new(Vec::new),
+            None,
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while handles[0].error_count() < 3 || handles[1].error_count() < 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(handles[1].error_count(), 1);
+
+        let slow = handles.pop().unwrap();
+        handles.pop().unwrap().stop().await;
+        assert!(!slow.handle.is_finished());
+        slow.stop().await;
     }
 }
