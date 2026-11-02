@@ -1,7 +1,7 @@
 use alloy_primitives::{keccak256, Address, B256};
 use alloy_signer::Signer;
 use alloy_signer_local::{coins_bip39::English, MnemonicBuilder, Secp256k1Signer};
-use eyre::{bail, Result, WrapErr};
+use eyre::{bail, ensure, Result, WrapErr};
 use rand::Rng;
 use serde::{Deserialize, Deserializer};
 use std::{collections::HashMap, sync::Mutex};
@@ -225,6 +225,7 @@ impl FastAddressPool {
 
 /// Definition of an account pool in the workload spec.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccountPoolDef {
     /// BIP-39 mnemonic phrase (supports `${ENV_VAR}` expansion).
     pub mnemonic: String,
@@ -247,6 +248,7 @@ impl AccountPoolDef {
 
 /// Definition of a destination-only address pool in the workload spec.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddressPoolDef {
     /// Literal destination addresses.
     #[serde(default)]
@@ -269,6 +271,7 @@ pub struct AddressPoolDef {
 
 /// Definition of a fast deterministic destination-only address pool.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FastAddressPoolDef {
     /// Seed string hashed before deriving addresses.
     pub seed: String,
@@ -281,12 +284,6 @@ pub struct FastAddressPoolDef {
 }
 
 impl AddressPoolDef {
-    /// Derive destination-only addresses from this pool definition eagerly.
-    pub fn derive_addresses(&self) -> Result<Vec<Address>> {
-        let pool = self.to_pool()?;
-        (0..pool.len()).map(|idx| pool.get_by_index(idx)).collect()
-    }
-
     fn to_pool(&self) -> Result<AddressPool> {
         let has_addresses = !self.addresses.is_empty();
         let has_mnemonic = self.mnemonic.is_some();
@@ -345,10 +342,12 @@ fn selected_range(
     range: Option<[u32; 2]>,
     context: &str,
 ) -> Result<(u32, usize)> {
+    ensure!(index.is_none() || range.is_none(), "{context} must not set both 'index' and 'range'");
     if let Some(idx) = index {
         Ok((idx, 1))
     } else if let Some([start, end]) = range {
-        Ok((start, end.saturating_sub(start) as usize))
+        ensure!(start <= end, "{context} range end must be greater than or equal to start");
+        Ok((start, (end - start) as usize))
     } else {
         bail!("{context} must have either 'index' or 'range'");
     }
@@ -359,6 +358,7 @@ fn selected_fast_range(
     range: Option<[u64; 2]>,
     context: &str,
 ) -> Result<(u64, usize)> {
+    ensure!(index.is_none() || range.is_none(), "{context} must not set both 'index' and 'range'");
     if let Some(idx) = index {
         Ok((idx, 1))
     } else if let Some([start, end]) = range {
@@ -398,6 +398,7 @@ fn derive_fast_address(seed: B256, index: u64) -> Address {
 
 /// Reference to an account in a pool.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AccountRef {
     /// Pool name.
     pub pool: String,
@@ -477,6 +478,28 @@ mod tests {
     }
 
     #[test]
+    fn test_pool_rejects_invalid_index_and_range() {
+        let pool =
+            |index, range| AccountPoolDef { mnemonic: TEST_MNEMONIC.to_string(), index, range };
+        assert!(pool(Some(0), Some([0, 2])).derive_signers().is_err());
+        assert!(pool(None, Some([2, 1])).derive_signers().is_err());
+
+        let fast = FastAddressPoolDef {
+            seed: TEST_MNEMONIC.to_string(),
+            index: Some(0),
+            range: Some([0, 2]),
+        };
+        let def = AddressPoolDef {
+            addresses: Vec::new(),
+            mnemonic: None,
+            index: None,
+            range: None,
+            fast: Some(fast),
+        };
+        assert!(AddressPoolManager::from_spec(&HashMap::from([("fast".to_string(), def)])).is_err());
+    }
+
+    #[test]
     fn test_account_manager_get_random() {
         use rand::SeedableRng;
 
@@ -506,10 +529,10 @@ mod tests {
             fast: None,
         };
 
-        let addresses = def.derive_addresses()?;
-        assert_eq!(addresses.len(), 3);
+        let pool = def.to_pool()?;
+        assert_eq!(pool.len(), 3);
         assert_eq!(
-            addresses[0],
+            pool.get_by_index(0)?,
             AccountPoolDef { mnemonic: TEST_MNEMONIC.to_string(), index: Some(0), range: None }
                 .derive_signers()?[0]
                 .address()

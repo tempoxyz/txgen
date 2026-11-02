@@ -6,39 +6,36 @@
 //! (as `BlockRlp`) and `reth_forkchoiceUpdated`,
 //! collecting per-block timing and engine status from [`alloy_reth::RethPayloadStatus`].
 
-use crate::{
-    load_metric_names,
-    metrics_forwarder::{build_metrics_forwarder, finish_metrics_forwarder, push_samples},
-    metrics_url::metrics_scraper_configs,
-    send::parse_metadata,
-    wait_for_persistence::WaitForPersistence,
-    SendBlocksArgs,
-};
+use crate::{reporting::Reporting, wait_for_persistence::WaitForPersistence, SendBlocksArgs};
 use alloy_consensus::Header as ConsensusHeader;
 use alloy_network::Ethereum;
-use alloy_primitives::{Address, Bytes, B256};
-use alloy_provider::{ext::TestingApi, Provider, RootProvider};
-use alloy_reth::{BigBlockData, RethApi, RethNewPayloadInput, RethNewPayloadParams};
+use alloy_primitives::{keccak256, Address, Bytes, B256};
+use alloy_provider::{
+    ext::{TestingApi, TxPoolApi},
+    Provider, RootProvider,
+};
+use alloy_reth::{
+    BigBlockData, RethApi, RethNewPayloadInput, RethNewPayloadParams, RethPayloadStatus,
+};
 use alloy_rlp::{Decodable, Header};
 use alloy_rpc_types_engine::{
     ExecutionData, ForkchoiceState, JwtSecret, PayloadAttributes, TestingBuildBlockRequestV1,
 };
 use alloy_transport_http::{AuthLayer, Http, HyperClient};
 use bench_core::{
-    parse_reporters, start_scrapers, BlockStats, ConsoleReporter, FinalReport, ProgressState,
-    Reporter, RunClock, RunStats, Sample, SampleStore,
+    parse_metadata, BlockStats, FinalReport, ProgressState, Reporter, RunClock, RunStats, Sample,
 };
 use eyre::{Context, Result};
+use futures::StreamExt;
 use std::{
-    collections::BTreeMap,
-    io::BufRead,
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 /// NDJSON line from the block source (`txgen extract` output).
 #[derive(serde::Deserialize)]
@@ -113,7 +110,8 @@ impl ReorgState {
 struct ProcessingState<'a> {
     collector: &'a mut MetricsCollector,
     reorg_state: Option<&'a mut ReorgState>,
-    persistence_policy: &'a WaitForPersistence,
+    mempool: Option<&'a mut MempoolReplay>,
+    persistence_policy: WaitForPersistence,
 }
 
 const REORG_NON_BLOB_TX_DROP_INTERVAL: usize = 10;
@@ -124,9 +122,8 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let jwt_secret =
         JwtSecret::from_hex(jwt_secret_hex.trim()).wrap_err("invalid JWT secret hex")?;
 
-    let metadata = parse_metadata(&args.metadata)?;
-    let scraper_configs =
-        metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
+    let metadata: HashMap<_, _> = parse_metadata(&args.reporting.metadata)?;
+    let scraper_configs = args.reporting.scraper_configs()?;
     let persistence_policy = args.wait_for_persistence;
     tracing::info!(
         engine = %args.engine,
@@ -135,6 +132,8 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         wait_time_ms = args.wait_time.map(|d| d.as_millis()),
         reorg_depth = args.reorg,
         reorg_gap = args.reorg.map(|_| args.reorg_gap),
+        mempool_delay_ms = args.mempool.then_some(args.mempool_delay.as_millis()),
+        mempool_fraction = args.mempool.then_some(args.mempool_fraction),
         rpc = %args.rpc,
         "Starting block submission"
     );
@@ -145,89 +144,55 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
     let testing_provider =
         RootProvider::<Ethereum>::new_http(args.rpc.parse().wrap_err("invalid RPC URL")?);
 
-    let clickhouse_metric_names = load_metric_names(args.clickhouse_metrics_file.as_ref())?;
-    let mut reporters =
-        parse_reporters(&args.reports, "send-blocks", &metadata, clickhouse_metric_names)?;
-    if reporters.is_empty() {
-        reporters.push(Box::new(ConsoleReporter::stderr(false)));
-    }
-
-    let clock = RunClock::new();
-    let store = SampleStore::with_labels(metadata.clone())?;
-    let counters = Arc::new(BlockCounters::default());
-    let metrics_forwarder =
-        build_metrics_forwarder(args.metrics_forward.as_deref(), &metadata, &scraper_configs)?;
-
-    // Start background scraper if metrics URL is configured.
-    let scraper_handles = if !scraper_configs.is_empty() {
-        let snap_counters = counters.clone();
-        let snap_clock = clock.clone();
-        let callback: bench_core::SampleCallback =
-            Arc::new(move || snap_counters.snapshot_samples(&snap_clock));
-        let forwarder_handle = metrics_forwarder.as_ref().map(|f| f.handle());
-
-        start_scrapers(&scraper_configs, clock.clone(), store.clone(), callback, forwarder_handle)
-    } else {
-        Vec::new()
+    let clock = match args.reporting.metrics_align {
+        Some(start) => RunClock::new_with_start_unix_ms(start),
+        None => RunClock::new(),
     };
+    let counters = Arc::new(BlockCounters::default());
+    let snap_counters = counters.clone();
+    let snap_clock = clock.clone();
+    let mut reporting = Reporting::start(
+        &args.reporting,
+        "send-blocks",
+        &metadata,
+        &scraper_configs,
+        &clock,
+        Arc::new(move || snap_counters.snapshot_samples(&snap_clock)),
+        false,
+    )?;
 
     let mut collector = MetricsCollector::new(counters);
-    let mut reorg_state = args.reorg.map(|depth| ReorgState::new(depth, args.reorg_gap));
+    let mut reorg_state = args.reorg.map(|depth| ReorgState::new(depth.get(), args.reorg_gap));
+    let mut mempool = args.mempool.then(|| MempoolReplay {
+        delay: args.mempool_delay,
+        fraction: args.mempool_fraction,
+        totals: MempoolStats::default(),
+    });
     let start = Instant::now();
 
-    if let Some(ref path) = args.input {
-        let file = std::fs::File::open(path).wrap_err("failed to open input file")?;
-        let reader = std::io::BufReader::new(file);
-
-        for line in reader.lines() {
-            let line = line.wrap_err("failed to read line")?;
-            let input = parse_input_line(&line)?;
-
-            process_input_and_wait(
-                &provider,
-                &testing_provider,
-                input,
-                ProcessingState {
-                    collector: &mut collector,
-                    reorg_state: reorg_state.as_mut(),
-                    persistence_policy: &persistence_policy,
-                },
-                args.wait_time,
-                start,
-                &mut reporters,
-            )
-            .await?;
-        }
-    } else {
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin);
-        let mut line_buf = String::new();
-
-        loop {
-            line_buf.clear();
-            let bytes_read =
-                reader.read_line(&mut line_buf).await.wrap_err("failed to read from stdin")?;
-            if bytes_read == 0 {
-                break;
-            }
-
-            let input = parse_input_line(&line_buf)?;
-
-            process_input_and_wait(
-                &provider,
-                &testing_provider,
-                input,
-                ProcessingState {
-                    collector: &mut collector,
-                    reorg_state: reorg_state.as_mut(),
-                    persistence_policy: &persistence_policy,
-                },
-                args.wait_time,
-                start,
-                &mut reporters,
-            )
-            .await?;
-        }
+    let reader: Box<dyn AsyncBufRead + Unpin> = match &args.input {
+        Some(path) => Box::new(BufReader::new(
+            tokio::fs::File::open(path).await.wrap_err("failed to open input file")?,
+        )),
+        None => Box::new(BufReader::new(tokio::io::stdin())),
+    };
+    let mut lines = reader.lines();
+    while let Some(line) = lines.next_line().await.wrap_err("failed to read input line")? {
+        process_input_and_wait(
+            &provider,
+            &testing_provider,
+            parse_input_line(&line)?,
+            ProcessingState {
+                collector: &mut collector,
+                reorg_state: reorg_state.as_mut(),
+                mempool: mempool.as_mut(),
+                persistence_policy,
+            },
+            args.wait_time,
+            start,
+            &mut reporting.reporters,
+        )
+        .await?;
     }
 
     if let Some(reorg_state) = reorg_state.as_mut() {
@@ -236,44 +201,38 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
             &testing_provider,
             reorg_state,
             &mut collector,
-            &persistence_policy,
+            persistence_policy,
             args.wait_time,
             start,
-            &mut reporters,
+            &mut reporting.reporters,
             None,
         )
         .await?;
     }
 
-    // Stop the scraper before finalizing.
-    if !scraper_handles.is_empty() {
+    if let Some(MempoolReplay { totals, .. }) = &mempool {
         tracing::info!(
-            scrapers = scraper_handles.len(),
-            scrapes = scraper_handles.iter().map(|h| h.scrape_count()).sum::<u64>(),
-            errors = scraper_handles.iter().map(|h| h.error_count()).sum::<u64>(),
-            "Stopping metrics scrapers"
+            accepted = totals.accepted,
+            rejected = totals.rejected_total(),
+            blobs = totals.blobs,
+            unselected = totals.unselected,
+            rejections = ?totals.rejected,
+            "Mempool submission summary"
         );
-        for handle in scraper_handles {
-            handle.stop().await;
-        }
     }
+
+    reporting.stop_scrapers().await;
 
     // Push a final snapshot so counter totals are captured even if the
     // last scraper tick fired before the final block was submitted.
-    let final_samples = collector.final_snapshot(&clock);
-    let forwarder_handle = metrics_forwarder.as_ref().map(|f| f.handle());
-    push_samples(&store, forwarder_handle.as_ref(), final_samples).await?;
+    reporting.push_samples(collector.final_snapshot(&clock)).await?;
 
-    let sample_archive = store.finish().await?;
+    let sample_archive = reporting.store.finish().await?;
 
     let blocks = std::mem::take(&mut collector.blocks);
     let run_stats = RunStats::from_blocks_wall_time(&blocks, start.elapsed());
 
-    for block in &blocks {
-        for reporter in reporters.iter_mut() {
-            reporter.on_block(block)?;
-        }
-    }
+    reporting.on_blocks(&blocks)?;
 
     let report = FinalReport {
         metadata: metadata.clone(),
@@ -283,19 +242,7 @@ pub async fn execute(args: SendBlocksArgs) -> Result<()> {
         ..Default::default()
     };
 
-    let mut finalize_result = Ok(());
-    for reporter in reporters.iter_mut() {
-        if let Err(err) = reporter.finalize(&report) {
-            finalize_result = Err(err);
-            break;
-        }
-    }
-
-    let forwarder_result = finish_metrics_forwarder(metrics_forwarder).await;
-
-    finalize_result?;
-    forwarder_result?;
-    Ok(())
+    reporting.finish(&report).await
 }
 
 fn parse_input_line(line: &str) -> Result<InputLine> {
@@ -310,7 +257,7 @@ fn report_progress(
     let state = ProgressState {
         sent: collector.blocks_submitted(),
         success: collector.blocks_success(),
-        failed: collector.blocks_failed(),
+        failed: 0,
         elapsed: start.elapsed(),
         max_concurrent: 0,
         target_tps: None,
@@ -331,7 +278,7 @@ async fn process_input_and_wait(
     start: Instant,
     reporters: &mut [Box<dyn Reporter>],
 ) -> Result<()> {
-    let ProcessingState { collector, reorg_state, persistence_policy } = state;
+    let ProcessingState { collector, reorg_state, mempool, persistence_policy } = state;
     if let Some(reorg_state) = reorg_state {
         let InputLine::RawBlock(block) = input else {
             eyre::bail!("--reorg is only supported for raw RLP block input");
@@ -348,6 +295,13 @@ async fn process_input_and_wait(
             Some(block),
         )
         .await;
+    }
+
+    if let Some(mempool) = mempool {
+        let InputLine::RawBlock(block) = &input else {
+            eyre::bail!("--mempool is only supported for raw RLP block input");
+        };
+        submit_to_mempool(testing_provider, block, mempool).await?;
     }
 
     let block_start = Instant::now();
@@ -379,98 +333,139 @@ async fn process_block(
     block: &BlockLine,
     collector: &mut MetricsCollector,
     forkchoice_anchor: Option<B256>,
-    persistence_policy: &WaitForPersistence,
+    persistence_policy: WaitForPersistence,
 ) -> Result<()> {
-    let input: RethNewPayloadInput<()> = match block.bal.clone() {
+    let input = match block.bal.clone() {
         Some(bal) => RethNewPayloadInput::block_rlp_with_bal(block.raw.clone(), bal),
         None => RethNewPayloadInput::block_rlp(block.raw.clone()),
     };
-    let wait = persistence_policy.should_wait(collector.blocks_submitted());
-
-    let new_payload_start = Instant::now();
-    let payload_status = provider
-        .reth_new_payload(RethNewPayloadParams::new(input).with_wait_for_persistence(wait))
-        .await
-        .wrap_err("reth_newPayload failed")?;
-    let new_payload_latency = new_payload_start.elapsed();
-
-    if !payload_status.status.is_valid() {
-        collector.record_failure();
-        eyre::bail!(
-            "reth_newPayload returned non-VALID status for block {}: {:?}",
-            block.number,
-            payload_status.status,
-        );
-    }
-
-    let (safe_block_hash, finalized_block_hash) = if let Some(anchor) = forkchoice_anchor {
-        (anchor, anchor)
-    } else {
-        let safe_hash = collector.prev_block_hash.unwrap_or(block.key);
-        (safe_hash, *collector.finalized_hash.get_or_insert(safe_hash))
-    };
-
-    let forkchoice_state =
-        ForkchoiceState { head_block_hash: block.key, safe_block_hash, finalized_block_hash };
-    let fcu_start = Instant::now();
-    let fcu_result = provider
-        .reth_forkchoice_updated(forkchoice_state)
-        .await
-        .wrap_err("reth_forkchoiceUpdated failed")?;
-    let fcu_latency = fcu_start.elapsed();
-
-    if !fcu_result.is_valid() {
-        collector.record_failure();
-        eyre::bail!(
-            "reth_forkchoiceUpdated returned non-VALID status for block {}: {:?}",
-            block.number,
-            fcu_result.payload_status,
-        );
-    }
-
-    let total_latency = new_payload_latency + fcu_latency;
-    let payload_status_str = payload_status.status.status.to_string();
-
-    let timestamp_ms = block.timestamp * 1000;
-    let block_time_ms = collector.prev_timestamp_ms.map(|prev| timestamp_ms.saturating_sub(prev));
-    collector.prev_timestamp_ms = Some(timestamp_ms);
-
-    let block_stats = BlockStats {
+    let summary = BlockSummary {
+        kind: "block",
         number: block.number,
-        timestamp_ms,
+        hash: block.key,
+        timestamp_ms: block.timestamp * 1000,
         tx_count: block.tx_count,
         gas_used: block.gas_used,
         gas_limit: block.gas_limit,
-        block_time_ms,
-        new_payload_ms: Some(new_payload_latency.as_millis() as u64),
-        forkchoice_updated_ms: Some(fcu_latency.as_millis() as u64),
-        new_payload_server_latency_us: Some(payload_status.latency_us),
-        persistence_wait_us: payload_status.persistence_wait_us,
-        execution_cache_wait_us: payload_status.execution_cache_wait_us,
-        sparse_trie_wait_us: payload_status.sparse_trie_wait_us,
     };
+    submit_block(provider, collector, persistence_policy, input, forkchoice_anchor, summary).await
+}
 
-    collector.record_success(block_stats);
+/// Header fields reported for a submitted canonical block.
+struct BlockSummary {
+    kind: &'static str,
+    number: u64,
+    hash: B256,
+    timestamp_ms: u64,
+    tx_count: usize,
+    gas_used: u64,
+    gas_limit: u64,
+}
+
+/// Submit a canonical block and record its stats.
+///
+/// Without a forkchoice anchor, the previous block is safe and the last
+/// 32-block checkpoint is finalized.
+async fn submit_block(
+    provider: &(impl Provider + RethApi<Ethereum>),
+    collector: &mut MetricsCollector,
+    persistence_policy: WaitForPersistence,
+    input: RethNewPayloadInput<ExecutionData>,
+    forkchoice_anchor: Option<B256>,
+    block: BlockSummary,
+) -> Result<()> {
+    let (safe_block_hash, finalized_block_hash) = match forkchoice_anchor {
+        Some(anchor) => (anchor, anchor),
+        None => {
+            let safe_hash = collector.prev_block_hash.unwrap_or(block.hash);
+            (safe_hash, *collector.finalized_hash.get_or_insert(safe_hash))
+        }
+    };
+    let forkchoice_state =
+        ForkchoiceState { head_block_hash: block.hash, safe_block_hash, finalized_block_hash };
+    let wait = persistence_policy.should_wait(collector.blocks_submitted());
+    let label = format!("{} {}", block.kind, block.number);
+    let Submission { status, new_payload, forkchoice_updated } =
+        submit(provider, input, wait, forkchoice_state, &label).await?;
 
     tracing::info!(
         block = block.number,
         txs = block.tx_count,
         gas = block.gas_used,
-        new_payload_ms = new_payload_latency.as_millis(),
-        forkchoice_updated_ms = fcu_latency.as_millis(),
-        total_ms = total_latency.as_millis(),
-        new_payload_server_latency_us = payload_status.latency_us,
-        status = %payload_status_str,
-        "Submitted block"
+        new_payload_ms = new_payload.as_millis(),
+        forkchoice_updated_ms = forkchoice_updated.as_millis(),
+        total_ms = (new_payload + forkchoice_updated).as_millis(),
+        new_payload_server_latency_us = status.latency_us,
+        status = %status.status.status,
+        "Submitted {}",
+        block.kind
     );
 
-    collector.prev_block_hash = Some(block.key);
-
+    let block_time_ms =
+        collector.prev_timestamp_ms.map(|prev| block.timestamp_ms.saturating_sub(prev));
+    collector.prev_timestamp_ms = Some(block.timestamp_ms);
+    collector.prev_block_hash = Some(block.hash);
     if block.number.is_multiple_of(32) {
-        collector.finalized_hash = Some(block.key);
+        collector.finalized_hash = Some(block.hash);
+    }
+    collector.record_success(BlockStats {
+        number: block.number,
+        timestamp_ms: block.timestamp_ms,
+        tx_count: block.tx_count,
+        gas_used: block.gas_used,
+        gas_limit: block.gas_limit,
+        block_time_ms,
+        new_payload_ms: Some(new_payload.as_millis() as u64),
+        forkchoice_updated_ms: Some(forkchoice_updated.as_millis() as u64),
+        new_payload_server_latency_us: Some(status.latency_us),
+        persistence_wait_us: status.persistence_wait_us,
+        execution_cache_wait_us: status.execution_cache_wait_us,
+        sparse_trie_wait_us: status.sparse_trie_wait_us,
+    });
+    Ok(())
+}
+
+/// Engine API status and client-side latencies of one block submission.
+struct Submission {
+    status: RethPayloadStatus,
+    new_payload: Duration,
+    forkchoice_updated: Duration,
+}
+
+/// Send `reth_newPayload` and then `reth_forkchoiceUpdated`; both must be VALID.
+async fn submit(
+    provider: &(impl Provider + RethApi<Ethereum>),
+    input: RethNewPayloadInput<ExecutionData>,
+    wait_for_persistence: bool,
+    forkchoice_state: ForkchoiceState,
+    label: &str,
+) -> Result<Submission> {
+    let start = Instant::now();
+    let status = provider
+        .reth_new_payload(
+            RethNewPayloadParams::new(input).with_wait_for_persistence(wait_for_persistence),
+        )
+        .await
+        .wrap_err_with(|| format!("reth_newPayload failed for {label}"))?;
+    let new_payload = start.elapsed();
+    if !status.status.is_valid() {
+        eyre::bail!("reth_newPayload returned non-VALID status for {label}: {:?}", status.status);
     }
 
-    Ok(())
+    let start = Instant::now();
+    let fcu_result = provider
+        .reth_forkchoice_updated(forkchoice_state)
+        .await
+        .wrap_err_with(|| format!("reth_forkchoiceUpdated failed for {label}"))?;
+    let forkchoice_updated = start.elapsed();
+    if !fcu_result.is_valid() {
+        eyre::bail!(
+            "reth_forkchoiceUpdated returned non-VALID status for {label}: {:?}",
+            fcu_result.payload_status,
+        );
+    }
+
+    Ok(Submission { status, new_payload, forkchoice_updated })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -479,7 +474,7 @@ async fn process_reorg_action(
     testing_provider: &(impl Provider + TestingApi<Ethereum>),
     state: &mut ReorgState,
     collector: &mut MetricsCollector,
-    persistence_policy: &WaitForPersistence,
+    persistence_policy: WaitForPersistence,
     wait_time: Option<Duration>,
     start: Instant,
     reporters: &mut [Box<dyn Reporter>],
@@ -494,10 +489,11 @@ async fn process_reorg_action(
         ReorgAction::Canonical(blocks) => (blocks, None),
         ReorgAction::Batch(blocks) => {
             let first = blocks.first().expect("reorg batch must not be empty");
-            let branch_point_hash = extract_block_header_from_block_rlp(first.raw.as_ref())
+            let branch_point_hash = split_block_rlp(&first.raw)
                 .wrap_err_with(|| {
                     format!("failed to extract parent hash from block {}", first.number)
                 })?
+                .0
                 .parent_hash;
 
             tracing::info!(
@@ -555,14 +551,12 @@ async fn process_synthetic_block(
     branch_point_hash: B256,
     wait: bool,
 ) -> Result<B256> {
-    let transactions = extract_tx_bytes_from_block_rlp(block.raw.as_ref()).wrap_err_with(|| {
+    let (header, body) = split_block_rlp(&block.raw)
+        .wrap_err_with(|| format!("failed to decode block {}", block.number))?;
+    let transactions = extract_reorg_transactions(body).wrap_err_with(|| {
         format!("failed to extract raw transaction bytes from block {}", block.number)
     })?;
-    let parent_beacon_block_root = extract_block_header_from_block_rlp(block.raw.as_ref())
-        .wrap_err_with(|| {
-            format!("failed to extract parent beacon block root from block {}", block.number)
-        })?
-        .parent_beacon_block_root;
+    let parent_beacon_block_root = header.parent_beacon_block_root;
     let payload_attributes = PayloadAttributes {
         timestamp: block.timestamp,
         prev_randao: B256::ZERO,
@@ -592,103 +586,95 @@ async fn process_synthetic_block(
     let (payload, sidecar) = envelope.into_payload_and_sidecar(parent_beacon_block_root);
     let execution_data = ExecutionData::new(payload, sidecar);
 
-    let payload_status = provider
-        .reth_new_payload(
-            RethNewPayloadParams::new(RethNewPayloadInput::execution_data(execution_data))
-                .with_wait_for_persistence(wait),
-        )
-        .await
-        .wrap_err_with(|| {
-            format!("reth_newPayload failed for synthetic fork block after block {}", block.number)
-        })?;
-
-    if !payload_status.status.is_valid() {
-        eyre::bail!(
-            "reth_newPayload returned non-VALID status for synthetic fork block after block {}: {:?}",
-            block.number,
-            payload_status.status,
-        );
-    }
-
-    let fcu_result = provider
-        .reth_forkchoice_updated(ForkchoiceState {
-            head_block_hash: synthetic_block_hash,
-            safe_block_hash: branch_point_hash,
-            finalized_block_hash: branch_point_hash,
-        })
-        .await
-        .wrap_err_with(|| {
-            format!(
-                "reth_forkchoiceUpdated failed for synthetic fork block after block {}",
-                block.number
-            )
-        })?;
-
-    if !fcu_result.is_valid() {
-        eyre::bail!(
-            "reth_forkchoiceUpdated returned non-VALID status for synthetic fork block after block {}: {:?}",
-            block.number,
-            fcu_result.payload_status,
-        );
-    }
+    let forkchoice_state = ForkchoiceState {
+        head_block_hash: synthetic_block_hash,
+        safe_block_hash: branch_point_hash,
+        finalized_block_hash: branch_point_hash,
+    };
+    let label = format!("synthetic fork block after block {}", block.number);
+    submit(
+        provider,
+        RethNewPayloadInput::execution_data(execution_data),
+        wait,
+        forkchoice_state,
+        &label,
+    )
+    .await?;
 
     Ok(synthetic_block_hash)
 }
 
-fn extract_block_header_from_block_rlp(raw: &[u8]) -> Result<ConsensusHeader> {
+/// Returns the fields inside a block's outer RLP list.
+fn block_rlp_fields(raw: &[u8]) -> Result<&[u8]> {
     let mut block_buf = raw;
-    let mut block_payload = Header::decode_bytes(&mut block_buf, true)
+    let block_payload = Header::decode_bytes(&mut block_buf, true)
         .wrap_err("failed to decode outer block RLP list")?;
     if !block_buf.is_empty() {
         eyre::bail!("block RLP has trailing bytes after outer list");
     }
-
-    ConsensusHeader::decode(&mut block_payload).wrap_err("failed to decode block header")
+    Ok(block_payload)
 }
 
-fn extract_tx_bytes_from_block_rlp(raw: &[u8]) -> Result<Vec<Bytes>> {
-    let mut block_buf = raw;
-    let mut block_payload = Header::decode_bytes(&mut block_buf, true)
-        .wrap_err("failed to decode outer block RLP list")?;
-    if !block_buf.is_empty() {
-        eyre::bail!("block RLP has trailing bytes after outer list");
-    }
+/// Split block RLP into the decoded header and the remaining body fields.
+fn split_block_rlp(raw: &[u8]) -> Result<(ConsensusHeader, &[u8])> {
+    let mut block_payload = block_rlp_fields(raw)?;
+    let header =
+        ConsensusHeader::decode(&mut block_payload).wrap_err("failed to decode block header")?;
+    Ok((header, block_payload))
+}
 
+/// Returns the EIP-2718 encoded transactions of an RLP-encoded block.
+fn extract_encoded_txs_from_block_rlp(raw: &[u8]) -> Result<Vec<&[u8]>> {
+    let mut block_payload = block_rlp_fields(raw)?;
     skip_rlp_item(&mut block_payload).wrap_err("failed to skip block header")?;
-    let mut txs_payload = Header::decode_bytes(&mut block_payload, true)
-        .wrap_err("failed to decode transactions RLP list")?;
+    extract_encoded_txs_from_body(block_payload)
+}
+
+/// Returns the EIP-2718 encoded transactions of a block body, the fields after its header.
+fn extract_encoded_txs_from_body(mut body: &[u8]) -> Result<Vec<&[u8]>> {
+    let mut txs_payload =
+        Header::decode_bytes(&mut body, true).wrap_err("failed to decode transactions RLP list")?;
 
     let mut transactions = Vec::new();
-    let mut skipped_blob_txs = 0usize;
-    let mut non_blob_txs = 0usize;
-    let mut dropped_non_blob_txs = 0usize;
     while !txs_payload.is_empty() {
         let item_start = txs_payload;
         let header =
             Header::decode(&mut txs_payload).wrap_err("failed to decode transaction RLP item")?;
         let header_len = item_start.len() - txs_payload.len();
-        let payload = &txs_payload[..header.payload_length];
-        let encoded = &item_start[..header_len + header.payload_length];
-
         if header.list {
-            non_blob_txs += 1;
-            if should_keep_reorg_transaction(non_blob_txs) {
-                transactions.push(Bytes::copy_from_slice(encoded));
-            } else {
-                dropped_non_blob_txs += 1;
-            }
-        } else if payload.first() == Some(&0x03) {
-            skipped_blob_txs += 1;
+            // Legacy transactions are encoded as the RLP list itself.
+            transactions.push(&item_start[..header_len + header.payload_length]);
         } else {
-            non_blob_txs += 1;
-            if should_keep_reorg_transaction(non_blob_txs) {
-                transactions.push(Bytes::copy_from_slice(payload));
-            } else {
-                dropped_non_blob_txs += 1;
-            }
+            // Typed transactions are wrapped in an RLP string.
+            transactions.push(&txs_payload[..header.payload_length]);
         }
-
         txs_payload = &txs_payload[header.payload_length..];
+    }
+
+    Ok(transactions)
+}
+
+const fn is_blob_transaction(encoded: &[u8]) -> bool {
+    matches!(encoded.first(), Some(0x03))
+}
+
+/// Extract the transactions to rebuild a block body on a synthetic fork.
+fn extract_reorg_transactions(body: &[u8]) -> Result<Vec<Bytes>> {
+    let mut transactions = Vec::new();
+    let mut skipped_blob_txs = 0usize;
+    let mut non_blob_txs = 0usize;
+    let mut dropped_non_blob_txs = 0usize;
+    for encoded in extract_encoded_txs_from_body(body)? {
+        if is_blob_transaction(encoded) {
+            skipped_blob_txs += 1;
+            continue;
+        }
+        non_blob_txs += 1;
+        if should_keep_reorg_transaction(non_blob_txs) {
+            transactions.push(Bytes::copy_from_slice(encoded));
+        } else {
+            dropped_non_blob_txs += 1;
+        }
     }
 
     if skipped_blob_txs > 0 {
@@ -715,107 +701,158 @@ fn skip_rlp_item(buf: &mut &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Submits the transactions of each block to the node's transaction pool before its payload.
+struct MempoolReplay {
+    delay: Duration,
+    fraction: f64,
+    totals: MempoolStats,
+}
+
+/// Transaction pool submission outcomes.
+#[derive(Debug, Default)]
+struct MempoolStats {
+    accepted: u64,
+    /// Rejection counts by error message.
+    rejected: BTreeMap<String, u64>,
+    /// Blob transactions, which cannot be submitted without sidecars.
+    blobs: u64,
+    /// Transactions left out by the submitted fraction.
+    unselected: u64,
+}
+
+impl MempoolStats {
+    fn rejected_total(&self) -> u64 {
+        self.rejected.values().sum()
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.accepted += other.accepted;
+        self.blobs += other.blobs;
+        self.unselected += other.unselected;
+        for (message, count) in other.rejected {
+            *self.rejected.entry(message).or_default() += count;
+        }
+    }
+}
+
+/// Maximum concurrent `eth_sendRawTransaction` requests.
+const MEMPOOL_SUBMIT_CONCURRENCY: usize = 32;
+
+/// Maximum time to wait for the node's head to reach a block's parent.
+const MEMPOOL_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Returns the non-blob transactions of a block that `fraction` selects by transaction hash,
+/// and records the others in `stats`.
+fn select_mempool_transactions<'a>(
+    encoded_txs: Vec<&'a [u8]>,
+    fraction: f64,
+    stats: &mut MempoolStats,
+) -> Vec<&'a [u8]> {
+    let threshold = (fraction * 2f64.powi(64)) as u128;
+    encoded_txs
+        .into_iter()
+        .filter(|encoded| {
+            if is_blob_transaction(encoded) {
+                stats.blobs += 1;
+                return false;
+            }
+            let hash = keccak256(encoded);
+            let selected =
+                u128::from(u64::from_be_bytes(hash[..8].try_into().unwrap())) < threshold;
+            if !selected {
+                stats.unselected += 1;
+            }
+            selected
+        })
+        .collect()
+}
+
+async fn submit_to_mempool(
+    rpc: &impl Provider,
+    block: &BlockLine,
+    mempool: &mut MempoolReplay,
+) -> Result<()> {
+    // The pool validates against the latest state, so the parent must be canonical first.
+    let parent = block.number.saturating_sub(1);
+    let deadline = Instant::now() + MEMPOOL_HEAD_TIMEOUT;
+    loop {
+        let head = rpc.get_block_number().await.wrap_err("eth_blockNumber failed")?;
+        if head >= parent {
+            break;
+        }
+        if Instant::now() >= deadline {
+            eyre::bail!("node head {head} did not reach block {parent} before mempool submission");
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    let mut stats = MempoolStats::default();
+    let encoded_txs =
+        extract_encoded_txs_from_block_rlp(block.raw.as_ref()).wrap_err_with(|| {
+            format!("failed to extract raw transaction bytes from block {}", block.number)
+        })?;
+    let selected = select_mempool_transactions(encoded_txs, mempool.fraction, &mut stats);
+    let results = futures::stream::iter(selected)
+        .map(|encoded| rpc.send_raw_transaction(encoded))
+        .buffer_unordered(MEMPOOL_SUBMIT_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for result in results {
+        match result {
+            Ok(_) => stats.accepted += 1,
+            Err(err) => {
+                let Some(resp) = err.as_error_resp() else {
+                    return Err(err).wrap_err("eth_sendRawTransaction failed");
+                };
+                // Drop transaction-specific details such as nonces and balances.
+                let reason = resp.message.split(':').next().unwrap_or_default().to_string();
+                *stats.rejected.entry(reason).or_default() += 1;
+            }
+        }
+    }
+
+    let status = rpc.txpool_status().await.wrap_err("txpool_status failed")?;
+    tracing::info!(
+        block = block.number,
+        accepted = stats.accepted,
+        rejected = stats.rejected_total(),
+        blobs = stats.blobs,
+        unselected = stats.unselected,
+        pool_pending = status.pending,
+        pool_queued = status.queued,
+        "Submitted block transactions to the mempool"
+    );
+    if !stats.rejected.is_empty() {
+        tracing::debug!(block = block.number, rejected = ?stats.rejected, "Mempool rejections");
+    }
+    mempool.totals.merge(stats);
+
+    tokio::time::sleep(mempool.delay).await;
+    Ok(())
+}
+
 async fn process_big_block(
     provider: &(impl Provider + RethApi<Ethereum>),
     big_block: &BigBlockData<ExecutionData>,
     collector: &mut MetricsCollector,
-    persistence_policy: &WaitForPersistence,
+    persistence_policy: WaitForPersistence,
 ) -> Result<()> {
-    let first_payload = big_block
-        .env_switches
-        .first()
-        .ok_or_else(|| eyre::eyre!("big-block payload contains no execution payloads"))?;
-    let last_payload = big_block
-        .env_switches
-        .last()
-        .ok_or_else(|| eyre::eyre!("big-block payload contains no execution payloads"))?;
-
+    let payloads = &big_block.env_switches;
+    let (Some(first_payload), Some(last_payload)) = (payloads.first(), payloads.last()) else {
+        eyre::bail!("big-block payload contains no execution payloads");
+    };
     let block_hash = last_payload.block_hash();
-    let block_number = big_block.block_number;
-    let tx_count = big_block.env_switches.iter().map(|data| data.transaction_count()).sum();
-    let gas_used = big_block.env_switches.iter().map(|data| data.payload.as_v1().gas_used).sum();
-    let gas_limit = big_block.env_switches.iter().map(|data| data.payload.gas_limit()).sum();
-    let wait = persistence_policy.should_wait(collector.blocks_submitted());
-
+    let summary = BlockSummary {
+        kind: "big block",
+        number: big_block.block_number,
+        hash: block_hash,
+        timestamp_ms: first_payload.payload.timestamp() * 1000,
+        tx_count: payloads.iter().map(|data| data.transaction_count()).sum(),
+        gas_used: payloads.iter().map(|data| data.payload.as_v1().gas_used).sum(),
+        gas_limit: payloads.iter().map(|data| data.payload.gas_limit()).sum(),
+    };
     let input = RethNewPayloadInput::big_block_data(big_block.clone());
-
-    let new_payload_start = Instant::now();
-    let payload_status = provider
-        .reth_new_payload(RethNewPayloadParams::new(input).with_wait_for_persistence(wait))
-        .await
-        .wrap_err("reth_newPayload failed")?;
-    let new_payload_latency = new_payload_start.elapsed();
-
-    if !payload_status.status.is_valid() {
-        collector.record_failure();
-        eyre::bail!(
-            "reth_newPayload returned non-VALID status for big block {}: {:?}",
-            block_number,
-            payload_status.status,
-        );
-    }
-
-    let forkchoice_state = ForkchoiceState {
-        head_block_hash: block_hash,
-        safe_block_hash: block_hash,
-        finalized_block_hash: block_hash,
-    };
-
-    let fcu_start = Instant::now();
-    let fcu_result = provider
-        .reth_forkchoice_updated(forkchoice_state)
-        .await
-        .wrap_err("reth_forkchoiceUpdated failed")?;
-    let fcu_latency = fcu_start.elapsed();
-
-    if !fcu_result.is_valid() {
-        collector.record_failure();
-        eyre::bail!(
-            "reth_forkchoiceUpdated returned non-VALID status for big block {}: {:?}",
-            block_number,
-            fcu_result.payload_status,
-        );
-    }
-
-    let timestamp_ms = first_payload.payload.timestamp() * 1000;
-    let block_time_ms = collector.prev_timestamp_ms.map(|prev| timestamp_ms.saturating_sub(prev));
-    collector.prev_timestamp_ms = Some(timestamp_ms);
-
-    let block_stats = BlockStats {
-        number: block_number,
-        timestamp_ms,
-        tx_count,
-        gas_used,
-        gas_limit,
-        block_time_ms,
-        new_payload_ms: Some(new_payload_latency.as_millis() as u64),
-        forkchoice_updated_ms: Some(fcu_latency.as_millis() as u64),
-        new_payload_server_latency_us: Some(payload_status.latency_us),
-        persistence_wait_us: payload_status.persistence_wait_us,
-        execution_cache_wait_us: payload_status.execution_cache_wait_us,
-        sparse_trie_wait_us: payload_status.sparse_trie_wait_us,
-    };
-
-    collector.record_success(block_stats);
-
-    tracing::info!(
-        block = block_number,
-        txs = tx_count,
-        gas = gas_used,
-        new_payload_ms = new_payload_latency.as_millis(),
-        forkchoice_updated_ms = fcu_latency.as_millis(),
-        total_ms = (new_payload_latency + fcu_latency).as_millis(),
-        new_payload_server_latency_us = payload_status.latency_us,
-        status = %payload_status.status.status,
-        "Submitted big block"
-    );
-
-    collector.prev_block_hash = Some(block_hash);
-    if block_number.is_multiple_of(32) {
-        collector.finalized_hash = Some(block_hash);
-    }
-
-    Ok(())
+    submit_block(provider, collector, persistence_policy, input, Some(block_hash), summary).await
 }
 
 /// Shared atomic counters for the scraper snapshot callback.
@@ -823,14 +860,12 @@ async fn process_big_block(
 struct BlockCounters {
     submitted: AtomicU64,
     success: AtomicU64,
-    failed: AtomicU64,
 }
 
 impl BlockCounters {
     fn snapshot_samples(&self, clock: &RunClock) -> Vec<Sample> {
         let submitted = self.submitted.load(Ordering::Relaxed);
         let success = self.success.load(Ordering::Relaxed);
-        let failed = self.failed.load(Ordering::Relaxed);
         let offset_ms = clock.offset_ms();
         let unix_ms = clock.unix_ms();
         let labels = BTreeMap::new();
@@ -850,10 +885,11 @@ impl BlockCounters {
                 offset_ms,
                 unix_ms,
             },
+            // A failed submission aborts the run, so no failure is ever reported.
             Sample {
                 name: "txgen_blocks_failed_total".to_string(),
                 labels,
-                value: failed as f64,
+                value: 0.0,
                 offset_ms,
                 unix_ms,
             },
@@ -887,21 +923,12 @@ impl MetricsCollector {
         self.blocks.push(stats);
     }
 
-    fn record_failure(&self) {
-        self.counters.submitted.fetch_add(1, Ordering::Relaxed);
-        self.counters.failed.fetch_add(1, Ordering::Relaxed);
-    }
-
     fn blocks_submitted(&self) -> u64 {
         self.counters.submitted.load(Ordering::Relaxed)
     }
 
     fn blocks_success(&self) -> u64 {
         self.counters.success.load(Ordering::Relaxed)
-    }
-
-    fn blocks_failed(&self) -> u64 {
-        self.counters.failed.load(Ordering::Relaxed)
     }
 
     fn final_snapshot(&self, clock: &RunClock) -> Vec<Sample> {
@@ -939,7 +966,8 @@ mod tests {
     }
 
     fn block_with_transactions(transactions: &[Vec<u8>]) -> Vec<u8> {
-        let header = rlp_list_from_encoded(&[]);
+        let mut header = Vec::new();
+        ConsensusHeader::default().encode(&mut header);
         let transactions = rlp_list_from_encoded(transactions);
         let ommers = rlp_list_from_encoded(&[]);
         rlp_list_from_encoded(&[header, transactions, ommers])
@@ -990,7 +1018,7 @@ mod tests {
         let source_transactions = (0..10).map(legacy_tx).collect::<Vec<_>>();
         let block = block_with_transactions(&source_transactions);
 
-        let extracted = extract_tx_bytes_from_block_rlp(&block)
+        let extracted = extract_reorg_transactions(split_block_rlp(&block).unwrap().1)
             .expect("valid block RLP should extract transactions");
 
         let expected = source_transactions
@@ -1008,7 +1036,7 @@ mod tests {
         source_transactions.push(legacy_tx(9));
         let block = block_with_transactions(&source_transactions);
 
-        let extracted = extract_tx_bytes_from_block_rlp(&block)
+        let extracted = extract_reorg_transactions(split_block_rlp(&block).unwrap().1)
             .expect("valid block RLP should extract transactions");
 
         let expected = source_transactions
@@ -1017,5 +1045,33 @@ mod tests {
             .map(Bytes::from)
             .collect::<Vec<_>>();
         assert_eq!(extracted, expected);
+    }
+
+    #[test]
+    fn selects_eip2718_non_blob_transactions_for_mempool_by_hash_fraction() {
+        let mut source_transactions =
+            (0..=255).flat_map(|id| [legacy_tx(id), typed_tx(0x02, id)]).collect::<Vec<_>>();
+        source_transactions.insert(7, typed_tx(0x03, 0));
+        let block = block_with_transactions(&source_transactions);
+        let encoded = extract_encoded_txs_from_block_rlp(&block).unwrap();
+        let select = |fraction| {
+            let mut stats = MempoolStats::default();
+            let selected = select_mempool_transactions(encoded.clone(), fraction, &mut stats);
+            (selected, stats)
+        };
+
+        // Legacy transactions keep their RLP list encoding, typed ones drop the RLP string header.
+        let expected = (0..=255).flat_map(|id| [legacy_tx(id), vec![0x02, id]]).collect::<Vec<_>>();
+        let (all, stats) = select(1.0);
+        assert_eq!(all, expected);
+        assert_eq!((stats.blobs, stats.unselected), (1, 0));
+
+        let (quarter, stats) = select(0.25);
+        let (half, _) = select(0.5);
+        assert_eq!(stats.blobs, 1);
+        assert_eq!(quarter.len() + stats.unselected as usize, expected.len());
+        assert!((96..160).contains(&quarter.len()), "{}", quarter.len());
+        assert!((224..288).contains(&half.len()), "{}", half.len());
+        assert!(quarter.iter().all(|tx| half.contains(tx)));
     }
 }

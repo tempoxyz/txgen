@@ -8,23 +8,16 @@
 //! Every response is digested as it streams in so two runs can be compared byte
 //! for byte without any output ever carrying a request or response body.
 
-use crate::{
-    load_metric_names,
-    metrics_forwarder::{build_metrics_forwarder, finish_metrics_forwarder},
-    metrics_url::metrics_scraper_configs,
-    send::parse_metadata,
-    CallArgs, CallPhase,
-};
+use crate::{reporting::Reporting, CallArgs, CallPhase};
 use bench_core::{
-    digest_response, parse_reporters, start_scrapers, CallMethod, CallReport, CallRunConfig,
-    ConsoleReporter, Corpus, CorpusOptions, FinalReport, NodeIdentity, ReplayRecorder,
-    ReplayResults, RequestOutcome, RequestStatus, ResponseKind, ResponseSummary, RunClock,
-    SampleStore,
+    digest_response, parse_metadata, CallMethod, CallReport, CallRunConfig, Corpus, CorpusOptions,
+    FinalReport, NodeIdentity, ReplayRecorder, ReplayResults, RequestOutcome, RequestStatus,
+    ResponseKind, ResponseSummary, RunClock,
 };
 use eyre::{bail, Context, Result};
 use rand::{Rng, SeedableRng};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     io::{BufWriter, Write},
     path::Path,
     sync::{
@@ -55,9 +48,8 @@ pub async fn execute(args: CallArgs) -> Result<()> {
         "Starting RPC corpus replay"
     );
 
-    let metadata = parse_metadata(&args.metadata)?;
-    let scraper_configs =
-        metrics_scraper_configs(&args.metrics_url, Duration::from_millis(args.scrape_interval_ms))?;
+    let metadata: HashMap<_, _> = parse_metadata(&args.reporting.metadata)?;
+    let scraper_configs = args.reporting.scraper_configs()?;
 
     let replay = Replay::new(&args, corpus.clone())?;
     let identity = replay.identity().await?;
@@ -67,33 +59,21 @@ pub async fn execute(args: CallArgs) -> Result<()> {
         head_hash = %identity.head_hash,
         "Node identity"
     );
-    replay.prime(args.concurrency).await?;
+    replay.prime(args.concurrency.get()).await?;
 
-    let clickhouse_metric_names = load_metric_names(args.clickhouse_metrics_file.as_ref())?;
-    let mut reporters = parse_reporters(&args.reports, "call", &metadata, clickhouse_metric_names)?;
-    if reporters.is_empty() {
-        reporters.push(Box::new(ConsoleReporter::stderr(false)));
-    }
-
-    let clock = match args.metrics_align {
+    let clock = match args.reporting.metrics_align {
         Some(start) => RunClock::new_with_start_unix_ms(start),
         None => RunClock::new(),
     };
-    let store = SampleStore::with_labels(metadata.clone())?;
-    let metrics_forwarder =
-        build_metrics_forwarder(args.metrics_forward.as_deref(), &metadata, &scraper_configs)?;
-    let scraper_handles = if scraper_configs.is_empty() {
-        Vec::new()
-    } else {
-        let callback: bench_core::SampleCallback = Arc::new(Vec::new);
-        start_scrapers(
-            &scraper_configs,
-            clock.clone(),
-            store.clone(),
-            callback,
-            metrics_forwarder.as_ref().map(|forwarder| forwarder.handle()),
-        )
-    };
+    let mut reporting = Reporting::start(
+        &args.reporting,
+        "call",
+        &metadata,
+        &scraper_configs,
+        &clock,
+        Arc::new(Vec::new),
+        false,
+    )?;
 
     let open_loop_secs = replay.run_open_loop(&args, &clock).await?;
     let closed_loop_secs = match args.phase {
@@ -101,14 +81,7 @@ pub async fn execute(args: CallArgs) -> Result<()> {
         CallPhase::Measure => replay.run_closed_loop(&args).await?,
     };
 
-    if !scraper_handles.is_empty() {
-        let scrapes = scraper_handles.iter().map(|handle| handle.scrape_count()).sum::<u64>();
-        let errors = scraper_handles.iter().map(|handle| handle.error_count()).sum::<u64>();
-        for handle in scraper_handles {
-            handle.stop().await;
-        }
-        tracing::info!(scrapes, errors, "Metrics scrapers stopped");
-    }
+    reporting.stop_scrapers().await;
 
     let results = replay.recorder.finish();
     if args.phase == CallPhase::Measure {
@@ -140,21 +113,12 @@ pub async fn execute(args: CallArgs) -> Result<()> {
 
     let report = FinalReport {
         metadata,
-        sample_archive: Some(store.finish().await?),
+        sample_archive: Some(reporting.store.finish().await?),
         call: Some(call),
         ..Default::default()
     };
 
-    let mut finalize_result = Ok(());
-    for reporter in &mut reporters {
-        if let Err(err) = reporter.finalize(&report) {
-            finalize_result = Err(err);
-            break;
-        }
-    }
-    let forwarder_result = finish_metrics_forwarder(metrics_forwarder).await;
-    finalize_result?;
-    forwarder_result?;
+    reporting.finish(&report).await?;
 
     if failure_rate_pct > args.max_fail_rate_pct {
         bail!(
@@ -167,6 +131,7 @@ pub async fn execute(args: CallArgs) -> Result<()> {
 }
 
 /// One replay against one endpoint.
+#[derive(Clone)]
 struct Replay {
     client: reqwest::Client,
     url: String,
@@ -176,7 +141,7 @@ struct Replay {
 
 impl Replay {
     fn new(args: &CallArgs, corpus: Arc<Corpus>) -> Result<Self> {
-        let pool = args.max_concurrent.max(args.concurrency);
+        let pool = args.max_concurrent.max(args.concurrency).get();
         let client = reqwest::Client::builder()
             .timeout(args.timeout)
             .pool_max_idle_per_host(pool)
@@ -213,7 +178,7 @@ impl Replay {
     async fn prime(&self, connections: usize) -> Result<()> {
         let mut opened = JoinSet::new();
         for _ in 0..connections {
-            let replay = self.clone_handles();
+            let replay = self.clone();
             opened.spawn(async move { replay.rpc("eth_chainId", serde_json::json!([])).await });
         }
         while let Some(result) = opened.join_next().await {
@@ -235,7 +200,7 @@ impl Replay {
         }
 
         let record = args.phase == CallPhase::Measure;
-        let semaphore = Arc::new(Semaphore::new(args.max_concurrent));
+        let semaphore = Arc::new(Semaphore::new(args.max_concurrent.get()));
         let mut rng = rand::rngs::StdRng::seed_from_u64(args.seed);
         let started = tokio::time::Instant::now();
         let mut progress = started + PROGRESS_INTERVAL;
@@ -258,10 +223,9 @@ impl Replay {
             let offset_ms = clock.offset_ms();
             match Arc::clone(&semaphore).try_acquire_owned() {
                 Ok(permit) => {
-                    let replay = self.clone_handles();
-                    let body = self.corpus.records()[slot].body().to_string();
+                    let replay = self.clone();
                     tokio::spawn(async move {
-                        let outcome = replay.send(&body).await;
+                        let outcome = replay.send(slot).await;
                         if record {
                             replay.recorder.record_open_loop(slot, offset_ms, outcome);
                         }
@@ -283,14 +247,14 @@ impl Replay {
                     issued,
                     dropped,
                     rps = issued as f64 / elapsed.max(f64::MIN_POSITIVE),
-                    in_flight = args.max_concurrent - semaphore.available_permits(),
+                    in_flight = args.max_concurrent.get() - semaphore.available_permits(),
                     "Open-loop progress"
                 );
                 progress = tokio::time::Instant::now() + PROGRESS_INTERVAL;
             }
         }
 
-        drain(&semaphore, args.max_concurrent).await;
+        drain(&semaphore, args.max_concurrent.get()).await;
         let elapsed = started.elapsed().as_secs_f64();
         tracing::info!(issued, dropped, elapsed_secs = elapsed, "Open-loop phase complete");
         Ok(elapsed)
@@ -311,8 +275,8 @@ impl Replay {
         let started = Instant::now();
         let mut workers = JoinSet::new();
 
-        for _ in 0..args.concurrency {
-            let replay = self.clone_handles();
+        for _ in 0..args.concurrency.get() {
+            let replay = self.clone();
             let cursor = cursor.clone();
             workers.spawn(async move {
                 loop {
@@ -322,8 +286,7 @@ impl Replay {
                     }
                     let slot = (ticket % records) as usize;
                     let pass = (ticket / records) as u32;
-                    let body = replay.corpus.records()[slot].body().to_string();
-                    let outcome = replay.send(&body).await;
+                    let outcome = replay.send(slot).await;
                     replay.recorder.record_closed_loop(slot, pass, outcome);
                 }
             });
@@ -360,17 +323,18 @@ impl Replay {
         Ok(elapsed)
     }
 
-    /// Send one request and digest its response.
+    /// Send one corpus record and digest its response.
     ///
     /// Never logs or returns the body: failures are reported as a status and
     /// counted per method.
-    async fn send(&self, body: &str) -> RequestOutcome {
+    async fn send(&self, slot: usize) -> RequestOutcome {
+        let body = self.corpus.records()[slot].body().to_owned();
         let started = Instant::now();
         let response = self
             .client
             .post(&self.url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body.to_string())
+            .body(body)
             .send()
             .await;
 
@@ -409,15 +373,6 @@ impl Replay {
         }
         Ok(response["result"].clone())
     }
-
-    fn clone_handles(&self) -> Self {
-        Self {
-            client: self.client.clone(),
-            url: self.url.clone(),
-            corpus: self.corpus.clone(),
-            recorder: self.recorder.clone(),
-        }
-    }
 }
 
 fn load_corpus(args: &CallArgs) -> Result<Corpus> {
@@ -443,9 +398,9 @@ fn run_config(args: &CallArgs) -> CallRunConfig {
         rps: args.rps,
         duration_secs: args.requests.is_none().then_some(args.duration.as_secs_f64()),
         requests: args.requests,
-        max_concurrent: args.max_concurrent as u64,
+        max_concurrent: args.max_concurrent.get() as u64,
         passes: if args.phase == CallPhase::Measure { args.passes } else { 0 },
-        concurrency: args.concurrency as u64,
+        concurrency: args.concurrency.get() as u64,
         seed: args.seed,
         timeout_secs: args.timeout.as_secs_f64(),
         methods: (!args.methods.is_empty()).then(|| args.methods.clone()),
@@ -539,10 +494,12 @@ fn status_of(summary: &ResponseSummary) -> RequestStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReportArgs;
     use std::{
         collections::HashMap,
         io::{BufRead, BufReader as StdBufReader, Read},
         net::{TcpListener, TcpStream},
+        num::NonZeroUsize,
         sync::{
             atomic::{AtomicBool, AtomicUsize},
             Mutex,
@@ -720,9 +677,9 @@ mod tests {
             rps: 0,
             duration: Duration::from_millis(200),
             requests: None,
-            max_concurrent: 16,
+            max_concurrent: NonZeroUsize::new(16).unwrap(),
             passes: 0,
-            concurrency: 2,
+            concurrency: NonZeroUsize::new(2).unwrap(),
             seed: 1,
             block_tag: None,
             strip_fees: false,
@@ -732,13 +689,15 @@ mod tests {
             record_csv: None,
             requests_csv: None,
             max_fail_rate_pct: 100.0,
-            reports: Vec::new(),
-            metadata: Vec::new(),
-            metrics_url: Vec::new(),
-            clickhouse_metrics_file: None,
-            scrape_interval_ms: 500,
-            metrics_align: None,
-            metrics_forward: None,
+            reporting: ReportArgs {
+                reports: Vec::new(),
+                metadata: Vec::new(),
+                metrics_url: Vec::new(),
+                clickhouse_metrics_file: None,
+                scrape_interval_ms: 500,
+                metrics_align: None,
+                metrics_forward: None,
+            },
         }
     }
 
@@ -768,7 +727,7 @@ mod tests {
         let mut args = args(&server.url, file.path());
         args.rps = 100;
         args.requests = Some(40);
-        args.max_concurrent = 4;
+        args.max_concurrent = NonZeroUsize::new(4).unwrap();
         args.timeout = Duration::from_millis(400);
 
         let replay = Replay::new(&args, Arc::new(load_corpus(&args).unwrap())).unwrap();
@@ -792,7 +751,7 @@ mod tests {
         let file = corpus_file(3);
         let mut args = args(&server.url, file.path());
         args.passes = 2;
-        args.concurrency = 1;
+        args.concurrency = NonZeroUsize::new(1).unwrap();
 
         let replay = Replay::new(&args, Arc::new(load_corpus(&args).unwrap())).unwrap();
         let elapsed = replay.run_closed_loop(&args).await.unwrap();
