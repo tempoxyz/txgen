@@ -85,38 +85,22 @@ impl ObservationRuntime {
         }
     }
 
+    /// Connect the configured optional WebSocket observation endpoint.
+    ///
+    /// Auto mode allows a connection failure to fall back to canonical HTTP
+    /// polling. Poll mode does not connect to the WebSocket endpoint at all.
     pub(crate) async fn from_config(
         query_provider: DynProvider<AnyNetwork>,
         config: &ObservationDef,
     ) -> Result<Self, StepError> {
         let behavior = SubscriptionBehavior::from(config.mode);
-        Self::connect(
-            query_provider,
-            config.websocket_url.as_deref(),
-            config.poll_interval,
-            behavior,
-        )
-        .await
-    }
-
-    /// Connect an optional WebSocket observation endpoint.
-    ///
-    /// Auto mode allows a connection failure to fall back to canonical HTTP
-    /// polling. Poll mode does not connect to the WebSocket endpoint at all.
-    pub(crate) async fn connect(
-        query_provider: DynProvider<AnyNetwork>,
-        websocket_url: Option<&str>,
-        poll_interval: Duration,
-        behavior: SubscriptionBehavior,
-    ) -> Result<Self, StepError> {
-        let websocket_provider = match (behavior, websocket_url) {
+        let websocket_provider = match (behavior, config.websocket_url.as_deref()) {
             (SubscriptionBehavior::Disabled, _) => None,
             (_, Some(url)) => {
                 let connect = WsConnect::new(url);
                 match ProviderBuilder::new_with_network::<AnyNetwork>().connect_ws(connect).await {
                     Ok(provider) => Some(provider.erased()),
-                    Err(error) if behavior == SubscriptionBehavior::Require => {
-                        let _ = error;
+                    Err(_) if behavior == SubscriptionBehavior::Require => {
                         return Err(StepError::new(
                             "configuration_error",
                             "failed to connect configured observation WebSocket",
@@ -141,7 +125,7 @@ impl ObservationRuntime {
             )),
             query_provider,
             websocket_provider,
-            poll_interval,
+            poll_interval: config.poll_interval,
             subscription_behavior: behavior,
         })
     }
@@ -166,32 +150,15 @@ impl ObservationRuntime {
         self.websocket_provider.is_some()
     }
 
-    pub(crate) fn subscription_behavior(&self) -> SubscriptionBehavior {
-        self.subscription_behavior
-    }
-
-    async fn subscribe_heads(
-        &self,
-        behavior: SubscriptionBehavior,
-    ) -> Result<Option<WakeStream>, StepError> {
-        if behavior == SubscriptionBehavior::Disabled {
-            return Ok(None);
-        }
-        let require_subscription = behavior == SubscriptionBehavior::Require;
-        let Some(provider) = &self.websocket_provider else {
-            if require_subscription {
-                return Err(StepError::new(
-                    "configuration_error",
-                    "subscription observation mode has no connected WebSocket",
-                ));
-            }
-            return Ok(None);
-        };
+    async fn subscribe_heads(&self) -> Result<Option<WakeStream>, StepError> {
+        let Some(provider) = &self.websocket_provider else { return Ok(None) };
         match provider.subscribe_blocks().await {
             Ok(subscription) => {
                 Ok(Some(Box::pin(subscription.into_stream().map(|_| ())) as WakeStream))
             }
-            Err(error) if require_subscription => Err(StepError::rpc(error)),
+            Err(error) if self.subscription_behavior == SubscriptionBehavior::Require => {
+                Err(StepError::rpc(error))
+            }
             Err(_) => Ok(None),
         }
     }
@@ -227,7 +194,7 @@ pub(crate) struct ObservationMetadata {
     pub block_number: u64,
     pub transaction_index: Option<u64>,
     pub log_indices: Vec<u64>,
-    pub block_timestamp_ms: Option<u64>,
+    pub block_timestamp_ms: u64,
     pub confirmation_depth: u64,
 }
 
@@ -254,7 +221,6 @@ pub(crate) async fn wait_for_receipt(
         sender,
         transaction_hash,
         confirmations,
-        SubscriptionBehavior::Disabled,
     )
     .await
 }
@@ -266,9 +232,8 @@ pub(crate) async fn wait_for_receipt_observed(
     sender: Option<Address>,
     transaction_hash: TxHash,
     confirmations: u64,
-    subscription: SubscriptionBehavior,
 ) -> Result<ReceiptResult, StepError> {
-    let mut wake = observation.subscribe_heads(subscription).await?;
+    let mut wake = observation.subscribe_heads().await?;
     let mut first_observed = None::<(B256, u64, ObservationPoint)>;
     loop {
         let receipt = submitter
@@ -338,22 +303,9 @@ pub(crate) async fn wait_for_receipt_observed(
     }
 }
 
-#[cfg(test)]
-async fn receipt_is_canonical_on_query(
-    provider: &DynProvider<AnyNetwork>,
-    receipt: &AnyTransactionReceipt,
-) -> Result<bool, StepError> {
-    let (Some(block_number), Some(receipt_block_hash)) =
-        (receipt.block_number(), receipt.block_hash())
-    else {
-        return Ok(false);
-    };
-    Ok(canonical_block(provider, block_number, receipt_block_hash).await?.is_some())
-}
-
 #[derive(Debug, Clone, Copy)]
 struct CanonicalBlock {
-    timestamp_ms: Option<u64>,
+    timestamp_ms: u64,
 }
 
 async fn canonical_block(
@@ -387,7 +339,7 @@ async fn block_by_number(
         .map_err(StepError::rpc)
 }
 
-fn block_timestamp_ms(block: &AnyRpcBlock) -> Result<Option<u64>, StepError> {
+fn block_timestamp_ms(block: &AnyRpcBlock) -> Result<u64, StepError> {
     // Tempo exposes the full millisecond value as `timestampMillis`. Its
     // consensus header also contains `timestampMillisPart`, which is only the
     // 0..999 sub-second component. Prefer the full field whenever present.
@@ -398,7 +350,6 @@ fn block_timestamp_ms(block: &AnyRpcBlock) -> Result<Option<u64>, StepError> {
         .map_err(|_| StepError::rpc("query RPC block had an invalid timestampMillis"))?;
     if let Some(value) = timestamp_millis.filter(|value| !value.is_null()) {
         return parse_quantity_u64(&value)
-            .map(Some)
             .map_err(|_| StepError::rpc("query RPC block had an invalid timestampMillis"));
     }
 
@@ -412,7 +363,7 @@ fn block_timestamp_ms(block: &AnyRpcBlock) -> Result<Option<u64>, StepError> {
         .transpose()
         .map_err(|_| StepError::rpc("query RPC block had an invalid timestampMillisPart"))?
         .unwrap_or(0);
-    Ok(Some(block.header().timestamp.saturating_mul(1_000).saturating_add(millis_part)))
+    Ok(block.header().timestamp.saturating_mul(1_000).saturating_add(millis_part))
 }
 
 fn parse_quantity_u64(value: &serde_json::Value) -> Result<u64> {
@@ -436,7 +387,7 @@ fn receipt_runtime_value(
     receipt: &AnyTransactionReceipt,
     first_observed: ObservationPoint,
     confirmed: ObservationPoint,
-    block_timestamp_ms: Option<u64>,
+    block_timestamp_ms: u64,
     confirmation_depth: u64,
 ) -> ReceiptResult {
     let status = receipt.status();
@@ -470,12 +421,7 @@ fn receipt_runtime_value(
             ),
             ("status", RuntimeValue::Bool(status)),
             ("gas_used", RuntimeValue::Uint(U256::from(receipt.gas_used()))),
-            (
-                "block_timestamp_ms",
-                block_timestamp_ms
-                    .map(|value| RuntimeValue::Uint(U256::from(value)))
-                    .unwrap_or(RuntimeValue::Null),
-            ),
+            ("block_timestamp_ms", RuntimeValue::Uint(U256::from(block_timestamp_ms))),
             ("first_observed_at", RuntimeValue::Uint(U256::from(first_observed.unix_ms()))),
             ("observed_at", RuntimeValue::Uint(U256::from(first_observed.unix_ms()))),
             ("confirmed_at", RuntimeValue::Uint(U256::from(confirmed.unix_ms()))),
@@ -489,18 +435,18 @@ async fn wait_for_confirmations(
     block_number: u64,
     confirmations: u64,
     wake: &mut Option<WakeStream>,
-) -> Result<u64, StepError> {
+) -> Result<(), StepError> {
     // Zero means inclusion itself. Canonical block verification below is
     // sufficient and, importantly, does not wait for another head.
     if confirmations == 0 {
-        return Ok(0);
+        return Ok(());
     }
     let target = block_number.saturating_add(confirmations);
     loop {
         let current =
             observation.query_provider.get_block_number().await.map_err(StepError::rpc)?;
         if current >= target {
-            return Ok(current.saturating_sub(block_number));
+            return Ok(());
         }
         wait_for_wake(wake, observation.poll_interval).await;
     }
@@ -534,32 +480,6 @@ pub(crate) async fn wait_for_wake(wake: &mut Option<WakeStream>, poll_interval: 
     }
 }
 
-#[cfg(test)]
-pub(crate) async fn wait_for_log(
-    query_provider: &DynProvider<AnyNetwork>,
-    submitter: &RpcSubmitter,
-    chain: &str,
-    abi: &JsonAbi,
-    step: &WaitLogStep,
-    context: &RuntimeContext,
-) -> Result<RuntimeValue, StepError> {
-    let observation = ObservationRuntime::polling(
-        query_provider.clone(),
-        step.poll_interval.unwrap_or(DEFAULT_POLL_INTERVAL),
-    );
-    wait_for_log_observed(
-        &observation,
-        submitter,
-        chain,
-        abi,
-        step,
-        context,
-        SubscriptionBehavior::Disabled,
-    )
-    .await
-    .map(|result| result.value)
-}
-
 pub(crate) struct LogResult {
     pub value: RuntimeValue,
     pub observation: ObservationMetadata,
@@ -572,7 +492,6 @@ pub(crate) async fn wait_for_log_observed(
     abi: &JsonAbi,
     step: &WaitLogStep,
     context: &RuntimeContext,
-    subscription: SubscriptionBehavior,
 ) -> Result<LogResult, StepError> {
     let matcher =
         EventMatcher::new(abi, &step.event, &step.where_value, context).map_err(StepError::abi)?;
@@ -617,7 +536,6 @@ pub(crate) async fn wait_for_log_observed(
                 address,
                 matcher: &matcher,
                 confirmations,
-                subscription,
             },
         )
         .await;
@@ -625,12 +543,6 @@ pub(crate) async fn wait_for_log_observed(
 
     let start_block = from_block.expect("checked above");
     let max_range = step.max_block_range.unwrap_or(DEFAULT_MAX_BLOCK_RANGE);
-    if subscription == SubscriptionBehavior::Require && !observation.has_subscription() {
-        return Err(StepError::new(
-            "configuration_error",
-            "subscription observation mode has no connected WebSocket",
-        ));
-    }
 
     // All log waits on this chain feed one shared poller. This step only
     // issues its own RPC calls for blocks below the shared window and to
@@ -867,7 +779,6 @@ struct TransactionLogWait<'a> {
     address: Option<Address>,
     matcher: &'a EventMatcher,
     confirmations: u64,
-    subscription: SubscriptionBehavior,
 }
 
 async fn wait_for_transaction_log(
@@ -875,16 +786,9 @@ async fn wait_for_transaction_log(
     submitter: &RpcSubmitter,
     request: TransactionLogWait<'_>,
 ) -> Result<LogResult, StepError> {
-    let TransactionLogWait {
-        chain,
-        sender,
-        transaction_hash,
-        address,
-        matcher,
-        confirmations,
-        subscription,
-    } = request;
-    let mut wake = observation.subscribe_heads(subscription).await?;
+    let TransactionLogWait { chain, sender, transaction_hash, address, matcher, confirmations } =
+        request;
+    let mut wake = observation.subscribe_heads().await?;
     let mut first_observed = None::<(B256, u64, ObservationPoint)>;
     loop {
         let receipt = submitter
@@ -1110,15 +1014,8 @@ pub(crate) async fn wait_for_transaction_events(
     transaction_hash: TxHash,
     events: &[PreparedReceiptEvent],
     confirmations: u64,
-    subscription: SubscriptionBehavior,
 ) -> Result<LogResult, StepError> {
-    if events.is_empty() {
-        return Err(StepError::missing(
-            "receipt-scoped event group must contain at least one event",
-        ));
-    }
-
-    let mut wake = observation.subscribe_heads(subscription).await?;
+    let mut wake = observation.subscribe_heads().await?;
     let mut first_observed = None::<(B256, u64, ObservationPoint)>;
     loop {
         let receipt = submitter
@@ -1222,12 +1119,7 @@ pub(crate) async fn wait_for_transaction_events(
             ),
             ("status", RuntimeValue::Bool(status)),
             ("gas_used", RuntimeValue::Uint(U256::from(canonical.gas_used()))),
-            (
-                "block_timestamp_ms",
-                block_timestamp
-                    .map(|value| RuntimeValue::Uint(U256::from(value)))
-                    .unwrap_or(RuntimeValue::Null),
-            ),
+            ("block_timestamp_ms", RuntimeValue::Uint(U256::from(block_timestamp))),
             (
                 "first_observed_at",
                 RuntimeValue::Uint(U256::from(candidate_first_observed.unix_ms())),
@@ -1485,7 +1377,7 @@ fn log_runtime_value(
     values: Vec<DynSolValue>,
     first_observed: ObservationPoint,
     confirmed: ObservationPoint,
-    block_timestamp_ms: Option<u64>,
+    block_timestamp_ms: u64,
     confirmation_depth: u64,
 ) -> Result<RuntimeValue> {
     let arguments = decoded_event_arguments(event, values)?;
@@ -1521,12 +1413,7 @@ fn log_runtime_value(
         ("event", RuntimeValue::String(event.name.clone())),
         ("event_name", RuntimeValue::String(event.name.clone())),
         ("args", RuntimeValue::Object(arguments)),
-        (
-            "block_timestamp_ms",
-            block_timestamp_ms
-                .map(|value| RuntimeValue::Uint(U256::from(value)))
-                .unwrap_or(RuntimeValue::Null),
-        ),
+        ("block_timestamp_ms", RuntimeValue::Uint(U256::from(block_timestamp_ms))),
         ("first_observed_at", RuntimeValue::Uint(U256::from(first_observed.unix_ms()))),
         ("observed_at", RuntimeValue::Uint(U256::from(first_observed.unix_ms()))),
         ("confirmed_at", RuntimeValue::Uint(U256::from(confirmed.unix_ms()))),
@@ -1570,7 +1457,7 @@ fn decoded_event_arguments(
 fn log_observation_metadata(
     log: &Log,
     first_observed: ObservationPoint,
-    block_timestamp_ms: Option<u64>,
+    block_timestamp_ms: u64,
     confirmation_depth: u64,
 ) -> Result<ObservationMetadata, StepError> {
     Ok(ObservationMetadata {
@@ -1601,7 +1488,7 @@ pub(crate) fn expression_address(
     }
 }
 
-fn expression_hash(value: &serde_yaml::Value, context: &RuntimeContext) -> Result<B256> {
+pub(crate) fn expression_hash(value: &serde_yaml::Value, context: &RuntimeContext) -> Result<B256> {
     match eval_expression(value, context)?.coerce_dyn_sol(&DynSolType::FixedBytes(32))? {
         DynSolValue::FixedBytes(value, 32) => Ok(value),
         _ => unreachable!("bytes32 coercion returned another type"),
@@ -1623,7 +1510,7 @@ pub(crate) fn sort_logs(logs: &mut [Log]) {
     });
 }
 
-fn object<const N: usize>(values: [(&str, RuntimeValue); N]) -> RuntimeValue {
+pub(crate) fn object<const N: usize>(values: [(&str, RuntimeValue); N]) -> RuntimeValue {
     RuntimeValue::Object(values.into_iter().map(|(key, value)| (key.to_string(), value)).collect())
 }
 
@@ -1642,6 +1529,35 @@ mod tests {
 
     fn mock_submitter(provider: &DynProvider<AnyNetwork>) -> RpcSubmitter {
         RpcSubmitter::new(vec![provider.clone()], SenderConfig::default()).unwrap()
+    }
+
+    async fn wait_for_log(
+        query_provider: &DynProvider<AnyNetwork>,
+        submitter: &RpcSubmitter,
+        chain: &str,
+        abi: &JsonAbi,
+        step: &WaitLogStep,
+        context: &RuntimeContext,
+    ) -> Result<RuntimeValue, StepError> {
+        let observation = ObservationRuntime::polling(
+            query_provider.clone(),
+            step.poll_interval.unwrap_or(DEFAULT_POLL_INTERVAL),
+        );
+        wait_for_log_observed(&observation, submitter, chain, abi, step, context)
+            .await
+            .map(|result| result.value)
+    }
+
+    async fn receipt_is_canonical_on_query(
+        provider: &DynProvider<AnyNetwork>,
+        receipt: &AnyTransactionReceipt,
+    ) -> Result<bool, StepError> {
+        let (Some(block_number), Some(receipt_block_hash)) =
+            (receipt.block_number(), receipt.block_hash())
+        else {
+            return Ok(false);
+        };
+        Ok(canonical_block(provider, block_number, receipt_block_hash).await?.is_some())
     }
 
     /// Stateful JSON-RPC chain mock. Unlike the FIFO [`Asserter`], responses
@@ -1976,7 +1892,7 @@ mod tests {
         let values = matcher.decode_if_matches(&log).unwrap().unwrap();
         let observed = ObservationPoint::now();
         let saved =
-            log_runtime_value("chain_a", event, &log, values, observed, observed, None, 0).unwrap();
+            log_runtime_value("chain_a", event, &log, values, observed, observed, 0, 0).unwrap();
         let RuntimeValue::Object(saved) = saved else { panic!("expected object") };
         let RuntimeValue::Object(args) = &saved["args"] else { panic!("expected args") };
         assert_eq!(args["amount"], RuntimeValue::Uint(U256::from(7)));
@@ -2020,10 +1936,10 @@ mod tests {
     fn canonical_timestamp_prefers_full_millis_and_supports_part_fallback() {
         assert_eq!(
             block_timestamp_ms(&typed_block(Some("0x1876b"), Some("0x1"))).unwrap(),
-            Some(100_203)
+            100_203
         );
-        assert_eq!(block_timestamp_ms(&typed_block(None, Some("0xcb"))).unwrap(), Some(100_203));
-        assert_eq!(block_timestamp_ms(&typed_block(None, None)).unwrap(), Some(100_000));
+        assert_eq!(block_timestamp_ms(&typed_block(None, Some("0xcb"))).unwrap(), 100_203);
+        assert_eq!(block_timestamp_ms(&typed_block(None, None)).unwrap(), 100_000);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2105,13 +2021,12 @@ mod tests {
             transaction_hash,
             &events,
             0,
-            SubscriptionBehavior::Disabled,
         )
         .await
         .unwrap();
 
         assert_eq!(result.observation.log_indices, vec![2, 3]);
-        assert_eq!(result.observation.block_timestamp_ms, Some(100_100));
+        assert_eq!(result.observation.block_timestamp_ms, 100_100);
         let RuntimeValue::Object(value) = result.value else { panic!("expected object") };
         let RuntimeValue::Object(events) = &value["events"] else {
             panic!("expected grouped events")
@@ -2171,7 +2086,6 @@ mod tests {
             transaction_hash,
             &events,
             0,
-            SubscriptionBehavior::Disabled,
         )
         .await
         .unwrap();
@@ -2308,7 +2222,6 @@ mod tests {
                 &event_abi(),
                 &step,
                 &RuntimeContext::empty(),
-                SubscriptionBehavior::Disabled,
             ),
         )
         .await
@@ -2478,7 +2391,6 @@ mod tests {
                         &event_abi(),
                         &step,
                         &RuntimeContext::empty(),
-                        SubscriptionBehavior::Disabled,
                     )
                     .await
                 })
@@ -2548,7 +2460,6 @@ mod tests {
                         &event_abi(),
                         &wait_log_step("Moved", 4, poll_interval, 0, 100),
                         &RuntimeContext::empty(),
-                        SubscriptionBehavior::Disabled,
                     )
                     .await
                 })
@@ -2588,7 +2499,6 @@ mod tests {
                     &abi,
                     &step,
                     &RuntimeContext::empty(),
-                    SubscriptionBehavior::Disabled,
                 )
                 .await
             }
@@ -2627,7 +2537,6 @@ mod tests {
                 &jumped_abi,
                 &short_step,
                 &RuntimeContext::empty(),
-                SubscriptionBehavior::Disabled,
             ),
         )
         .await
@@ -2692,7 +2601,6 @@ mod tests {
                     &abi,
                     &step,
                     &RuntimeContext::empty(),
-                    SubscriptionBehavior::Disabled,
                 )
                 .await
             }));
@@ -2759,7 +2667,7 @@ mod tests {
         .unwrap();
         assert!(!result.status);
         assert_eq!(result.observation.confirmation_depth, 0);
-        assert_eq!(result.observation.block_timestamp_ms, Some(100_100));
+        assert_eq!(result.observation.block_timestamp_ms, 100_100);
         assert!(asserter.read_q().is_empty());
 
         let asserter = Asserter::new();
