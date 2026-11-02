@@ -2,7 +2,7 @@ use crate::{yaml, AccountPoolDef, AccountRef, AddressPoolDef, ArtifactDef, GenVa
 use alloy_primitives::{Address, B256, U256};
 use eyre::{Result, WrapErr};
 use serde::{Deserialize, Deserializer};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Workload specification parsed from YAML.
 #[derive(Debug, Clone, Deserialize)]
@@ -46,6 +46,7 @@ pub struct WorkloadSpec {
 
 /// Default gas configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GasConfig {
     #[serde(default = "default_max_fee")]
     pub max_fee_per_gas: u128,
@@ -122,6 +123,7 @@ impl<'de> Deserialize<'de> for MixEntry {
 
 /// Deterministic setup phase.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetupDef {
     /// Ordered setup steps. All setup transactions are emitted before workload transactions.
     #[serde(default)]
@@ -130,6 +132,7 @@ pub struct SetupDef {
 
 /// One deterministic setup step.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetupStep {
     /// Setup step IDs whose transactions must all succeed before this step submits.
     #[serde(default)]
@@ -138,7 +141,7 @@ pub struct SetupStep {
     pub id: String,
     /// Values resolved once for this setup step.
     #[serde(default)]
-    pub bindings: HashMap<String, SequenceBinding>,
+    pub bindings: BTreeMap<String, SequenceBinding>,
     /// Contract deployment definition.
     #[serde(default)]
     pub deploy: Option<serde_yaml::Value>,
@@ -152,16 +155,18 @@ pub struct SetupStep {
 
 /// A multi-transaction workload unit.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SequenceDef {
     /// Values resolved once per sequence instance and reused by steps.
     #[serde(default)]
-    pub bindings: HashMap<String, SequenceBinding>,
+    pub bindings: BTreeMap<String, SequenceBinding>,
     /// Ordered transaction steps.
     pub steps: Vec<SequenceStep>,
 }
 
 /// A transaction step in a sequence.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SequenceStep {
     /// Optional human-readable step name for diagnostics.
     #[serde(default)]
@@ -183,9 +188,9 @@ pub enum SequenceBinding {
     /// Resolve a bytes32 value once.
     Bytes32(GenValue<B256>),
     /// ABI packed-encode values once.
-    AbiEncodePacked(AbiEncodePackedDef),
+    AbiEncodePacked(AbiValuesDef),
     /// Resolve a Keccak-256 hash over ABI-encoded values once.
-    AbiHash(AbiHashDef),
+    AbiHash(AbiValuesDef),
     /// Resolve a U256 once.
     U256(GenValue<U256>),
     /// Resolve a u64 once.
@@ -194,19 +199,9 @@ pub enum SequenceBinding {
     String(GenValue<String>),
 }
 
-/// Values to ABI packed-encode.
+/// Typed values for the `abi_encode_packed` and `abi_hash` bindings.
 #[derive(Debug, Clone, Deserialize)]
-pub struct AbiEncodePackedDef {
-    /// Solidity ABI types, one per value.
-    pub types: Vec<String>,
-    /// Values to encode using the corresponding type.
-    #[serde(alias = "args")]
-    pub values: Vec<serde_yaml::Value>,
-}
-
-/// Values to ABI-encode and hash with Keccak-256.
-#[derive(Debug, Clone, Deserialize)]
-pub struct AbiHashDef {
+pub struct AbiValuesDef {
     /// Solidity ABI types, one per value.
     pub types: Vec<String>,
     /// Values to encode using the corresponding type.
@@ -224,8 +219,8 @@ impl<'de> Deserialize<'de> for SequenceBinding {
             account: Option<AccountRef>,
             address: Option<GenValue<Address>>,
             bytes32: Option<GenValue<B256>>,
-            abi_encode_packed: Option<AbiEncodePackedDef>,
-            abi_hash: Option<AbiHashDef>,
+            abi_encode_packed: Option<AbiValuesDef>,
+            abi_hash: Option<AbiValuesDef>,
             u256: Option<GenValue<U256>>,
             u64: Option<GenValue<u64>>,
             string: Option<GenValue<String>>,
