@@ -254,6 +254,10 @@ impl SendArgs {
             usize::try_from(limit).context("pending limit exceeds this platform's capacity")?;
         Ok(NonZeroUsize::new(limit))
     }
+
+    fn has_warmup(&self) -> bool {
+        !self.warmup.is_zero() || self.warmup_validators.is_some()
+    }
 }
 
 /// Arguments for the `send-blocks` subcommand.
