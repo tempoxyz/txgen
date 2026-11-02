@@ -579,7 +579,6 @@ where
                 adapter,
                 &format!("setup.{}[{idx}]", step.id),
                 value,
-                &[],
                 ctx,
                 output.prepare_timeout,
             )
@@ -596,7 +595,6 @@ where
             adapter,
             &format!("setup.{}", step.id),
             value,
-            &[],
             ctx,
             output.prepare_timeout,
         )
@@ -615,7 +613,6 @@ where
             adapter,
             &format!("setup.{}", step.id),
             materialized,
-            &[],
             ctx,
             output.prepare_timeout,
         )
@@ -623,15 +620,7 @@ where
     };
     output.transactions.push((output.submit)(generated).await?);
 
-    setup_bindings.insert(
-        format!("setup.{}", step.id),
-        ResolvedBinding::SetupTx {
-            address: info.created_address,
-            tx_hash: info.tx_hash,
-            sender: info.sender,
-            nonce: info.nonce,
-        },
-    );
+    setup_bindings.insert(format!("setup.{}", step.id), ResolvedBinding::SetupTx(info));
 
     Ok(())
 }
@@ -640,7 +629,6 @@ async fn materialize_setup_value_online<A: NetworkAdapter>(
     adapter: &A,
     name: &str,
     value: serde_yaml::Value,
-    inclusion_keys: &[SchedulingKey],
     ctx: &mut BuildContext<'_>,
     prepare_timeout: Duration,
 ) -> Result<(GeneratedTx, EmittedTxInfo)>
@@ -669,17 +657,7 @@ where
             bail!("timed out preparing request from template '{name}'");
         }
     }
-    let materialized =
-        materialize_and_sign_template(adapter, name, value, TxPhase::Setup, inclusion_keys, ctx)?;
-    let nonce =
-        materialized.nonce.ok_or_else(|| eyre::eyre!("template '{name}' did not set a nonce"))?;
-    let info = EmittedTxInfo {
-        sender: materialized.sender,
-        nonce,
-        tx_hash: materialized.tx_hash,
-        created_address: materialized.created_address,
-    };
-    Ok((materialized.generated, info))
+    materialize_setup_value(adapter, name, value, ctx)
 }
 
 /// Runtime context supplied to an adapter-defined scenario action.
@@ -1075,20 +1053,9 @@ impl SetupState {
     ) -> Result<Self> {
         let transactions = bindings
             .iter()
-            .filter_map(|(id, binding)| {
-                if let ResolvedBinding::SetupTx { address, tx_hash, sender, nonce } = binding {
-                    Some((
-                        id.clone(),
-                        EmittedTxInfo {
-                            created_address: *address,
-                            tx_hash: *tx_hash,
-                            sender: *sender,
-                            nonce: *nonce,
-                        },
-                    ))
-                } else {
-                    None
-                }
+            .filter_map(|(id, binding)| match binding {
+                ResolvedBinding::SetupTx(info) => Some((id.clone(), info.clone())),
+                _ => None,
             })
             .collect();
         Ok(Self {
@@ -1141,17 +1108,11 @@ impl SetupState {
             "chain_id".to_owned(),
             ResolvedBinding::U64(self.chain_id),
         )]);
-        bindings.extend(self.transactions.iter().map(|(id, info)| {
-            (
-                id.clone(),
-                ResolvedBinding::SetupTx {
-                    address: info.created_address,
-                    tx_hash: info.tx_hash,
-                    sender: info.sender,
-                    nonce: info.nonce,
-                },
-            )
-        }));
+        bindings.extend(
+            self.transactions
+                .iter()
+                .map(|(id, info)| (id.clone(), ResolvedBinding::SetupTx(info.clone()))),
+        );
         bindings
     }
 }
@@ -1165,7 +1126,7 @@ enum ResolvedBinding {
     U256(U256),
     U64(u64),
     String(String),
-    SetupTx { address: Option<Address>, tx_hash: B256, sender: Address, nonce: u64 },
+    SetupTx(EmittedTxInfo),
 }
 
 struct WeightedWorkloadItem {
@@ -1437,63 +1398,33 @@ where
             bail!("setup step `keychain_authorize_pool` produced no transactions");
         }
         for (idx, value) in templates.into_iter().enumerate() {
-            emit_template_value(
-                adapter,
-                &format!("setup.{}[{idx}]", step.id),
-                value,
-                TxPhase::Setup,
-                &[],
-                ctx,
-                transactions,
-            )?;
+            let (generated, _) =
+                materialize_setup_value(adapter, &format!("setup.{}[{idx}]", step.id), value, ctx)?;
+            transactions.push(generated);
         }
         return Ok(());
     }
 
-    let info = if let Some(deploy) = &step.deploy {
+    let (generated, info) = if let Some(deploy) = &step.deploy {
         let materialized = substitute_vars(deploy.clone(), &local_bindings)?;
         let (value, create2_address) = build_deploy_template_value(materialized, ctx)?;
-        let mut info = emit_template_value(
-            adapter,
-            &format!("setup.{}", step.id),
-            value,
-            TxPhase::Setup,
-            &[],
-            ctx,
-            transactions,
-        )?
-        .expect("setup emissions request tx info");
+        let mut result =
+            materialize_setup_value(adapter, &format!("setup.{}", step.id), value, ctx)?;
         if create2_address.is_some() {
-            info.created_address = create2_address;
+            result.1.created_address = create2_address;
         }
-        if info.created_address.is_none() {
+        if result.1.created_address.is_none() {
             bail!("deploy setup step did not produce a contract creation transaction");
         }
-        info
+        result
     } else {
         let tx = step.tx.as_ref().expect("checked exactly one setup action");
         let materialized = substitute_vars(tx.clone(), &local_bindings)?;
-        emit_template_value(
-            adapter,
-            &format!("setup.{}", step.id),
-            materialized,
-            TxPhase::Setup,
-            &[],
-            ctx,
-            transactions,
-        )?
-        .expect("setup emissions request tx info")
+        materialize_setup_value(adapter, &format!("setup.{}", step.id), materialized, ctx)?
     };
+    transactions.push(generated);
 
-    setup_bindings.insert(
-        format!("setup.{}", step.id),
-        ResolvedBinding::SetupTx {
-            address: info.created_address,
-            tx_hash: info.tx_hash,
-            sender: info.sender,
-            nonce: info.nonce,
-        },
-    );
+    setup_bindings.insert(format!("setup.{}", step.id), ResolvedBinding::SetupTx(info));
 
     Ok(())
 }
@@ -1903,38 +1834,28 @@ where
     Ok(written)
 }
 
-fn emit_template_value<A: NetworkAdapter>(
+fn materialize_setup_value<A: NetworkAdapter>(
     adapter: &A,
     name: &str,
     value: serde_yaml::Value,
-    phase: TxPhase,
-    inclusion_keys: &[SchedulingKey],
     ctx: &mut BuildContext<'_>,
-    transactions: &mut Vec<GeneratedTx>,
-) -> Result<Option<EmittedTxInfo>>
+) -> Result<(GeneratedTx, EmittedTxInfo)>
 where
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
     let materialized =
-        materialize_and_sign_template(adapter, name, value, phase, inclusion_keys, ctx)?;
-    let info = if phase == TxPhase::Setup {
-        let nonce = materialized
-            .nonce
-            .ok_or_else(|| eyre::eyre!("template '{name}' did not set a nonce"))?;
-        Some(EmittedTxInfo {
-            sender: materialized.sender,
-            nonce,
-            tx_hash: materialized.tx_hash,
-            created_address: materialized.created_address,
-        })
-    } else {
-        None
+        materialize_and_sign_template(adapter, name, value, TxPhase::Setup, &[], ctx)?;
+    let nonce =
+        materialized.nonce.ok_or_else(|| eyre::eyre!("template '{name}' did not set a nonce"))?;
+    let info = EmittedTxInfo {
+        sender: materialized.sender,
+        nonce,
+        tx_hash: materialized.tx_hash,
+        created_address: materialized.created_address,
     };
-
-    transactions.push(materialized.generated);
-    Ok(info)
+    Ok((materialized.generated, info))
 }
 
 fn resolve_sequence_bindings(
@@ -2192,20 +2113,21 @@ fn binding_to_value(
         (ResolvedBinding::U256(value), None) => Ok(serde_yaml::Value::String(value.to_string())),
         (ResolvedBinding::U64(value), None) => Ok(serde_yaml::to_value(value)?),
         (ResolvedBinding::String(value), None) => Ok(serde_yaml::Value::String(value.clone())),
-        (ResolvedBinding::SetupTx { address: Some(address), .. }, Some("address")) => {
-            Ok(serde_yaml::Value::String(address.to_string()))
-        }
-        (ResolvedBinding::SetupTx { address: None, .. }, Some("address")) => {
+        (
+            ResolvedBinding::SetupTx(EmittedTxInfo { created_address: Some(address), .. }),
+            Some("address"),
+        ) => Ok(serde_yaml::Value::String(address.to_string())),
+        (ResolvedBinding::SetupTx(_), Some("address")) => {
             bail!("setup transaction binding '{name}' has no deployed address");
         }
-        (ResolvedBinding::SetupTx { tx_hash, .. }, Some("tx_hash")) => {
-            Ok(serde_yaml::Value::String(tx_hash.to_string()))
+        (ResolvedBinding::SetupTx(info), Some("tx_hash")) => {
+            Ok(serde_yaml::Value::String(info.tx_hash.to_string()))
         }
-        (ResolvedBinding::SetupTx { sender, .. }, Some("sender")) => {
-            Ok(serde_yaml::Value::String(sender.to_string()))
+        (ResolvedBinding::SetupTx(info), Some("sender")) => {
+            Ok(serde_yaml::Value::String(info.sender.to_string()))
         }
-        (ResolvedBinding::SetupTx { nonce, .. }, Some("nonce")) => Ok(serde_yaml::to_value(nonce)?),
-        (ResolvedBinding::SetupTx { .. }, None) => {
+        (ResolvedBinding::SetupTx(info), Some("nonce")) => Ok(serde_yaml::to_value(info.nonce)?),
+        (ResolvedBinding::SetupTx(_), None) => {
             bail!("setup transaction binding '{name}' requires a field");
         }
         (_, Some(field)) => {
@@ -2728,7 +2650,6 @@ mix: [{sequence: s, weight: 1}]
             &PendingPrepareAdapter,
             "pending",
             serde_yaml::Value::Null,
-            &[],
             &mut context,
             Duration::from_millis(1),
         )
