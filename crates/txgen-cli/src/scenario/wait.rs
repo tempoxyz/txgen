@@ -233,6 +233,80 @@ pub(crate) async fn wait_for_receipt_observed(
     transaction_hash: TxHash,
     confirmations: u64,
 ) -> Result<ReceiptResult, StepError> {
+    let confirmed =
+        wait_for_confirmed_receipt(observation, submitter, sender, transaction_hash, confirmations)
+            .await?;
+    Ok(ReceiptResult {
+        status: confirmed.receipt.status(),
+        observation: confirmed.observation(Vec::new()),
+        value: RuntimeValue::Object(confirmed.runtime_fields(chain)),
+    })
+}
+
+/// A receipt that remained canonical through its requested confirmation depth.
+struct ConfirmedReceipt {
+    receipt: AnyTransactionReceipt,
+    block_hash: B256,
+    block_number: u64,
+    first_observed: ObservationPoint,
+    block_timestamp_ms: u64,
+    confirmation_depth: u64,
+}
+
+impl ConfirmedReceipt {
+    fn observation(&self, log_indices: Vec<u64>) -> ObservationMetadata {
+        ObservationMetadata {
+            first_observed: self.first_observed,
+            transaction_hash: self.receipt.transaction_hash(),
+            block_hash: self.block_hash,
+            block_number: self.block_number,
+            transaction_index: self.receipt.transaction_index(),
+            log_indices,
+            block_timestamp_ms: self.block_timestamp_ms,
+            confirmation_depth: self.confirmation_depth,
+        }
+    }
+
+    /// Runtime fields shared by receipt saves and receipt-scoped event groups.
+    fn runtime_fields(&self, chain: &str) -> BTreeMap<String, RuntimeValue> {
+        let transaction_hash = self.receipt.transaction_hash();
+        let first_observed_at = RuntimeValue::Uint(U256::from(self.first_observed.unix_ms()));
+        [
+            ("chain", RuntimeValue::String(chain.to_string())),
+            ("transaction_hash", RuntimeValue::Bytes32(transaction_hash)),
+            ("tx_hash", RuntimeValue::Bytes32(transaction_hash)),
+            ("block_hash", RuntimeValue::Bytes32(self.block_hash)),
+            ("block_number", RuntimeValue::Uint(U256::from(self.block_number))),
+            (
+                "transaction_index",
+                self.receipt
+                    .transaction_index()
+                    .map(|value| RuntimeValue::Uint(U256::from(value)))
+                    .unwrap_or(RuntimeValue::Null),
+            ),
+            ("status", RuntimeValue::Bool(self.receipt.status())),
+            ("gas_used", RuntimeValue::Uint(U256::from(self.receipt.gas_used()))),
+            ("block_timestamp_ms", RuntimeValue::Uint(U256::from(self.block_timestamp_ms))),
+            ("first_observed_at", first_observed_at.clone()),
+            ("observed_at", first_observed_at),
+            ("confirmed_at", RuntimeValue::Uint(U256::from(ObservationPoint::now().unix_ms()))),
+            ("confirmation_depth", RuntimeValue::Uint(U256::from(self.confirmation_depth))),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect()
+    }
+}
+
+/// Wait for a receipt, its confirmations, and a re-fetch proving it is still
+/// canonical on the query RPC.
+async fn wait_for_confirmed_receipt(
+    observation: &ObservationRuntime,
+    submitter: &RpcSubmitter,
+    sender: Option<Address>,
+    transaction_hash: TxHash,
+    confirmations: u64,
+) -> Result<ConfirmedReceipt, StepError> {
     let mut wake = observation.subscribe_heads().await?;
     let mut first_observed = None::<(B256, u64, ObservationPoint)>;
     loop {
@@ -291,15 +365,14 @@ pub(crate) async fn wait_for_receipt_observed(
             continue;
         };
 
-        let confirmed = ObservationPoint::now();
-        return Ok(receipt_runtime_value(
-            chain,
-            &canonical,
-            candidate_first_observed,
-            confirmed,
-            block.timestamp_ms,
+        return Ok(ConfirmedReceipt {
+            receipt: canonical,
+            block_hash,
+            block_number,
+            first_observed: candidate_first_observed,
+            block_timestamp_ms: block.timestamp_ms,
             confirmation_depth,
-        ));
+        });
     }
 }
 
@@ -379,54 +452,6 @@ fn parse_quantity_u64(value: &serde_json::Value) -> Result<u64> {
         u64::from_str_radix(digits, 16).map_err(Into::into)
     } else {
         value.parse().map_err(Into::into)
-    }
-}
-
-fn receipt_runtime_value(
-    chain: &str,
-    receipt: &AnyTransactionReceipt,
-    first_observed: ObservationPoint,
-    confirmed: ObservationPoint,
-    block_timestamp_ms: u64,
-    confirmation_depth: u64,
-) -> ReceiptResult {
-    let status = receipt.status();
-    let transaction_hash = receipt.transaction_hash();
-    let block_hash = receipt.block_hash().expect("canonical receipt has a block hash");
-    let block_number = receipt.block_number().expect("canonical receipt has a block number");
-    let transaction_index = receipt.transaction_index();
-    ReceiptResult {
-        status,
-        observation: ObservationMetadata {
-            first_observed,
-            transaction_hash,
-            block_hash,
-            block_number,
-            transaction_index,
-            log_indices: Vec::new(),
-            block_timestamp_ms,
-            confirmation_depth,
-        },
-        value: object([
-            ("chain", RuntimeValue::String(chain.to_string())),
-            ("transaction_hash", RuntimeValue::Bytes32(transaction_hash)),
-            ("tx_hash", RuntimeValue::Bytes32(transaction_hash)),
-            ("block_hash", RuntimeValue::Bytes32(block_hash)),
-            ("block_number", RuntimeValue::Uint(U256::from(block_number))),
-            (
-                "transaction_index",
-                transaction_index
-                    .map(|value| RuntimeValue::Uint(U256::from(value)))
-                    .unwrap_or(RuntimeValue::Null),
-            ),
-            ("status", RuntimeValue::Bool(status)),
-            ("gas_used", RuntimeValue::Uint(U256::from(receipt.gas_used()))),
-            ("block_timestamp_ms", RuntimeValue::Uint(U256::from(block_timestamp_ms))),
-            ("first_observed_at", RuntimeValue::Uint(U256::from(first_observed.unix_ms()))),
-            ("observed_at", RuntimeValue::Uint(U256::from(first_observed.unix_ms()))),
-            ("confirmed_at", RuntimeValue::Uint(U256::from(confirmed.unix_ms()))),
-            ("confirmation_depth", RuntimeValue::Uint(U256::from(confirmation_depth))),
-        ]),
     }
 }
 
@@ -788,92 +813,38 @@ async fn wait_for_transaction_log(
 ) -> Result<LogResult, StepError> {
     let TransactionLogWait { chain, sender, transaction_hash, address, matcher, confirmations } =
         request;
-    let mut wake = observation.subscribe_heads().await?;
-    let mut first_observed = None::<(B256, u64, ObservationPoint)>;
-    loop {
-        let receipt = submitter
-            .get_transaction_receipt(sender, transaction_hash)
-            .await
-            .map_err(StepError::rpc)?;
-        let Some(receipt) = receipt else {
-            wait_for_wake(&mut wake, observation.poll_interval).await;
-            continue;
-        };
-        let (Some(block_number), Some(block_hash)) = (receipt.block_number(), receipt.block_hash())
-        else {
-            wait_for_wake(&mut wake, observation.poll_interval).await;
-            continue;
-        };
-        let candidate_first_observed = match first_observed {
-            Some((seen_hash, seen_number, observed))
-                if seen_hash == block_hash && seen_number == block_number =>
-            {
-                observed
-            }
-            _ => {
-                let observed = ObservationPoint::now();
-                first_observed = Some((block_hash, block_number, observed));
-                observed
-            }
-        };
-        wait_for_confirmations(observation, block_number, confirmations, &mut wake).await?;
-
-        let canonical = submitter
-            .get_transaction_receipt(sender, transaction_hash)
-            .await
-            .map_err(StepError::rpc)?;
-        let Some(canonical) = canonical else { continue };
-        if canonical.block_hash() != receipt.block_hash() ||
-            canonical.block_number() != receipt.block_number()
-        {
+    let confirmed =
+        wait_for_confirmed_receipt(observation, submitter, sender, transaction_hash, confirmations)
+            .await?;
+    let mut logs = confirmed.receipt.logs().to_vec();
+    sort_logs(&mut logs);
+    for log in logs {
+        if log.removed || address.is_some_and(|expected| log.address() != expected) {
             continue;
         }
-        let Some(block) =
-            canonical_block(&observation.query_provider, block_number, block_hash).await?
-        else {
-            wait_for_wake(&mut wake, observation.poll_interval).await;
-            continue;
-        };
-        let Some(confirmation_depth) =
-            current_confirmation_depth(observation, block_number, confirmations).await?
-        else {
-            wait_for_wake(&mut wake, observation.poll_interval).await;
-            continue;
-        };
-
-        let mut logs = canonical.logs().to_vec();
-        sort_logs(&mut logs);
-        for log in logs {
-            if log.removed || address.is_some_and(|expected| log.address() != expected) {
-                continue;
-            }
-            if let Some(decoded) = matcher.decode_if_matches(&log).map_err(StepError::abi)? {
-                let confirmed = ObservationPoint::now();
-                return Ok(LogResult {
-                    observation: log_observation_metadata(
-                        &log,
-                        candidate_first_observed,
-                        block.timestamp_ms,
-                        confirmation_depth,
-                    )?,
-                    value: log_runtime_value(
-                        chain,
-                        &matcher.event,
-                        &log,
-                        decoded,
-                        candidate_first_observed,
-                        confirmed,
-                        block.timestamp_ms,
-                        confirmation_depth,
-                    )
-                    .map_err(StepError::abi)?,
-                });
-            }
+        if let Some(decoded) = matcher.decode_if_matches(&log).map_err(StepError::abi)? {
+            return Ok(LogResult {
+                observation: log_observation_metadata(
+                    &log,
+                    confirmed.first_observed,
+                    confirmed.block_timestamp_ms,
+                    confirmed.confirmation_depth,
+                )?,
+                value: log_runtime_value(
+                    chain,
+                    &matcher.event,
+                    &log,
+                    decoded,
+                    confirmed.first_observed,
+                    ObservationPoint::now(),
+                    confirmed.block_timestamp_ms,
+                    confirmed.confirmation_depth,
+                )
+                .map_err(StepError::abi)?,
+            });
         }
-        return Err(StepError::missing(
-            "confirmed transaction receipt contained no matching canonical event",
-        ));
     }
+    Err(StepError::missing("confirmed transaction receipt contained no matching canonical event"))
 }
 
 /// One required event in a receipt-scoped grouped wait.
@@ -1015,122 +986,38 @@ pub(crate) async fn wait_for_transaction_events(
     events: &[PreparedReceiptEvent],
     confirmations: u64,
 ) -> Result<LogResult, StepError> {
-    let mut wake = observation.subscribe_heads().await?;
-    let mut first_observed = None::<(B256, u64, ObservationPoint)>;
-    loop {
-        let receipt = submitter
-            .get_transaction_receipt(sender, transaction_hash)
-            .await
-            .map_err(StepError::rpc)?;
-        let Some(receipt) = receipt else {
-            wait_for_wake(&mut wake, observation.poll_interval).await;
-            continue;
-        };
-        let (Some(block_number), Some(block_hash)) = (receipt.block_number(), receipt.block_hash())
-        else {
-            wait_for_wake(&mut wake, observation.poll_interval).await;
-            continue;
-        };
-        let candidate_first_observed = match first_observed {
-            Some((seen_hash, seen_number, observed))
-                if seen_hash == block_hash && seen_number == block_number =>
-            {
-                observed
-            }
-            _ => {
-                let observed = ObservationPoint::now();
-                first_observed = Some((block_hash, block_number, observed));
-                observed
-            }
-        };
-        wait_for_confirmations(observation, block_number, confirmations, &mut wake).await?;
+    let confirmed =
+        wait_for_confirmed_receipt(observation, submitter, sender, transaction_hash, confirmations)
+            .await?;
+    let mut logs = confirmed.receipt.logs().to_vec();
+    sort_logs(&mut logs);
+    let mut decoded_events = BTreeMap::new();
+    let mut log_indices = Vec::with_capacity(events.len());
+    let assignment = complete_receipt_event_assignment(events, &logs)?;
 
-        let canonical = submitter
-            .get_transaction_receipt(sender, transaction_hash)
-            .await
-            .map_err(StepError::rpc)?;
-        let Some(canonical) = canonical else { continue };
-        if canonical.block_hash() != Some(block_hash) ||
-            canonical.block_number() != Some(block_number)
-        {
-            continue;
+    for (required, position) in events.iter().zip(assignment) {
+        let log = &logs[position];
+        let decoded = required
+            .matcher
+            .decode_if_matches(log)
+            .map_err(StepError::abi)?
+            .expect("complete assignment selects only matching logs");
+        if let Some(index) = log.log_index {
+            log_indices.push(index);
         }
-        let Some(block) =
-            canonical_block(&observation.query_provider, block_number, block_hash).await?
-        else {
-            wait_for_wake(&mut wake, observation.poll_interval).await;
-            continue;
-        };
-        let Some(confirmation_depth) =
-            current_confirmation_depth(observation, block_number, confirmations).await?
-        else {
-            wait_for_wake(&mut wake, observation.poll_interval).await;
-            continue;
-        };
-
-        let mut logs = canonical.logs().to_vec();
-        sort_logs(&mut logs);
-        let mut decoded_events = BTreeMap::new();
-        let mut log_indices = Vec::with_capacity(events.len());
-        let assignment = complete_receipt_event_assignment(events, &logs)?;
-
-        for (required, position) in events.iter().zip(assignment) {
-            let log = &logs[position];
-            let decoded = required
-                .matcher
-                .decode_if_matches(log)
-                .map_err(StepError::abi)?
-                .expect("complete assignment selects only matching logs");
-            if let Some(index) = log.log_index {
-                log_indices.push(index);
-            }
-            decoded_events.insert(
-                required.id.clone(),
-                grouped_event_runtime_value(&required.matcher.event, log, decoded)
-                    .map_err(StepError::abi)?,
-            );
-        }
-
-        let confirmed = ObservationPoint::now();
-        let transaction_index = canonical.transaction_index();
-        let status = canonical.status();
-        let block_timestamp = block.timestamp_ms;
-        let observation_metadata = ObservationMetadata {
-            first_observed: candidate_first_observed,
-            transaction_hash,
-            block_hash,
-            block_number,
-            transaction_index,
-            log_indices,
-            block_timestamp_ms: block_timestamp,
-            confirmation_depth,
-        };
-        let value = object([
-            ("chain", RuntimeValue::String(chain.to_string())),
-            ("transaction_hash", RuntimeValue::Bytes32(transaction_hash)),
-            ("tx_hash", RuntimeValue::Bytes32(transaction_hash)),
-            ("block_hash", RuntimeValue::Bytes32(block_hash)),
-            ("block_number", RuntimeValue::Uint(U256::from(block_number))),
-            (
-                "transaction_index",
-                transaction_index
-                    .map(|value| RuntimeValue::Uint(U256::from(value)))
-                    .unwrap_or(RuntimeValue::Null),
-            ),
-            ("status", RuntimeValue::Bool(status)),
-            ("gas_used", RuntimeValue::Uint(U256::from(canonical.gas_used()))),
-            ("block_timestamp_ms", RuntimeValue::Uint(U256::from(block_timestamp))),
-            (
-                "first_observed_at",
-                RuntimeValue::Uint(U256::from(candidate_first_observed.unix_ms())),
-            ),
-            ("observed_at", RuntimeValue::Uint(U256::from(candidate_first_observed.unix_ms()))),
-            ("confirmed_at", RuntimeValue::Uint(U256::from(confirmed.unix_ms()))),
-            ("confirmation_depth", RuntimeValue::Uint(U256::from(confirmation_depth))),
-            ("events", RuntimeValue::Object(decoded_events)),
-        ]);
-        return Ok(LogResult { value, observation: observation_metadata });
+        decoded_events.insert(
+            required.id.clone(),
+            grouped_event_runtime_value(&required.matcher.event, log, decoded)
+                .map_err(StepError::abi)?,
+        );
     }
+
+    let mut value = confirmed.runtime_fields(chain);
+    value.insert("events".to_string(), RuntimeValue::Object(decoded_events));
+    Ok(LogResult {
+        value: RuntimeValue::Object(value),
+        observation: confirmed.observation(log_indices),
+    })
 }
 
 struct EventMatcher {
