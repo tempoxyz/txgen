@@ -49,12 +49,29 @@ pub struct ReceiptGasRecord {
     pub gas_used: U256,
     /// Effective gas price, when the receipt supplied a fee field.
     pub effective_gas_price: Option<U256>,
+    /// Load-generator wall-clock time, in Unix milliseconds, when the
+    /// submission request started. `None` for untracked transactions.
+    #[serde(default)]
+    pub submitted_at_unix_ms: Option<u64>,
+    /// Timestamp of the including block in Unix milliseconds, when known.
+    #[serde(default)]
+    pub block_timestamp_ms: Option<u64>,
 }
 
 impl ReceiptGasRecord {
     /// The gas fields of this record.
     pub fn sample(&self) -> ReceiptGasSample {
         ReceiptGasSample { gas_used: self.gas_used, effective_gas_price: self.effective_gas_price }
+    }
+
+    /// Including block timestamp minus submission time, in milliseconds.
+    ///
+    /// Signed because the two timestamps come from different clocks; see
+    /// [`crate::inclusion_latency`].
+    pub fn inclusion_latency_ms(&self) -> Option<i64> {
+        let included = i64::try_from(self.block_timestamp_ms?).ok()?;
+        let submitted = i64::try_from(self.submitted_at_unix_ms?).ok()?;
+        included.checked_sub(submitted)
     }
 }
 
@@ -206,6 +223,7 @@ struct ReceiptRequest {
     tx_hash: TxHash,
     labels: ReceiptMetricLabels,
     scenario_instance: Option<u64>,
+    submitted_at_unix_ms: Option<u64>,
     tracked_at: tokio::time::Instant,
 }
 
@@ -226,11 +244,27 @@ impl ReceiptCollectorHandle {
     ///
     /// Calls made after the collector starts finishing are ignored.
     pub fn track(&self, sender: Option<Address>, tx_hash: TxHash, labels: ReceiptMetricLabels) {
+        self.track_submission(sender, tx_hash, labels, None);
+    }
+
+    /// Register an accepted transaction with the wall-clock time, in Unix
+    /// milliseconds, at which its submission started.
+    ///
+    /// The time is retained on the granular record for submit-to-inclusion
+    /// latency. Calls made after the collector starts finishing are ignored.
+    pub fn track_submission(
+        &self,
+        sender: Option<Address>,
+        tx_hash: TxHash,
+        labels: ReceiptMetricLabels,
+        submitted_at_unix_ms: Option<u64>,
+    ) {
         let _ = self.requests.send(ReceiptRequest {
             sender,
             tx_hash,
             labels,
             scenario_instance: None,
+            submitted_at_unix_ms,
             tracked_at: tokio::time::Instant::now(),
         });
     }
@@ -251,6 +285,7 @@ impl ReceiptCollectorHandle {
             tx_hash,
             labels,
             scenario_instance: Some(scenario_instance),
+            submitted_at_unix_ms: None,
             tracked_at: tokio::time::Instant::now(),
         });
     }
@@ -336,6 +371,7 @@ async fn collect_block_receipts(
                     tx_hash,
                     labels: BTreeMap::new(),
                     scenario_instance: None,
+                    submitted_at_unix_ms: None,
                     tracked_at: tokio::time::Instant::now(),
                 }]
             });
@@ -351,6 +387,8 @@ async fn collect_block_receipts(
                     block_hash: details.receipt.block_hash(),
                     gas_used: details.gas_used,
                     effective_gas_price: details.effective_gas_price,
+                    submitted_at_unix_ms: request.submitted_at_unix_ms,
+                    block_timestamp_ms: None,
                 });
             }
         }
@@ -510,6 +548,8 @@ async fn collect_receipt(
                     block_hash: receipt.receipt.block_hash(),
                     gas_used: receipt.gas_used,
                     effective_gas_price: receipt.effective_gas_price,
+                    submitted_at_unix_ms: request.submitted_at_unix_ms,
+                    block_timestamp_ms: None,
                 });
             }
             Ok(Ok(None)) => {}
@@ -565,6 +605,8 @@ mod tests {
             block_hash: Some(B256::repeat_byte(0x33)),
             gas_used: U256::from(21_000),
             effective_gas_price,
+            submitted_at_unix_ms: None,
+            block_timestamp_ms: None,
         }
     }
 
@@ -622,6 +664,7 @@ mod tests {
             tx_hash: TxHash::repeat_byte(0x11),
             labels: labels("transfer"),
             scenario_instance,
+            submitted_at_unix_ms: None,
             tracked_at: tokio::time::Instant::now(),
         };
 

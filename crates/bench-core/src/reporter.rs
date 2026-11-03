@@ -10,6 +10,7 @@ use crate::{
     clickhouse::ClickHouseClient,
     clock::unix_ms,
     composition::RunComposition,
+    inclusion_latency::InclusionLatency,
     metrics::{
         BenchMetrics, BlockStats, LatencyStats, RunStats, ThroughputSample, TimeSeriesMetrics,
     },
@@ -51,6 +52,8 @@ pub struct FinalReport {
     pub receipt_metrics: Vec<ReceiptMetricGroup>,
     /// Exact total fees paid by confirmed tracked transactions, in base units.
     pub total_fees_paid: Option<U256>,
+    /// Submit-to-inclusion latency overall and per workload input labels.
+    pub inclusion_latency: Option<InclusionLatency>,
     /// Receipt-derived gas details for ClickHouse publication.
     pub receipt_records: Vec<ReceiptGasRecord>,
     pub block_composition: Option<RunComposition>,
@@ -359,6 +362,19 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
             }
         }
 
+        if let Some(inclusion) = &report.inclusion_latency {
+            let overall = &inclusion.overall;
+            writeln!(self.writer)?;
+            writeln!(self.writer, "  Inclusion Latency ({} txs):", overall.count)?;
+            for (label, value) in
+                [("P50", overall.p50_ms), ("P90", overall.p90_ms), ("P99", overall.p99_ms)]
+            {
+                if let Some(value) = value {
+                    writeln!(self.writer, "    {label}:           {value:>10.2}ms")?;
+                }
+            }
+        }
+
         if let Some(run) = &report.run_stats {
             writeln!(self.writer)?;
             writeln!(self.writer, "  Blocks:")?;
@@ -434,6 +450,10 @@ pub struct JsonReport {
     /// Exact total fees paid, encoded as a decimal base-unit string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_fees_paid: Option<String>,
+    /// Submit-to-inclusion latency (including block timestamp minus
+    /// submission wall-clock time) overall and per workload input labels.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub inclusion_latency: Option<InclusionLatency>,
     /// RPC corpus replay results (call mode only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call: Option<CallReport>,
@@ -620,6 +640,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             receipt_metrics: report.receipt_metrics.clone(),
             block_composition: report.block_composition.clone(),
             total_fees_paid: report.total_fees_paid.map(|fees| fees.to_string()),
+            inclusion_latency: report.inclusion_latency.clone(),
             call: report.call.clone(),
         };
 
@@ -1182,6 +1203,32 @@ mod tests {
     }
 
     #[test]
+    fn test_json_reporter_includes_inclusion_latency() {
+        let mut report = sample_report();
+        report.inclusion_latency = InclusionLatency::from_records(&[ReceiptGasRecord {
+            tx_hash: TxHash::repeat_byte(0x11),
+            sender: None,
+            labels: BTreeMap::from([("input".to_string(), "transfer".to_string())]),
+            scenario_instance: None,
+            success: true,
+            block_number: Some(42),
+            block_hash: None,
+            gas_used: U256::from(21_000),
+            effective_gas_price: None,
+            submitted_at_unix_ms: Some(1_000),
+            block_timestamp_ms: Some(1_420),
+        }]);
+        let mut output = Vec::new();
+        JsonReporter::new(&mut output).finalize(&report).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["inclusion_latency"]["overall"]["count"], 1);
+        assert_eq!(parsed["inclusion_latency"]["overall"]["p90_ms"], 420.0);
+        assert_eq!(parsed["inclusion_latency"]["groups"][0]["labels"]["input"], "transfer");
+        assert_eq!(parsed["inclusion_latency"]["groups"][0]["p99_ms"], 420.0);
+    }
+
+    #[test]
     fn test_json_reporter_includes_block_composition() {
         let mut report = sample_report();
         report.block_composition = Some(RunComposition {
@@ -1223,6 +1270,8 @@ mod tests {
             block_hash: Some(B256::repeat_byte(0x33)),
             gas_used: U256::from(21_000),
             effective_gas_price: Some(U256::from(2)),
+            submitted_at_unix_ms: None,
+            block_timestamp_ms: None,
         }];
         let mut output = Vec::new();
         JsonReporter::new(&mut output).finalize(&report).unwrap();

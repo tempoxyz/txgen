@@ -433,7 +433,7 @@ txgen-tempo generate -s workload.yaml -n 1000 --defer-signing | bench send --lat
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
 | `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url` |
 | `--collect-latencies` | Collect and report aggregate latency stats plus individual request samples under `time_series.latencies` (default: disabled) |
-| `--collect-receipt-metrics[=true\|false]` | Enabled by default: collect non-system transaction gas, fee, and composition metrics using block receipts only after sending and draining finish; `=false` disables collection |
+| `--collect-receipt-metrics[=true\|false]` | Enabled by default: collect non-system transaction gas, fee, composition, and submit-to-inclusion latency metrics using block receipts only after sending and draining finish; `=false` disables collection |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 0, set >0 to enable) |
 
@@ -797,7 +797,7 @@ txgen-tempo scenario run \
 
 The scenario name, platform, and `mode=scenario` are derived from the finalized report; those metadata keys are reserved and conflicting user values are rejected. `git-sha` and `git-ref` are required metadata for the common `txgen_runs` row. Every destination receives the same client-generated `run_id`. JSON destinations are finalized before ClickHouse publication, so an upload error is returned without deleting a report file that was already written.
 
-Deploy migrations through `009_txgen_scenario_causal_metrics.sql` before publishing scenario report schema version 2. Detail rows are synchronously acknowledged before `txgen_runs` is inserted as the visibility marker. Queries for complete benchmark or scenario reports must begin at `txgen_runs` and join detail tables by `run_id`; an interrupted publication can leave child rows without a visible common run row.
+Deploy migrations through `009_txgen_scenario_causal_metrics.sql` before publishing scenario report schema version 2, and `010_txgen_receipt_inclusion_latency.sql` before `bench send` publishes receipt rows with submit-to-inclusion timing. Detail rows are synchronously acknowledged before `txgen_runs` is inserted as the visibility marker. Queries for complete benchmark or scenario reports must begin at `txgen_runs` and join detail tables by `run_id`; an interrupted publication can leave child rows without a visible common run row.
 
 The bench JSON report includes:
 - `samples` — point-in-time metric snapshots (internal + node), stored as a time series
@@ -806,6 +806,7 @@ The bench JSON report includes:
 - `block_composition` — actual included non-system transaction composition over the same retained measured `blocks`: a run-wide `summary` and individual `blocks`, each containing exact `tx_count` and decimal-string `gas_used` totals and `kinds` with `input`, `tx_count_pct`, `gas_pct`, and `reverted_tx_count`. Percentages include reverted transactions, which consume block capacity. Input labels are generated template names or `sequence.step` names, so new presets require no classifier changes. Untracked transactions have `input: null` and remain in the denominator. System receipts with zero gas are excluded. Missing receipts or a receipt gas total that differs from the block header fail reporting rather than publish partial composition.
 
 - `total_fees_paid` — exact total paid by confirmed non-system transactions in the benchmark block range, encoded as a decimal base-unit string
+- `inclusion_latency` — submit-to-inclusion latency in milliseconds: the including block's timestamp minus the load generator's wall-clock time when it started `eth_sendRawTransaction`. `overall` and one entry per workload input in `groups` (each with `labels`) carry `count`, `min_ms`, `mean_ms`, `p50_ms`, `p90_ms`, `p95_ms`, `p99_ms`, and `max_ms`. It covers the same measured blocks as `receipt_metrics` and reuses their block timestamps (Tempo millisecond precision), so it adds no RPC requests. Clock skew between the load generator and validators shifts every value, and values are signed rather than clamped at zero. ClickHouse receipt rows carry the per-transaction `submitted_at_unix_ms`, `block_timestamp_ms`, and `inclusion_latency_ms` (migration `010`).
 
 Receipts without `effectiveGasPrice` or legacy `gasPrice` still contribute gas usage to `receipt_metrics`, but are excluded from `total_fees_paid`.
 
