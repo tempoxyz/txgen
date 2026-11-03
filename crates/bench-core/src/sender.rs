@@ -5,6 +5,7 @@
 //! - Applying rate limiting
 
 use crate::{
+    clock::unix_ms,
     metrics::MetricsCollector,
     receipt_metrics::{ReceiptCollectorHandle, ReceiptMetricLabels},
     receipt_tracker::Inclusion,
@@ -1445,6 +1446,7 @@ async fn submit_tx(
         }
     };
 
+    let submitted_at_unix_ms = unix_ms(SystemTime::now());
     let start = Instant::now();
     let tx_hash = match send_raw_transaction(&endpoint, &raw, submission_headers).await {
         Ok(tx_hash) => {
@@ -1454,7 +1456,12 @@ async fn submit_tx(
         Err(e) => {
             let uncertain = submission_may_have_been_accepted(&e);
             if uncertain {
-                track_workload_receipt(receipt_collector.as_ref(), &pending, expected_hash);
+                track_workload_receipt(
+                    receipt_collector.as_ref(),
+                    &pending,
+                    expected_hash,
+                    submitted_at_unix_ms,
+                );
             }
 
             if request_auth.is_some() {
@@ -1478,7 +1485,12 @@ async fn submit_tx(
 
     drop(permit);
 
-    track_workload_receipt(receipt_collector.as_ref(), &pending, expected_hash);
+    track_workload_receipt(
+        receipt_collector.as_ref(),
+        &pending,
+        expected_hash,
+        submitted_at_unix_ms,
+    );
 
     release_keys(&completion_tx, pending.submission_keys);
 
@@ -1551,6 +1563,7 @@ fn track_workload_receipt(
     collector: Option<&ReceiptCollectorHandle>,
     pending: &PendingTx,
     tx_hash: TxHash,
+    submitted_at_unix_ms: u64,
 ) {
     if pending.phase != TxPhase::Workload {
         return;
@@ -1561,7 +1574,7 @@ fn track_workload_receipt(
     if let Some(input) = pending.id.clone() {
         labels.insert("input".to_string(), input);
     }
-    collector.track(pending.sender, tx_hash, labels);
+    collector.track_submission(pending.sender, tx_hash, labels, Some(submitted_at_unix_ms));
 }
 
 async fn send_raw_transaction(

@@ -12,6 +12,7 @@ pub mod call;
 pub mod clickhouse;
 pub mod clock;
 pub mod composition;
+pub mod inclusion_latency;
 pub mod metrics;
 pub mod prometheus;
 pub mod prometheus_reporter;
@@ -35,6 +36,9 @@ pub use clickhouse::ClickHouseClient;
 pub use clock::RunClock;
 pub use composition::{
     block_composition, BlockComposition, KindComposition, RunComposition, TransactionComposition,
+};
+pub use inclusion_latency::{
+    attach_block_timestamps, InclusionLatency, InclusionLatencyDistribution, InclusionLatencyGroup,
 };
 pub use metrics::{
     collect_block_stats, compute_latency_stats, percentile, trim_trailing_empty_blocks,

@@ -6,11 +6,11 @@ use alloy_provider::{ext::TxPoolApi, DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::RetryBackoffLayer;
 use bench_core::{
-    block_composition, collect_block_stats, parse_metadata, total_fees_paid,
-    trim_trailing_empty_blocks, BlockReceiptCollector, FileSource, FinalReport, GeneratedTx,
-    LateSigner, MetricsCollector, ProgressState, ReceiptCollection, ReceiptTracker, Reporter,
-    RequestAuthProvider, RpcEndpoint, RunClock, RunStats, ScraperConfig, Sender, SenderConfig,
-    SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
+    attach_block_timestamps, block_composition, collect_block_stats, parse_metadata,
+    total_fees_paid, trim_trailing_empty_blocks, BlockReceiptCollector, FileSource, FinalReport,
+    GeneratedTx, InclusionLatency, LateSigner, MetricsCollector, ProgressState, ReceiptCollection,
+    ReceiptTracker, Reporter, RequestAuthProvider, RpcEndpoint, RunClock, RunStats, ScraperConfig,
+    Sender, SenderConfig, SenderHeaderAuthProvider, StdinSource, TxPhase, TxSource,
 };
 use eyre::{bail, Context, Result};
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
@@ -414,6 +414,9 @@ async fn execute_source<S: TxSource>(
             Some(block_composition(&report.receipt_records, &report.blocks)?);
         report.total_fees_paid = total_fees_paid(&report.receipt_records);
         report.receipt_metrics = ReceiptCollection::metrics_for_records(&report.receipt_records);
+        // Block timestamps come from the block stats fetched above: no extra RPC.
+        attach_block_timestamps(&mut report.receipt_records, &report.blocks);
+        report.inclusion_latency = InclusionLatency::from_records(&report.receipt_records);
     }
 
     reporting.finish(&report).await?;

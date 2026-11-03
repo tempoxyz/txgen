@@ -179,6 +179,8 @@ mod tests {
             block_hash: None,
             gas_used: U256::from(gas),
             effective_gas_price: None,
+            submitted_at_unix_ms: None,
+            block_timestamp_ms: None,
         }
     }
 

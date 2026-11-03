@@ -192,10 +192,13 @@ One row per confirmed transaction. The row retains receipt-level gas values exac
 | `gas_used` | UInt256 | Outer transaction gas consumed |
 | `effective_gas_price` | UInt256? | Effective gas price when supplied by the receipt |
 | `fee_paid` | UInt256? | Exact `gas_used * effective_gas_price` when the fee field is present |
+| `submitted_at_unix_ms` | UInt64? | Load-generator wall time when `bench send` started submitting the transaction (migration `010`) |
+| `block_timestamp_ms` | UInt64? | Including block timestamp, with Tempo millisecond precision (migration `010`) |
+| `inclusion_latency_ms` | Int64? | Submit-to-inclusion latency, `block_timestamp_ms - submitted_at_unix_ms`; signed, includes clock skew between the load generator and validators (migration `010`) |
 
 ## Setup
 
-The nine numbered migrations are applied in filename order. For a new database, apply the complete set:
+The ten numbered migrations are applied in filename order. For a new database, apply the complete set:
 
 ```bash
 # Local (no auth)
@@ -217,9 +220,15 @@ On a deployment already migrated through `008`, apply only the additive scenario
 ./scripts/clickhouse/apply.sh https://host.clickhouse.cloud:8443 default password 009
 ```
 
+On a deployment already migrated through `009`, apply only the additive receipt inclusion-latency migration:
+
+```bash
+./scripts/clickhouse/apply.sh https://host.clickhouse.cloud:8443 default password 010
+```
+
 `apply.sh` sends migrations to the authenticated user's default database. It does not read `CLICKHOUSE_DATABASE`; when the runtime writer uses a non-default database, configure the migration user with the same default database or apply the numbered SQL files to that database through your normal deployment tooling.
 
-Migrations `006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sql` must be deployed before any scenario uses `--report clickhouse:<url>`. Migration `008_txgen_receipt_gas.sql` must be deployed before enabling granular receipt publication. Deploy additive migration `009_txgen_scenario_causal_metrics.sql` before publishing report schema version 2; it retains the version 1 columns for existing queries.
+Migrations `006_txgen_scenario_runs.sql` and `007_txgen_scenario_steps.sql` must be deployed before any scenario uses `--report clickhouse:<url>`. Migration `008_txgen_receipt_gas.sql` must be deployed before enabling granular receipt publication. Deploy additive migration `009_txgen_scenario_causal_metrics.sql` before publishing report schema version 2; it retains the version 1 columns for existing queries. Deploy additive migration `010_txgen_receipt_inclusion_latency.sql` before `bench send` publishes receipt rows with submission timing; scenario receipt rows omit those columns.
 
 ## Usage
 
@@ -328,6 +337,21 @@ SELECT
 FROM txgen_receipt_gas
 WHERE run_id = '{run_id}'
 ORDER BY labels_json, scenario_instance, tx_hash;
+```
+
+### Submit-to-inclusion latency per template
+
+```sql
+SELECT
+    JSONExtractString(labels_json, 'input') AS input,
+    count() AS txs,
+    quantileExact(0.5)(inclusion_latency_ms) AS p50_ms,
+    quantileExact(0.9)(inclusion_latency_ms) AS p90_ms,
+    quantileExact(0.99)(inclusion_latency_ms) AS p99_ms
+FROM txgen_receipt_gas
+WHERE run_id = '{run_id}' AND inclusion_latency_ms IS NOT NULL
+GROUP BY input WITH ROLLUP
+ORDER BY input;
 ```
 
 ### Per-block stats

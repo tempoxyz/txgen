@@ -11,6 +11,10 @@ pub const DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE: usize = 50_000;
 ///
 /// Gas quantities are encoded as decimal strings so JSON serialization does not
 /// lose precision before ClickHouse parses them as `UInt256` values.
+///
+/// Submission and inclusion timing columns are omitted from rows that lack
+/// them, so scenario runs keep writing to tables without migration `010`;
+/// `bench send` rows need it.
 pub fn insert_receipt_gas_records(
     client: &ClickHouseClient,
     run_id: uuid::Uuid,
@@ -47,6 +51,12 @@ struct ReceiptGasRow {
     gas_used: String,
     effective_gas_price: Option<String>,
     fee_paid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    submitted_at_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_timestamp_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inclusion_latency_ms: Option<i64>,
 }
 
 impl ReceiptGasRow {
@@ -64,6 +74,9 @@ impl ReceiptGasRow {
             gas_used: record.gas_used.to_string(),
             effective_gas_price: record.effective_gas_price.map(|price| price.to_string()),
             fee_paid: record.sample().fee_paid().map(|fee| fee.to_string()),
+            submitted_at_unix_ms: record.submitted_at_unix_ms,
+            block_timestamp_ms: record.block_timestamp_ms,
+            inclusion_latency_ms: record.inclusion_latency_ms(),
         })
     }
 }
@@ -94,6 +107,8 @@ mod tests {
             block_hash: Some(B256::repeat_byte(0x22)),
             gas_used,
             effective_gas_price: Some(U256::from(3)),
+            submitted_at_unix_ms: None,
+            block_timestamp_ms: None,
         }
     }
 
@@ -173,6 +188,16 @@ mod tests {
         assert!(value["block_hash"].is_null());
         assert!(value["effective_gas_price"].is_null());
         assert!(value["fee_paid"].is_null());
+        assert!(value.get("submitted_at_unix_ms").is_none());
+        assert!(value.get("inclusion_latency_ms").is_none());
+
+        let mut timed = record(0x55, U256::from(21_000));
+        timed.submitted_at_unix_ms = Some(1_000);
+        timed.block_timestamp_ms = Some(1_250);
+        let value = serde_json::to_value(ReceiptGasRow::new(run_id, &timed).unwrap()).unwrap();
+        assert_eq!(value["submitted_at_unix_ms"], 1_000);
+        assert_eq!(value["block_timestamp_ms"], 1_250);
+        assert_eq!(value["inclusion_latency_ms"], 250);
     }
 
     #[tokio::test(flavor = "multi_thread")]
