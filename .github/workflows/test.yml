@@ -35,6 +35,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
       - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace
 
   decode-tx:
@@ -64,8 +66,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
       - uses: tempoxyz/gh-actions/vendor/dtolnay/rust-toolchain@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: tempoxyz/gh-actions/actions/setup-foundry@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
           version: nightly
+          cache: ${{ github.ref == 'refs/heads/main' }}
       - name: Generate and decode transactions
         run: ./tests/decode-tx.sh ${{ matrix.bin }} ${{ matrix.spec }}
