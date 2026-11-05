@@ -1759,8 +1759,11 @@ where
         }
         if gas_refresh.as_ref().is_some_and(|refresh| refresh.is_finished()) {
             let refresh = gas_refresh.take().expect("finished refresh exists");
-            let estimates = runtime.block_on(refresh).wrap_err("gas sampling task failed")??;
-            selector.set_sampled_gas_estimates(&estimates)?;
+            // A failed refresh keeps the weights in use; only the first sample must succeed.
+            match runtime.block_on(refresh).wrap_err("gas sampling task failed").and_then(|r| r) {
+                Ok(estimates) => selector.set_sampled_gas_estimates(&estimates)?,
+                Err(error) => eprintln!("gas sampling refresh failed; keeping weights: {error:#}"),
+            }
         }
         if let Some(client) = &gas_client &&
             gas_refresh.is_none() &&
@@ -2313,13 +2316,34 @@ fn gas_samples<A: NetworkAdapter>(
         .collect()
 }
 
+/// How far past the send time a sampled call's expiry is set.
+const GAS_SAMPLE_VALID_FOR_SECS: u64 = 20;
+
+/// A refresh sends its calls long after building them, so an expiring-nonce call's expiry may
+/// already have passed: move it to just ahead of the send time.
+fn refresh_expiry(calls: &mut [serde_json::Value], now: u64) {
+    for call in calls {
+        if let Some(call) = call.as_object_mut() &&
+            call.contains_key("validBefore")
+        {
+            call.insert(
+                "validBefore".to_string(),
+                serde_json::json!(format!("{:#x}", now + GAS_SAMPLE_VALID_FOR_SECS)),
+            );
+            call.remove("validAfter");
+        }
+    }
+}
+
 /// Simulate each sample against the latest block and return its block gas, in order.
 async fn simulate_gas_samples(
     client: alloy_rpc_client::RpcClient,
     samples: Vec<GasSample>,
 ) -> Result<Vec<(MixItem, u64)>> {
     let mut estimates = Vec::with_capacity(samples.len());
-    for sample in samples {
+    for mut sample in samples {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+        refresh_expiry(&mut sample.calls, now);
         let expected_calls = sample.calls.len();
         let payload = serde_json::json!({
             "blockStateCalls": [{"calls": sample.calls}],
@@ -2981,6 +3005,70 @@ mix: [{template: transfer, weight: 1}]
         selector.set_sampled_gas_estimates(&sampled)?;
         assert!(selector.gas_weighted);
         assert!(selector.set_gas_estimates(&[10; 5]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_expiry_moves_only_expiring_calls_ahead_of_the_send_time() {
+        let mut calls = vec![
+            serde_json::json!({"validBefore": "0x1", "validAfter": "0x1", "to": "0x00"}),
+            serde_json::json!({"to": "0x00"}),
+        ];
+        refresh_expiry(&mut calls, 1_000);
+        assert_eq!(calls[0]["validBefore"], format!("{:#x}", 1_000 + GAS_SAMPLE_VALID_FOR_SECS));
+        assert!(calls[0].get("validAfter").is_none());
+        assert_eq!(calls[1], serde_json::json!({"to": "0x00"}));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_gas_refresh_keeps_generating_with_previous_weights() -> Result<()> {
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = requests.clone();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                let counter = counter.clone();
+                async move {
+                    // Only the first sample succeeds.
+                    let body = if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": [{"gasUsed": "0x5208", "calls": [{"status": "0x1"}]}]})
+                    } else {
+                        serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32003, "message": "transaction expired"}})
+                    };
+                    axum::Json(body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let rpc = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let written = tokio::task::spawn_blocking(move || {
+            let spec = sampling_spec()?;
+            let accounts = AccountManager::from_spec(&spec.accounts)?;
+            let artifacts = ArtifactManager::empty();
+            let mut nonces = NonceTracker::new();
+            let mut rng = StdRng::seed_from_u64(42);
+            let mut ctx =
+                BuildContext::new(1, &spec.gas, &accounts, &artifacts, &mut nonces, &mut rng);
+            let mut output = NdjsonWriter::new(Vec::new());
+            generate_txs(
+                &SamplingAdapter,
+                &spec,
+                GenerationConfig {
+                    limit: GenerationLimit { count: Some(2_000), duration: None },
+                    signing_workers: 1,
+                    gas_sample_rpc: Some(&rpc),
+                    gas_sample_interval: Duration::ZERO,
+                },
+                &HashMap::new(),
+                &mut ctx,
+                &mut output,
+            )
+        })
+        .await??;
+        assert_eq!(written, 2_000);
+        assert!(requests.load(std::sync::atomic::Ordering::SeqCst) >= 2, "no refresh ran");
+        server.abort();
         Ok(())
     }
 }
