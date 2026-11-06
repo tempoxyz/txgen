@@ -1,6 +1,9 @@
 //! Receipt-based transaction gas metric collection and aggregation.
 
-use crate::sender::{RpcReceiptDetails, RpcSubmitter};
+use crate::{
+    metrics::percentile,
+    sender::{RpcReceiptDetails, RpcSubmitter},
+};
 use alloy_eips::BlockId;
 use alloy_network::{primitives::ReceiptResponse, AnyNetwork};
 use alloy_primitives::{Address, TxHash, B256, U256};
@@ -46,15 +49,29 @@ pub struct ReceiptGasRecord {
     pub gas_used: U256,
     /// Effective gas price, when the receipt supplied a fee field.
     pub effective_gas_price: Option<U256>,
+    /// Load-generator wall-clock time, in Unix milliseconds, when the
+    /// submission request started. `None` for untracked transactions.
+    #[serde(default)]
+    pub submitted_at_unix_ms: Option<u64>,
+    /// Timestamp of the including block in Unix milliseconds, when known.
+    #[serde(default)]
+    pub block_timestamp_ms: Option<u64>,
 }
 
 impl ReceiptGasRecord {
-    /// Calculate the transaction fee when an effective gas price is available.
+    /// The gas fields of this record.
+    pub fn sample(&self) -> ReceiptGasSample {
+        ReceiptGasSample { gas_used: self.gas_used, effective_gas_price: self.effective_gas_price }
+    }
+
+    /// Including block timestamp minus submission time, in milliseconds.
     ///
-    /// Valid Ethereum receipt field widths fit exactly in a `U256`. An
-    /// out-of-range RPC response is omitted instead of wrapping the fee.
-    pub fn fee_paid(&self) -> Option<U256> {
-        self.effective_gas_price.and_then(|price| self.gas_used.checked_mul(price))
+    /// Signed because the two timestamps come from different clocks; see
+    /// [`crate::inclusion_latency`].
+    pub fn inclusion_latency_ms(&self) -> Option<i64> {
+        let included = i64::try_from(self.block_timestamp_ms?).ok()?;
+        let submitted = i64::try_from(self.submitted_at_unix_ms?).ok()?;
+        included.checked_sub(submitted)
     }
 }
 
@@ -102,15 +119,15 @@ impl ReceiptMetricDistribution {
 
         samples.sort_unstable();
         let count = samples.len() as u64;
-        let mean = samples.iter().copied().map(u256_to_f64).sum::<f64>() / count as f64;
+        let mean = samples.iter().map(f64::from).sum::<f64>() / count as f64;
 
         Self {
             count,
-            min: Some(u256_to_f64(samples[0])),
+            min: Some(f64::from(samples[0])),
             mean: Some(mean),
-            p50: Some(u256_to_f64(percentile(&samples, 50))),
-            p95: Some(u256_to_f64(percentile(&samples, 95))),
-            p99: Some(u256_to_f64(percentile(&samples, 99))),
+            p50: Some(f64::from(percentile(&samples, 50))),
+            p95: Some(f64::from(percentile(&samples, 95))),
+            p99: Some(f64::from(percentile(&samples, 99))),
         }
     }
 }
@@ -142,18 +159,17 @@ pub struct ReceiptCollection {
 
 impl ReceiptCollection {
     fn from_records(records: Vec<ReceiptGasRecord>) -> Self {
+        let metrics = Self::metrics_for_records(&records);
+        Self { metrics, records }
+    }
+
+    pub fn metrics_for_records(records: &[ReceiptGasRecord]) -> ReceiptMetrics {
         let mut accumulator = ReceiptMetricsAccumulator::default();
-        for record in &records {
-            accumulator.record(
-                record.labels.clone(),
-                ReceiptGasSample {
-                    gas_used: record.gas_used,
-                    effective_gas_price: record.effective_gas_price,
-                },
-            );
+        for record in records {
+            accumulator.record(record.labels.clone(), record.sample());
         }
 
-        Self { metrics: accumulator.into_metrics(), records }
+        accumulator.into_metrics()
     }
 }
 
@@ -207,6 +223,7 @@ struct ReceiptRequest {
     tx_hash: TxHash,
     labels: ReceiptMetricLabels,
     scenario_instance: Option<u64>,
+    submitted_at_unix_ms: Option<u64>,
     tracked_at: tokio::time::Instant,
 }
 
@@ -227,11 +244,27 @@ impl ReceiptCollectorHandle {
     ///
     /// Calls made after the collector starts finishing are ignored.
     pub fn track(&self, sender: Option<Address>, tx_hash: TxHash, labels: ReceiptMetricLabels) {
+        self.track_submission(sender, tx_hash, labels, None);
+    }
+
+    /// Register an accepted transaction with the wall-clock time, in Unix
+    /// milliseconds, at which its submission started.
+    ///
+    /// The time is retained on the granular record for submit-to-inclusion
+    /// latency. Calls made after the collector starts finishing are ignored.
+    pub fn track_submission(
+        &self,
+        sender: Option<Address>,
+        tx_hash: TxHash,
+        labels: ReceiptMetricLabels,
+        submitted_at_unix_ms: Option<u64>,
+    ) {
         let _ = self.requests.send(ReceiptRequest {
             sender,
             tx_hash,
             labels,
             scenario_instance: None,
+            submitted_at_unix_ms,
             tracked_at: tokio::time::Instant::now(),
         });
     }
@@ -252,6 +285,7 @@ impl ReceiptCollectorHandle {
             tx_hash,
             labels,
             scenario_instance: Some(scenario_instance),
+            submitted_at_unix_ms: None,
             tracked_at: tokio::time::Instant::now(),
         });
     }
@@ -337,6 +371,7 @@ async fn collect_block_receipts(
                     tx_hash,
                     labels: BTreeMap::new(),
                     scenario_instance: None,
+                    submitted_at_unix_ms: None,
                     tracked_at: tokio::time::Instant::now(),
                 }]
             });
@@ -352,6 +387,8 @@ async fn collect_block_receipts(
                     block_hash: details.receipt.block_hash(),
                     gas_used: details.gas_used,
                     effective_gas_price: details.effective_gas_price,
+                    submitted_at_unix_ms: request.submitted_at_unix_ms,
+                    block_timestamp_ms: None,
                 });
             }
         }
@@ -368,7 +405,7 @@ async fn fetch_block_receipts(
         .get_block_receipts(BlockId::number(block_number))
         .await
         .wrap_err_with(|| format!("failed to fetch receipts for block {block_number}"))?
-        .unwrap_or_default();
+        .ok_or_else(|| eyre::eyre!("receipts for block {block_number} not found"))?;
 
     Ok(receipts
         .into_iter()
@@ -511,6 +548,8 @@ async fn collect_receipt(
                     block_hash: receipt.receipt.block_hash(),
                     gas_used: receipt.gas_used,
                     effective_gas_price: receipt.effective_gas_price,
+                    submitted_at_unix_ms: request.submitted_at_unix_ms,
+                    block_timestamp_ms: None,
                 });
             }
             Ok(Ok(None)) => {}
@@ -537,18 +576,9 @@ async fn collect_receipt(
 /// Returns `None` when no record has a calculable fee or when the aggregate
 /// exceeds `U256`.
 pub fn total_fees_paid(records: &[ReceiptGasRecord]) -> Option<U256> {
-    let mut fees = records.iter().filter_map(ReceiptGasRecord::fee_paid);
+    let mut fees = records.iter().filter_map(|record| record.sample().fee_paid());
     let first = fees.next()?;
     fees.try_fold(first, U256::checked_add)
-}
-
-fn percentile(samples: &[U256], percentile: usize) -> U256 {
-    let index = (samples.len() * percentile / 100).min(samples.len() - 1);
-    samples[index]
-}
-
-fn u256_to_f64(value: U256) -> f64 {
-    value.to_string().parse().expect("a U256 decimal value always fits in a finite f64")
 }
 
 #[cfg(test)]
@@ -575,6 +605,8 @@ mod tests {
             block_hash: Some(B256::repeat_byte(0x33)),
             gas_used: U256::from(21_000),
             effective_gas_price,
+            submitted_at_unix_ms: None,
+            block_timestamp_ms: None,
         }
     }
 
@@ -584,7 +616,7 @@ mod tests {
         let collection = ReceiptCollection::from_records(vec![record.clone()]);
 
         assert_eq!(collection.records, vec![record.clone()]);
-        assert_eq!(record.fee_paid(), Some(U256::from(42_000)));
+        assert_eq!(record.sample().fee_paid(), Some(U256::from(42_000)));
         assert_eq!(collection.metrics.len(), 1);
         assert_eq!(collection.metrics[0].labels, labels("transfer"));
         assert_eq!(collection.metrics[0].gas_used.count, 1);
@@ -632,6 +664,7 @@ mod tests {
             tx_hash: TxHash::repeat_byte(0x11),
             labels: labels("transfer"),
             scenario_instance,
+            submitted_at_unix_ms: None,
             tracked_at: tokio::time::Instant::now(),
         };
 

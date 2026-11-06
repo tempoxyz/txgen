@@ -4,14 +4,17 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::task::JoinHandle;
 use txgen_cli::scenario::{execute_scenario, FailurePolicy, ScenarioExecutionConfig, ScenarioSpec};
 use txgen_core::derive_mnemonic_signer;
 use txgen_ethereum::EthereumAdapter;
+
+mod common;
+use common::{block_value, quantity, receipt_value};
 
 const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
 const AUTH_HEADER: &str = "x-zone-auth";
@@ -46,35 +49,12 @@ struct ObservedRequest {
     transaction_hash: Option<B256>,
 }
 
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let suffix =
-            SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after epoch").as_nanos();
-        let path = std::env::temp_dir()
-            .join(format!("txgen-scenario-auth-{}-{suffix}", std::process::id()));
-        fs::create_dir_all(&path).expect("create temporary test directory");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routes_sender_authenticated_requests_separately_from_queries() {
     let shared = Arc::new(Mutex::new(SharedState::default()));
     let (submission_url, submission_server) = spawn_rpc(RpcRole::Submission, shared.clone()).await;
     let (query_url, query_server) = spawn_rpc(RpcRole::Query, shared.clone()).await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     let sender_zero = derive_mnemonic_signer(TEST_MNEMONIC, 0).unwrap().address();
     let sender_one = derive_mnemonic_signer(TEST_MNEMONIC, 1).unwrap().address();
 
@@ -182,7 +162,7 @@ async fn preflights_all_setup_sender_auth_before_dispatch() {
     let shared = Arc::new(Mutex::new(SharedState::default()));
     let (submission_url, submission_server) = spawn_rpc(RpcRole::Submission, shared.clone()).await;
     let (query_url, query_server) = spawn_rpc(RpcRole::Query, shared.clone()).await;
-    let directory = TempDir::new();
+    let directory = tempfile::tempdir().expect("create temporary test directory");
     let sender_zero = derive_mnemonic_signer(TEST_MNEMONIC, 0).unwrap().address();
     let sender_one = derive_mnemonic_signer(TEST_MNEMONIC, 1).unwrap().address();
 
@@ -233,13 +213,8 @@ async fn preflights_all_setup_sender_auth_before_dispatch() {
 }
 
 async fn spawn_rpc(role: RpcRole, shared: Arc<Mutex<SharedState>>) -> (String, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock RPC");
-    let address = listener.local_addr().expect("mock RPC address");
-    let app = Router::new().route("/", post(handle_rpc)).with_state(RpcState { role, shared });
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve mock RPC");
-    });
-    (format!("http://{address}"), server)
+    common::serve(Router::new().route("/", post(handle_rpc)).with_state(RpcState { role, shared }))
+        .await
 }
 
 async fn handle_rpc(
@@ -317,7 +292,7 @@ async fn handle_rpc(
                 }
                 _ => return rpc_error(id, -32001, "unknown sender authentication"),
             };
-            receipt_value(transaction_hash, sender)
+            receipt_value(transaction_hash, sender, HEAD_BLOCK, true)
         }
         _ => return rpc_error(id, -32601, &format!("unsupported {method} on {:?} RPC", state.role)),
     };
@@ -331,53 +306,6 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Json<Value> {
         "id": id,
         "error": { "code": code, "message": message }
     }))
-}
-
-fn receipt_value(transaction_hash: B256, sender: Address) -> Value {
-    json!({
-        "status": "0x1",
-        "cumulativeGasUsed": "0x5208",
-        "logs": [],
-        "logsBloom": format!("0x{}", "00".repeat(256)),
-        "type": "0x2",
-        "transactionHash": transaction_hash,
-        "transactionIndex": "0x0",
-        "blockHash": B256::repeat_byte(0x55),
-        "blockNumber": quantity(HEAD_BLOCK),
-        "gasUsed": "0x5208",
-        "effectiveGasPrice": "0x1",
-        "from": sender,
-        "to": Address::repeat_byte(0x22),
-        "contractAddress": null
-    })
-}
-
-fn block_value(number: u64, hash: B256) -> Value {
-    json!({
-        "hash": hash,
-        "parentHash": B256::ZERO,
-        "sha3Uncles": B256::ZERO,
-        "miner": Address::ZERO,
-        "stateRoot": B256::ZERO,
-        "transactionsRoot": B256::ZERO,
-        "receiptsRoot": B256::ZERO,
-        "logsBloom": format!("0x{}", "00".repeat(256)),
-        "difficulty": "0x0",
-        "number": quantity(number),
-        "gasLimit": "0x1c9c380",
-        "gasUsed": "0x0",
-        "timestamp": "0x0",
-        "extraData": "0x",
-        "mixHash": B256::ZERO,
-        "nonce": "0x0000000000000000",
-        "baseFeePerGas": "0x0",
-        "transactions": [],
-        "uncles": []
-    })
-}
-
-fn quantity(value: u64) -> String {
-    format!("0x{value:x}")
 }
 
 fn write_fixture_files(

@@ -8,7 +8,12 @@
 use crate::{
     call::{CallReport, MethodStats},
     clickhouse::ClickHouseClient,
-    metrics::{BenchMetrics, BlockStats, RunStats, ThroughputSample, TimeSeriesMetrics},
+    clock::unix_ms,
+    composition::RunComposition,
+    inclusion_latency::InclusionLatency,
+    metrics::{
+        BenchMetrics, BlockStats, LatencyStats, RunStats, ThroughputSample, TimeSeriesMetrics,
+    },
     receipt_clickhouse::{insert_receipt_gas_records, DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE},
     receipt_metrics::{ReceiptGasRecord, ReceiptMetricGroup},
     sample::{Sample, SampleArchive},
@@ -22,6 +27,7 @@ use std::{
     fs::File,
     io::{BufWriter, Write},
     path::Path,
+    time::Duration,
 };
 
 /// Unified final report passed to reporters at finalization.
@@ -46,8 +52,11 @@ pub struct FinalReport {
     pub receipt_metrics: Vec<ReceiptMetricGroup>,
     /// Exact total fees paid by confirmed tracked transactions, in base units.
     pub total_fees_paid: Option<U256>,
+    /// Submit-to-inclusion latency overall and per workload input labels.
+    pub inclusion_latency: Option<InclusionLatency>,
     /// Receipt-derived gas details for ClickHouse publication.
     pub receipt_records: Vec<ReceiptGasRecord>,
+    pub block_composition: Option<RunComposition>,
     /// RPC corpus replay results (call mode only).
     pub call: Option<CallReport>,
 }
@@ -94,11 +103,10 @@ impl FinalReport {
     }
 
     /// Retain only samples at or before the given Unix millisecond timestamp.
-    pub fn retain_samples_until(&mut self, cutoff_ms: u64) -> Result<()> {
+    pub fn retain_samples_until(&mut self, cutoff_ms: u64) {
         if let Some(archive) = self.sample_archive.as_mut() {
             archive.retain_until(cutoff_ms);
         }
-        Ok(())
     }
 }
 
@@ -160,11 +168,6 @@ pub struct ConsoleReporter<W: Write + Send = Box<dyn Write + Send>> {
 }
 
 impl ConsoleReporter {
-    /// Create a new console reporter writing to stdout.
-    pub fn stdout(show_progress: bool) -> Self {
-        Self { writer: Box::new(std::io::stdout()), show_progress }
-    }
-
     /// Create a new console reporter writing to stderr.
     pub fn stderr(show_progress: bool) -> Self {
         Self { writer: Box::new(std::io::stderr()), show_progress }
@@ -315,6 +318,7 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
             writeln!(self.writer, "  Total Sent:      {:>10}", metrics.sent)?;
             writeln!(self.writer, "  Successful:      {:>10}", metrics.success)?;
             writeln!(self.writer, "  Failed:          {:>10}", metrics.failed)?;
+            writeln!(self.writer, "  Not Included:    {:>10}", metrics.inclusion_failed)?;
             writeln!(self.writer)?;
             writeln!(self.writer, "  Duration:        {:>10.2}s", metrics.elapsed.as_secs_f64())?;
             writeln!(self.writer, "  Throughput:      {:>10.2} tx/s", metrics.tps())?;
@@ -358,6 +362,19 @@ impl<W: Write + Send> Reporter for ConsoleReporter<W> {
             }
         }
 
+        if let Some(inclusion) = &report.inclusion_latency {
+            let overall = &inclusion.overall;
+            writeln!(self.writer)?;
+            writeln!(self.writer, "  Inclusion Latency ({} txs):", overall.count)?;
+            for (label, value) in
+                [("P50", overall.p50_ms), ("P90", overall.p90_ms), ("P99", overall.p99_ms)]
+            {
+                if let Some(value) = value {
+                    writeln!(self.writer, "    {label}:           {value:>10.2}ms")?;
+                }
+            }
+        }
+
         if let Some(run) = &report.run_stats {
             writeln!(self.writer)?;
             writeln!(self.writer, "  Blocks:")?;
@@ -398,6 +415,9 @@ pub struct JsonReport {
     /// Failed transactions (send mode).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed: Option<u64>,
+    /// Accepted transactions that reverted, expired, or were not confirmed included (send mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inclusion_failed: Option<u64>,
     /// Elapsed time in seconds (send mode).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_secs: Option<f64>,
@@ -425,12 +445,15 @@ pub struct JsonReport {
     /// Receipt-derived gas metrics grouped by workload input labels.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub receipt_metrics: Vec<ReceiptMetricGroup>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub block_composition: Option<RunComposition>,
     /// Exact total fees paid, encoded as a decimal base-unit string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_fees_paid: Option<String>,
-    /// Unified time-series samples (internal + node metrics).
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub samples: Vec<Sample>,
+    /// Submit-to-inclusion latency (including block timestamp minus
+    /// submission wall-clock time) overall and per workload input labels.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub inclusion_latency: Option<InclusionLatency>,
     /// RPC corpus replay results (call mode only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call: Option<CallReport>,
@@ -454,6 +477,35 @@ pub struct JsonLatency {
     pub p95_ms: f64,
     /// P99 latency in milliseconds.
     pub p99_ms: f64,
+}
+
+impl From<&LatencyStats> for JsonLatency {
+    fn from(stats: &LatencyStats) -> Self {
+        let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        Self {
+            min_ms: ms(stats.min),
+            max_ms: ms(stats.max),
+            mean_ms: ms(stats.mean),
+            p50_ms: ms(stats.p50),
+            p90_ms: None,
+            p95_ms: ms(stats.p95),
+            p99_ms: ms(stats.p99),
+        }
+    }
+}
+
+impl From<&JsonLatency> for LatencyStats {
+    fn from(latency: &JsonLatency) -> Self {
+        let duration = |ms: f64| Duration::from_secs_f64(ms / 1000.0);
+        Self {
+            min: duration(latency.min_ms),
+            max: duration(latency.max_ms),
+            mean: duration(latency.mean_ms),
+            p50: duration(latency.p50_ms),
+            p95: duration(latency.p95_ms),
+            p99: duration(latency.p99_ms),
+        }
+    }
 }
 
 /// Time-series data in JSON format.
@@ -493,11 +545,6 @@ pub struct JsonReporter<W: Write + Send = Box<dyn Write + Send>> {
 }
 
 impl JsonReporter {
-    /// Create a JSON reporter writing to stdout.
-    pub fn stdout() -> Self {
-        Self { writer: Box::new(std::io::stdout()), benchmark_id: None, samples_path: None }
-    }
-
     /// Create a JSON reporter writing to a file.
     ///
     /// Samples are written to a sibling gzip-compressed NDJSON file derived
@@ -529,11 +576,7 @@ impl<W: Write + Send> JsonReporter<W> {
 /// - `output.json`            → `output.samples.ndjson.gz`
 fn samples_path_from_report(report_path: &Path) -> Option<std::path::PathBuf> {
     let stem = report_path.file_stem()?.to_str()?;
-    let filename = format!("{stem}.samples.ndjson.gz");
-    match report_path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => Some(p.join(filename)),
-        _ => Some(std::path::PathBuf::from(filename)),
-    }
+    Some(report_path.with_file_name(format!("{stem}.samples.ndjson.gz")))
 }
 
 impl<W: Write + Send> Reporter for JsonReporter<W> {
@@ -568,15 +611,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
                     Some(metrics.elapsed.as_secs_f64()),
                     Some(metrics.tps()),
                     Some(metrics.success_rate()),
-                    metrics.latency.as_ref().map(|latency| JsonLatency {
-                        min_ms: latency.min.as_secs_f64() * 1000.0,
-                        max_ms: latency.max.as_secs_f64() * 1000.0,
-                        mean_ms: latency.mean.as_secs_f64() * 1000.0,
-                        p50_ms: latency.p50.as_secs_f64() * 1000.0,
-                        p90_ms: None,
-                        p95_ms: latency.p95.as_secs_f64() * 1000.0,
-                        p99_ms: latency.p99.as_secs_f64() * 1000.0,
-                    }),
+                    metrics.latency.as_ref().map(JsonLatency::from),
                     ts,
                 )
             } else {
@@ -593,6 +628,7 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             sent,
             success,
             failed,
+            inclusion_failed: report.bench_metrics.as_ref().map(|metrics| metrics.inclusion_failed),
             elapsed_secs,
             tps,
             success_rate,
@@ -602,8 +638,9 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
             run_stats: report.run_stats.clone(),
             metadata,
             receipt_metrics: report.receipt_metrics.clone(),
+            block_composition: report.block_composition.clone(),
             total_fees_paid: report.total_fees_paid.map(|fees| fees.to_string()),
-            samples: Vec::new(),
+            inclusion_latency: report.inclusion_latency.clone(),
             call: report.call.clone(),
         };
 
@@ -651,14 +688,9 @@ fn copy_and_gzip_samples_ndjson(report: &FinalReport, path: &Path) -> Result<usi
 /// ClickHouse reporter configuration.
 #[derive(Clone)]
 pub struct ClickHouseConfig {
-    /// ClickHouse HTTP endpoint (e.g. `https://host:8443`).
+    /// ClickHouse HTTP endpoint (e.g. `https://host:8443`). The database and
+    /// credentials are read by [`ClickHouseClient::from_env`].
     pub url: String,
-    /// Database name (from `CLICKHOUSE_DATABASE`, default: `default`).
-    pub database: String,
-    /// ClickHouse user (from `CLICKHOUSE_USER`).
-    pub user: Option<String>,
-    /// ClickHouse password (from `CLICKHOUSE_PASSWORD`).
-    pub password: Option<String>,
     /// Run identifier.
     pub run_id: uuid::Uuid,
     /// Benchmark start time.
@@ -691,9 +723,6 @@ impl fmt::Debug for ClickHouseConfig {
         formatter
             .debug_struct("ClickHouseConfig")
             .field("url", &url)
-            .field("database", &self.database)
-            .field("user", &self.user)
-            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
             .field("run_id", &self.run_id)
             .field("started_at", &self.started_at)
             .field("scenario_name", &self.scenario_name)
@@ -736,10 +765,6 @@ impl ClickHouseConfig {
             );
         }
 
-        let database =
-            std::env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "default".to_string());
-        let user = std::env::var("CLICKHOUSE_USER").ok();
-        let password = std::env::var("CLICKHOUSE_PASSWORD").ok();
         let sample_batch_size = std::env::var("CLICKHOUSE_SAMPLE_BATCH_SIZE")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -761,9 +786,6 @@ impl ClickHouseConfig {
 
         Ok(Self {
             url: url.to_string(),
-            database,
-            user,
-            password,
             run_id,
             started_at: std::time::SystemTime::now(),
             scenario_name: metadata["scenario"].clone(),
@@ -794,20 +816,14 @@ pub struct ClickHouseReporter {
 impl ClickHouseReporter {
     /// Create a new ClickHouse reporter.
     pub fn new(config: ClickHouseConfig) -> Result<Self> {
-        let client = ClickHouseClient::new(
-            config.url.clone(),
-            config.database.clone(),
-            config.user.clone(),
-            config.password.clone(),
-        )?;
+        let client = ClickHouseClient::from_env(&config.url)?;
 
         tracing::info!(
             run_id = %config.run_id,
             scenario = %config.scenario_name,
             platform = %config.platform,
             mode = %config.mode,
-            url = %client.endpoint_origin(),
-            database = %config.database,
+            ?client,
             sample_batch_size = config.sample_batch_size,
             "ClickHouse reporter initialized"
         );
@@ -819,8 +835,8 @@ impl ClickHouseReporter {
     fn build_run_row(&self, finished_at: std::time::SystemTime) -> ClickHouseRunRow<'_> {
         ClickHouseRunRow {
             run_id: self.config.run_id,
-            started_at: system_time_to_millis(self.config.started_at),
-            finished_at: system_time_to_millis(finished_at),
+            started_at: unix_ms(self.config.started_at),
+            finished_at: unix_ms(finished_at),
             scenario_name: &self.config.scenario_name,
             platform: &self.config.platform,
             mode: &self.config.mode,
@@ -986,10 +1002,20 @@ struct ClickHouseMetricSampleRow<'a> {
     value: f64,
 }
 
-/// Convert a [`SystemTime`](std::time::SystemTime) to Unix milliseconds.
-fn system_time_to_millis(t: std::time::SystemTime) -> u64 {
-    // SAFETY: SystemTime::now() is always after UNIX_EPOCH
-    t.duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+/// Parse `key=value` metadata arguments into a map.
+pub fn parse_metadata<M: FromIterator<(String, String)>>(values: &[String]) -> Result<M> {
+    values
+        .iter()
+        .map(|value| {
+            let (key, value) = value.split_once('=').ok_or_else(|| {
+                eyre::eyre!("invalid metadata format '{value}'; expected key=value")
+            })?;
+            if key.is_empty() {
+                bail!("metadata key cannot be empty");
+            }
+            Ok((key.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 /// Parse reporter specifications into boxed reporters.
@@ -1015,10 +1041,6 @@ pub fn parse_reporters(
     let mut reporters: Vec<Box<dyn Reporter>> = Vec::new();
     let benchmark_id = uuid::Uuid::new_v4();
 
-    if specs.is_empty() {
-        return Ok(reporters);
-    }
-
     for spec in specs {
         if spec == "console" {
             reporters.push(Box::new(ConsoleReporter::stderr(true)));
@@ -1043,8 +1065,7 @@ pub fn parse_reporters(
         } else if let Some(url) =
             spec.strip_prefix("prometheus:").or_else(|| spec.strip_prefix("victoriametrics:"))
         {
-            let config =
-                crate::prometheus_reporter::PrometheusConfig::from_metadata(url, metadata)?;
+            let config = crate::prometheus_reporter::PrometheusConfig::from_env(url)?;
             reporters.push(Box::new(
                 crate::prometheus_reporter::PrometheusReporter::new(config)
                     .wrap_err("failed to create Prometheus reporter")?,
@@ -1066,11 +1087,22 @@ mod tests {
     use alloy_primitives::{Address, TxHash, B256, U256};
     use std::{collections::BTreeMap, time::Duration};
 
+    #[test]
+    fn parses_metadata_and_rejects_malformed_values() {
+        let metadata: HashMap<String, String> =
+            parse_metadata(&["git-sha=abc".into(), "phase=nightly=zones".into()]).unwrap();
+        assert_eq!(metadata["git-sha"], "abc");
+        assert_eq!(metadata["phase"], "nightly=zones");
+        assert!(parse_metadata::<HashMap<_, _>>(&["missing-separator".into()]).is_err());
+        assert!(parse_metadata::<HashMap<_, _>>(&["=value".into()]).is_err());
+    }
+
     fn sample_metrics() -> BenchMetrics {
         BenchMetrics {
             sent: 1000,
             success: 950,
             failed: 50,
+            inclusion_failed: 0,
             elapsed: Duration::from_secs(10),
             latency: Some(LatencyStats {
                 min: Duration::from_millis(1),
@@ -1171,6 +1203,61 @@ mod tests {
     }
 
     #[test]
+    fn test_json_reporter_includes_inclusion_latency() {
+        let mut report = sample_report();
+        report.inclusion_latency = InclusionLatency::from_records(&[ReceiptGasRecord {
+            tx_hash: TxHash::repeat_byte(0x11),
+            sender: None,
+            labels: BTreeMap::from([("input".to_string(), "transfer".to_string())]),
+            scenario_instance: None,
+            success: true,
+            block_number: Some(42),
+            block_hash: None,
+            gas_used: U256::from(21_000),
+            effective_gas_price: None,
+            submitted_at_unix_ms: Some(1_000),
+            block_timestamp_ms: Some(1_420),
+        }]);
+        let mut output = Vec::new();
+        JsonReporter::new(&mut output).finalize(&report).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["inclusion_latency"]["overall"]["count"], 1);
+        assert_eq!(parsed["inclusion_latency"]["overall"]["p90_ms"], 420.0);
+        assert_eq!(parsed["inclusion_latency"]["groups"][0]["labels"]["input"], "transfer");
+        assert_eq!(parsed["inclusion_latency"]["groups"][0]["p99_ms"], 420.0);
+    }
+
+    #[test]
+    fn test_json_reporter_includes_block_composition() {
+        let mut report = sample_report();
+        report.block_composition = Some(RunComposition {
+            block_count: 1,
+            summary: crate::composition::TransactionComposition {
+                tx_count: 1,
+                gas_used: "21000".into(),
+                kinds: vec![crate::composition::KindComposition {
+                    input: Some("future_preset".into()),
+                    tx_count: 1,
+                    tx_count_pct: 100.0,
+                    gas_used: "21000".into(),
+                    gas_pct: 100.0,
+                    reverted_tx_count: 0,
+                }],
+            },
+            blocks: Vec::new(),
+        });
+        let mut output = Vec::new();
+        JsonReporter::new(&mut output).finalize(&report).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["block_composition"]["summary"]["kinds"][0]["input"], "future_preset");
+        assert_eq!(parsed["block_composition"]["summary"]["kinds"][0]["gas_pct"], 100.0);
+        assert_eq!(parsed["block_composition"]["summary"]["kinds"][0]["tx_count_pct"], 100.0);
+        let restored: JsonReport = serde_json::from_slice(&output).unwrap();
+        assert_eq!(restored.block_composition, report.block_composition);
+    }
+
+    #[test]
     fn test_json_reporter_omits_granular_receipt_records() {
         let mut report = sample_report();
         report.receipt_records = vec![ReceiptGasRecord {
@@ -1183,6 +1270,8 @@ mod tests {
             block_hash: Some(B256::repeat_byte(0x33)),
             gas_used: U256::from(21_000),
             effective_gas_price: Some(U256::from(2)),
+            submitted_at_unix_ms: None,
+            block_timestamp_ms: None,
         }];
         let mut output = Vec::new();
         JsonReporter::new(&mut output).finalize(&report).unwrap();
@@ -1400,7 +1489,7 @@ mod tests {
             let source_content = std::fs::read_to_string(&source_samples_path).unwrap();
             assert_eq!(source_content.lines().count(), 2);
 
-            report.retain_samples_until(1000).unwrap();
+            report.retain_samples_until(1000);
             assert_eq!(std::fs::read_to_string(&source_samples_path).unwrap(), source_content);
 
             reporter.finalize(&report).unwrap();

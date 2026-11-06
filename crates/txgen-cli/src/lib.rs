@@ -13,7 +13,7 @@ mod generate;
 pub mod scenario;
 
 use addresses::run_addresses;
-pub use addresses::AddressesArgs;
+pub use addresses::{AddressesArgs, AddressesFormat};
 use extract::{run_extract, run_extract_big_blocks};
 pub use extract::{ExtractArgs, ExtractBigBlocksArgs, ExtractFormat};
 use generate::run_generate;
@@ -24,7 +24,10 @@ pub use generate::{
     ScenarioActionContext, TxRequest,
 };
 use scenario::run_scenario_command;
-pub use scenario::{ScenarioArgs, ScenarioRenderArgs, ScenarioRunArgs, ScenarioValidateArgs};
+pub use scenario::{
+    ScenarioActionDiagnostic, ScenarioArgs, ScenarioRenderArgs, ScenarioRunArgs,
+    ScenarioValidateArgs,
+};
 
 // ---------------------------------------------------------------------------
 // Private CLI plumbing

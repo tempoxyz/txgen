@@ -433,7 +433,7 @@ txgen-tempo generate -s workload.yaml -n 1000 --defer-signing | bench send --lat
 | `--metrics-align <TIMESTAMP>` | Align exported metric timestamps to a benchmark-start Unix timestamp, in seconds or milliseconds |
 | `--metrics-forward <URL>` | Forward scraped samples in real time via Prometheus remote write; requires `--metrics-url` |
 | `--collect-latencies` | Collect and report aggregate latency stats plus individual request samples under `time_series.latencies` (default: disabled) |
-| `--collect-receipt-metrics` | Collect non-system transaction gas and fee metrics with block-level receipt requests after sending |
+| `--collect-receipt-metrics[=true\|false]` | Enabled by default: collect non-system transaction gas, fee, composition, and submit-to-inclusion latency metrics using block receipts only after sending and draining finish; `=false` disables collection |
 | `--skip-setup` | Ignore setup-phase transactions in the input stream |
 | `--drain-timeout <N>` | Wait for txpool drain after sending, in seconds (default: 0, set >0 to enable) |
 
@@ -481,6 +481,14 @@ bench send-blocks \
   --rpc http://localhost:8545 \
   --reorg 8 \
   --input blocks.ndjson
+
+# Fill the node's transaction pool with each block's transactions before its payload.
+bench send-blocks \
+  --engine http://localhost:8551 \
+  --jwt-secret /path/to/jwt.hex \
+  --rpc http://localhost:8545 \
+  --mempool --mempool-delay 200ms --mempool-fraction 0.5 \
+  --input blocks.ndjson
 ```
 
 | Flag | Description |
@@ -492,7 +500,10 @@ bench send-blocks \
 | `--wait-time <DURATION>` | Minimum interval between block submissions. Accepts `100ms`, `2s`, or bare milliseconds like `400` |
 | `--reorg [DEPTH]` | Build synthetic side-fork blocks and alternate forkchoice updates to exercise reorg paths. If `DEPTH` is omitted, defaults to `8`. Requires raw RLP block input |
 | `--reorg-gap <BLOCKS>` | Add `BLOCKS` canonical blocks between resolved side chains (default: `0`; requires `--reorg`) |
-| `--rpc <URL>` | Regular HTTP RPC endpoint for `testing_buildBlockV1` when `--reorg` is enabled (default: `http://localhost:8545`) |
+| `--rpc <URL>` | Regular HTTP RPC endpoint for `testing_buildBlockV1` when `--reorg` is enabled and for `--mempool` (default: `http://localhost:8545`) |
+| `--mempool` | Before each block's `reth_newPayload`, wait until the node's head is the block's parent, then submit the block's transactions to `--rpc` via `eth_sendRawTransaction`. Skips blob transactions, which blocks carry without sidecars. Requires raw RLP block input; conflicts with `--reorg` |
+| `--mempool-delay <DURATION>` | Delay between submitting a block's transactions and its `reth_newPayload` (default: `200ms`; requires `--mempool`) |
+| `--mempool-fraction <FRACTION>` | Fraction in `(0, 1]` of each block's non-blob transactions to submit, selected by transaction hash so every run submits the same ones (default: `1`; requires `--mempool`) |
 | `--report <FORMAT>` | Report destinations, repeatable (see [Reporters](#reporters)) |
 | `-m, --metadata <K=V>` | Metadata key=value pairs for the report, repeatable |
 | `--metrics-url <URL or NODE:URL,...>` | Prometheus endpoint(s) to scrape during the run (see [Metrics Scraping](#metrics-scraping)) |
@@ -502,7 +513,9 @@ bench send-blocks \
 
 For `send-blocks`, aggregate run rates use benchmark wall-clock duration. Per-block timestamps remain the original chain timestamps from the input. With `--reorg`, canonical block stats remain canonical-only, but the wall-clock duration includes synthetic fork block build/submission work.
 
-**Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API). Big-block inputs require a `reth-bb` compatible node. `--reorg` additionally requires `testing_buildBlockV1` on the regular HTTP RPC endpoint. Because synthetic forks intentionally omit transactions, start Reth with `--http --http.api eth,testing --testing.skip-invalid-transactions`. `--rpc-url` and `--local-rpc-url` are accepted as backwards-compatible aliases for `--rpc`.
+With `--mempool`, transaction submission and `--mempool-delay` happen before each block's measured `reth_newPayload` and outside `--wait-time`, which still covers only `reth_newPayload` and `reth_forkchoiceUpdated`. Each block logs the accepted, rejected, blob and unselected transaction counts and the pool's pending and queued counts; the run ends with a summary that groups rejections by error message.
+
+**Required RPC methods:** `reth_newPayload`, `reth_forkchoiceUpdated` (reth custom Engine API). Big-block inputs require a `reth-bb` compatible node. `--reorg` additionally requires `testing_buildBlockV1` on the regular HTTP RPC endpoint. Because synthetic forks intentionally omit transactions, start Reth with `--http --http.api eth,testing --testing.skip-invalid-transactions`. `--mempool` additionally requires `eth_sendRawTransaction`, `eth_blockNumber` and `txpool_status` on the regular HTTP RPC endpoint, for example `--http --http.api eth,txpool`. `--rpc-url` and `--local-rpc-url` are accepted as backwards-compatible aliases for `--rpc`.
 
 #### `bench call`
 
@@ -724,7 +737,7 @@ For a single endpoint, pass the URL directly. Legacy multiple-endpoint entries u
 `node_label:URL` and add `node=<node_label>`. Rich entries use
 `key=value;key=value@URL` and add each supplied label to the scraped samples.
 
-Internal txgen metrics are snapshotted on the same interval and included alongside node metrics. In `send` mode: `txgen_transactions_sent_total`, `txgen_transactions_success_total`, etc. In `send-blocks` mode: `txgen_blocks_sent_total`, `txgen_blocks_success_total`, `txgen_blocks_failed_total`.
+Internal txgen metrics are snapshotted on the same interval and included alongside node metrics. In `send` mode: `txgen_transactions_sent_total`, `txgen_transactions_success_total`, `txgen_transactions_failed_total` (submission failures), `txgen_transactions_inclusion_failed_total` (accepted transactions that reverted, expired or were never confirmed included) and `txgen_transactions_inflight`. In `send-blocks` mode: `txgen_blocks_sent_total`, `txgen_blocks_success_total`, `txgen_blocks_failed_total`.
 
 Metadata key=value pairs (`-m key=value`) are applied as labels to all samples, useful for tagging runs with build SHAs, profiles, or experiment IDs.
 
@@ -784,15 +797,20 @@ txgen-tempo scenario run \
 
 The scenario name, platform, and `mode=scenario` are derived from the finalized report; those metadata keys are reserved and conflicting user values are rejected. `git-sha` and `git-ref` are required metadata for the common `txgen_runs` row. Every destination receives the same client-generated `run_id`. JSON destinations are finalized before ClickHouse publication, so an upload error is returned without deleting a report file that was already written.
 
-Deploy migrations through `009_txgen_scenario_causal_metrics.sql` before publishing scenario report schema version 2. Detail rows are synchronously acknowledged before `txgen_runs` is inserted as the visibility marker. Queries for complete benchmark or scenario reports must begin at `txgen_runs` and join detail tables by `run_id`; an interrupted publication can leave child rows without a visible common run row.
+Deploy migrations through `009_txgen_scenario_causal_metrics.sql` before publishing scenario report schema version 2, and `010_txgen_receipt_inclusion_latency.sql` before `bench send` publishes receipt rows with submit-to-inclusion timing. Detail rows are synchronously acknowledged before `txgen_runs` is inserted as the visibility marker. Queries for complete benchmark or scenario reports must begin at `txgen_runs` and join detail tables by `run_id`; an interrupted publication can leave child rows without a visible common run row.
 
 The bench JSON report includes:
 - `samples` — point-in-time metric snapshots (internal + node), stored as a time series
 - `blocks` — factual chain data for each block in the run (tx count, gas used, etc.)
 - `receipt_metrics` — confirmed-transaction `gas_used`, `effective_gas_price`, and `fee_paid` distributions grouped by workload input
+- `block_composition` — actual included non-system transaction composition over the same retained measured `blocks`: a run-wide `summary` and individual `blocks`, each containing exact `tx_count` and decimal-string `gas_used` totals and `kinds` with `input`, `tx_count_pct`, `gas_pct`, and `reverted_tx_count`. Percentages include reverted transactions, which consume block capacity. Input labels are generated template names or `sequence.step` names, so new presets require no classifier changes. Untracked transactions have `input: null` and remain in the denominator. System receipts with zero gas are excluded. Missing receipts or a receipt gas total that differs from the block header fail reporting rather than publish partial composition.
+
 - `total_fees_paid` — exact total paid by confirmed non-system transactions in the benchmark block range, encoded as a decimal base-unit string
+- `inclusion_latency` — submit-to-inclusion latency in milliseconds: the including block's timestamp minus the load generator's wall-clock time when it started `eth_sendRawTransaction`. `overall` and one entry per workload input in `groups` (each with `labels`) carry `count`, `min_ms`, `mean_ms`, `p50_ms`, `p90_ms`, `p95_ms`, `p99_ms`, and `max_ms`. It covers the same measured blocks as `receipt_metrics` and reuses their block timestamps (Tempo millisecond precision), so it adds no RPC requests. Clock skew between the load generator and validators shifts every value, and values are signed rather than clamped at zero. ClickHouse receipt rows carry the per-transaction `submitted_at_unix_ms`, `block_timestamp_ms`, and `inclusion_latency_ms` (migration `010`).
 
 Receipts without `effectiveGasPrice` or legacy `gasPrice` still contribute gas usage to `receipt_metrics`, but are excluded from `total_fees_paid`.
+
+Receipt collection is entirely post-run and does not issue gas-reporting receipt requests during submission. Gas/fee distributions, composition, and ClickHouse receipt rows are restricted to the measured blocks after warmup and trailing-empty-block trimming. Run-wide percentages are weighted by total transaction count and total gas, not the unweighted mean of per-block percentages; divide a kind's run-wide `tx_count` by `block_composition.block_count` for its average transactions per measured block. Both Tempo `bench-e2e` and multi-region workflows upload these JSON reports in their existing results artifacts (`report-*.json` and phase `txgen-report.json`, respectively).
 
 ### Prometheus Reporting
 
@@ -1241,6 +1259,14 @@ Runs a query-only action supplied by the selected network adapter. `with` values
 
 The Tempo adapter provides `prepare_encrypted_deposit`, which reads the current ZonePortal encryption key and creates a fresh secp256k1/AES-GCM payload for each invocation. `sender` is required and must be the address that will call `ZonePortal.deposit`; it is bound into the encryption key derivation. Cryptographic material always comes from the operating system and is intentionally not controlled by the scenario seed. `portalAddress` is optional for Zone IDs known to viem; supply it for other deployments. `memo` is an optional `bytes32` and defaults to zero.
 
+Adapter invocation failures retain bounded, safe diagnostics in the JSON report's
+`failures[].sample_detail`, including failures outside `sampled_instances`.
+`prepare_encrypted_deposit` identifies the failed portal call or key validation and
+includes numeric RPC error codes or HTTP statuses when available. RPC messages, response bodies,
+credentials, and action arguments are excluded. Custom adapters can opt in with
+`txgen_cli::ScenarioActionDiagnostic` containing fixed, secret-free text; unannotated
+adapter errors receive a generic diagnostic.
+
 ```yaml
 - invoke:
     chain: l1
@@ -1628,6 +1654,22 @@ mix:
     weight: 10
 ```
 
+### Gas-Weighted Mix
+
+`generate --gas-weighted-mix --rpc <url>` interprets mix weights as target shares
+of submitted block gas rather than workload-item counts. It simulates one instance
+of each positive-weight item with `eth_simulateV1` before workload generation and
+every 10 seconds thereafter, selecting items proportionally to `weight / gas`.
+Sequence steps are simulated together and charged their total simulated block
+`gasUsed`, which follows the node's block-capacity accounting. Sampling clones
+the generator's nonce and RNG state and does not submit transactions. Sampling
+failures abort generation; there are no retries or fallback estimates.
+
+Confirm setup before sampling: generate setup with `--count 0 --setup-state-out
+setup.json`, submit it successfully, then generate workload with
+`--setup-state-in setup.json --gas-weighted-mix`. Gas shares are estimates,
+not guarantees for individual mined blocks; inspect the report's `block_composition` for actuals.
+
 ### Account Selection
 
 Accounts are selected from signer pools using `select`. Only `accounts` pools can be used in signing positions such as `from` and `sponsor`; `address_pools` are destination-only values.
@@ -1821,6 +1863,26 @@ concurrency, and `--max-pending`. Transactions on the same ordered nonce lane st
 submit in nonce order, without waiting for receipts. Expiring nonces provide no
 implicit execution ordering.
 
+A deploy step with `create2: {salt: N}` deploys through the CreateX predeploy
+(`0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed`) with `deployCreate2` instead of a contract-creation
+transaction. Its `setup.<id>.address` then depends only on the salt and init code, not on the
+sender's nonce, so CREATE2 deploys can share one sender and use expiring or 2D nonces. The salt
+must fit CreateX's 11 free salt bytes (below 2^88); give each deployment of the same init code
+its own salt, since a second deploy to the same address reverts. With `--rpc`, `generate` fails up
+front when the chain has no code at the CreateX address.
+
+```yaml
+    - id: portal_0
+      deploy:
+        type: tempo
+        from: {pool: deployer, select: {index: 0}}
+        expiring_nonce: true
+        artifact: PortalFixture
+        gas_limit: 10000000
+        create2: {salt: 0}
+```
+
+
 Declare real receipt dependencies with `depends_on`, referencing setup **step IDs**:
 
 ```yaml
@@ -1876,8 +1938,10 @@ contract addresses and transaction hashes. Reuse that file only after every setu
 transaction succeeds, with the same spec and chain. `--setup-state-in` emits only
 workload transactions, retains the original `setup.<id>.*` bindings, and requires
 `--rpc` to fetch current nonces without reserving setup nonces again. Chain IDs,
-state versions, and setup step IDs are checked. Keychain setup extensions are not
-supported by this state file because they also initialize adapter state.
+state versions, and setup step IDs are checked. The file records a hash of each
+`keychain_authorize_pool` step, which must still match: its access keys come from
+the spec, so a resumed workload derives them again without emitting the setup
+transactions.
 
 ```yaml
 artifacts:
@@ -2183,7 +2247,8 @@ Summary of which RPC methods are required by each feature:
 | `reth_newPayload` | `bench send-blocks` |
 | `reth_forkchoiceUpdated` | `bench send-blocks` |
 | `testing_buildBlockV1` | `bench send-blocks --reorg` |
-| `txpool_status` | `bench send` (query RPC when configured; pool drain wait) |
+| `eth_sendRawTransaction`, `eth_blockNumber` | `bench send-blocks --mempool` |
+| `txpool_status` | `bench send` (query RPC when configured; pool drain wait), `bench send-blocks --mempool` |
 
 > **Note:** `debug_*` methods require a node with the debug namespace enabled (typically archive nodes), and `trace_*` methods the trace namespace. `reth_*` methods are custom reth Engine API extensions.
 

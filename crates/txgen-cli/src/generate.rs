@@ -8,6 +8,7 @@ use alloy_primitives::{keccak256, Address, Bytes, TxKind, B256, U256};
 use alloy_provider::{DynProvider, Provider};
 use clap::{ArgGroup, Args};
 use eyre::{bail, Result, WrapErr};
+use futures::{stream, StreamExt};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::{
@@ -18,17 +19,14 @@ use std::{
     time::{Duration, Instant},
 };
 use txgen_core::{
-    dedup_scheduling_keys, merge_yaml, AbiEncodePackedDef, AbiHashDef, AccountManager,
-    AddressPoolManager, ArtifactManager, BuildContext, EcdsaSigner, GeneratedTx, LateSignSpec,
-    MixItem, NdjsonWriter, NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase,
-    WorkloadSpec,
+    dedup_scheduling_keys, merge_yaml, AbiValuesDef, AccountManager, AddressPoolManager,
+    ArtifactManager, BuildContext, EcdsaSigner, GeneratedTx, LateSignSpec, MixItem, NdjsonWriter,
+    NonceTracker, SchedulingKey, SequenceBinding, SetupStep, TxPhase, WorkloadSpec,
 };
 
-fn default_signing_workers() -> usize {
-    2
-}
-
 const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const GAS_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+const NONCE_FETCH_CONCURRENCY: usize = 32;
 
 #[derive(Args)]
 #[command(group(
@@ -67,7 +65,7 @@ pub struct GenerateArgs {
     pub seed: Option<u64>,
 
     /// Number of worker threads used to sign and encode workload transactions.
-    #[arg(long, visible_alias = "workers", default_value_t = default_signing_workers())]
+    #[arg(long, visible_alias = "workers", default_value_t = 2)]
     pub signing_workers: usize,
 
     /// Emit deferred-signing envelopes instead of signed workload transactions.
@@ -85,6 +83,11 @@ pub struct GenerateArgs {
     /// setup again. Fetches current workload nonces using --rpc.
     #[arg(long, requires = "rpc", conflicts_with = "setup_state_out")]
     pub setup_state_in: Option<PathBuf>,
+
+    /// Interpret mix weights as gas shares, sampling each workload item every 10s.
+    /// Setup must be confirmed before workload generation starts.
+    #[arg(long, requires = "rpc")]
+    pub gas_weighted_mix: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -103,6 +106,7 @@ pub struct GenerateContext {
     defer_signing: bool,
     setup_state_in: Option<SetupState>,
     setup_state_out: Option<PathBuf>,
+    gas_sample_rpc: Option<String>,
 }
 
 impl GenerateContext {
@@ -116,12 +120,12 @@ impl GenerateContext {
         if args.setup_state_out.is_some() && args.count != Some(0) {
             bail!("--setup-state-out requires --count 0; submit setup successfully before generating workload");
         }
-        if (args.setup_state_in.is_some() || args.setup_state_out.is_some()) &&
-            spec.setup.as_ref().is_some_and(|setup| {
-                setup.steps.iter().any(|step| step.keychain_authorize_pool.is_some())
-            })
+        if args.gas_weighted_mix &&
+            args.count != Some(0) &&
+            spec.setup.as_ref().is_some_and(|setup| !setup.steps.is_empty()) &&
+            args.setup_state_in.is_none()
         {
-            bail!("setup state does not support keychain_authorize_pool adapter state");
+            bail!("gas-weighted generation requires confirmed setup via --setup-state-in");
         }
         let setup_state_in = args
             .setup_state_in
@@ -155,12 +159,8 @@ impl GenerateContext {
             defer_signing: args.defer_signing,
             setup_state_in,
             setup_state_out: args.setup_state_out.clone(),
+            gas_sample_rpc: args.gas_weighted_mix.then(|| args.rpc.clone()).flatten(),
         })
-    }
-
-    /// Borrow accounts and nonces simultaneously for prefetching.
-    pub fn accounts_and_nonces(&mut self) -> (&AccountManager, &mut NonceTracker) {
-        (&self.accounts, &mut self.nonces)
     }
 
     /// Borrow spec, accounts, and nonces simultaneously for prefetching.
@@ -371,36 +371,10 @@ pub(crate) fn prepare_materialized_template<A: NetworkAdapter>(
     inclusion_keys: &[SchedulingKey],
     ctx: &mut BuildContext<'_>,
 ) -> Result<PreparedMaterializedTx<A>> {
-    let result = (|| -> Result<_> {
-        let template: A::Template = serde_yaml::from_value(value)
-            .wrap_err_with(|| format!("failed to parse template '{name}'"))?;
-        let tx_req = adapter
-            .build_request(template, ctx)
-            .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
-        let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?.clone();
-        let sender = signer.address();
-        let nonce = tx_req.request.nonce();
-        let created_address = match (tx_req.request.kind(), nonce) {
-            (Some(TxKind::Create), Some(nonce)) => Some(sender.create(nonce)),
-            _ => None,
-        };
-        Ok((tx_req, signer, sender, nonce, created_address))
-    })();
-
-    match result {
-        Ok((tx_req, signer, sender, nonce, created_address)) => {
-            let nonce_reservations = ctx.take_nonce_reservations();
-            Ok(PreparedMaterializedTx {
-                name: name.to_string(),
-                phase,
-                tx_req,
-                signer,
-                inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),
-                sender,
-                nonce,
-                nonce_reservations,
-                created_address,
-            })
+    match build_prepared_template(adapter, name, value, phase, inclusion_keys, ctx) {
+        Ok(mut prepared) => {
+            prepared.nonce_reservations = ctx.take_nonce_reservations();
+            Ok(prepared)
         }
         Err(error) => {
             if !ctx.rollback_nonce_reservations() {
@@ -409,6 +383,39 @@ pub(crate) fn prepare_materialized_template<A: NetworkAdapter>(
             Err(error)
         }
     }
+}
+
+fn build_prepared_template<A: NetworkAdapter>(
+    adapter: &A,
+    name: &str,
+    value: serde_yaml::Value,
+    phase: TxPhase,
+    inclusion_keys: &[SchedulingKey],
+    ctx: &mut BuildContext<'_>,
+) -> Result<PreparedMaterializedTx<A>> {
+    let template: A::Template = serde_yaml::from_value(value)
+        .wrap_err_with(|| format!("failed to parse template '{name}'"))?;
+    let tx_req = adapter
+        .build_request(template, ctx)
+        .wrap_err_with(|| format!("failed to build request from template '{name}'"))?;
+    let signer = ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index)?.clone();
+    let sender = signer.address();
+    let nonce = tx_req.request.nonce();
+    let created_address = match (tx_req.request.kind(), nonce) {
+        (Some(TxKind::Create), Some(nonce)) => Some(sender.create(nonce)),
+        _ => None,
+    };
+    Ok(PreparedMaterializedTx {
+        name: name.to_string(),
+        phase,
+        tx_req,
+        signer,
+        inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),
+        sender,
+        nonce,
+        nonce_reservations: Vec::new(),
+        created_address,
+    })
 }
 
 /// Sign and encode a previously prepared adapter request.
@@ -481,20 +488,6 @@ fn rollback_nonce_reservations(
     restored
 }
 
-/// Materialize a workload's setup section for direct online submission.
-pub fn materialize_setup<A: NetworkAdapter>(
-    adapter: &mut A,
-    spec: &WorkloadSpec,
-    ctx: &mut BuildContext<'_>,
-) -> Result<MaterializedSetup>
-where
-    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
-    <A::Network as Network>::TxEnvelope:
-        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
-{
-    build_setup(adapter, spec, ctx)
-}
-
 /// Materialize setup transactions after asynchronously preparing adapter state.
 ///
 /// Scenario execution uses this path because an online adapter may need to read
@@ -561,82 +554,18 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    let has_deploy = step.deploy.is_some();
-    let has_tx = step.tx.is_some();
-    let has_keychain_authorize_pool = step.keychain_authorize_pool.is_some();
-    let action_count =
-        usize::from(has_deploy) + usize::from(has_tx) + usize::from(has_keychain_authorize_pool);
-    if action_count != 1 {
-        bail!("setup step must set exactly one of `deploy`, `tx`, or `keychain_authorize_pool`");
-    }
-
-    let local_bindings = resolve_sequence_bindings(&step.bindings, ctx, setup_bindings)?;
-    if let Some(keychain_authorize_pool) = &step.keychain_authorize_pool {
-        let materialized = substitute_vars(keychain_authorize_pool.clone(), &local_bindings)?;
-        let templates = adapter
-            .expand_setup_extension(&step.id, "keychain_authorize_pool", materialized, ctx)?
-            .ok_or_else(|| {
-                eyre::eyre!("adapter does not support setup step `keychain_authorize_pool`")
-            })?;
-        if templates.is_empty() {
-            bail!("setup step `keychain_authorize_pool` produced no transactions");
-        }
-        for (idx, value) in templates.into_iter().enumerate() {
-            let (generated, _) = materialize_setup_value_online(
-                adapter,
-                &format!("setup.{}[{idx}]", step.id),
-                value,
-                &[],
-                ctx,
-                output.prepare_timeout,
-            )
-            .await?;
-            output.transactions.push((output.submit)(generated).await?);
-        }
-        return Ok(());
-    }
-
-    let (generated, info) = if let Some(deploy) = &step.deploy {
-        let materialized = substitute_vars(deploy.clone(), &local_bindings)?;
-        let value = build_deploy_template_value(materialized, ctx)?;
-        let result = materialize_setup_value_online(
+    for template in setup_step_templates(adapter, step, setup_bindings, ctx)? {
+        let (generated, info) = materialize_setup_value_online(
             adapter,
-            &format!("setup.{}", step.id),
-            value,
-            &[],
+            &template.name,
+            template.value,
             ctx,
             output.prepare_timeout,
         )
         .await?;
-        if result.1.created_address.is_none() {
-            bail!("deploy setup step did not produce a contract creation transaction");
-        }
-        result
-    } else {
-        let tx = step.tx.as_ref().expect("checked exactly one setup action");
-        let materialized = substitute_vars(tx.clone(), &local_bindings)?;
-        materialize_setup_value_online(
-            adapter,
-            &format!("setup.{}", step.id),
-            materialized,
-            &[],
-            ctx,
-            output.prepare_timeout,
-        )
-        .await?
-    };
-    output.transactions.push((output.submit)(generated).await?);
-
-    setup_bindings.insert(
-        format!("setup.{}", step.id),
-        ResolvedBinding::SetupTx {
-            address: info.created_address,
-            tx_hash: info.tx_hash,
-            sender: info.sender,
-            nonce: info.nonce,
-        },
-    );
-
+        bind_setup_tx(step, info, template.created_address, setup_bindings)?;
+        output.transactions.push((output.submit)(generated).await?);
+    }
     Ok(())
 }
 
@@ -644,7 +573,6 @@ async fn materialize_setup_value_online<A: NetworkAdapter>(
     adapter: &A,
     name: &str,
     value: serde_yaml::Value,
-    inclusion_keys: &[SchedulingKey],
     ctx: &mut BuildContext<'_>,
     prepare_timeout: Duration,
 ) -> Result<(GeneratedTx, EmittedTxInfo)>
@@ -673,17 +601,7 @@ where
             bail!("timed out preparing request from template '{name}'");
         }
     }
-    let materialized =
-        materialize_and_sign_template(adapter, name, value, TxPhase::Setup, inclusion_keys, ctx)?;
-    let nonce =
-        materialized.nonce.ok_or_else(|| eyre::eyre!("template '{name}' did not set a nonce"))?;
-    let info = EmittedTxInfo {
-        sender: materialized.sender,
-        nonce,
-        tx_hash: materialized.tx_hash,
-        created_address: materialized.created_address,
-    };
-    Ok((materialized.generated, info))
+    materialize_setup_value(adapter, name, value, ctx)
 }
 
 /// Runtime context supplied to an adapter-defined scenario action.
@@ -813,9 +731,18 @@ pub trait NetworkAdapter: Send + Sync {
         rpc: &'a str,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
         async move {
-            let (accounts, nonces) = ctx.accounts_and_nonces();
+            let (_, accounts, nonces) = ctx.prefetch_state();
             fetch_protocol_nonces(accounts, nonces, rpc).await
         }
+    }
+
+    /// Normalize adapter-specific fields for eth_simulateV1.
+    fn simulation_request(
+        &self,
+        request: &TxRequest<<Self::Network as Network>::TransactionRequest, Self::SignContext>,
+        _signer: &EcdsaSigner,
+    ) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(&request.request)?)
     }
 }
 
@@ -845,19 +772,19 @@ where
         eprintln!("starting nonce prefetch");
         adapter.prefetch_nonces(&mut ctx, rpc).await?;
         eprintln!("nonce prefetch completed: elapsed={:?}", nonce_prefetch_started.elapsed());
+        ensure_createx_deployed(&ctx.spec, rpc).await?;
     }
 
     let stdout = output.is_none();
-    if let Err(error) = generate_loop(&mut adapter, &mut ctx, output) {
+    let result =
+        tokio::task::spawn_blocking(move || generate_loop(&mut adapter, &mut ctx, output)).await?;
+    if let Err(error) = result {
         // A duration-limited consumer may finish before this producer.
         let closed = stdout &&
             error.chain().any(|cause| {
                 cause
                     .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe) ||
-                    cause.downcast_ref::<serde_json::Error>().is_some_and(|error| {
-                        error.io_error_kind() == Some(std::io::ErrorKind::BrokenPipe)
-                    })
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
             });
         if !closed {
             return Err(error);
@@ -902,30 +829,38 @@ async fn fetch_protocol_nonces_with_state(
     let provider =
         alloy_provider::ProviderBuilder::<_, _, alloy_provider::network::Ethereum>::new()
             .connect_http(rpc_url.parse().wrap_err("invalid RPC URL")?);
-    let state = "latest";
+    let state = if pending { "pending" } else { "latest" };
 
     for (pool_name, addresses) in accounts.all_addresses() {
         let total = addresses.len();
         let started = Instant::now();
         let mut last_progress = started;
         eprintln!("fetching {state} nonces for {pool_name} ({total} accounts)...");
-        for (idx, address) in addresses.iter().enumerate() {
-            let request = Provider::get_transaction_count(&provider, *address);
-            let request = if pending { request.pending() } else { request.latest() };
-            let nonce = tokio::time::timeout(std::time::Duration::from_secs(10), request)
-                .await
-                .wrap_err_with(|| format!("timeout fetching nonce for {}[{}]", pool_name, idx))?
-                .wrap_err_with(|| {
-                    format!("failed to fetch nonce for {}[{}] ({})", pool_name, idx, address)
-                })?;
-
-            let scheduling_key = address.0 .0;
-            nonces.reset(scheduling_key, nonce);
+        let mut fetches = stream::iter(addresses.into_iter().enumerate())
+            .map(|(idx, address)| {
+                let provider = &provider;
+                async move {
+                    let request = Provider::get_transaction_count(provider, address);
+                    let request = if pending { request.pending() } else { request.latest() };
+                    let nonce = tokio::time::timeout(std::time::Duration::from_secs(10), request)
+                        .await
+                        .wrap_err_with(|| format!("timeout fetching nonce for {pool_name}[{idx}]"))?
+                        .wrap_err_with(|| {
+                            format!("failed to fetch nonce for {pool_name}[{idx}] ({address})")
+                        })?;
+                    Ok::<_, eyre::Report>((address, nonce))
+                }
+            })
+            .buffer_unordered(NONCE_FETCH_CONCURRENCY);
+        let mut completed = 0;
+        while let Some(result) = fetches.next().await {
+            let (address, nonce) = result?;
+            nonces.reset(address.0 .0, nonce);
+            completed += 1;
 
             if last_progress.elapsed() >= PROGRESS_LOG_INTERVAL {
                 eprintln!(
-                    "nonce prefetch progress: pool={pool_name} completed={} total={total} state={state} elapsed={:?}",
-                    idx + 1,
+                    "nonce prefetch progress: pool={pool_name} completed={completed} total={total} state={state} elapsed={:?}",
                     started.elapsed(),
                 );
                 last_progress = Instant::now();
@@ -948,6 +883,12 @@ async fn fetch_protocol_nonces_with_state(
 struct GenerationLimit {
     count: Option<u64>,
     duration: Option<Duration>,
+}
+
+struct GenerationConfig<'a> {
+    limit: GenerationLimit,
+    signing_workers: usize,
+    gas_sample_rpc: Option<&'a str>,
 }
 
 fn generate_loop<A>(
@@ -977,54 +918,62 @@ where
     );
     build_ctx.set_defer_signing(ctx.defer_signing);
 
-    match output {
-        Some(path) => {
-            let mut writer = txgen_core::output::file_writer(&path)?;
-            let setup_bindings = if let Some(state) = &ctx.setup_state_in {
-                state.bindings()
-            } else {
-                let bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
-                if let Some(path) = &ctx.setup_state_out {
-                    writer.flush()?;
-                    SetupState::from_bindings(ctx.spec.chain_id, &bindings).save(path)?;
-                }
-                bindings
-            };
-            let written = generate_txs(
-                adapter,
-                &ctx.spec,
-                ctx.limit,
-                ctx.signing_workers,
-                &setup_bindings,
-                &mut build_ctx,
-                &mut writer,
-            )?;
-            eprintln!("wrote {} workload transactions to {}", written, path.display());
+    let mut writer = txgen_core::output::ndjson_writer(output.as_deref())?;
+    let setup_bindings = if let Some(state) = &ctx.setup_state_in {
+        let bindings = state.bindings();
+        restore_setup_extensions(adapter, &ctx.spec, &bindings, &mut build_ctx)?;
+        bindings
+    } else {
+        let bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
+        if let Some(path) = &ctx.setup_state_out {
+            writer.flush()?;
+            SetupState::from_bindings(&ctx.spec, &bindings)?.save(path)?;
         }
-        None => {
-            let mut writer = txgen_core::output::stdout_writer();
-            let setup_bindings = if let Some(state) = &ctx.setup_state_in {
-                state.bindings()
-            } else {
-                let bindings = emit_setup(adapter, &ctx.spec, &mut build_ctx, &mut writer)?;
-                if let Some(path) = &ctx.setup_state_out {
-                    writer.flush()?;
-                    SetupState::from_bindings(ctx.spec.chain_id, &bindings).save(path)?;
-                }
-                bindings
-            };
-            generate_txs(
-                adapter,
-                &ctx.spec,
-                ctx.limit,
-                ctx.signing_workers,
-                &setup_bindings,
-                &mut build_ctx,
-                &mut writer,
-            )?;
-        }
+        bindings
+    };
+    let written = generate_txs(
+        adapter,
+        &ctx.spec,
+        GenerationConfig {
+            limit: ctx.limit,
+            signing_workers: ctx.signing_workers,
+            gas_sample_rpc: ctx.gas_sample_rpc.as_deref(),
+        },
+        &setup_bindings,
+        &mut build_ctx,
+        &mut writer,
+    )?;
+    if let Some(path) = output {
+        eprintln!("wrote {} workload transactions to {}", written, path.display());
     }
 
+    Ok(())
+}
+
+/// Rebuild adapter state from setup extensions without emitting their transactions.
+///
+/// Extension steps such as `keychain_authorize_pool` derive their state (access keys)
+/// from the spec alone, so a resumed workload expands them again and discards the
+/// setup transactions the caller already submitted.
+fn restore_setup_extensions<A: NetworkAdapter>(
+    adapter: &mut A,
+    spec: &WorkloadSpec,
+    setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
+    ctx: &mut BuildContext<'_>,
+) -> Result<()> {
+    for step in spec.setup.iter().flat_map(|setup| &setup.steps) {
+        let Some(keychain_authorize_pool) = &step.keychain_authorize_pool else {
+            continue;
+        };
+        let local_bindings = resolve_sequence_bindings(&step.bindings, ctx, setup_bindings)?;
+        let materialized = substitute_vars(keychain_authorize_pool.clone(), &local_bindings)?;
+        adapter
+            .expand_setup_extension(&step.id, "keychain_authorize_pool", materialized, ctx)
+            .wrap_err_with(|| format!("failed to restore setup step '{}'", step.id))?
+            .ok_or_else(|| {
+                eyre::eyre!("adapter does not support setup step `keychain_authorize_pool`")
+            })?;
+    }
     Ok(())
 }
 
@@ -1035,32 +984,41 @@ struct SetupState {
     version: u32,
     chain_id: u64,
     transactions: BTreeMap<String, EmittedTxInfo>,
+    /// Setup extension steps, which bind no transaction, by `setup.<id>`: a hash of
+    /// each step's definition, so a resumed spec cannot sign with unauthorized keys.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    extensions: BTreeMap<String, B256>,
 }
 
 impl SetupState {
     fn from_bindings(
-        chain_id: u64,
+        spec: &WorkloadSpec,
         bindings: &std::collections::HashMap<String, ResolvedBinding>,
-    ) -> Self {
+    ) -> Result<Self> {
         let transactions = bindings
             .iter()
-            .filter_map(|(id, binding)| {
-                if let ResolvedBinding::SetupTx { address, tx_hash, sender, nonce } = binding {
-                    Some((
-                        id.clone(),
-                        EmittedTxInfo {
-                            created_address: *address,
-                            tx_hash: *tx_hash,
-                            sender: *sender,
-                            nonce: *nonce,
-                        },
-                    ))
-                } else {
-                    None
-                }
+            .filter_map(|(id, binding)| match binding {
+                ResolvedBinding::SetupTx(info) => Some((id.clone(), info.clone())),
+                _ => None,
             })
             .collect();
-        Self { version: 1, chain_id, transactions }
+        Ok(Self {
+            version: 1,
+            chain_id: spec.chain_id,
+            transactions,
+            extensions: Self::extension_hashes(spec)?,
+        })
+    }
+
+    fn extension_hashes(spec: &WorkloadSpec) -> Result<BTreeMap<String, B256>> {
+        spec.setup
+            .iter()
+            .flat_map(|setup| &setup.steps)
+            .filter_map(|step| step.keychain_authorize_pool.as_ref().map(|def| (step, def)))
+            .map(|(step, def)| {
+                Ok((format!("setup.{}", step.id), keccak256(serde_yaml::to_string(def)?)))
+            })
+            .collect()
     }
 
     fn save(&self, path: &std::path::Path) -> Result<()> {
@@ -1076,10 +1034,15 @@ impl SetupState {
             .setup
             .iter()
             .flat_map(|setup| &setup.steps)
+            // Extension steps emit many transactions and no single binding.
+            .filter(|step| step.keychain_authorize_pool.is_none())
             .map(|step| format!("setup.{}", step.id))
             .collect();
         if self.transactions.keys().cloned().collect::<BTreeSet<_>>() != expected {
             bail!("setup state step IDs do not match this workload");
+        }
+        if self.extensions != Self::extension_hashes(spec)? {
+            bail!("setup state keychain_authorize_pool steps do not match this workload");
         }
         Ok(())
     }
@@ -1089,17 +1052,11 @@ impl SetupState {
             "chain_id".to_owned(),
             ResolvedBinding::U64(self.chain_id),
         )]);
-        bindings.extend(self.transactions.iter().map(|(id, info)| {
-            (
-                id.clone(),
-                ResolvedBinding::SetupTx {
-                    address: info.created_address,
-                    tx_hash: info.tx_hash,
-                    sender: info.sender,
-                    nonce: info.nonce,
-                },
-            )
-        }));
+        bindings.extend(
+            self.transactions
+                .iter()
+                .map(|(id, info)| (id.clone(), ResolvedBinding::SetupTx(info.clone()))),
+        );
         bindings
     }
 }
@@ -1113,7 +1070,7 @@ enum ResolvedBinding {
     U256(U256),
     U64(u64),
     String(String),
-    SetupTx { address: Option<Address>, tx_hash: B256, sender: Address, nonce: u64 },
+    SetupTx(EmittedTxInfo),
 }
 
 struct WeightedWorkloadItem {
@@ -1121,6 +1078,8 @@ struct WeightedWorkloadItem {
     tx_count: u64,
     weight: u64,
     cumulative_weight: u64,
+    gas_weight: f64,
+    cumulative_gas_weight: f64,
 }
 
 /// Precompute weights and validate references once. The remaining transaction
@@ -1129,11 +1088,19 @@ struct WorkloadSelector {
     entries: Vec<WeightedWorkloadItem>,
     total_weight: u64,
     max_tx_count: u64,
+    gas_weighted: bool,
+    total_gas_weight: f64,
 }
 
 impl WorkloadSelector {
     fn new(spec: &WorkloadSpec, remaining_txs: u64) -> Result<Self> {
-        let mut selector = Self { entries: Vec::new(), total_weight: 0, max_tx_count: 0 };
+        let mut selector = Self {
+            entries: Vec::new(),
+            total_weight: 0,
+            max_tx_count: 0,
+            gas_weighted: false,
+            total_gas_weight: 0.0,
+        };
         if remaining_txs == 0 {
             return Ok(selector);
         }
@@ -1150,6 +1117,8 @@ impl WorkloadSelector {
                     tx_count,
                     weight: entry.weight,
                     cumulative_weight: selector.total_weight,
+                    gas_weight: 0.0,
+                    cumulative_gas_weight: 0.0,
                 });
             }
         }
@@ -1163,18 +1132,40 @@ impl WorkloadSelector {
             self.entries.retain(|entry| entry.tx_count <= remaining_txs);
             self.total_weight = 0;
             self.max_tx_count = 0;
+            self.total_gas_weight = 0.0;
             for entry in &mut self.entries {
                 self.total_weight += entry.weight;
                 entry.cumulative_weight = self.total_weight;
+                self.total_gas_weight += entry.gas_weight;
+                entry.cumulative_gas_weight = self.total_gas_weight;
                 self.max_tx_count = self.max_tx_count.max(entry.tx_count);
             }
         }
         if self.total_weight == 0 {
             return None;
         }
+        if self.gas_weighted {
+            let roll = rng.random_range(0.0..self.total_gas_weight);
+            let index = self.entries.partition_point(|entry| entry.cumulative_gas_weight <= roll);
+            return Some(&self.entries[index].item);
+        }
         let roll = rng.random_range(0..self.total_weight);
         let index = self.entries.partition_point(|entry| entry.cumulative_weight <= roll);
         Some(&self.entries[index].item)
+    }
+
+    fn set_gas_estimates(&mut self, estimates: &[u64]) -> Result<()> {
+        if estimates.len() != self.entries.len() || estimates.contains(&0) {
+            bail!("gas sampling must return positive gas usage for each workload item");
+        }
+        self.total_gas_weight = 0.0;
+        for (entry, gas) in self.entries.iter_mut().zip(estimates) {
+            entry.gas_weight = entry.weight as f64 / *gas as f64;
+            self.total_gas_weight += entry.gas_weight;
+            entry.cumulative_gas_weight = self.total_gas_weight;
+        }
+        self.gas_weighted = true;
+        Ok(())
     }
 }
 
@@ -1218,7 +1209,7 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    let setup = build_setup(adapter, spec, ctx)?;
+    let setup = materialize_setup(adapter, spec, ctx)?;
     for tx in &setup.transactions {
         writer.write(tx)?;
     }
@@ -1250,7 +1241,8 @@ fn validate_setup_steps(steps: &[SetupStep], online: bool) -> Result<()> {
     Ok(())
 }
 
-fn build_setup<A: NetworkAdapter>(
+/// Materialize a workload's setup section for direct online submission.
+pub fn materialize_setup<A: NetworkAdapter>(
     adapter: &mut A,
     spec: &WorkloadSpec,
     ctx: &mut BuildContext<'_>,
@@ -1268,19 +1260,18 @@ where
     };
 
     validate_setup_steps(&setup.steps, false)?;
-    let mut encoded = Vec::new();
-    let mut writer = NdjsonWriter::new(&mut encoded);
+    let mut transactions = Vec::new();
     let mut ranges = Vec::new();
     let started = Instant::now();
     let mut last_progress = started;
     let total_steps = setup.steps.len();
     eprintln!("starting setup generation: steps={total_steps}");
     for (idx, step) in setup.steps.iter().enumerate() {
-        let start = writer.count() as usize;
-        emit_setup_step(adapter, step, &mut bindings, ctx, &mut writer)
+        let start = transactions.len();
+        emit_setup_step(adapter, step, &mut bindings, ctx, &mut transactions)
             .wrap_err_with(|| format!("failed to emit setup step '{}'", step.id))?;
 
-        ranges.push(start..writer.count() as usize);
+        ranges.push(start..transactions.len());
         if last_progress.elapsed() >= PROGRESS_LOG_INTERVAL {
             eprintln!(
                 "setup generation progress: completed_steps={} total_steps={total_steps} elapsed={:?}",
@@ -1292,12 +1283,6 @@ where
     }
     eprintln!("setup generation completed: steps={total_steps} elapsed={:?}", started.elapsed(),);
 
-    writer.flush()?;
-    let encoded = writer.into_inner();
-    let mut transactions = std::str::from_utf8(encoded)?
-        .lines()
-        .map(|line| serde_json::from_str::<bench_core::SourceTx>(line)?.into_generated_tx())
-        .collect::<Result<Vec<_>>>()?;
     let outputs: std::collections::HashMap<_, Vec<_>> = setup
         .steps
         .iter()
@@ -1323,12 +1308,12 @@ where
     Ok(MaterializedSetup { transactions, bindings })
 }
 
-fn emit_setup_step<A: NetworkAdapter, W: Write>(
+fn emit_setup_step<A: NetworkAdapter>(
     adapter: &mut A,
     step: &SetupStep,
     setup_bindings: &mut std::collections::HashMap<String, ResolvedBinding>,
     ctx: &mut BuildContext<'_>,
-    writer: &mut NdjsonWriter<W>,
+    transactions: &mut Vec<GeneratedTx>,
 ) -> Result<()>
 where
     A::SignContext: RequestSignContext<A::Network>,
@@ -1336,6 +1321,32 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
+    for template in setup_step_templates(adapter, step, setup_bindings, ctx)? {
+        let (generated, info) =
+            materialize_setup_value(adapter, &template.name, template.value, ctx)?;
+        bind_setup_tx(step, info, template.created_address, setup_bindings)?;
+        transactions.push(generated);
+    }
+    Ok(())
+}
+
+/// One transaction template of a setup step, named for its `setup.<id>` binding.
+struct SetupTemplate {
+    name: String,
+    value: serde_yaml::Value,
+    /// The address a CREATE2 `deploy` creates, which overrides the transaction's own.
+    created_address: Option<Address>,
+}
+
+/// Expand a setup step into its transaction templates, in submission order.
+///
+/// `deploy` and `tx` steps yield one template; adapter extensions may yield several.
+fn setup_step_templates<A: NetworkAdapter>(
+    adapter: &mut A,
+    step: &SetupStep,
+    setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
+    ctx: &mut BuildContext<'_>,
+) -> Result<Vec<SetupTemplate>> {
     let has_deploy = step.deploy.is_some();
     let has_tx = step.tx.is_some();
     let has_keychain_authorize_pool = step.keychain_authorize_pool.is_some();
@@ -1356,69 +1367,142 @@ where
         if templates.is_empty() {
             bail!("setup step `keychain_authorize_pool` produced no transactions");
         }
-        for (idx, value) in templates.into_iter().enumerate() {
-            emit_template_value(
-                adapter,
-                &format!("setup.{}[{idx}]", step.id),
+        return Ok(templates
+            .into_iter()
+            .enumerate()
+            .map(|(idx, value)| SetupTemplate {
+                name: format!("setup.{}[{idx}]", step.id),
                 value,
-                TxPhase::Setup,
-                &[],
-                ctx,
-                writer,
-            )?;
-        }
-        return Ok(());
+                created_address: None,
+            })
+            .collect());
     }
 
-    let info = if let Some(deploy) = &step.deploy {
-        let materialized = substitute_vars(deploy.clone(), &local_bindings)?;
-        let value = build_deploy_template_value(materialized, ctx)?;
-        let info = emit_template_value(
-            adapter,
-            &format!("setup.{}", step.id),
-            value,
-            TxPhase::Setup,
-            &[],
-            ctx,
-            writer,
-        )?
-        .expect("setup emissions request tx info");
-        if info.created_address.is_none() {
-            bail!("deploy setup step did not produce a contract creation transaction");
-        }
-        info
+    let name = format!("setup.{}", step.id);
+    let template = if let Some(deploy) = &step.deploy {
+        let (value, created_address) =
+            build_deploy_template_value(substitute_vars(deploy.clone(), &local_bindings)?, ctx)?;
+        SetupTemplate { name, value, created_address }
     } else {
         let tx = step.tx.as_ref().expect("checked exactly one setup action");
-        let materialized = substitute_vars(tx.clone(), &local_bindings)?;
-        emit_template_value(
-            adapter,
-            &format!("setup.{}", step.id),
-            materialized,
-            TxPhase::Setup,
-            &[],
-            ctx,
-            writer,
-        )?
-        .expect("setup emissions request tx info")
+        SetupTemplate {
+            name,
+            value: substitute_vars(tx.clone(), &local_bindings)?,
+            created_address: None,
+        }
     };
+    Ok(vec![template])
+}
 
-    setup_bindings.insert(
-        format!("setup.{}", step.id),
-        ResolvedBinding::SetupTx {
-            address: info.created_address,
-            tx_hash: info.tx_hash,
-            sender: info.sender,
-            nonce: info.nonce,
-        },
-    );
-
+/// Expose a `deploy` or `tx` step's transaction to later steps as `setup.<id>`.
+fn bind_setup_tx(
+    step: &SetupStep,
+    mut info: EmittedTxInfo,
+    created_address: Option<Address>,
+    setup_bindings: &mut std::collections::HashMap<String, ResolvedBinding>,
+) -> Result<()> {
+    if step.keychain_authorize_pool.is_some() {
+        return Ok(());
+    }
+    if created_address.is_some() {
+        info.created_address = created_address;
+    }
+    if step.deploy.is_some() && info.created_address.is_none() {
+        bail!("deploy setup step did not produce a contract creation transaction");
+    }
+    setup_bindings.insert(format!("setup.{}", step.id), ResolvedBinding::SetupTx(info));
     Ok(())
 }
 
+/// CreateX (https://github.com/pcaversaccio/createx), predeployed at the same address on Tempo
+/// and most EVM chains. Setup deploys with a `create2` block go through it.
+const CREATEX_ADDRESS: Address =
+    alloy_primitives::address!("ba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed");
+
+/// Selector of CreateX `deployCreate2(bytes32,bytes)`.
+const CREATEX_DEPLOY_CREATE2_SELECTOR: [u8; 4] = [0x26, 0x30, 0x76, 0x68];
+
+/// The CreateX salt for a deploy step's `create2.salt`: zero sender bytes and a zero
+/// redeploy-protection byte, so the address depends on neither the sender nor the chain ID,
+/// with the step's salt in the low 11 bytes.
+fn createx_salt(salt: u128) -> Result<B256> {
+    if salt >> 88 != 0 {
+        bail!("create2 salt {salt} does not fit CreateX's 11 free salt bytes");
+    }
+    Ok(B256::from(U256::from(salt)))
+}
+
+/// The address CreateX `deployCreate2(salt, init_code)` creates for a salt from
+/// [`createx_salt`]: CreateX hashes such a salt as `keccak256(abi.encode(salt))`.
+fn createx_create2_address(salt: B256, init_code: &[u8]) -> Address {
+    CREATEX_ADDRESS.create2(keccak256(salt), keccak256(init_code))
+}
+
+fn createx_deploy_create2_calldata(salt: B256, init_code: Bytes) -> Bytes {
+    let args = DynSolValue::Tuple(vec![
+        DynSolValue::FixedBytes(salt, 32),
+        DynSolValue::Bytes(init_code.to_vec()),
+    ])
+    .abi_encode_params();
+    let mut calldata = CREATEX_DEPLOY_CREATE2_SELECTOR.to_vec();
+    calldata.extend(args);
+    calldata.into()
+}
+
+/// Whether any setup step deploys with `create2`.
+fn spec_uses_create2(spec: &WorkloadSpec) -> bool {
+    let key = serde_yaml::Value::String("create2".to_string());
+    spec.setup.as_ref().is_some_and(|setup| {
+        setup.steps.iter().any(|step| {
+            step.deploy
+                .as_ref()
+                .and_then(|deploy| deploy.as_mapping())
+                .is_some_and(|deploy| deploy.contains_key(&key))
+        })
+    })
+}
+
+/// Fails before generation when a spec has CREATE2 deploys but the chain has no CreateX: a call
+/// to an account without code succeeds, so setup would bind addresses where nothing was deployed.
+async fn ensure_createx_deployed(spec: &WorkloadSpec, rpc_url: &str) -> Result<()> {
+    if !spec_uses_create2(spec) {
+        return Ok(());
+    }
+    let provider =
+        alloy_provider::ProviderBuilder::<_, _, alloy_provider::network::Ethereum>::new()
+            .connect_http(rpc_url.parse().wrap_err("invalid RPC URL")?);
+    ensure_createx_code(spec, &provider).await
+}
+
+/// [`ensure_createx_deployed`] over an existing provider, for scenario setup.
+pub(crate) async fn ensure_createx_code<N: Network>(
+    spec: &WorkloadSpec,
+    provider: &impl Provider<N>,
+) -> Result<()> {
+    if !spec_uses_create2(spec) {
+        return Ok(());
+    }
+    let code = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        provider.get_code_at(CREATEX_ADDRESS),
+    )
+    .await
+    .wrap_err("timeout fetching CreateX code")?
+    .wrap_err("failed to fetch CreateX code")?;
+    if code.is_empty() {
+        bail!("create2 deploy steps need CreateX at {CREATEX_ADDRESS}, which has no code on this chain");
+    }
+    Ok(())
+}
+
+/// Builds the transaction template for a deploy step. A step with `create2: {salt: N}`
+/// deploys through CreateX, so its address is known before it lands and does not depend on
+/// the sender's nonce: such steps may use expiring or 2D nonces and share one sender. Returns
+/// that address for CREATE2 deploys.
 fn build_deploy_template_value(
     value: serde_yaml::Value,
     ctx: &mut BuildContext<'_>,
-) -> Result<serde_yaml::Value> {
+) -> Result<(serde_yaml::Value, Option<Address>)> {
     let serde_yaml::Value::Mapping(mut mapping) = value else {
         bail!("deploy setup step must be a mapping");
     };
@@ -1428,9 +1512,17 @@ fn build_deploy_template_value(
     let input_key = serde_yaml::Value::String("input".to_string());
     let to_key = serde_yaml::Value::String("to".to_string());
 
-    if mapping.contains_key(&input_key) || mapping.contains_key(&to_key) {
-        bail!("deploy setup steps must not set `to` or `input`");
+    if ["to", "input", "call", "calls"]
+        .iter()
+        .any(|key| mapping.contains_key(serde_yaml::Value::String((*key).to_string())))
+    {
+        bail!("deploy setup steps must not set `to`, `input`, `call` or `calls`");
     }
+    let create2 = mapping
+        .remove(serde_yaml::Value::String("create2".to_string()))
+        .map(serde_yaml::from_value::<Create2Deploy>)
+        .transpose()
+        .wrap_err("invalid deploy `create2`")?;
 
     let artifact_value = mapping
         .remove(&artifact_key)
@@ -1447,22 +1539,28 @@ fn build_deploy_template_value(
         let mut resolver = ctx.resolver();
         artifacts.encode_constructor(&artifact, &constructor_args, &mut resolver)?
     };
-    mapping.insert(input_key, serde_yaml::Value::String(initcode.to_string()));
+    let Some(create2) = create2 else {
+        mapping.insert(input_key, serde_yaml::Value::String(initcode.to_string()));
+        return Ok((serde_yaml::Value::Mapping(mapping), None));
+    };
+    let salt = createx_salt(create2.salt)?;
+    let address = createx_create2_address(salt, &initcode);
+    let calldata = createx_deploy_create2_calldata(salt, initcode);
+    mapping.insert(to_key, serde_yaml::Value::String(CREATEX_ADDRESS.to_string()));
+    mapping.insert(input_key, serde_yaml::Value::String(calldata.to_string()));
+    Ok((serde_yaml::Value::Mapping(mapping), Some(address)))
+}
 
-    Ok(serde_yaml::Value::Mapping(mapping))
+/// A deploy step's `create2` block.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Create2Deploy {
+    /// Salt in CreateX's 11 free bytes; give each deployment of the same init code its own.
+    salt: u128,
 }
 
 type NetworkRequest<A> = <<A as NetworkAdapter>::Network as Network>::TransactionRequest;
 type AdapterTxRequest<A> = TxRequest<NetworkRequest<A>, <A as NetworkAdapter>::SignContext>;
-
-struct SigningJob<A: NetworkAdapter> {
-    sequence: u64,
-    name: String,
-    phase: TxPhase,
-    tx_req: AdapterTxRequest<A>,
-    signer: EcdsaSigner,
-    inclusion_keys: Vec<SchedulingKey>,
-}
 
 struct SigningResult {
     sequence: u64,
@@ -1482,10 +1580,6 @@ struct SigningPool {
 
 impl SigningPool {
     fn new(worker_count: usize) -> Result<Self> {
-        if worker_count == 0 {
-            bail!("signing worker count must be at least 1");
-        }
-
         let (result_tx, result_rx) = mpsc::channel();
         let pool = ThreadPoolBuilder::new()
             .num_threads(worker_count)
@@ -1501,22 +1595,13 @@ impl SigningPool {
             next_sequence: 0,
             next_to_write: 0,
             in_flight: 0,
-            max_in_flight: worker_count.saturating_mul(64).max(1),
+            max_in_flight: worker_count.saturating_mul(64),
         })
-    }
-
-    fn next_sequence(&mut self) -> Result<u64> {
-        let sequence = self.next_sequence;
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .ok_or_else(|| eyre::eyre!("signing job sequence counter overflowed u64"))?;
-        Ok(sequence)
     }
 
     fn submit<A: NetworkAdapter + 'static, W: Write>(
         &mut self,
-        job: SigningJob<A>,
+        prepared: PreparedMaterializedTx<A>,
         writer: &mut NdjsonWriter<W>,
     ) -> Result<()>
     where
@@ -1530,8 +1615,10 @@ impl SigningPool {
             self.recv_one(writer)?;
         }
 
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
         let result_tx = self.result_tx.clone();
-        self.pool.spawn_fifo(move || submit_signing_job::<A>(job, result_tx));
+        self.pool.spawn_fifo(move || submit_signing_job::<A>(sequence, prepared, result_tx));
         self.in_flight += 1;
 
         Ok(())
@@ -1545,26 +1632,14 @@ impl SigningPool {
     }
 
     fn drain_available<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
-        loop {
-            match self.result_rx.try_recv() {
-                Ok(result) => self.handle_result(result, writer)?,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    if self.in_flight > 0 {
-                        bail!("signing worker pool stopped before completing all jobs");
-                    }
-                    break;
-                }
-            }
+        while let Ok(result) = self.result_rx.try_recv() {
+            self.handle_result(result, writer)?;
         }
         Ok(())
     }
 
     fn recv_one<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
-        let result = self
-            .result_rx
-            .recv()
-            .map_err(|_| eyre::eyre!("signing worker pool stopped before completing all jobs"))?;
+        let result = self.result_rx.recv().expect("the pool holds a result sender");
         self.handle_result(result, writer)
     }
 
@@ -1573,41 +1648,33 @@ impl SigningPool {
         result: SigningResult,
         writer: &mut NdjsonWriter<W>,
     ) -> Result<()> {
-        let tx = result.result?;
-        if self.completed.insert(result.sequence, tx).is_some() {
-            bail!("received duplicate signing result for sequence {}", result.sequence);
-        }
+        self.completed.insert(result.sequence, result.result?);
         self.write_ready(writer)
     }
 
     fn write_ready<W: Write>(&mut self, writer: &mut NdjsonWriter<W>) -> Result<()> {
         while let Some(tx) = self.completed.remove(&self.next_to_write) {
-            if self.in_flight == 0 {
-                bail!("received unexpected signing result");
-            }
             writer.write(&tx)?;
             self.in_flight -= 1;
-            self.next_to_write = self
-                .next_to_write
-                .checked_add(1)
-                .ok_or_else(|| eyre::eyre!("written signing result counter overflowed u64"))?;
+            self.next_to_write += 1;
         }
         Ok(())
     }
 }
 
-fn submit_signing_job<A: NetworkAdapter>(job: SigningJob<A>, result_tx: mpsc::Sender<SigningResult>)
-where
+fn submit_signing_job<A: NetworkAdapter>(
+    sequence: u64,
+    prepared: PreparedMaterializedTx<A>,
+    result_tx: mpsc::Sender<SigningResult>,
+) where
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    let sequence = job.sequence;
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sign_workload_job::<A>(job)))
-            .unwrap_or_else(|panic| {
-                Err(eyre::eyre!("signing worker panicked: {}", panic_msg(&panic)))
-            });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sign_prepared_materialized_template(prepared).map(|materialized| materialized.generated)
+    }))
+    .unwrap_or_else(|panic| Err(eyre::eyre!("signing worker panicked: {}", panic_msg(&panic))));
     let _ = result_tx.send(SigningResult { sequence, result });
 }
 
@@ -1621,83 +1688,10 @@ fn panic_msg(panic: &(dyn std::any::Any + Send)) -> &str {
     }
 }
 
-fn prepare_signing_job<A: NetworkAdapter>(
-    adapter: &A,
-    name: String,
-    value: serde_yaml::Value,
-    phase: TxPhase,
-    inclusion_keys: &[SchedulingKey],
-    sequence: u64,
-    ctx: &mut BuildContext<'_>,
-) -> Result<SigningJob<A>> {
-    let template: A::Template = serde_yaml::from_value(value)
-        .wrap_err_with(|| format!("failed to parse template '{name}'"))?;
-
-    let tx_req = match adapter
-        .build_request(template, ctx)
-        .wrap_err_with(|| format!("failed to build request from template '{name}'"))
-    {
-        Ok(tx_req) => tx_req,
-        Err(error) => {
-            let _ = ctx.rollback_nonce_reservations();
-            return Err(error);
-        }
-    };
-
-    let signer = match ctx.accounts.get_by_index(&tx_req.signer_pool, tx_req.signer_index) {
-        Ok(signer) => signer.clone(),
-        Err(error) => {
-            let _ = ctx.rollback_nonce_reservations();
-            return Err(error);
-        }
-    };
-    let _ = ctx.take_nonce_reservations();
-
-    Ok(SigningJob {
-        sequence,
-        name,
-        phase,
-        tx_req,
-        signer,
-        inclusion_keys: dedup_scheduling_keys(inclusion_keys.iter().copied()),
-    })
-}
-
-fn sign_workload_job<A: NetworkAdapter>(job: SigningJob<A>) -> Result<GeneratedTx>
-where
-    <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
-    <A::Network as Network>::TxEnvelope:
-        From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
-{
-    let SigningJob { sequence: _, name, phase, tx_req, signer, inclusion_keys } = job;
-    let TxRequest { request, signer_pool: _, signer_index: _, key, sign_context, late_sign } =
-        tx_req;
-
-    match late_sign {
-        Some(late_sign) => {
-            if phase == TxPhase::Setup {
-                bail!("deferred signing is not supported for setup transactions");
-            }
-            Ok(GeneratedTx {
-                depends_on: Vec::new(),
-                phase,
-                id: Some(name),
-                raw: Bytes::new(),
-                late_sign: Some(late_sign),
-                sender: Some(signer.address()),
-                submission_keys: vec![SchedulingKey::from(key)],
-                inclusion_keys,
-            })
-        }
-        None => sign_context.sign_request(name, phase, request, signer, key, inclusion_keys),
-    }
-}
-
 fn generate_txs<A, W: Write>(
     adapter: &A,
     spec: &WorkloadSpec,
-    limit: GenerationLimit,
-    signing_workers: usize,
+    config: GenerationConfig<'_>,
     setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
     ctx: &mut BuildContext<'_>,
     writer: &mut NdjsonWriter<W>,
@@ -1709,7 +1703,20 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
+    let GenerationConfig { limit, signing_workers, gas_sample_rpc } = config;
     let mut selector = WorkloadSelector::new(spec, limit.count.unwrap_or(u64::MAX))?;
+    let gas_provider = gas_sample_rpc
+        .map(|rpc| {
+            Ok::<_, eyre::Report>(
+                alloy_provider::ProviderBuilder::new()
+                    .connect_http(rpc.parse().wrap_err("invalid gas sampling RPC URL")?),
+            )
+        })
+        .transpose()?;
+    if let Some(provider) = &gas_provider {
+        refresh_gas_estimates(adapter, spec, setup_bindings, ctx, &mut selector, provider)?;
+    }
+    let mut last_gas_sample = Instant::now();
     let mut signing_pool = SigningPool::new(signing_workers)?;
     let mut written = 0u64;
     let mut sequence_instances = 0u64;
@@ -1724,6 +1731,12 @@ where
     while limit.count.is_none_or(|count| written < count) {
         if limit.duration.is_some_and(|duration| start.elapsed() > duration) {
             break;
+        }
+        if let Some(provider) = &gas_provider &&
+            last_gas_sample.elapsed() >= GAS_SAMPLE_INTERVAL
+        {
+            refresh_gas_estimates(adapter, spec, setup_bindings, ctx, &mut selector, provider)?;
+            last_gas_sample = Instant::now();
         }
 
         let remaining = limit.count.map(|count| count - written).unwrap_or(u64::MAX);
@@ -1740,17 +1753,15 @@ where
                     .clone();
                 let materialized = substitute_vars(value, setup_bindings)
                     .wrap_err_with(|| format!("failed to materialize template '{name}'"))?;
-                let sequence = signing_pool.next_sequence()?;
-                let job = prepare_signing_job(
+                let prepared = prepare_materialized_template(
                     adapter,
-                    name,
+                    &name,
                     materialized,
                     TxPhase::Workload,
                     &[],
-                    sequence,
                     ctx,
                 )?;
-                signing_pool.submit(job, writer)?;
+                signing_pool.submit(prepared, writer)?;
                 written += 1;
             }
             MixItem::Sequence(name) => {
@@ -1758,11 +1769,8 @@ where
                     .sequences
                     .get(&name)
                     .ok_or_else(|| eyre::eyre!("sequence '{}' not found", name))?;
-                let sequence_instance = sequence_instances;
-                sequence_instances = sequence_instances
-                    .checked_add(1)
-                    .ok_or_else(|| eyre::eyre!("sequence instance counter overflowed u64"))?;
-                let sequence_key = compute_sequence_key(&name, sequence_instance);
+                let sequence_key = compute_sequence_key(&name, sequence_instances);
+                sequence_instances += 1;
                 // A single step has no dependent transaction to wait for its inclusion.
                 let inclusion_keys = (sequence.steps.len() > 1).then_some(sequence_key);
                 let bindings = resolve_sequence_bindings(&sequence.bindings, ctx, setup_bindings)
@@ -1772,26 +1780,24 @@ where
 
                 for (idx, step) in sequence.steps.iter().enumerate() {
                     let label = step.name.as_deref().unwrap_or(&step.template);
-                    let base = spec
+                    let mut merged = spec
                         .templates
                         .get(&step.template)
                         .ok_or_else(|| eyre::eyre!("template '{}' not found", step.template))?
                         .clone();
-                    let merged = merge_template_overlay(base, step.with_value.clone());
+                    merge_yaml(&mut merged, step.with_value.clone());
                     let materialized = substitute_vars(merged, &bindings).wrap_err_with(|| {
                         format!("failed to materialize sequence '{name}' step {idx} ('{label}')")
                     })?;
-                    let sequence = signing_pool.next_sequence()?;
-                    let job = prepare_signing_job(
+                    let prepared = prepare_materialized_template(
                         adapter,
-                        format!("{name}.{label}"),
+                        &format!("{name}.{label}"),
                         materialized,
                         TxPhase::Workload,
                         inclusion_keys.as_slice(),
-                        sequence,
                         ctx,
                     )?;
-                    signing_pool.submit(job, writer)?;
+                    signing_pool.submit(prepared, writer)?;
                     written += 1;
                 }
             }
@@ -1813,42 +1819,32 @@ where
     Ok(written)
 }
 
-fn emit_template_value<A: NetworkAdapter, W: Write>(
+fn materialize_setup_value<A: NetworkAdapter>(
     adapter: &A,
     name: &str,
     value: serde_yaml::Value,
-    phase: TxPhase,
-    inclusion_keys: &[SchedulingKey],
     ctx: &mut BuildContext<'_>,
-    writer: &mut NdjsonWriter<W>,
-) -> Result<Option<EmittedTxInfo>>
+) -> Result<(GeneratedTx, EmittedTxInfo)>
 where
     <A::Network as Network>::UnsignedTx: SignableTransaction<alloy_primitives::Signature>,
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
     let materialized =
-        materialize_and_sign_template(adapter, name, value, phase, inclusion_keys, ctx)?;
-    let info = if phase == TxPhase::Setup {
-        let nonce = materialized
-            .nonce
-            .ok_or_else(|| eyre::eyre!("template '{name}' did not set a nonce"))?;
-        Some(EmittedTxInfo {
-            sender: materialized.sender,
-            nonce,
-            tx_hash: materialized.tx_hash,
-            created_address: materialized.created_address,
-        })
-    } else {
-        None
+        materialize_and_sign_template(adapter, name, value, TxPhase::Setup, &[], ctx)?;
+    let nonce =
+        materialized.nonce.ok_or_else(|| eyre::eyre!("template '{name}' did not set a nonce"))?;
+    let info = EmittedTxInfo {
+        sender: materialized.sender,
+        nonce,
+        tx_hash: materialized.tx_hash,
+        created_address: materialized.created_address,
     };
-
-    writer.write(&materialized.generated)?;
-    Ok(info)
+    Ok((materialized.generated, info))
 }
 
 fn resolve_sequence_bindings(
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
+    bindings: &BTreeMap<String, SequenceBinding>,
     ctx: &mut BuildContext<'_>,
     globals: &std::collections::HashMap<String, ResolvedBinding>,
 ) -> Result<std::collections::HashMap<String, ResolvedBinding>> {
@@ -1870,7 +1866,7 @@ fn resolve_sequence_bindings(
 
 fn resolve_sequence_binding(
     name: &str,
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
+    bindings: &BTreeMap<String, SequenceBinding>,
     resolved: &mut std::collections::HashMap<String, ResolvedBinding>,
     resolving: &mut HashSet<String>,
     ctx: &mut BuildContext<'_>,
@@ -1916,15 +1912,12 @@ fn resolve_sequence_binding(
 
 fn resolve_binding_dependencies(
     binding: &SequenceBinding,
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
+    bindings: &BTreeMap<String, SequenceBinding>,
     resolved: &mut std::collections::HashMap<String, ResolvedBinding>,
     resolving: &mut HashSet<String>,
     ctx: &mut BuildContext<'_>,
 ) -> Result<()> {
     for dep in binding_dependency_names(binding, bindings) {
-        if resolved.contains_key(&dep) {
-            continue;
-        }
         resolve_sequence_binding(&dep, bindings, resolved, resolving, ctx)?;
     }
     Ok(())
@@ -1932,16 +1925,11 @@ fn resolve_binding_dependencies(
 
 fn binding_dependency_names(
     binding: &SequenceBinding,
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
-) -> HashSet<String> {
-    let mut deps = HashSet::new();
+    bindings: &BTreeMap<String, SequenceBinding>,
+) -> BTreeSet<String> {
+    let mut deps = BTreeSet::new();
     match binding {
-        SequenceBinding::AbiEncodePacked(def) => {
-            for value in &def.values {
-                collect_var_names(value, bindings, &mut deps);
-            }
-        }
-        SequenceBinding::AbiHash(def) => {
+        SequenceBinding::AbiEncodePacked(def) | SequenceBinding::AbiHash(def) => {
             for value in &def.values {
                 collect_var_names(value, bindings, &mut deps);
             }
@@ -1952,7 +1940,7 @@ fn binding_dependency_names(
 }
 
 fn resolve_abi_encode_packed(
-    def: &AbiEncodePackedDef,
+    def: &AbiValuesDef,
     bindings: &std::collections::HashMap<String, ResolvedBinding>,
 ) -> Result<Bytes> {
     let values = resolve_abi_values(&def.types, &def.values, bindings, "abi_encode_packed")?;
@@ -1960,7 +1948,7 @@ fn resolve_abi_encode_packed(
 }
 
 fn resolve_abi_hash(
-    def: &AbiHashDef,
+    def: &AbiValuesDef,
     bindings: &std::collections::HashMap<String, ResolvedBinding>,
 ) -> Result<B256> {
     let values = resolve_abi_values(&def.types, &def.values, bindings, "abi_hash")?;
@@ -1984,7 +1972,7 @@ fn resolve_abi_values(
     let mut values = Vec::with_capacity(raw_values.len());
     for (idx, (sol_type, value)) in types.iter().zip(raw_values).enumerate() {
         let substituted = substitute_vars(value.clone(), bindings)?;
-        let json = yaml_to_json(substituted)?;
+        let json = serde_json::to_value(substituted)?;
         let ty = DynSolType::parse(sol_type)
             .wrap_err_with(|| format!("failed to parse {context} type {idx} ('{sol_type}')"))?;
         let value = ty
@@ -1996,29 +1984,19 @@ fn resolve_abi_values(
     Ok(values)
 }
 
-fn yaml_to_json(value: serde_yaml::Value) -> Result<serde_json::Value> {
-    Ok(serde_json::to_value(value)?)
-}
-
 fn collect_var_names(
     value: &serde_yaml::Value,
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
-    names: &mut HashSet<String>,
+    bindings: &BTreeMap<String, SequenceBinding>,
+    names: &mut BTreeSet<String>,
 ) {
     match value {
-        serde_yaml::Value::Mapping(mapping) if mapping.len() == 1 => {
-            let var_key = serde_yaml::Value::String("var".to_string());
-            if let Some(serde_yaml::Value::String(path)) = mapping.get(&var_key) {
+        serde_yaml::Value::Mapping(mapping) => {
+            if let Some(path) = var_path(mapping) {
                 if let Some(name) = referenced_local_binding(path, bindings) {
                     names.insert(name);
                 }
                 return;
             }
-            for value in mapping.values() {
-                collect_var_names(value, bindings, names);
-            }
-        }
-        serde_yaml::Value::Mapping(mapping) => {
             for value in mapping.values() {
                 collect_var_names(value, bindings, names);
             }
@@ -2034,7 +2012,7 @@ fn collect_var_names(
 
 fn referenced_local_binding(
     path: &str,
-    bindings: &std::collections::HashMap<String, SequenceBinding>,
+    bindings: &BTreeMap<String, SequenceBinding>,
 ) -> Option<String> {
     let first = path.split('.').next().unwrap_or(path);
     if bindings.contains_key(first) {
@@ -2059,35 +2037,19 @@ fn compute_sequence_key(sequence_name: &str, sequence_instance: u64) -> Scheduli
     scheduling_key_from_hash(keccak256(data))
 }
 
-fn merge_template_overlay(
-    mut base: serde_yaml::Value,
-    overlay: serde_yaml::Value,
-) -> serde_yaml::Value {
-    merge_yaml(&mut base, overlay);
-    base
-}
-
 fn substitute_vars(
     value: serde_yaml::Value,
     bindings: &std::collections::HashMap<String, ResolvedBinding>,
 ) -> Result<serde_yaml::Value> {
     match value {
-        serde_yaml::Value::Mapping(mapping) if mapping.len() == 1 => {
-            let var_key = serde_yaml::Value::String("var".to_string());
-            if let Some(serde_yaml::Value::String(path)) = mapping.get(&var_key) {
-                // If we don't yet have a binding for this variable, leave it for later parsing.
-                if split_binding_path(path, bindings).is_none() {
-                    return Ok(serde_yaml::Value::Mapping(mapping));
-                }
-                return binding_to_value(path, bindings);
-            }
-            let substituted = mapping
-                .into_iter()
-                .map(|(key, value)| Ok((key, substitute_vars(value, bindings)?)))
-                .collect::<Result<serde_yaml::Mapping>>()?;
-            Ok(serde_yaml::Value::Mapping(substituted))
-        }
         serde_yaml::Value::Mapping(mapping) => {
+            if let Some(path) = var_path(&mapping) {
+                // If we don't yet have a binding for this variable, leave it for later parsing.
+                return match split_binding_path(path, bindings) {
+                    Some((name, field)) => binding_to_value(name, field, &bindings[name]),
+                    None => Ok(serde_yaml::Value::Mapping(mapping)),
+                };
+            }
             let substituted = mapping
                 .into_iter()
                 .map(|(key, value)| Ok((key, substitute_vars(value, bindings)?)))
@@ -2105,14 +2067,19 @@ fn substitute_vars(
     }
 }
 
-fn binding_to_value(
-    path: &str,
-    bindings: &std::collections::HashMap<String, ResolvedBinding>,
-) -> Result<serde_yaml::Value> {
-    let (name, field) = split_binding_path(path, bindings)
-        .ok_or_else(|| eyre::eyre!("unknown binding '{path}'"))?;
-    let binding = bindings.get(name).ok_or_else(|| eyre::eyre!("unknown binding '{name}'"))?;
+/// The path of a `{ var: <path> }` reference.
+fn var_path(mapping: &serde_yaml::Mapping) -> Option<&str> {
+    match mapping.get("var") {
+        Some(serde_yaml::Value::String(path)) if mapping.len() == 1 => Some(path),
+        _ => None,
+    }
+}
 
+fn binding_to_value(
+    name: &str,
+    field: Option<&str>,
+    binding: &ResolvedBinding,
+) -> Result<serde_yaml::Value> {
     match (binding, field) {
         (ResolvedBinding::Account { pool, index, .. }, Some("ref")) => {
             account_ref_value(pool, *index)
@@ -2131,20 +2098,21 @@ fn binding_to_value(
         (ResolvedBinding::U256(value), None) => Ok(serde_yaml::Value::String(value.to_string())),
         (ResolvedBinding::U64(value), None) => Ok(serde_yaml::to_value(value)?),
         (ResolvedBinding::String(value), None) => Ok(serde_yaml::Value::String(value.clone())),
-        (ResolvedBinding::SetupTx { address: Some(address), .. }, Some("address")) => {
-            Ok(serde_yaml::Value::String(address.to_string()))
-        }
-        (ResolvedBinding::SetupTx { address: None, .. }, Some("address")) => {
+        (
+            ResolvedBinding::SetupTx(EmittedTxInfo { created_address: Some(address), .. }),
+            Some("address"),
+        ) => Ok(serde_yaml::Value::String(address.to_string())),
+        (ResolvedBinding::SetupTx(_), Some("address")) => {
             bail!("setup transaction binding '{name}' has no deployed address");
         }
-        (ResolvedBinding::SetupTx { tx_hash, .. }, Some("tx_hash")) => {
-            Ok(serde_yaml::Value::String(tx_hash.to_string()))
+        (ResolvedBinding::SetupTx(info), Some("tx_hash")) => {
+            Ok(serde_yaml::Value::String(info.tx_hash.to_string()))
         }
-        (ResolvedBinding::SetupTx { sender, .. }, Some("sender")) => {
-            Ok(serde_yaml::Value::String(sender.to_string()))
+        (ResolvedBinding::SetupTx(info), Some("sender")) => {
+            Ok(serde_yaml::Value::String(info.sender.to_string()))
         }
-        (ResolvedBinding::SetupTx { nonce, .. }, Some("nonce")) => Ok(serde_yaml::to_value(nonce)?),
-        (ResolvedBinding::SetupTx { .. }, None) => {
+        (ResolvedBinding::SetupTx(info), Some("nonce")) => Ok(serde_yaml::to_value(info.nonce)?),
+        (ResolvedBinding::SetupTx(_), None) => {
             bail!("setup transaction binding '{name}' requires a field");
         }
         (_, Some(field)) => {
@@ -2189,6 +2157,131 @@ fn account_ref_value(pool: &str, index: usize) -> Result<serde_yaml::Value> {
     Ok(serde_yaml::Value::Mapping(account))
 }
 
+fn sample_workload_calls<A: NetworkAdapter>(
+    adapter: &A,
+    spec: &WorkloadSpec,
+    item: &MixItem,
+    setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
+    ctx: &mut BuildContext<'_>,
+) -> Result<Vec<serde_json::Value>> {
+    let mut nonces = ctx.nonces.clone();
+    let mut rng = ctx.rng.clone();
+    let mut sample_ctx = BuildContext::new_with_address_pools(
+        ctx.chain_id,
+        ctx.gas,
+        ctx.accounts,
+        ctx.address_pools,
+        ctx.artifacts,
+        &mut nonces,
+        &mut rng,
+    );
+    let templates = match item {
+        MixItem::Template(name) => {
+            vec![(name.clone(), substitute_vars(spec.templates[name].clone(), setup_bindings)?)]
+        }
+        MixItem::Sequence(name) => {
+            let sequence = &spec.sequences[name];
+            let bindings =
+                resolve_sequence_bindings(&sequence.bindings, &mut sample_ctx, setup_bindings)?;
+            sequence
+                .steps
+                .iter()
+                .map(|step| {
+                    let mut value = spec.templates[&step.template].clone();
+                    merge_yaml(&mut value, step.with_value.clone());
+                    Ok((
+                        format!("{name}.{}", step.name.as_deref().unwrap_or(&step.template)),
+                        substitute_vars(value, &bindings)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+    templates
+        .into_iter()
+        .map(|(name, value)| {
+            let prepared = prepare_materialized_template(
+                adapter,
+                &name,
+                value,
+                TxPhase::Workload,
+                &[],
+                &mut sample_ctx,
+            )?;
+            let mut call = adapter.simulation_request(&prepared.tx_req, &prepared.signer)?;
+            call["from"] = serde_json::to_value(prepared.sender)?;
+            call.as_object_mut()
+                .ok_or_else(|| eyre::eyre!("simulation request must be an object"))?
+                .remove("nonce");
+            Ok(call)
+        })
+        .collect()
+}
+
+fn simulation_gas(response: &serde_json::Value, expected_calls: usize) -> Result<u64> {
+    let blocks = response.as_array().ok_or_else(|| eyre::eyre!("invalid simulation response"))?;
+    if blocks.len() != 1 {
+        bail!("gas sampling expected one simulated block");
+    }
+    let calls = blocks[0]["calls"]
+        .as_array()
+        .ok_or_else(|| eyre::eyre!("simulation response is missing calls"))?;
+    if calls.len() != expected_calls {
+        bail!("gas sampling returned {} calls, expected {expected_calls}", calls.len());
+    }
+    for (index, call) in calls.iter().enumerate() {
+        if call["status"] != "0x1" {
+            bail!("gas sample call {index} failed: {}", call["error"]);
+        }
+    }
+    let gas = blocks[0]["gasUsed"]
+        .as_str()
+        .ok_or_else(|| eyre::eyre!("simulation response is missing block gasUsed"))?;
+    let gas = u64::from_str_radix(
+        gas.strip_prefix("0x").ok_or_else(|| eyre::eyre!("invalid simulation gasUsed"))?,
+        16,
+    )?;
+    if gas == 0 {
+        bail!("gas sample consumed zero block gas");
+    }
+    Ok(gas)
+}
+
+fn refresh_gas_estimates<A: NetworkAdapter>(
+    adapter: &A,
+    spec: &WorkloadSpec,
+    setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
+    ctx: &mut BuildContext<'_>,
+    selector: &mut WorkloadSelector,
+    provider: &impl Provider,
+) -> Result<()> {
+    let mut estimates = Vec::with_capacity(selector.entries.len());
+    for entry in &selector.entries {
+        let calls = sample_workload_calls(adapter, spec, &entry.item, setup_bindings, ctx)?;
+        let expected_calls = calls.len();
+        let payload = serde_json::json!({
+            "blockStateCalls": [{"calls": calls}],
+            "validation": false,
+            "traceTransfers": false,
+        });
+        let response = tokio::runtime::Handle::current()
+            .block_on(
+                provider
+                    .client()
+                    .request::<_, serde_json::Value>("eth_simulateV1", (payload, "latest")),
+            )
+            .wrap_err_with(|| format!("gas sampling failed for {:?}", entry.item))?;
+        let gas = simulation_gas(&response, expected_calls)
+            .wrap_err_with(|| format!("invalid gas sample for {:?}", entry.item))?;
+        eprintln!(
+            "gas sample: item={:?} block_gas={gas} target_weight={}",
+            entry.item, entry.weight
+        );
+        estimates.push(gas);
+    }
+    selector.set_gas_estimates(&estimates)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2196,6 +2289,20 @@ mod tests {
     use alloy_rpc_types_eth::TransactionRequest;
     use std::collections::HashMap;
     use txgen_core::{derive_mnemonic_signer, GasConfig};
+
+    #[test]
+    fn createx_create2_address_matches_createx() {
+        // eth_call of CreateX deployCreate2(salt 42, init code returning 0x01) on Ethereum mainnet.
+        let salt = createx_salt(42).unwrap();
+        let init_code = alloy_primitives::hex!("600160005360016000f3");
+        assert_eq!(
+            createx_create2_address(salt, &init_code),
+            alloy_primitives::address!("fe440002F39c56EC83D442734e15Dd79F4c9ac3f")
+        );
+        let calldata = createx_deploy_create2_calldata(salt, Bytes::from_static(&[0x60, 0x80]));
+        assert_eq!(&calldata[..4], &[0x26, 0x30, 0x76, 0x68]);
+        assert!(createx_salt(1u128 << 88).is_err());
+    }
 
     struct PendingPrepareAdapter;
     struct MutatingKeyAdapter;
@@ -2471,6 +2578,50 @@ call:
         Ok(())
     }
 
+    #[test]
+    fn seeded_sequence_bindings_resolve_deterministically() -> Result<()> {
+        let yaml = r#"
+chain_id: 1
+templates: {t: {}}
+sequences:
+  s:
+    bindings:
+      digest:
+        abi_hash: { types: [bytes32, bytes32, bytes32], values: [{ var: x6 }, { var: x4 }, { var: x2 }] }
+      x1: { bytes32: { random_bytes: 32 } }
+      x2: { bytes32: { random_bytes: 32 } }
+      x3: { bytes32: { random_bytes: 32 } }
+      x4: { bytes32: { random_bytes: 32 } }
+      x5: { bytes32: { random_bytes: 32 } }
+      x6: { bytes32: { random_bytes: 32 } }
+    steps: [{template: t}]
+mix: [{sequence: s, weight: 1}]
+"#;
+        let names = ["digest", "x1", "x2", "x3", "x4", "x5", "x6"];
+
+        let resolve = || -> Result<Vec<String>> {
+            let spec = WorkloadSpec::parse(yaml)?;
+            let accounts = AccountManager::empty();
+            let artifacts = ArtifactManager::empty();
+            let gas = GasConfig::default();
+            let mut nonces = NonceTracker::new();
+            let mut rng = StdRng::seed_from_u64(7);
+            let mut ctx = BuildContext::new(1, &gas, &accounts, &artifacts, &mut nonces, &mut rng);
+            let resolved = resolve_sequence_bindings(
+                &spec.sequences["s"].bindings,
+                &mut ctx,
+                &HashMap::new(),
+            )?;
+            Ok(names.iter().map(|name| format!("{:?}", resolved[*name])).collect())
+        };
+
+        let expected = resolve()?;
+        for _ in 0..8 {
+            assert_eq!(resolve()?, expected);
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn timed_out_async_preparation_rewinds_ordered_nonce_reservations() {
         let accounts = AccountManager::empty();
@@ -2484,7 +2635,6 @@ call:
             &PendingPrepareAdapter,
             "pending",
             serde_yaml::Value::Null,
-            &[],
             &mut context,
             Duration::from_millis(1),
         )
@@ -2523,5 +2673,185 @@ call:
 
         let error = sign_prepared_materialized_template(prepared).unwrap_err();
         assert!(error.to_string().contains("changed the prepared scheduling keys"));
+    }
+
+    #[test]
+    fn gas_selector_targets_gas_shares_and_refreshes() -> Result<()> {
+        let spec = WorkloadSpec::parse("chain_id: 1\ntemplates: {cheap: {}, expensive: {}}\nmix:\n- {template: cheap, weight: 80}\n- {template: expensive, weight: 20}\n")?;
+        let mut selector = WorkloadSelector::new(&spec, u64::MAX)?;
+        let mut rng = StdRng::seed_from_u64(42);
+        for estimates in [[10, 100], [100, 10]] {
+            selector.set_gas_estimates(&estimates)?;
+            let mut gas = [0u64; 2];
+            for _ in 0..100_000 {
+                let index = match selector.pick(&mut rng, u64::MAX).unwrap() {
+                    MixItem::Template(name) if name == "cheap" => 0,
+                    _ => 1,
+                };
+                gas[index] += estimates[index];
+            }
+            let share = gas[0] as f64 / (gas[0] + gas[1]) as f64;
+            assert!((share - 0.8).abs() < 0.01, "gas share was {share}");
+        }
+        assert!(selector.set_gas_estimates(&[0, 1]).is_err());
+        assert!(selector.set_gas_estimates(&[1]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn gas_selector_prunes_sequences_without_losing_gas_weights() -> Result<()> {
+        let mut spec = selector_spec();
+        spec.mix.retain(|entry| entry.weight > 0);
+        let mut selector = WorkloadSelector::new(&spec, 100)?;
+        selector.set_gas_estimates(&[10, 70, 30, 10, 10])?;
+        let mut rng = StdRng::seed_from_u64(3);
+        assert!(selector.pick(&mut rng, 1).is_some());
+        assert_eq!(selector.entries.len(), 3);
+        assert!((selector.total_gas_weight - 0.8).abs() < f64::EPSILON);
+        for _ in 0..100 {
+            assert!(matches!(selector.pick(&mut rng, 1), Some(MixItem::Template(_))));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn simulation_gas_uses_block_capacity_and_rejects_failed_samples() -> Result<()> {
+        let response = serde_json::json!([{
+            "gasUsed": "0x100", "calls": [
+                {"status": "0x1", "gasUsed": "0x100"},
+                {"status": "0x1", "gasUsed": "0x200"}
+            ]
+        }]);
+        assert_eq!(simulation_gas(&response, 2)?, 256);
+        assert!(simulation_gas(&response, 1).is_err());
+        let mut response = response;
+        response[0]["calls"][1]["status"] = serde_json::json!("0x0");
+        assert!(simulation_gas(&response, 2).is_err());
+        assert!(simulation_gas(&serde_json::json!([]), 0).is_err());
+        assert!(simulation_gas(&serde_json::json!([{"gasUsed": "0x0", "calls": []}]), 0).is_err());
+        Ok(())
+    }
+
+    struct SamplingAdapter;
+
+    impl NetworkAdapter for SamplingAdapter {
+        type Template = serde_yaml::Value;
+        type Network = Ethereum;
+        type SignContext = ();
+
+        fn network_name() -> &'static str {
+            "sampling-test"
+        }
+
+        fn build_request(
+            &self,
+            _template: Self::Template,
+            ctx: &mut BuildContext<'_>,
+        ) -> Result<TxRequest<TransactionRequest>> {
+            Ok(TxRequest {
+                request: TransactionRequest {
+                    nonce: Some(ctx.next_nonce([0x33; 20])),
+                    value: Some(U256::from(ctx.rng.random::<u64>())),
+                    ..Default::default()
+                },
+                signer_pool: "users".to_string(),
+                signer_index: 0,
+                key: [0x33; 20],
+                sign_context: (),
+                late_sign: None,
+            })
+        }
+    }
+
+    fn sampling_spec() -> Result<WorkloadSpec> {
+        WorkloadSpec::parse(
+            r#"
+chain_id: 1
+accounts:
+  users:
+    mnemonic: "test test test test test test test test test test test junk"
+    range: [0, 1]
+templates: {transfer: {}}
+sequences:
+  pair:
+    steps: [{template: transfer}, {template: transfer}]
+mix: [{template: transfer, weight: 1}]
+"#,
+        )
+    }
+
+    #[test]
+    fn gas_sampling_preserves_nonce_rng_and_sequence_order() -> Result<()> {
+        let spec = sampling_spec()?;
+        let accounts = AccountManager::from_spec(&spec.accounts)?;
+        let artifacts = ArtifactManager::empty();
+        let mut nonces = NonceTracker::new();
+        nonces.reset([0x33; 20], 7);
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut expected_rng = rng.clone();
+        let mut ctx = BuildContext::new(1, &spec.gas, &accounts, &artifacts, &mut nonces, &mut rng);
+        let calls = sample_workload_calls(
+            &SamplingAdapter,
+            &spec,
+            &MixItem::Sequence("pair".to_string()),
+            &HashMap::new(),
+            &mut ctx,
+        )?;
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            assert!(call.get("nonce").is_none());
+            assert_eq!(
+                call["from"],
+                serde_json::to_value(accounts.get_by_index("users", 0)?.address())?
+            );
+            assert_eq!(
+                call["value"],
+                serde_json::to_value(U256::from(expected_rng.random::<u64>()))?
+            );
+        }
+        assert_eq!(ctx.nonces.current(&[0x33; 20]), 7);
+        assert_eq!(ctx.rng.random::<u64>(), StdRng::seed_from_u64(42).random::<u64>());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initial_simulation_failure_aborts_before_emitting_workload() -> Result<()> {
+        let app = axum::Router::new().route("/", axum::routing::post(|axum::Json(request): axum::Json<serde_json::Value>| async move {
+            assert_eq!(request["method"], "eth_simulateV1");
+            assert_eq!(request["params"][0]["blockStateCalls"][0]["calls"].as_array().unwrap().len(), 1);
+            axum::Json(serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32000, "message": "simulation failed"}}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let rpc = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        tokio::task::spawn_blocking(move || {
+            let spec = sampling_spec()?;
+            let accounts = AccountManager::from_spec(&spec.accounts)?;
+            let artifacts = ArtifactManager::empty();
+            let mut nonces = NonceTracker::new();
+            let mut rng = StdRng::seed_from_u64(42);
+            let mut ctx =
+                BuildContext::new(1, &spec.gas, &accounts, &artifacts, &mut nonces, &mut rng);
+            let mut output = NdjsonWriter::new(Vec::new());
+            let result = generate_txs(
+                &SamplingAdapter,
+                &spec,
+                GenerationConfig {
+                    limit: GenerationLimit { count: Some(1), duration: None },
+                    signing_workers: 1,
+                    gas_sample_rpc: Some(&rpc),
+                },
+                &HashMap::new(),
+                &mut ctx,
+                &mut output,
+            );
+            assert!(result.is_err());
+            assert_eq!(output.count(), 0);
+            assert!(output.into_inner().is_empty());
+            Ok::<_, eyre::Report>(())
+        })
+        .await??;
+        server.abort();
+        Ok(())
     }
 }
