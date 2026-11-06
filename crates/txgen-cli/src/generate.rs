@@ -889,6 +889,7 @@ struct GenerationConfig<'a> {
     limit: GenerationLimit,
     signing_workers: usize,
     gas_sample_rpc: Option<&'a str>,
+    gas_sample_interval: Duration,
 }
 
 fn generate_loop<A>(
@@ -938,6 +939,7 @@ where
             limit: ctx.limit,
             signing_workers: ctx.signing_workers,
             gas_sample_rpc: ctx.gas_sample_rpc.as_deref(),
+            gas_sample_interval: GAS_SAMPLE_INTERVAL,
         },
         &setup_bindings,
         &mut build_ctx,
@@ -1152,6 +1154,24 @@ impl WorkloadSelector {
         let roll = rng.random_range(0..self.total_weight);
         let index = self.entries.partition_point(|entry| entry.cumulative_weight <= roll);
         Some(&self.entries[index].item)
+    }
+
+    /// Apply estimates sampled before entries may have been pruned. Pruning keeps the order,
+    /// so each remaining entry matches the next sampled item equal to it.
+    fn set_sampled_gas_estimates(&mut self, sampled: &[(MixItem, u64)]) -> Result<()> {
+        let mut sampled = sampled.iter();
+        let estimates = self
+            .entries
+            .iter()
+            .map(|entry| {
+                sampled
+                    .by_ref()
+                    .find(|(item, _)| *item == entry.item)
+                    .map(|(_, gas)| *gas)
+                    .ok_or_else(|| eyre::eyre!("gas sampling is missing {:?}", entry.item))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.set_gas_estimates(&estimates)
     }
 
     fn set_gas_estimates(&mut self, estimates: &[u64]) -> Result<()> {
@@ -1703,20 +1723,25 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    let GenerationConfig { limit, signing_workers, gas_sample_rpc } = config;
+    let GenerationConfig { limit, signing_workers, gas_sample_rpc, gas_sample_interval } = config;
     let mut selector = WorkloadSelector::new(spec, limit.count.unwrap_or(u64::MAX))?;
-    let gas_provider = gas_sample_rpc
+    let gas_client = gas_sample_rpc
         .map(|rpc| {
-            Ok::<_, eyre::Report>(
-                alloy_provider::ProviderBuilder::new()
-                    .connect_http(rpc.parse().wrap_err("invalid gas sampling RPC URL")?),
-            )
+            Ok::<_, eyre::Report>(alloy_rpc_client::RpcClient::new_http(
+                rpc.parse().wrap_err("invalid gas sampling RPC URL")?,
+            ))
         })
         .transpose()?;
-    if let Some(provider) = &gas_provider {
-        refresh_gas_estimates(adapter, spec, setup_bindings, ctx, &mut selector, provider)?;
+    let runtime = tokio::runtime::Handle::current();
+    // The first sample sets the mix before any workload is emitted. Later samples run on the
+    // runtime while generation continues, and their weights apply once they all return.
+    if let Some(client) = &gas_client {
+        let samples = gas_samples(adapter, spec, setup_bindings, ctx, &selector)?;
+        let estimates = runtime.block_on(simulate_gas_samples(client.clone(), samples))?;
+        selector.set_sampled_gas_estimates(&estimates)?;
     }
     let mut last_gas_sample = Instant::now();
+    let mut gas_refresh: Option<GasRefresh> = None;
     let mut signing_pool = SigningPool::new(signing_workers)?;
     let mut written = 0u64;
     let mut sequence_instances = 0u64;
@@ -1732,10 +1757,20 @@ where
         if limit.duration.is_some_and(|duration| start.elapsed() > duration) {
             break;
         }
-        if let Some(provider) = &gas_provider &&
-            last_gas_sample.elapsed() >= GAS_SAMPLE_INTERVAL
+        if gas_refresh.as_ref().is_some_and(|refresh| refresh.is_finished()) {
+            let refresh = gas_refresh.take().expect("finished refresh exists");
+            // A failed refresh keeps the weights in use; only the first sample must succeed.
+            match runtime.block_on(refresh).wrap_err("gas sampling task failed").and_then(|r| r) {
+                Ok(estimates) => selector.set_sampled_gas_estimates(&estimates)?,
+                Err(error) => eprintln!("gas sampling refresh failed; keeping weights: {error:#}"),
+            }
+        }
+        if let Some(client) = &gas_client &&
+            gas_refresh.is_none() &&
+            last_gas_sample.elapsed() >= gas_sample_interval
         {
-            refresh_gas_estimates(adapter, spec, setup_bindings, ctx, &mut selector, provider)?;
+            let samples = gas_samples(adapter, spec, setup_bindings, ctx, &selector)?;
+            gas_refresh = Some(runtime.spawn(simulate_gas_samples(client.clone(), samples)));
             last_gas_sample = Instant::now();
         }
 
@@ -1813,6 +1848,9 @@ where
         }
     }
 
+    if let Some(refresh) = gas_refresh {
+        refresh.abort();
+    }
     signing_pool.finish(writer)?;
     writer.flush()?;
     eprintln!("workload generation completed: prepared={written} elapsed={:?}", start.elapsed(),);
@@ -2247,39 +2285,84 @@ fn simulation_gas(response: &serde_json::Value, expected_calls: usize) -> Result
     Ok(gas)
 }
 
-fn refresh_gas_estimates<A: NetworkAdapter>(
+/// A background gas refresh: each sampled item with its block gas.
+type GasRefresh = tokio::task::JoinHandle<Result<Vec<(MixItem, u64)>>>;
+
+/// One workload item's gas sample: the eth_simulateV1 calls of one instance.
+struct GasSample {
+    item: MixItem,
+    weight: u64,
+    calls: Vec<serde_json::Value>,
+}
+
+/// Build every mix item's simulation calls from the current generation state.
+fn gas_samples<A: NetworkAdapter>(
     adapter: &A,
     spec: &WorkloadSpec,
     setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
     ctx: &mut BuildContext<'_>,
-    selector: &mut WorkloadSelector,
-    provider: &impl Provider,
-) -> Result<()> {
-    let mut estimates = Vec::with_capacity(selector.entries.len());
-    for entry in &selector.entries {
-        let calls = sample_workload_calls(adapter, spec, &entry.item, setup_bindings, ctx)?;
-        let expected_calls = calls.len();
+    selector: &WorkloadSelector,
+) -> Result<Vec<GasSample>> {
+    selector
+        .entries
+        .iter()
+        .map(|entry| {
+            Ok(GasSample {
+                item: entry.item.clone(),
+                weight: entry.weight,
+                calls: sample_workload_calls(adapter, spec, &entry.item, setup_bindings, ctx)?,
+            })
+        })
+        .collect()
+}
+
+/// How far past the send time a sampled call's expiry is set.
+const GAS_SAMPLE_VALID_FOR_SECS: u64 = 20;
+
+/// A refresh sends its calls long after building them, so an expiring-nonce call's expiry may
+/// already have passed: move it to just ahead of the send time.
+fn refresh_expiry(calls: &mut [serde_json::Value], now: u64) {
+    for call in calls {
+        if let Some(call) = call.as_object_mut() &&
+            call.contains_key("validBefore")
+        {
+            call.insert(
+                "validBefore".to_string(),
+                serde_json::json!(format!("{:#x}", now + GAS_SAMPLE_VALID_FOR_SECS)),
+            );
+            call.remove("validAfter");
+        }
+    }
+}
+
+/// Simulate each sample against the latest block and return its block gas, in order.
+async fn simulate_gas_samples(
+    client: alloy_rpc_client::RpcClient,
+    samples: Vec<GasSample>,
+) -> Result<Vec<(MixItem, u64)>> {
+    let mut estimates = Vec::with_capacity(samples.len());
+    for mut sample in samples {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+        refresh_expiry(&mut sample.calls, now);
+        let expected_calls = sample.calls.len();
         let payload = serde_json::json!({
-            "blockStateCalls": [{"calls": calls}],
+            "blockStateCalls": [{"calls": sample.calls}],
             "validation": false,
             "traceTransfers": false,
         });
-        let response = tokio::runtime::Handle::current()
-            .block_on(
-                provider
-                    .client()
-                    .request::<_, serde_json::Value>("eth_simulateV1", (payload, "latest")),
-            )
-            .wrap_err_with(|| format!("gas sampling failed for {:?}", entry.item))?;
+        let response = client
+            .request::<_, serde_json::Value>("eth_simulateV1", (payload, "latest"))
+            .await
+            .wrap_err_with(|| format!("gas sampling failed for {:?}", sample.item))?;
         let gas = simulation_gas(&response, expected_calls)
-            .wrap_err_with(|| format!("invalid gas sample for {:?}", entry.item))?;
+            .wrap_err_with(|| format!("invalid gas sample for {:?}", sample.item))?;
         eprintln!(
             "gas sample: item={:?} block_gas={gas} target_weight={}",
-            entry.item, entry.weight
+            sample.item, sample.weight
         );
-        estimates.push(gas);
+        estimates.push((sample.item, gas));
     }
-    selector.set_gas_estimates(&estimates)
+    Ok(estimates)
 }
 
 #[cfg(test)]
@@ -2752,6 +2835,10 @@ mix: [{sequence: s, weight: 1}]
                 request: TransactionRequest {
                     nonce: Some(ctx.next_nonce([0x33; 20])),
                     value: Some(U256::from(ctx.rng.random::<u64>())),
+                    to: Some(TxKind::Call(Address::ZERO)),
+                    gas: Some(21_000),
+                    max_fee_per_gas: Some(1),
+                    max_priority_fee_per_gas: Some(1),
                     ..Default::default()
                 },
                 signer_pool: "users".to_string(),
@@ -2840,6 +2927,7 @@ mix: [{template: transfer, weight: 1}]
                     limit: GenerationLimit { count: Some(1), duration: None },
                     signing_workers: 1,
                     gas_sample_rpc: Some(&rpc),
+                    gas_sample_interval: GAS_SAMPLE_INTERVAL,
                 },
                 &HashMap::new(),
                 &mut ctx,
@@ -2851,6 +2939,135 @@ mix: [{template: transfer, weight: 1}]
             Ok::<_, eyre::Report>(())
         })
         .await??;
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn slow_gas_refresh_does_not_pause_generation() -> Result<()> {
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = requests.clone();
+        let app = axum::Router::new().route("/", axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+            let counter = counter.clone();
+            async move {
+                // Every refresh after the first takes far longer than generating the workload.
+                if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                axum::Json(serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": [{"gasUsed": "0x5208", "calls": [{"status": "0x1"}]}]}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let rpc = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let started = Instant::now();
+        let written = tokio::task::spawn_blocking(move || {
+            let spec = sampling_spec()?;
+            let accounts = AccountManager::from_spec(&spec.accounts)?;
+            let artifacts = ArtifactManager::empty();
+            let mut nonces = NonceTracker::new();
+            let mut rng = StdRng::seed_from_u64(42);
+            let mut ctx =
+                BuildContext::new(1, &spec.gas, &accounts, &artifacts, &mut nonces, &mut rng);
+            let mut output = NdjsonWriter::new(Vec::new());
+            generate_txs(
+                &SamplingAdapter,
+                &spec,
+                GenerationConfig {
+                    limit: GenerationLimit { count: Some(100), duration: None },
+                    signing_workers: 1,
+                    gas_sample_rpc: Some(&rpc),
+                    gas_sample_interval: Duration::ZERO,
+                },
+                &HashMap::new(),
+                &mut ctx,
+                &mut output,
+            )
+        })
+        .await??;
+        assert_eq!(written, 100);
+        assert!(started.elapsed() < Duration::from_secs(5), "generation waited for a refresh");
+        assert!(requests.load(std::sync::atomic::Ordering::SeqCst) >= 2, "no refresh started");
+        server.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn sampled_gas_estimates_skip_pruned_entries() -> Result<()> {
+        let mut spec = selector_spec();
+        spec.mix.retain(|entry| entry.weight > 0);
+        let mut selector = WorkloadSelector::new(&spec, 100)?;
+        let sampled: Vec<_> =
+            selector.entries.iter().map(|entry| (entry.item.clone(), 10)).collect();
+        let mut rng = StdRng::seed_from_u64(3);
+        assert!(selector.pick(&mut rng, 1).is_some());
+        assert!(selector.entries.len() < sampled.len());
+        selector.set_sampled_gas_estimates(&sampled)?;
+        assert!(selector.gas_weighted);
+        assert!(selector.set_gas_estimates(&[10; 5]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_expiry_moves_only_expiring_calls_ahead_of_the_send_time() {
+        let mut calls = vec![
+            serde_json::json!({"validBefore": "0x1", "validAfter": "0x1", "to": "0x00"}),
+            serde_json::json!({"to": "0x00"}),
+        ];
+        refresh_expiry(&mut calls, 1_000);
+        assert_eq!(calls[0]["validBefore"], format!("{:#x}", 1_000 + GAS_SAMPLE_VALID_FOR_SECS));
+        assert!(calls[0].get("validAfter").is_none());
+        assert_eq!(calls[1], serde_json::json!({"to": "0x00"}));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_gas_refresh_keeps_generating_with_previous_weights() -> Result<()> {
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = requests.clone();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                let counter = counter.clone();
+                async move {
+                    // Only the first sample succeeds.
+                    let body = if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": [{"gasUsed": "0x5208", "calls": [{"status": "0x1"}]}]})
+                    } else {
+                        serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32003, "message": "transaction expired"}})
+                    };
+                    axum::Json(body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let rpc = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let written = tokio::task::spawn_blocking(move || {
+            let spec = sampling_spec()?;
+            let accounts = AccountManager::from_spec(&spec.accounts)?;
+            let artifacts = ArtifactManager::empty();
+            let mut nonces = NonceTracker::new();
+            let mut rng = StdRng::seed_from_u64(42);
+            let mut ctx =
+                BuildContext::new(1, &spec.gas, &accounts, &artifacts, &mut nonces, &mut rng);
+            let mut output = NdjsonWriter::new(Vec::new());
+            generate_txs(
+                &SamplingAdapter,
+                &spec,
+                GenerationConfig {
+                    limit: GenerationLimit { count: Some(2_000), duration: None },
+                    signing_workers: 1,
+                    gas_sample_rpc: Some(&rpc),
+                    gas_sample_interval: Duration::ZERO,
+                },
+                &HashMap::new(),
+                &mut ctx,
+                &mut output,
+            )
+        })
+        .await??;
+        assert_eq!(written, 2_000);
+        assert!(requests.load(std::sync::atomic::Ordering::SeqCst) >= 2, "no refresh ran");
         server.abort();
         Ok(())
     }
