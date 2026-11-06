@@ -83,4 +83,11 @@ jobs:
       - uses: tempoxyz/gh-actions/vendor/Swatinem/rust-cache@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo check --workspace --all-targets
+      - run: cargo check --workspace --all-targets --locked
+      - name: Install cargo-deny
+        uses: tempoxyz/gh-actions/actions/cargo-install@35019557465e3c38ee3468be171771fd73577584 # 2026-10-20T06-22-38Z-35019557
+        with:
+          tool: cargo-deny
+          version: "0.20.2"
+      - name: Check dependencies
+        run: cargo deny --locked check advisories sources
