@@ -69,16 +69,18 @@ List every signer account address referenced by a workload spec. Destination-onl
 txgen-tempo addresses --spec examples/bench-spec.yaml
 ```
 
-Shell-friendly output is useful for faucet scripts:
+Fund them on a node with the faucet enabled. `fund` requests `tempo_fundAddress` for every account
+that lacks pathUSD, waits for the txpool to drain, reads balances again and refunds the accounts
+still short, for up to `--rounds` rounds (default 5). It fails, listing the unfunded addresses, if
+any account is still short after the last round:
 
 ```bash
-txgen-tempo addresses --spec examples/bench-spec.yaml --format shell \
-  | tr ' ' '\n' \
-  | xargs -P 50 -I{} curl -sf -X POST \
-      -H 'Content-Type: application/json' \
-      -d '{"jsonrpc":"2.0","method":"tempo_fundAddress","params":["{}"],"id":1}' \
-      http://localhost:8545 -o /dev/null
+txgen-tempo fund --spec examples/bench-spec.yaml --rpc http://localhost:8545
 ```
+
+Use `--token <address>` (repeatable) to check other faucet tokens, `--min-balance` for the balance
+that counts as funded, and `--concurrency` to bound in-flight faucet requests (default 16). Accounts
+that already hold the tokens are skipped, so rerunning it is cheap.
 
 ## Send to destination-only address pools
 

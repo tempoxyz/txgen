@@ -1,4 +1,5 @@
 pub mod auth_token_map;
+pub mod fund;
 mod late_sign;
 mod nonce;
 mod template;
