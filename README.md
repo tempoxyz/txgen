@@ -204,7 +204,7 @@ txgen-tempo fund -s workload.yaml --rpc http://localhost:8545
 | `-s, --spec <PATH>` | Workload spec file (YAML) |
 | `--rpc <URL>` | RPC endpoint with `tempo_fundAddress` enabled |
 | `--token <ADDRESS>` | Token whose balance shows an account is funded; repeatable (default: pathUSD, `0x20c0…0000`) |
-| `--min-balance <N>` | Smallest balance of every token that counts as funded (default: 1) |
+| `--min-balance <N>` | Smallest raw balance of every token that counts as funded (default: 1000000000, 1,000 pathUSD, so dust such as 1 pathUSD does not count) |
 | `--rounds <N>` | Fund, drain and verify rounds (default: 5) |
 | `--concurrency <N>` | Concurrent faucet requests (default: 16) |
 | `--check-concurrency <N>` | Concurrent balance reads (default: 64) |

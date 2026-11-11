@@ -70,7 +70,7 @@ txgen-tempo addresses --spec examples/bench-spec.yaml
 ```
 
 Fund them on a node with the faucet enabled. `fund` requests `tempo_fundAddress` for every account
-that lacks pathUSD, waits for the txpool to drain, reads balances again and refunds the accounts
+that holds less than 1,000 pathUSD, waits for the txpool to drain, reads balances again and refunds the accounts
 still short, for up to `--rounds` rounds (default 5). It fails, listing the unfunded addresses, if
 any account is still short after the last round:
 

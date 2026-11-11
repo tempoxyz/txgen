@@ -29,6 +29,10 @@ const BALANCE_OF_SELECTOR: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];
 const DRAIN_EMPTY_READINGS: u32 = 3;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_REQUEST_BACKOFF: Duration = Duration::from_secs(5);
+/// Default smallest balance that counts as funded: 1,000 pathUSD (6 decimals). Far below a faucet
+/// mint (1e12 in the bench node) and above the dust state-bloat fixtures give existing accounts
+/// (1 pathUSD), so dust is not mistaken for funding.
+const DEFAULT_MIN_BALANCE: u64 = 1_000_000_000;
 /// Unfunded addresses listed in the final error.
 const REPORTED_ADDRESSES: usize = 10;
 
@@ -48,7 +52,7 @@ pub struct FundArgs {
     pub tokens: Vec<Address>,
 
     /// Smallest balance of every --token that counts as funded
-    #[arg(long, default_value_t = U256::from(1))]
+    #[arg(long, default_value_t = U256::from(DEFAULT_MIN_BALANCE))]
     pub min_balance: U256,
 
     /// Funding rounds: each funds the accounts still short, waits for the txpool to drain and

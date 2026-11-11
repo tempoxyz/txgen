@@ -50,7 +50,8 @@ async fn rpc(State(faucet): State<Arc<Faucet>>, Json(request): Json<Value>) -> J
             let count = requests.entry(address).or_default();
             *count += 1;
             if *count > faucet.dropped {
-                *faucet.balances.lock().unwrap().entry(address).or_default() += U256::from(1_000);
+                *faucet.balances.lock().unwrap().entry(address).or_default() +=
+                    U256::from(1_000_000_000_000u64);
             }
             json!([format!("0x{:064x}", 1)])
         }
@@ -106,13 +107,23 @@ async fn fails_when_accounts_stay_short_after_every_round() {
     let (output, faucet) = fund(u64::MAX, 0, 2).await;
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("4 of 4 account(s) still hold less than 1"), "{stderr}");
+    assert!(stderr.contains("4 of 4 account(s) still hold less than 1000000000 "), "{stderr}");
     assert!(faucet.requests.lock().unwrap().values().all(|count| *count == 2));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn skips_accounts_that_are_already_funded() {
-    let (output, faucet) = fund(0, 1_000, 1).await;
+    let (output, faucet) = fund(0, 1_000_000_000_000, 1).await;
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(faucet.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn funds_accounts_holding_only_dust() {
+    // State-bloat fixtures leave existing accounts 1 pathUSD, which is not funding.
+    let (output, faucet) = fund(0, 1_000_000, 1).await;
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let requests = faucet.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(requests.values().all(|count| *count == 1));
 }
