@@ -191,6 +191,28 @@ The 30-day TTL limit is the protocol maximum; a remote Zone node may enforce a s
 
 **Required RPC methods:** None (offline)
 
+#### `fund` (Tempo only)
+
+Fund every signer account of a workload spec with the node's faucet and verify that the funding landed. A faucet request answers once its mint enters the txpool, which does not guarantee the mint is mined, so `fund` waits for the txpool to drain, reads each account's token balances, and requests funding again for the accounts still short. It exits non-zero, listing the unfunded addresses, if any account is still short after the last round. Accounts that already hold the tokens are skipped.
+
+```bash
+txgen-tempo fund -s workload.yaml --rpc http://localhost:8545
+```
+
+| Flag | Description |
+|------|-------------|
+| `-s, --spec <PATH>` | Workload spec file (YAML) |
+| `--rpc <URL>` | RPC endpoint with `tempo_fundAddress` enabled |
+| `--token <ADDRESS>` | Token whose balance shows an account is funded; repeatable (default: pathUSD, `0x20c0…0000`) |
+| `--min-balance <N>` | Smallest raw balance of every token that counts as funded (default: 1000000000, 1,000 pathUSD, so dust such as 1 pathUSD does not count) |
+| `--rounds <N>` | Fund, drain and verify rounds (default: 5) |
+| `--concurrency <N>` | Concurrent faucet requests (default: 16) |
+| `--check-concurrency <N>` | Concurrent balance reads (default: 64) |
+| `--request-attempts <N>` | Attempts per faucet request within a round (default: 5) |
+| `--drain-timeout-secs <N>` | Seconds to wait each round for the txpool to drain (default: 120) |
+
+**Required RPC methods:** `tempo_fundAddress`, `eth_call`, `txpool_status`, `eth_blockNumber`
+
 #### `extract`
 
 Extract raw RLP-encoded blocks from an archive node as NDJSON. Use `--bal` to attach RLP-encoded block access lists for replaying EIP-7928/Amsterdam payloads.

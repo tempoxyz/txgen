@@ -88,39 +88,11 @@ wait_for_rpc() {
   done
 }
 
-# Fund accounts using tempo_fundAddress.
+# Fund accounts using tempo_fundAddress, verifying balances and refunding
+# accounts whose mint did not land.
 fund_accounts() {
   local txgen_bin="$1" spec="$2" rpc="$3"
-
-  local addresses
-  addresses=$("$txgen_bin" addresses -s "$spec" -f shell)
-  local addr_count
-  addr_count=$(echo "$addresses" | wc -w)
-  echo "Funding $addr_count accounts..."
-  echo "$addresses" | tr ' ' '\n' | xargs -P 50 -I{} \
-    curl -sf -X POST -H 'Content-Type: application/json' \
-    -d '{"jsonrpc":"2.0","method":"tempo_fundAddress","params":["{}"],"id":1}' \
-    "$rpc" -o /dev/null
-  echo "Funded. Waiting for txpool to drain..."
-
-  local zero_count=0
-  for i in $(seq 1 120); do
-    local pending
-    pending=$(curl -sf -X POST -H 'Content-Type: application/json' \
-      -d '{"jsonrpc":"2.0","method":"txpool_status","params":[],"id":1}' \
-      "$rpc" 2>/dev/null | python3 -c "import sys,json; print(int(json.load(sys.stdin)['result']['pending'],16))" 2>/dev/null || echo "?")
-    if [[ "$pending" == "0" ]]; then
-      zero_count=$((zero_count + 1))
-      if [[ $zero_count -ge 3 ]]; then
-        echo "Txpool drained after ${i}s"
-        return 0
-      fi
-    else
-      zero_count=0
-    fi
-    [[ $((i % 10)) -eq 0 ]] && echo "  pending: $pending"
-    sleep 1
-  done
+  "$txgen_bin" fund -s "$spec" --rpc "$rpc"
 }
 
 # Stop the tempo node if a PID file exists.
