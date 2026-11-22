@@ -4,6 +4,9 @@ ignore = [
     # crypto-bigint 0.5 comes in through elliptic-curve 0.13 (k256, p256, alloy-signer).
     # The fix is in 0.7.6, which no release of those crates uses yet.
     { id = "RUSTSEC-2026-0387", reason = "no fixed crypto-bigint is reachable through elliptic-curve 0.13" },
+    # humantime is unmaintained, not vulnerable. bench-cli, bench-core and txgen-cli parse durations with it;
+    # no maintained drop-in replacement yet (tempo ignores it too).
+    { id = "RUSTSEC-2026-0542", reason = "humantime is unmaintained with no safe upgrade" },
 ]
 
 [sources]
