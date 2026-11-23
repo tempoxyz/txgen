@@ -1519,7 +1519,7 @@ Transactions are output as NDJSON with scheduling keys split by release policy:
 
 **Scheduling rule:** Transactions that share any scheduling key must be sent sequentially until that key's release condition is met. Normal transactions carry their natural nonce-lane key in `submission_keys`, because the chain enforces nonce order after admission. Sequence steps on the same nonce lane are submitted back-to-back; txgen only adds synthetic `inclusion_keys` at cross-lane sequence boundaries where nonce order cannot guarantee execution order.
 
-A transaction without an expiry holds the next nonce of its lane, so `bench send` does not skip it when the node has no room: a `txpool is full` rejection is resubmitted with backoff for up to 60 seconds, and a submission whose response was lost is resubmitted up to three times. The lane stays blocked meanwhile, which holds back later transactions until the pool drains. Expiring transactions are never resubmitted; a rejected one counts as failed.
+A transaction without an expiry holds the next nonce of its lane, so `bench send` does not skip it when the node has no room: a `txpool is full` rejection is resubmitted with backoff for up to 60 seconds, and a submission whose response was lost is resubmitted up to three times. The lane stays blocked meanwhile, which holds back later transactions until the pool drains. Each resubmission takes a token from the `--tps` rate limit. Expiring transactions are never resubmitted; a rejected one counts as failed.
 
 The `sender` is independent of scheduling metadata. Txgen emits it for newly generated transactions. Older NDJSON may omit it and can still be sent without sender authentication.
 
