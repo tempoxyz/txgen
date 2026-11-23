@@ -13,7 +13,7 @@ Two modes are supported:
 
 ```bash
 # Install tempoup
-curl -L https://tempo.xyz/install | bash
+curl -L https://tempo.com/install | bash
 
 # Install Tempo (use a version with faucet + dev mode support)
 tempoup --version 1.5.1
