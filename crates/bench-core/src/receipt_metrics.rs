@@ -419,11 +419,14 @@ async fn collect_block_receipts(
     } else {
         (64 / providers.len()).clamp(2, 6)
     };
+    let primary = providers[0].clone();
     let next_block = Arc::new(AtomicU64::new(start_block));
     let mut workers = JoinSet::new();
-    for provider in providers {
+    for (provider_index, provider) in providers.iter().enumerate() {
+        let is_primary = provider_index == 0;
         for _ in 0..per_provider {
             let provider = provider.clone();
+            let primary = primary.clone();
             let next_block = Arc::clone(&next_block);
             workers.spawn(async move {
                 let mut batches = Vec::new();
@@ -432,7 +435,19 @@ async fn collect_block_receipts(
                     if block_number > end_block {
                         break;
                     }
-                    let receipts = fetch_minimal_block_receipts(&provider, block_number).await?;
+                    let receipts = match fetch_minimal_block_receipts(&provider, block_number)
+                        .await?
+                    {
+                        Some(receipts) => receipts,
+                        None if !is_primary => {
+                            fetch_minimal_block_receipts(&primary, block_number).await?.ok_or_else(
+                                || eyre::eyre!("receipts for block {block_number} not found"),
+                            )?
+                        }
+                        None => {
+                            eyre::bail!("receipts for block {block_number} not found");
+                        }
+                    };
                     batches.push((block_number, receipts));
                 }
                 Ok::<_, eyre::Report>(batches)
@@ -496,13 +511,11 @@ async fn collect_block_receipts(
 async fn fetch_minimal_block_receipts(
     provider: &DynProvider<AnyNetwork>,
     block_number: u64,
-) -> Result<Vec<MinimalBlockReceipt>> {
-    let receipts: Option<Vec<MinimalBlockReceipt>> = provider
+) -> Result<Option<Vec<MinimalBlockReceipt>>> {
+    provider
         .raw_request("eth_getBlockReceipts".into(), (BlockId::number(block_number),))
         .await
-        .wrap_err_with(|| format!("failed to fetch receipts for block {block_number}"))?;
-
-    receipts.ok_or_else(|| eyre::eyre!("receipts for block {block_number} not found"))
+        .wrap_err_with(|| format!("failed to fetch receipts for block {block_number}"))
 }
 
 /// Background collector for confirmed transaction receipt gas fields.

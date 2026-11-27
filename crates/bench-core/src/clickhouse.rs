@@ -156,19 +156,42 @@ impl ClickHouseClient {
         batches: Vec<Vec<T>>,
         concurrency: usize,
     ) -> Result<()> {
-        if batches.is_empty() {
-            return Ok(());
-        }
+        self.insert_fallible_batches_synchronous(table, batches.into_iter().map(Ok), concurrency)
+    }
+
+    /// Insert a lazy iterator of fallible batches concurrently, keeping at most
+    /// concurrency batches materialized in memory at once.
+    pub fn insert_fallible_batches_synchronous<T, I>(
+        &self,
+        table: &str,
+        batches: I,
+        concurrency: usize,
+    ) -> Result<()>
+    where
+        T: Serialize + Send + Sync,
+        I: IntoIterator<Item = Result<Vec<T>>>,
+    {
         let concurrency = concurrency.max(1);
-        if concurrency == 1 || batches.len() == 1 {
-            for batch in &batches {
-                self.insert_rows_synchronous(table, batch)?;
+        if concurrency == 1 {
+            for (batch_index, batch) in batches.into_iter().enumerate() {
+                let batch = batch.wrap_err_with(|| {
+                    format!("failed to prepare ClickHouse batch {batch_index} for {table}")
+                })?;
+                if !batch.is_empty() {
+                    self.insert_rows_synchronous(table, &batch)?;
+                }
             }
             return Ok(());
         }
         crate::block_on(async {
             stream::iter(batches.into_iter().enumerate())
                 .map(|(batch_index, batch)| async move {
+                    let batch = batch.wrap_err_with(|| {
+                        format!("failed to prepare ClickHouse batch {batch_index} for {table}")
+                    })?;
+                    if batch.is_empty() {
+                        return Ok(());
+                    }
                     self.insert_rows_synchronous_async(table, &batch).await.wrap_err_with(|| {
                         format!("failed to insert ClickHouse batch {batch_index} into {table}")
                     })
@@ -176,7 +199,7 @@ impl ClickHouseClient {
                 .buffer_unordered(concurrency)
                 .try_collect::<Vec<()>>()
                 .await?;
-            Ok::<(), eyre::Report>(())
+            Ok(())
         })?
     }
 }

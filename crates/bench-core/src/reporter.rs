@@ -20,7 +20,7 @@ use crate::{
 };
 use alloy_primitives::U256;
 use eyre::{bail, Context, Result};
-use flate2::{write::GzEncoder, Compression};
+use flate2::{Compress, Compression, Crc, FlushCompress, Status};
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -665,12 +665,30 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
 
 const PARALLEL_GZIP_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const PARALLEL_GZIP_MAX_WORKERS: usize = 16;
+const GZIP_HEADER: [u8; 10] = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0xff];
+// Final empty fixed-Huffman deflate block (BFINAL=1, BTYPE=01, EOB=0000000).
+const DEFLATE_FINAL_EMPTY_BLOCK: [u8; 2] = [0x03, 0x00];
 
+struct CompressedDeflateBlock {
+    bytes: Vec<u8>,
+    crc32: u32,
+    raw_len: usize,
+}
+
+/// Parallel single-member gzip writer (pigz-style).
+///
+/// Compresses independent 4 MiB chunks as byte-aligned sync-flushed raw deflate
+/// blocks in parallel, combines their CRC-32 checksums, and emits a single
+/// RFC 1952 gzip member compatible with both single-member and multi-member
+/// readers (including for empty 0-byte inputs).
 struct ParallelGzipWriter<W: Write> {
     inner: W,
     pending: Vec<Vec<u8>>,
     current: Vec<u8>,
     workers: usize,
+    header_written: bool,
+    crc32: u32,
+    total_len: u32,
 }
 
 impl<W: Write> ParallelGzipWriter<W> {
@@ -683,35 +701,60 @@ impl<W: Write> ParallelGzipWriter<W> {
             pending: Vec::with_capacity(workers),
             current: Vec::with_capacity(PARALLEL_GZIP_CHUNK_BYTES),
             workers,
+            header_written: false,
+            crc32: 0,
+            total_len: 0,
         }
+    }
+
+    fn ensure_header(&mut self) -> std::io::Result<()> {
+        if !self.header_written {
+            self.inner.write_all(&GZIP_HEADER)?;
+            self.header_written = true;
+        }
+        Ok(())
     }
 
     fn flush_pending(&mut self) -> std::io::Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
+        self.ensure_header()?;
         let chunks = std::mem::take(&mut self.pending);
-        let compressed: Vec<std::io::Result<Vec<u8>>> = if chunks.len() == 1 {
-            vec![compress_gzip_member(&chunks[0])]
-        } else {
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = chunks
-                    .iter()
-                    .map(|chunk| scope.spawn(move || compress_gzip_member(chunk)))
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        h.join().unwrap_or_else(|_| {
-                            Err(std::io::Error::other("gzip worker thread panicked"))
-                        })
-                    })
-                    .collect()
-            })
-        };
-        for member in compressed {
-            self.inner.write_all(&member?)?;
+        if chunks.len() == 1 || self.workers <= 1 {
+            for chunk in chunks {
+                let block = compress_deflate_block(&chunk)?;
+                self.write_block(&block)?;
+            }
+            return Ok(());
         }
+
+        let results: Vec<std::io::Result<CompressedDeflateBlock>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| scope.spawn(move || compress_deflate_block(&chunk)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or_else(|_| {
+                        Err(std::io::Error::other("parallel gzip worker panicked"))
+                    })
+                })
+                .collect()
+        });
+
+        for result in results {
+            let block = result?;
+            self.write_block(&block)?;
+        }
+        Ok(())
+    }
+
+    fn write_block(&mut self, block: &CompressedDeflateBlock) -> std::io::Result<()> {
+        self.inner.write_all(&block.bytes)?;
+        self.crc32 = crc32_combine(self.crc32, block.crc32, block.raw_len);
+        self.total_len = self.total_len.wrapping_add(block.raw_len as u32);
         Ok(())
     }
 
@@ -721,15 +764,98 @@ impl<W: Write> ParallelGzipWriter<W> {
             self.pending.push(tail);
         }
         self.flush_pending()?;
+        self.ensure_header()?;
+        self.inner.write_all(&DEFLATE_FINAL_EMPTY_BLOCK)?;
+        self.inner.write_all(&self.crc32.to_le_bytes())?;
+        self.inner.write_all(&self.total_len.to_le_bytes())?;
         self.inner.flush()?;
         Ok(self.inner)
     }
 }
 
-fn compress_gzip_member(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 8), Compression::default());
-    encoder.write_all(data)?;
-    encoder.finish()
+fn compress_deflate_block(data: &[u8]) -> std::io::Result<CompressedDeflateBlock> {
+    let mut crc = Crc::new();
+    crc.update(data);
+
+    let mut compressor = Compress::new(Compression::default(), false);
+    let mut out = Vec::with_capacity((data.len() / 8).max(64));
+    let mut consumed = 0usize;
+
+    loop {
+        if out.len() == out.capacity() {
+            out.reserve((data.len() - consumed).clamp(4096, 65_536));
+        }
+        let before_in = compressor.total_in();
+        let status = compressor
+            .compress_vec(&data[consumed..], &mut out, FlushCompress::Sync)
+            .map_err(std::io::Error::other)?;
+        consumed += (compressor.total_in() - before_in) as usize;
+
+        if consumed >= data.len() && out.ends_with(&[0x00, 0x00, 0xff, 0xff]) {
+            break;
+        }
+        if matches!(status, Status::StreamEnd) {
+            break;
+        }
+    }
+
+    Ok(CompressedDeflateBlock { bytes: out, crc32: crc.sum(), raw_len: data.len() })
+}
+
+fn gf2_matrix_times(mat: &[u32; 32], mut vec: u32) -> u32 {
+    let mut sum = 0u32;
+    let mut i = 0usize;
+    while vec != 0 {
+        if (vec & 1) != 0 {
+            sum ^= mat[i];
+        }
+        vec >>= 1;
+        i += 1;
+    }
+    sum
+}
+
+fn gf2_matrix_square(square: &mut [u32; 32], mat: &[u32; 32]) {
+    for n in 0..32 {
+        square[n] = gf2_matrix_times(mat, mat[n]);
+    }
+}
+
+/// Combine two IEEE CRC-32 checksums sequentially (zlib crc32_combine).
+fn crc32_combine(mut crc1: u32, crc2: u32, mut len2: usize) -> u32 {
+    if len2 == 0 {
+        return crc1;
+    }
+    let mut odd = [0u32; 32];
+    let mut even = [0u32; 32];
+    odd[0] = 0xedb8_8320;
+    let mut row = 1u32;
+    for slot in odd.iter_mut().skip(1) {
+        *slot = row;
+        row <<= 1;
+    }
+    gf2_matrix_square(&mut even, &odd);
+    gf2_matrix_square(&mut odd, &even);
+
+    loop {
+        gf2_matrix_square(&mut even, &odd);
+        if (len2 & 1) != 0 {
+            crc1 = gf2_matrix_times(&even, crc1);
+        }
+        len2 >>= 1;
+        if len2 == 0 {
+            break;
+        }
+        gf2_matrix_square(&mut odd, &even);
+        if (len2 & 1) != 0 {
+            crc1 = gf2_matrix_times(&odd, crc1);
+        }
+        len2 >>= 1;
+        if len2 == 0 {
+            break;
+        }
+    }
+    crc1 ^ crc2
 }
 
 impl<W: Write> Write for ParallelGzipWriter<W> {
@@ -1628,8 +1754,8 @@ mod tests {
     }
 
     #[test]
-    fn parallel_gzip_writer_produces_valid_multi_member_gzip() {
-        use flate2::read::MultiGzDecoder;
+    fn parallel_gzip_writer_produces_valid_single_member_gzip() {
+        use flate2::read::GzDecoder;
         use std::io::Read;
         let payload: Vec<u8> = (0..10_000_000usize)
             .map(|i| {
@@ -1644,7 +1770,19 @@ mod tests {
         }
         writer.finish().unwrap();
         let mut decoded = Vec::new();
-        MultiGzDecoder::new(out.as_slice()).read_to_end(&mut decoded).unwrap();
+        GzDecoder::new(out.as_slice()).read_to_end(&mut decoded).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn parallel_gzip_writer_writes_valid_empty_gzip_on_zero_bytes() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+        let mut out = Vec::new();
+        ParallelGzipWriter::new(&mut out).finish().unwrap();
+        assert!(!out.is_empty());
+        let mut decoded = Vec::new();
+        GzDecoder::new(out.as_slice()).read_to_end(&mut decoded).unwrap();
+        assert!(decoded.is_empty());
     }
 }

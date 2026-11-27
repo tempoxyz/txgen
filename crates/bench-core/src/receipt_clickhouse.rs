@@ -24,16 +24,11 @@ pub fn insert_receipt_gas_records(
 
     let concurrency =
         if records.len() >= 1_000 { DEFAULT_CLICKHOUSE_RECEIPT_CONCURRENCY } else { 1 };
-    let mut batches = Vec::with_capacity(records.len().div_ceil(batch_size));
-    for chunk in records.chunks(batch_size) {
-        let rows = chunk
-            .iter()
-            .map(|record| ReceiptGasRow::new(run_id, record))
-            .collect::<Result<Vec<_>>>()?;
-        batches.push(rows);
-    }
+    let batches = records.chunks(batch_size).map(|chunk| {
+        chunk.iter().map(|record| ReceiptGasRow::new(run_id, record)).collect::<Result<Vec<_>>>()
+    });
 
-    client.insert_batches_synchronous("txgen_receipt_gas", batches, concurrency)
+    client.insert_fallible_batches_synchronous("txgen_receipt_gas", batches, concurrency)
 }
 
 #[derive(Debug, Serialize)]
