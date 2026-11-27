@@ -72,10 +72,13 @@ pub async fn execute(args: SendArgs) -> Result<()> {
         .zip(providers.iter().cloned())
         .map(|(url, provider)| RpcEndpoint::new(url.clone(), provider))
         .collect::<Vec<_>>();
-    let query_provider = match args.query_rpc_url.as_deref() {
-        Some(url) => build_provider(url, &http_client, &retry_layer)
-            .wrap_err("failed to build query RPC provider")?,
-        None => providers[0].clone(),
+    let (query_provider, receipt_providers) = match args.query_rpc_url.as_deref() {
+        Some(url) => {
+            let qp = build_provider(url, &http_client, &retry_layer)
+                .wrap_err("failed to build query RPC provider")?;
+            (qp.clone(), vec![qp])
+        }
+        None => (providers[0].clone(), providers.clone()),
     };
     let request_auth = build_request_auth(&args)?;
     let late_signer = args
@@ -102,13 +105,29 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     match &args.input {
         Some(path) => {
             let mut source = FileSource::new(path).wrap_err("failed to open input file")?;
-            execute_source(&args, &metadata, senders, query_provider, &mut source, &scraper_configs)
-                .await
+            execute_source(
+                &args,
+                &metadata,
+                senders,
+                query_provider,
+                &receipt_providers,
+                &mut source,
+                &scraper_configs,
+            )
+            .await
         }
         None => {
             let mut source = StdinSource::new();
-            execute_source(&args, &metadata, senders, query_provider, &mut source, &scraper_configs)
-                .await
+            execute_source(
+                &args,
+                &metadata,
+                senders,
+                query_provider,
+                &receipt_providers,
+                &mut source,
+                &scraper_configs,
+            )
+            .await
         }
     }
 }
@@ -172,6 +191,7 @@ async fn execute_source<S: TxSource>(
     metadata: &HashMap<String, String>,
     senders: SenderFactory,
     query_provider: DynProvider<AnyNetwork>,
+    receipt_providers: &[DynProvider<AnyNetwork>],
     source: &mut S,
     scraper_configs: &[ScraperConfig],
 ) -> Result<()> {
@@ -309,7 +329,7 @@ async fn execute_source<S: TxSource>(
     let receipt_collection = match receipt_collector {
         Some(collector) => {
             let collection = collector
-                .finish(&query_provider, start_block.saturating_add(1), end_block)
+                .finish_with_providers(receipt_providers, start_block.saturating_add(1), end_block)
                 .await
                 .wrap_err("failed to collect block receipts")?;
             tracing::info!(

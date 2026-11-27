@@ -1,8 +1,13 @@
 //! Shared ClickHouse HTTP client.
 
 use eyre::{bail, Context, Result};
+use flate2::{write::GzEncoder, Compression};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::Serialize;
-use std::{fmt, time::Duration};
+use std::{fmt, io::Write, time::Duration};
+
+/// Minimum JSONEachRow payload size in bytes before gzipping the HTTP body.
+const CLICKHOUSE_GZIP_THRESHOLD_BYTES: usize = 4096;
 
 /// Synchronous JSONEachRow client for ClickHouse's HTTP interface.
 ///
@@ -74,16 +79,41 @@ impl ClickHouseClient {
         if rows.is_empty() {
             return Ok(());
         }
+        crate::block_on(self.insert_rows_synchronous_async(table, rows))?
+    }
+
+    /// Async implementation of [`Self::insert_rows_synchronous`], gzipping large
+    /// JSONEachRow payloads to reduce cross-region transfer time.
+    pub async fn insert_rows_synchronous_async<T: Serialize>(
+        &self,
+        table: &str,
+        rows: &[T],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         validate_identifier("table", table)?;
 
-        let mut body = String::new();
+        let mut raw = Vec::with_capacity(rows.len().saturating_mul(160));
         for row in rows {
-            body.push_str(
-                &serde_json::to_string(row)
-                    .wrap_err_with(|| format!("failed to serialize row for {table}"))?,
-            );
-            body.push('\n');
+            serde_json::to_writer(&mut raw, row)
+                .wrap_err_with(|| format!("failed to serialize row for {table}"))?;
+            raw.push(b'\n');
         }
+
+        let (body, gzipped) = if raw.len() >= CLICKHOUSE_GZIP_THRESHOLD_BYTES {
+            let mut encoder =
+                GzEncoder::new(Vec::with_capacity(raw.len() / 6), Compression::fast());
+            encoder
+                .write_all(&raw)
+                .wrap_err_with(|| format!("failed to gzip ClickHouse payload for {table}"))?;
+            let compressed = encoder
+                .finish()
+                .wrap_err_with(|| format!("failed to finish gzip payload for {table}"))?;
+            (compressed, true)
+        } else {
+            (raw, false)
+        };
 
         let query = format!("INSERT INTO {}.{} FORMAT JSONEachRow", self.database, table);
         let mut url = self.url.clone();
@@ -93,23 +123,84 @@ impl ClickHouseClient {
             .append_pair("wait_for_async_insert", "1");
 
         let mut req = self.client.post(url).header("Content-Type", "application/json");
+        if gzipped {
+            req = req.header("Content-Encoding", "gzip");
+        }
         if let Some(ref user) = self.user {
             req = req.header("X-ClickHouse-User", user);
         }
         if let Some(ref password) = self.password {
             req = req.header("X-ClickHouse-Key", password);
         }
-        let resp = crate::block_on(req.body(body).send())?
+        let resp = req
+            .body(body)
+            .send()
+            .await
             .wrap_err_with(|| format!("failed to insert into {table}"))?;
 
         let status = resp.status();
         if !status.is_success() {
-            let body = crate::block_on(resp.text())?.unwrap_or_else(|_| "<no body>".to_string());
+            let body = resp.text().await.unwrap_or_else(|_| "<no body>".to_string());
             bail!("ClickHouse insert into {table} failed (HTTP {status}): {body}");
         }
 
-        tracing::info!(table, rows = rows.len(), "Inserted rows into ClickHouse");
+        tracing::info!(table, rows = rows.len(), gzipped, "Inserted rows into ClickHouse");
         Ok(())
+    }
+
+    /// Insert multiple batches into a table with bounded concurrency, waiting
+    /// until every batch has committed synchronously.
+    pub fn insert_batches_synchronous<T: Serialize + Send + Sync>(
+        &self,
+        table: &str,
+        batches: Vec<Vec<T>>,
+        concurrency: usize,
+    ) -> Result<()> {
+        self.insert_fallible_batches_synchronous(table, batches.into_iter().map(Ok), concurrency)
+    }
+
+    /// Insert a lazy iterator of fallible batches concurrently, keeping at most
+    /// concurrency batches materialized in memory at once.
+    pub fn insert_fallible_batches_synchronous<T, I>(
+        &self,
+        table: &str,
+        batches: I,
+        concurrency: usize,
+    ) -> Result<()>
+    where
+        T: Serialize + Send + Sync,
+        I: IntoIterator<Item = Result<Vec<T>>>,
+    {
+        let concurrency = concurrency.max(1);
+        if concurrency == 1 {
+            for (batch_index, batch) in batches.into_iter().enumerate() {
+                let batch = batch.wrap_err_with(|| {
+                    format!("failed to prepare ClickHouse batch {batch_index} for {table}")
+                })?;
+                if !batch.is_empty() {
+                    self.insert_rows_synchronous(table, &batch)?;
+                }
+            }
+            return Ok(());
+        }
+        crate::block_on(async {
+            stream::iter(batches.into_iter().enumerate())
+                .map(|(batch_index, batch)| async move {
+                    let batch = batch.wrap_err_with(|| {
+                        format!("failed to prepare ClickHouse batch {batch_index} for {table}")
+                    })?;
+                    if batch.is_empty() {
+                        return Ok(());
+                    }
+                    self.insert_rows_synchronous_async(table, &batch).await.wrap_err_with(|| {
+                        format!("failed to insert ClickHouse batch {batch_index} into {table}")
+                    })
+                })
+                .buffer_unordered(concurrency)
+                .try_collect::<Vec<()>>()
+                .await?;
+            Ok(())
+        })?
     }
 }
 
@@ -286,5 +377,70 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("multi-threaded Tokio runtime"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gzips_large_clickhouse_payloads() {
+        use flate2::read::GzDecoder;
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            let mut expected = None;
+            let mut header_end = None;
+            let sep = [13u8, 10, 13, 10];
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+                if header_end.is_none() &&
+                    let Some(pos) = req.windows(4).position(|w| w == sep)
+                {
+                    header_end = Some(pos + 4);
+                    let hdr = String::from_utf8_lossy(&req[..pos]);
+                    for line in hdr.lines() {
+                        if let Some((k, v)) = line.split_once(':') &&
+                            k.eq_ignore_ascii_case("content-length")
+                        {
+                            expected = v.trim().parse::<usize>().ok();
+                        }
+                    }
+                }
+                if let (Some(he), Some(cl)) = (header_end, expected) &&
+                    req.len() >= he + cl
+                {
+                    break;
+                }
+            }
+            let resp = "HTTP/1.1 200 OK
+Content-Length: 0
+Connection: close
+
+";
+            stream.write_all(resp.as_bytes()).unwrap();
+            req
+        });
+        let client =
+            ClickHouseClient::new(format!("http://{addr}"), "default", None, None).unwrap();
+        let rows: Vec<serde_json::Value> = (0..200)
+            .map(|i| serde_json::json!({"id": i, "pad": "aaaaaaaaaaaaaaaaaaaaaaaaaaaa"}))
+            .collect();
+        client.insert_rows_synchronous("txgen_test", &rows).unwrap();
+        let req = server.join().unwrap();
+        let sep = [13u8, 10, 13, 10];
+        let pos = req.windows(4).position(|w| w == sep).unwrap();
+        let headers = String::from_utf8_lossy(&req[..pos]).to_lowercase();
+        assert!(headers.contains("content-encoding: gzip"), "headers={headers}");
+        let mut decoded = String::new();
+        GzDecoder::new(&req[pos + 4..]).read_to_string(&mut decoded).unwrap();
+        assert_eq!(decoded.lines().count(), 200);
     }
 }
