@@ -435,20 +435,35 @@ async fn collect_block_receipts(
                     if block_number > end_block {
                         break;
                     }
-                    let receipts = match fetch_minimal_block_receipts(&provider, block_number)
-                        .await?
+                    let mut retire_secondary = false;
+                    let receipts = match fetch_minimal_block_receipts(&provider, block_number).await
                     {
-                        Some(receipts) => receipts,
-                        None if !is_primary => {
+                        Ok(Some(receipts)) => receipts,
+                        Ok(None) if !is_primary => {
                             fetch_minimal_block_receipts(&primary, block_number).await?.ok_or_else(
                                 || eyre::eyre!("receipts for block {block_number} not found"),
                             )?
                         }
-                        None => {
+                        Err(error) if !is_primary => {
+                            tracing::debug!(
+                                %error,
+                                block_number,
+                                "secondary receipt provider failed; falling back to primary"
+                            );
+                            retire_secondary = true;
+                            fetch_minimal_block_receipts(&primary, block_number).await?.ok_or_else(
+                                || eyre::eyre!("receipts for block {block_number} not found"),
+                            )?
+                        }
+                        Ok(None) => {
                             eyre::bail!("receipts for block {block_number} not found");
                         }
+                        Err(error) => return Err(error),
                     };
                     batches.push((block_number, receipts));
+                    if retire_secondary {
+                        break;
+                    }
                 }
                 Ok::<_, eyre::Report>(batches)
             });
