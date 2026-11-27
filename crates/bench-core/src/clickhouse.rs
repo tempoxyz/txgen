@@ -102,7 +102,8 @@ impl ClickHouseClient {
         }
 
         let (body, gzipped) = if raw.len() >= CLICKHOUSE_GZIP_THRESHOLD_BYTES {
-            let mut encoder = GzEncoder::new(Vec::with_capacity(raw.len() / 6), Compression::fast());
+            let mut encoder =
+                GzEncoder::new(Vec::with_capacity(raw.len() / 6), Compression::fast());
             encoder
                 .write_all(&raw)
                 .wrap_err_with(|| format!("failed to gzip ClickHouse payload for {table}"))?;
@@ -358,8 +359,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn gzips_large_clickhouse_payloads() {
         use flate2::read::GzDecoder;
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
@@ -375,23 +378,23 @@ mod tests {
                     break;
                 }
                 req.extend_from_slice(&buf[..n]);
-                if header_end.is_none() {
-                    if let Some(pos) = req.windows(4).position(|w| w == sep) {
-                        header_end = Some(pos + 4);
-                        let hdr = String::from_utf8_lossy(&req[..pos]);
-                        for line in hdr.lines() {
-                            if let Some((k, v)) = line.split_once(':') {
-                                if k.eq_ignore_ascii_case("content-length") {
-                                    expected = v.trim().parse::<usize>().ok();
-                                }
-                            }
+                if header_end.is_none() &&
+                    let Some(pos) = req.windows(4).position(|w| w == sep)
+                {
+                    header_end = Some(pos + 4);
+                    let hdr = String::from_utf8_lossy(&req[..pos]);
+                    for line in hdr.lines() {
+                        if let Some((k, v)) = line.split_once(':') &&
+                            k.eq_ignore_ascii_case("content-length")
+                        {
+                            expected = v.trim().parse::<usize>().ok();
                         }
                     }
                 }
-                if let (Some(he), Some(cl)) = (header_end, expected) {
-                    if req.len() >= he + cl {
-                        break;
-                    }
+                if let (Some(he), Some(cl)) = (header_end, expected) &&
+                    req.len() >= he + cl
+                {
+                    break;
                 }
             }
             let resp = "HTTP/1.1 200 OK
@@ -402,7 +405,8 @@ Connection: close
             stream.write_all(resp.as_bytes()).unwrap();
             req
         });
-        let client = ClickHouseClient::new(format!("http://{addr}"), "default", None, None).unwrap();
+        let client =
+            ClickHouseClient::new(format!("http://{addr}"), "default", None, None).unwrap();
         let rows: Vec<serde_json::Value> = (0..200)
             .map(|i| serde_json::json!({"id": i, "pad": "aaaaaaaaaaaaaaaaaaaaaaaaaaaa"}))
             .collect();

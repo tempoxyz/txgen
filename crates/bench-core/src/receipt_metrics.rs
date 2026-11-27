@@ -1,9 +1,6 @@
 //! Receipt-based transaction gas metric collection and aggregation.
 
-use crate::{
-    metrics::percentile,
-    sender::RpcSubmitter,
-};
+use crate::{metrics::percentile, sender::RpcSubmitter};
 use alloy_eips::BlockId;
 use alloy_network::{primitives::ReceiptResponse, AnyNetwork};
 use alloy_primitives::{Address, TxHash, B256, U256, U64};
@@ -400,7 +397,7 @@ struct MinimalBlockReceipt {
 
 impl MinimalBlockReceipt {
     fn is_success(&self) -> bool {
-        self.status.map_or(true, ReceiptStatus::is_success)
+        self.status.is_none_or(ReceiptStatus::is_success)
     }
 }
 

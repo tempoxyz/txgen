@@ -736,10 +736,8 @@ impl<W: Write> Write for ParallelGzipWriter<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.current.extend_from_slice(buf);
         if self.current.len() >= PARALLEL_GZIP_CHUNK_BYTES {
-            let chunk = std::mem::replace(
-                &mut self.current,
-                Vec::with_capacity(PARALLEL_GZIP_CHUNK_BYTES),
-            );
+            let chunk =
+                std::mem::replace(&mut self.current, Vec::with_capacity(PARALLEL_GZIP_CHUNK_BYTES));
             self.pending.push(chunk);
             if self.pending.len() >= self.workers {
                 self.flush_pending()?;
@@ -999,7 +997,8 @@ impl ClickHouseReporter {
                 pending_rows.push(row);
                 if pending_rows.len() >= batch_size {
                     inserted_samples += pending_rows.len();
-                    let batch = std::mem::replace(&mut pending_rows, Vec::with_capacity(batch_size));
+                    let batch =
+                        std::mem::replace(&mut pending_rows, Vec::with_capacity(batch_size));
                     ready_batches.push(batch);
                     if ready_batches.len() >= CLICKHOUSE_SAMPLE_CONCURRENCY {
                         let to_send = std::mem::replace(
@@ -1632,8 +1631,12 @@ mod tests {
     fn parallel_gzip_writer_produces_valid_multi_member_gzip() {
         use flate2::read::MultiGzDecoder;
         use std::io::Read;
-        let payload: Vec<u8> = (0..10_000_000usize).map(|i| b"abcdefghijklmnopqrstuvwxyz0123456789
-"[i % 37]).collect();
+        let payload: Vec<u8> = (0..10_000_000usize)
+            .map(|i| {
+                b"abcdefghijklmnopqrstuvwxyz0123456789
+"[i % 37]
+            })
+            .collect();
         let mut out = Vec::new();
         let mut writer = ParallelGzipWriter::new(&mut out);
         for chunk in payload.chunks(65_536) {

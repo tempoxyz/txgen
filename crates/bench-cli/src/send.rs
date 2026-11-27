@@ -105,13 +105,29 @@ pub async fn execute(args: SendArgs) -> Result<()> {
     match &args.input {
         Some(path) => {
             let mut source = FileSource::new(path).wrap_err("failed to open input file")?;
-            execute_source(&args, &metadata, senders, query_provider, &receipt_providers, &mut source, &scraper_configs)
-                .await
+            execute_source(
+                &args,
+                &metadata,
+                senders,
+                query_provider,
+                &receipt_providers,
+                &mut source,
+                &scraper_configs,
+            )
+            .await
         }
         None => {
             let mut source = StdinSource::new();
-            execute_source(&args, &metadata, senders, query_provider, &receipt_providers, &mut source, &scraper_configs)
-                .await
+            execute_source(
+                &args,
+                &metadata,
+                senders,
+                query_provider,
+                &receipt_providers,
+                &mut source,
+                &scraper_configs,
+            )
+            .await
         }
     }
 }

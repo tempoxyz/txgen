@@ -22,7 +22,8 @@ pub fn insert_receipt_gas_records(
         return Ok(());
     }
 
-    let concurrency = if records.len() >= 1_000 { DEFAULT_CLICKHOUSE_RECEIPT_CONCURRENCY } else { 1 };
+    let concurrency =
+        if records.len() >= 1_000 { DEFAULT_CLICKHOUSE_RECEIPT_CONCURRENCY } else { 1 };
     let mut batches = Vec::with_capacity(records.len().div_ceil(batch_size));
     for chunk in records.chunks(batch_size) {
         let rows = chunk
