@@ -759,7 +759,7 @@ For a single endpoint, pass the URL directly. Legacy multiple-endpoint entries u
 `node_label:URL` and add `node=<node_label>`. Rich entries use
 `key=value;key=value@URL` and add each supplied label to the scraped samples.
 
-Internal txgen metrics are snapshotted on the same interval and included alongside node metrics. In `send` mode: `txgen_transactions_sent_total`, `txgen_transactions_success_total`, `txgen_transactions_failed_total` (submission failures), `txgen_transactions_inclusion_failed_total` (accepted transactions that reverted, expired or were never confirmed included) and `txgen_transactions_inflight`. In `send-blocks` mode: `txgen_blocks_sent_total`, `txgen_blocks_success_total`, `txgen_blocks_failed_total`.
+Internal txgen metrics are snapshotted on the same interval and included alongside node metrics. In `send` mode: `txgen_transactions_sent_total`, `txgen_transactions_success_total`, `txgen_transactions_failed_total` (submission failures), `txgen_transactions_inclusion_failed_total` (accepted transactions that reverted, expired or were never confirmed included), `txgen_transactions_resubmitted_total` (repeated submissions of transactions that cannot expire) and `txgen_transactions_inflight`. In `send-blocks` mode: `txgen_blocks_sent_total`, `txgen_blocks_success_total`, `txgen_blocks_failed_total`.
 
 Metadata key=value pairs (`-m key=value`) are applied as labels to all samples, useful for tagging runs with build SHAs, profiles, or experiment IDs.
 
@@ -1518,6 +1518,8 @@ Transactions are output as NDJSON with scheduling keys split by release policy:
 | `inclusion_keys` | 20-byte ordering constraints released after the transaction is included in a block |
 
 **Scheduling rule:** Transactions that share any scheduling key must be sent sequentially until that key's release condition is met. Normal transactions carry their natural nonce-lane key in `submission_keys`, because the chain enforces nonce order after admission. Sequence steps on the same nonce lane are submitted back-to-back; txgen only adds synthetic `inclusion_keys` at cross-lane sequence boundaries where nonce order cannot guarantee execution order.
+
+A transaction without an expiry holds the next nonce of its lane, so `bench send` does not skip it when the node has no room: a `txpool is full` rejection is resubmitted with backoff for up to 60 seconds, and a submission whose response was lost is resubmitted up to three times. The lane stays blocked meanwhile, which holds back later transactions until the pool drains. Each resubmission takes a token from the `--tps` rate limit. Expiring transactions are never resubmitted; a rejected one counts as failed.
 
 The `sender` is independent of scheduling metadata. Txgen emits it for newly generated transactions. Older NDJSON may omit it and can still be sent without sender authentication.
 

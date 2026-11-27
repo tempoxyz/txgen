@@ -248,6 +248,80 @@ fn known_transaction_error(message: &str) -> bool {
         message.contains("already imported")
 }
 
+/// Longest a pool-capacity rejection is resubmitted before the transaction is given up.
+const POOL_FULL_RESUBMIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Resubmissions after a submission whose outcome is unknown.
+const AMBIGUOUS_RESUBMIT_LIMIT: u32 = 3;
+const RESUBMIT_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+const RESUBMIT_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+fn pool_full_error(error: &alloy_transport::TransportError) -> bool {
+    let RpcError::ErrorResp(payload) = error else { return false };
+    payload.message.to_ascii_lowercase().contains("txpool is full")
+}
+
+/// Outcome of [`send_with_resubmission`].
+struct Submission {
+    /// Start of the final attempt.
+    start: Instant,
+    result: alloy_transport::TransportResult<TxHash>,
+    /// An earlier attempt may have delivered the transaction, whatever the final result says.
+    may_have_been_accepted: bool,
+}
+
+/// Submits a signed transaction. With `resubmit` set, the same bytes are submitted again
+/// when the node had no room for them or the outcome of the submission is unknown.
+/// Every resubmission takes a token from `rate_limiter`, like a first submission.
+async fn send_with_resubmission(
+    endpoint: &RpcEndpoint,
+    raw: &Bytes,
+    expected_hash: TxHash,
+    headers: HeaderMap,
+    resubmit: bool,
+    rate_limiter: Option<&RateLimiter>,
+    metrics: &MetricsCollector,
+) -> Submission {
+    let deadline = tokio::time::Instant::now() + POOL_FULL_RESUBMIT_TIMEOUT;
+    let mut backoff = RESUBMIT_INITIAL_BACKOFF;
+    let mut ambiguous = 0;
+    loop {
+        let start = Instant::now();
+        let may_have_been_accepted = ambiguous > 0;
+        let error = match send_raw_transaction(endpoint, raw, headers.clone()).await {
+            Ok(tx_hash) => return Submission { start, result: Ok(tx_hash), may_have_been_accepted },
+            Err(error) => error,
+        };
+        // The node already holds what an earlier attempt delivered.
+        if may_have_been_accepted &&
+            matches!(&error, RpcError::ErrorResp(payload) if known_transaction_error(&payload.message))
+        {
+            return Submission { start, result: Ok(expected_hash), may_have_been_accepted };
+        }
+        let retry = resubmit &&
+            match classify_transport_failure(&error) {
+                RpcSubmitFailureKind::Ambiguous => {
+                    ambiguous += 1;
+                    ambiguous <= AMBIGUOUS_RESUBMIT_LIMIT
+                }
+                RpcSubmitFailureKind::Rejected => {
+                    pool_full_error(&error) && tokio::time::Instant::now() + backoff < deadline
+                }
+                RpcSubmitFailureKind::BeforeSend => false,
+            };
+        if !retry {
+            return Submission { start, result: Err(error), may_have_been_accepted };
+        }
+        metrics.record_resubmission();
+        tokio::time::sleep(backoff.mul_f64(rand::random_range(0.5..=1.0))).await;
+        backoff = (backoff * 2).min(RESUBMIT_MAX_BACKOFF);
+        if let Some(limiter) = rate_limiter {
+            while let Some(delay) = limiter.try_acquire_or_delay() {
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for RpcSubmitError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.diagnostic)
@@ -1291,6 +1365,7 @@ impl Sender {
         let receipt_collector = self.receipt_collector.clone();
         let late_signer = self.late_signer.clone();
         let receipt_tracker = self.receipt_tracker.clone();
+        let rate_limiter = self.rate_limiter.clone();
 
         let transaction_expiry = self.transaction_expiry.clone();
         let pending_completion = self.max_pending.map(|_| {
@@ -1323,6 +1398,7 @@ impl Sender {
                 permit,
                 completion_tx,
                 late_signer,
+                rate_limiter,
             )
             .await;
             if let Some(completion) = pending_completion {
@@ -1378,6 +1454,7 @@ async fn submit_tx(
     permit: OwnedSemaphorePermit,
     completion_tx: mpsc::UnboundedSender<Completion>,
     late_signer: Option<Arc<dyn LateSigner>>,
+    rate_limiter: Option<Arc<RateLimiter>>,
 ) -> Result<()> {
     let release_all_keys = || {
         let mut keys = pending.submission_keys.clone();
@@ -1423,9 +1500,9 @@ async fn submit_tx(
     };
 
     let expected_hash = keccak256(&raw);
+    let expires_at = transaction_expiry.as_ref().and_then(|expiry| expiry(&raw));
     let inclusion = match inclusion
         .map(|registration| {
-            let expires_at = transaction_expiry.as_ref().and_then(|expiry| expiry(&raw));
             registration.register(
                 expected_hash,
                 pending.phase == TxPhase::Setup || !pending.inclusion_keys.is_empty(),
@@ -1447,14 +1524,29 @@ async fn submit_tx(
     };
 
     let submitted_at_unix_ms = unix_ms(SystemTime::now());
-    let start = Instant::now();
-    let tx_hash = match send_raw_transaction(&endpoint, &raw, submission_headers).await {
+    // A transaction that never expires holds the next nonce of its lane: dropping it
+    // strands every later transaction of that lane behind the gap. Keep the lane's
+    // keys and resubmit instead, which also holds new transactions back until the
+    // node has room.
+    let submission = send_with_resubmission(
+        &endpoint,
+        &raw,
+        expected_hash,
+        submission_headers,
+        expires_at.is_none(),
+        rate_limiter.as_deref(),
+        &metrics,
+    )
+    .await;
+    let tx_hash = match submission.result {
         Ok(tx_hash) => {
-            metrics.record_success(start.elapsed());
+            metrics.record_success(submission.start.elapsed());
             tx_hash
         }
         Err(e) => {
-            let uncertain = submission_may_have_been_accepted(&e);
+            // A rejection after a lost response does not prove the first attempt failed.
+            let uncertain =
+                submission.may_have_been_accepted || submission_may_have_been_accepted(&e);
             if uncertain {
                 track_workload_receipt(
                     receipt_collector.as_ref(),
@@ -1905,6 +1997,154 @@ mod tests {
         assert_eq!(sender.in_flight_pending, 0);
         let error = sender.pump().await.expect_err("cancelled tracking must stop refill");
         assert!(error.error.to_string().contains("submission worker stopped"));
+    }
+
+    fn workload_tx(raw: &Bytes, key: u8) -> GeneratedTx {
+        GeneratedTx {
+            depends_on: Vec::new(),
+            phase: TxPhase::Workload,
+            id: None,
+            raw: raw.clone(),
+            late_sign: None,
+            sender: None,
+            submission_keys: vec![SchedulingKey::from([key; 20])],
+            inclusion_keys: vec![],
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pool_full_rejection_is_resubmitted_before_the_lane_advances() {
+        let asserter = Asserter::new();
+        let first = Bytes::from_static(&[1]);
+        let second = Bytes::from_static(&[2]);
+        asserter.push_failure_msg("txpool is full");
+        asserter.push_failure_msg("txpool is full");
+        asserter.push_success(&keccak256(&first));
+        asserter.push_success(&keccak256(&second));
+        let metrics = MetricsCollector::new(RunClock::new());
+        let mut sender = Sender::new(
+            vec![mocked_provider(asserter.clone())],
+            SenderConfig { rate_limit: 0, max_concurrent: 2, rate_schedule: Vec::new() },
+            metrics.clone(),
+        )
+        .unwrap();
+        // Both share a lane: the second must wait until the first is accepted.
+        sender.send(workload_tx(&first, 1)).await.unwrap();
+        sender.send(workload_tx(&second, 1)).await.unwrap();
+        sender.flush().await.unwrap();
+
+        assert_eq!(metrics.counts(), (2, 2, 0));
+        assert!(asserter.read_q().is_empty());
+        let resubmitted = metrics
+            .snapshot_samples()
+            .into_iter()
+            .find(|sample| sample.name == "txgen_transactions_resubmitted_total")
+            .unwrap();
+        assert_eq!(resubmitted.value, 2.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiring_transaction_is_not_resubmitted() {
+        let asserter = Asserter::new();
+        let raw = Bytes::from_static(&[1]);
+        asserter.push_failure_msg("txpool is full");
+        asserter.push_success(&keccak256(&raw));
+        let metrics = MetricsCollector::new(RunClock::new());
+        let mut sender = Sender::new(
+            vec![mocked_provider(asserter.clone())],
+            SenderConfig::default(),
+            metrics.clone(),
+        )
+        .unwrap()
+        .with_transaction_expiry(Arc::new(|_| Some(1)));
+        sender.send(workload_tx(&raw, 1)).await.unwrap();
+        sender.flush().await.unwrap();
+
+        assert_eq!(metrics.counts(), (1, 0, 1));
+        assert_eq!(asserter.read_q().len(), 1, "the rejection must not be retried");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn other_rejections_are_not_resubmitted() {
+        let asserter = Asserter::new();
+        let raw = Bytes::from_static(&[1]);
+        asserter.push_failure_msg("nonce too low");
+        asserter.push_success(&keccak256(&raw));
+        let metrics = MetricsCollector::new(RunClock::new());
+        let mut sender = Sender::new(
+            vec![mocked_provider(asserter.clone())],
+            SenderConfig::default(),
+            metrics.clone(),
+        )
+        .unwrap();
+        sender.send(workload_tx(&raw, 1)).await.unwrap();
+        sender.flush().await.unwrap();
+
+        assert_eq!(metrics.counts(), (1, 0, 1));
+        assert_eq!(asserter.read_q().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn known_transaction_after_an_unreadable_response_counts_as_accepted() {
+        let asserter = Asserter::new();
+        let raw = Bytes::from_static(&[1]);
+        // The first response cannot be read, then the node reports it holds the transaction.
+        asserter.push_success(&"unreadable");
+        asserter.push_failure_msg("already known");
+        let metrics = MetricsCollector::new(RunClock::new());
+        let mut sender = Sender::new(
+            vec![mocked_provider(asserter.clone())],
+            SenderConfig::default(),
+            metrics.clone(),
+        )
+        .unwrap();
+        sender.send(workload_tx(&raw, 1)).await.unwrap();
+        sender.flush().await.unwrap();
+
+        assert_eq!(metrics.counts(), (1, 1, 0));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejection_after_an_unreadable_response_keeps_the_transaction_tracked() {
+        let asserter = Asserter::new();
+        let raw = Bytes::from_static(&[1]);
+        asserter.push_success(&"0x0");
+        // The first attempt may have been accepted, so `nonce too low` proves nothing.
+        asserter.push_success(&"unreadable");
+        asserter.push_failure_msg("nonce too low");
+        let metrics = MetricsCollector::new_with_latencies(RunClock::new(), false);
+        let mut sender =
+            Sender::new(vec![mocked_provider(asserter)], SenderConfig::default(), metrics.clone())
+                .unwrap()
+                .with_max_pending(1.try_into().unwrap());
+        sender.send(workload_tx(&raw, 1)).await.unwrap();
+
+        let error = sender.flush().await.unwrap_err();
+        assert!(error.to_string().contains("timed out waiting for transaction inclusion"));
+        assert_eq!(metrics.counts(), (1, 0, 1));
+    }
+
+    #[tokio::test]
+    async fn resubmission_waits_for_a_rate_limit_token() {
+        let asserter = Asserter::new();
+        let raw = Bytes::from_static(&[1]);
+        asserter.push_failure_msg("txpool is full");
+        asserter.push_success(&keccak256(&raw));
+        let metrics = MetricsCollector::new(RunClock::new());
+        let mut sender = Sender::new(
+            vec![mocked_provider(asserter.clone())],
+            SenderConfig { rate_limit: 2, max_concurrent: 1, rate_schedule: Vec::new() },
+            metrics.clone(),
+        )
+        .unwrap();
+        let start = Instant::now();
+        sender.send(workload_tx(&raw, 1)).await.unwrap();
+        sender.flush().await.unwrap();
+
+        assert_eq!(metrics.counts(), (1, 1, 0));
+        // The first submission took the only token; the next one arrives after 500 ms.
+        assert!(start.elapsed() >= Duration::from_millis(400), "{:?}", start.elapsed());
     }
 
     fn receipt_json(

@@ -106,11 +106,21 @@ impl MockState {
                 }
 
                 let hash = keccak256(hex::decode(raw.trim_start_matches("0x")).unwrap());
-                self.chain.lock().unwrap().pending.push(hash);
+                let lose_response = self.lose_send_response.load(Ordering::SeqCst);
+                {
+                    let mut chain = self.chain.lock().unwrap();
+                    // A resubmission after the lost response finds the transaction in the pool.
+                    if lose_response && chain.pending.contains(&hash) {
+                        return HttpResponse::ok(
+                            json!({"code": -32000, "message": "already known"}),
+                        );
+                    }
+                    chain.pending.push(hash);
+                }
                 if self.automine.load(Ordering::SeqCst) {
                     self.mine();
                 }
-                if self.lose_send_response.load(Ordering::SeqCst) {
+                if lose_response {
                     return HttpResponse::new(503, json!({"error": "response lost"}));
                 }
                 thread::sleep(Duration::from_millis(
@@ -749,10 +759,17 @@ async fn pending_limit_keeps_uncertain_submissions_until_inclusion() {
     let flush = tokio::spawn(async move { sender.flush().await });
     wait_for_pending(&rpc, 1).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
-    assert_eq!(
-        rpc.state.requests().iter().filter(|r| r.method == "eth_sendRawTransaction").count(),
-        1
-    );
+    // The lost response is resolved by resubmitting the same transaction, which the node
+    // already holds. The second one still waits for the first to be included.
+    let sends = |raw: &str| {
+        rpc.state
+            .requests()
+            .iter()
+            .filter(|r| r.method == "eth_sendRawTransaction" && r.params[0] == raw)
+            .count()
+    };
+    assert_eq!(sends("0x02"), 2);
+    assert_eq!(sends("0x03"), 0);
     rpc.state.mine();
     wait_for_pending(&rpc, 1).await;
     rpc.state.mine();

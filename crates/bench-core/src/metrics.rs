@@ -492,6 +492,7 @@ pub struct MetricsCollector {
     success: AtomicU64,
     failed: AtomicU64,
     inclusion_failed: AtomicU64,
+    resubmitted: AtomicU64,
     clock: RunClock,
     collect_latencies: bool,
     latency_tx: mpsc::UnboundedSender<TimestampedLatency>,
@@ -538,6 +539,7 @@ impl MetricsCollector {
             success: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             inclusion_failed: AtomicU64::new(0),
+            resubmitted: AtomicU64::new(0),
             clock,
             collect_latencies,
             latency_tx,
@@ -587,6 +589,11 @@ impl MetricsCollector {
         self.inclusion_failed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a submission repeated for a transaction the node had not accepted.
+    pub fn record_resubmission(&self) {
+        self.resubmitted.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Get the current counts (sent, success, failed).
     pub fn counts(&self) -> (u64, u64, u64) {
         (
@@ -605,6 +612,7 @@ impl MetricsCollector {
         let success = self.success.load(Ordering::Relaxed);
         let failed = self.failed.load(Ordering::Relaxed);
         let inclusion_failed = self.inclusion_failed.load(Ordering::Relaxed);
+        let resubmitted = self.resubmitted.load(Ordering::Relaxed);
         let inflight = sent.saturating_sub(success + failed);
         let offset_ms = self.clock.offset_ms();
         let unix_ms = self.clock.unix_ms();
@@ -636,6 +644,13 @@ impl MetricsCollector {
                 name: "txgen_transactions_inclusion_failed_total".to_string(),
                 labels: labels.clone(),
                 value: inclusion_failed as f64,
+                offset_ms,
+                unix_ms,
+            },
+            Sample {
+                name: "txgen_transactions_resubmitted_total".to_string(),
+                labels: labels.clone(),
+                value: resubmitted as f64,
                 offset_ms,
                 unix_ms,
             },
@@ -743,9 +758,10 @@ mod tests {
         collector.record_success(Duration::from_millis(5));
         collector.record_failure();
         collector.record_inclusion_failure();
+        collector.record_resubmission();
 
         let samples = collector.snapshot_samples();
-        assert_eq!(samples.len(), 5);
+        assert_eq!(samples.len(), 6);
 
         let by_name: std::collections::HashMap<&str, f64> =
             samples.iter().map(|s| (s.name.as_str(), s.value)).collect();
@@ -754,6 +770,7 @@ mod tests {
         assert_eq!(by_name["txgen_transactions_success_total"], 1.0);
         assert_eq!(by_name["txgen_transactions_failed_total"], 1.0);
         assert_eq!(by_name["txgen_transactions_inclusion_failed_total"], 1.0);
+        assert_eq!(by_name["txgen_transactions_resubmitted_total"], 1.0);
         assert_eq!(by_name["txgen_transactions_inflight"], 1.0);
 
         // All samples share the same timestamp.
