@@ -727,7 +727,7 @@ impl<W: Write> ParallelGzipWriter<W> {
 }
 
 fn compress_gzip_member(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 6), Compression::fast());
+    let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 8), Compression::default());
     encoder.write_all(data)?;
     encoder.finish()
 }

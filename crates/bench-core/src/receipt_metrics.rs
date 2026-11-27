@@ -2,18 +2,20 @@
 
 use crate::{
     metrics::percentile,
-    sender::{RpcReceiptDetails, RpcSubmitter},
+    sender::RpcSubmitter,
 };
 use alloy_eips::BlockId;
 use alloy_network::{primitives::ReceiptResponse, AnyNetwork};
-use alloy_primitives::{Address, TxHash, B256, U256};
+use alloy_primitives::{Address, TxHash, B256, U256, U64};
 use alloy_provider::{DynProvider, Provider};
 use eyre::{Context, Result};
-use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::{
@@ -166,7 +168,7 @@ impl ReceiptCollection {
     pub fn metrics_for_records(records: &[ReceiptGasRecord]) -> ReceiptMetrics {
         let mut accumulator = ReceiptMetricsAccumulator::default();
         for record in records {
-            accumulator.record(record.labels.clone(), record.sample());
+            accumulator.record_ref(&record.labels, record.sample());
         }
 
         accumulator.into_metrics()
@@ -192,6 +194,20 @@ impl ReceiptMetricsAccumulator {
     /// Gas usage is retained even when the RPC response omitted its fee fields.
     pub fn record(&mut self, labels: ReceiptMetricLabels, sample: ReceiptGasSample) {
         let group = self.groups.entry(labels).or_default();
+        Self::push_sample(group, sample);
+    }
+
+    /// Record a confirmed receipt without cloning `labels` when the group already exists.
+    pub fn record_ref(&mut self, labels: &ReceiptMetricLabels, sample: ReceiptGasSample) {
+        if let Some(group) = self.groups.get_mut(labels) {
+            Self::push_sample(group, sample);
+        } else {
+            let group = self.groups.entry(labels.clone()).or_default();
+            Self::push_sample(group, sample);
+        }
+    }
+
+    fn push_sample(group: &mut ReceiptMetricSamples, sample: ReceiptGasSample) {
         group.gas_used.push(sample.gas_used);
         if let Some(effective_gas_price) = sample.effective_gas_price {
             group.effective_gas_price.push(effective_gas_price);
@@ -336,8 +352,8 @@ impl BlockReceiptCollector {
         let Self { handle, mut receiver } = self;
         drop(handle);
 
-        let mut tracked = BTreeMap::<TxHash, Vec<ReceiptRequest>>::new();
-        let mut seen = BTreeSet::new();
+        let mut tracked = HashMap::<TxHash, Vec<ReceiptRequest>>::new();
+        let mut seen = HashSet::new();
         while let Some(request) = receiver.recv().await {
             if seen.insert(request.dedup_key()) {
                 tracked.entry(request.tx_hash).or_default().push(request);
@@ -348,56 +364,129 @@ impl BlockReceiptCollector {
     }
 }
 
+/// Lightweight deserialization target for `eth_getBlockReceipts` that skips
+/// `logs`, `logsBloom`, and extra network-specific fields unused by gas metrics.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(untagged)]
+enum ReceiptStatus {
+    Bool(bool),
+    Quantity(U64),
+}
+
+impl ReceiptStatus {
+    fn is_success(self) -> bool {
+        match self {
+            Self::Bool(flag) => flag,
+            Self::Quantity(value) => !value.is_zero(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MinimalBlockReceipt {
+    transaction_hash: TxHash,
+    from: Address,
+    #[serde(default)]
+    status: Option<ReceiptStatus>,
+    #[serde(default)]
+    block_number: Option<U64>,
+    #[serde(default)]
+    block_hash: Option<B256>,
+    gas_used: U256,
+    #[serde(default)]
+    effective_gas_price: Option<U256>,
+}
+
+impl MinimalBlockReceipt {
+    fn is_success(&self) -> bool {
+        self.status.map_or(true, ReceiptStatus::is_success)
+    }
+}
+
 async fn collect_block_receipts(
     providers: &[DynProvider<AnyNetwork>],
     start_block: u64,
     end_block: u64,
-    mut tracked: BTreeMap<TxHash, Vec<ReceiptRequest>>,
+    mut tracked: HashMap<TxHash, Vec<ReceiptRequest>>,
 ) -> Result<ReceiptCollection> {
     if start_block > end_block || providers.is_empty() {
         return Ok(ReceiptCollection::default());
     }
 
-    let concurrency =
-        providers.len().saturating_mul(4).clamp(BLOCK_RECEIPT_FETCH_CONCURRENCY, 64);
-    let mut blocks = stream::iter((start_block..=end_block).enumerate())
-        .map(|(idx, number)| {
-            let provider = &providers[idx % providers.len()];
-            fetch_block_receipts(provider, number)
-        })
-        .buffer_unordered(concurrency);
+    // Dynamic work-stealing across providers: each provider runs a small pool of
+    // concurrent fetchers pulling block numbers from a shared counter so fast
+    // local validators absorb most blocks instead of stalling on high-RTT regions.
+    let per_provider = if providers.len() == 1 {
+        BLOCK_RECEIPT_FETCH_CONCURRENCY
+    } else {
+        (64 / providers.len()).clamp(2, 6)
+    };
+    let next_block = Arc::new(AtomicU64::new(start_block));
+    let mut workers = JoinSet::new();
+    for provider in providers {
+        for _ in 0..per_provider {
+            let provider = provider.clone();
+            let next_block = Arc::clone(&next_block);
+            workers.spawn(async move {
+                let mut batches = Vec::new();
+                loop {
+                    let block_number = next_block.fetch_add(1, Ordering::Relaxed);
+                    if block_number > end_block {
+                        break;
+                    }
+                    let receipts = fetch_minimal_block_receipts(&provider, block_number).await?;
+                    batches.push((block_number, receipts));
+                }
+                Ok::<_, eyre::Report>(batches)
+            });
+        }
+    }
 
-    let mut records = Vec::new();
-    while let Some(block_receipts) = blocks.next().await {
-        for details in block_receipts? {
-            if details.gas_used.is_zero() {
+    let mut ordered_blocks = Vec::with_capacity((end_block - start_block + 1) as usize);
+    while let Some(worker_result) = workers.join_next().await {
+        let batches = worker_result.wrap_err("block receipt worker task panicked")??;
+        ordered_blocks.extend(batches);
+    }
+    ordered_blocks.sort_unstable_by_key(|(block_number, _)| *block_number);
+
+    let total_receipts: usize = ordered_blocks.iter().map(|(_, r)| r.len()).sum();
+    let mut records = Vec::with_capacity(total_receipts);
+    for (_, block_receipts) in ordered_blocks {
+        for receipt in block_receipts {
+            if receipt.gas_used.is_zero() {
                 continue;
             }
 
-            let tx_hash = details.receipt.transaction_hash();
-            let requests = tracked.remove(&tx_hash).unwrap_or_else(|| {
-                vec![ReceiptRequest {
-                    sender: None,
-                    tx_hash,
-                    labels: BTreeMap::new(),
-                    scenario_instance: None,
-                    submitted_at_unix_ms: None,
-                    tracked_at: tokio::time::Instant::now(),
-                }]
-            });
-
-            for request in requests {
+            let tx_hash = receipt.transaction_hash;
+            if let Some(requests) = tracked.remove(&tx_hash) {
+                for request in requests {
+                    records.push(ReceiptGasRecord {
+                        tx_hash,
+                        sender: request.sender.or(Some(receipt.from)),
+                        labels: request.labels,
+                        scenario_instance: request.scenario_instance,
+                        success: receipt.is_success(),
+                        block_number: receipt.block_number.map(|n| n.to::<u64>()),
+                        block_hash: receipt.block_hash,
+                        gas_used: receipt.gas_used,
+                        effective_gas_price: receipt.effective_gas_price,
+                        submitted_at_unix_ms: request.submitted_at_unix_ms,
+                        block_timestamp_ms: None,
+                    });
+                }
+            } else {
                 records.push(ReceiptGasRecord {
                     tx_hash,
-                    sender: request.sender.or_else(|| Some(details.receipt.from())),
-                    labels: request.labels,
-                    scenario_instance: request.scenario_instance,
-                    success: details.receipt.status(),
-                    block_number: details.receipt.block_number(),
-                    block_hash: details.receipt.block_hash(),
-                    gas_used: details.gas_used,
-                    effective_gas_price: details.effective_gas_price,
-                    submitted_at_unix_ms: request.submitted_at_unix_ms,
+                    sender: Some(receipt.from),
+                    labels: BTreeMap::new(),
+                    scenario_instance: None,
+                    success: receipt.is_success(),
+                    block_number: receipt.block_number.map(|n| n.to::<u64>()),
+                    block_hash: receipt.block_hash,
+                    gas_used: receipt.gas_used,
+                    effective_gas_price: receipt.effective_gas_price,
+                    submitted_at_unix_ms: None,
                     block_timestamp_ms: None,
                 });
             }
@@ -407,24 +496,16 @@ async fn collect_block_receipts(
     Ok(ReceiptCollection::from_records(records))
 }
 
-async fn fetch_block_receipts(
+async fn fetch_minimal_block_receipts(
     provider: &DynProvider<AnyNetwork>,
     block_number: u64,
-) -> Result<Vec<RpcReceiptDetails>> {
-    let receipts = provider
-        .get_block_receipts(BlockId::number(block_number))
+) -> Result<Vec<MinimalBlockReceipt>> {
+    let receipts: Option<Vec<MinimalBlockReceipt>> = provider
+        .raw_request("eth_getBlockReceipts".into(), (BlockId::number(block_number),))
         .await
-        .wrap_err_with(|| format!("failed to fetch receipts for block {block_number}"))?
-        .ok_or_else(|| eyre::eyre!("receipts for block {block_number} not found"))?;
+        .wrap_err_with(|| format!("failed to fetch receipts for block {block_number}"))?;
 
-    Ok(receipts
-        .into_iter()
-        .map(|receipt| RpcReceiptDetails {
-            gas_used: U256::from(receipt.gas_used()),
-            effective_gas_price: Some(U256::from(receipt.effective_gas_price())),
-            receipt,
-        })
-        .collect())
+    receipts.ok_or_else(|| eyre::eyre!("receipts for block {block_number} not found"))
 }
 
 /// Background collector for confirmed transaction receipt gas fields.
@@ -739,6 +820,43 @@ mod tests {
         assert_eq!(distribution.p50, Some(51.0));
         assert_eq!(distribution.p95, Some(96.0));
         assert_eq!(distribution.p99, Some(100.0));
+    }
+
+    #[test]
+    fn minimal_block_receipt_ignores_logs_and_extra_fields() {
+        let raw = json!({
+            "transactionHash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "from": "0x2222222222222222222222222222222222222222",
+            "to": "0x3333333333333333333333333333333333333333",
+            "status": "0x1",
+            "blockNumber": "0x2a",
+            "blockHash": "0x4444444444444444444444444444444444444444444444444444444444444444",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x3b9aca00",
+            "cumulativeGasUsed": "0x5208",
+            "logsBloom": "0x00",
+            "logs": [{"address": "0x3333333333333333333333333333333333333333", "topics": [], "data": "0x"}],
+            "feeToken": "0x5555555555555555555555555555555555555555",
+            "feePayer": "0x2222222222222222222222222222222222222222"
+        });
+        let parsed: MinimalBlockReceipt = serde_json::from_value(raw).unwrap();
+        assert_eq!(parsed.transaction_hash, TxHash::repeat_byte(0x11));
+        assert_eq!(parsed.from, Address::repeat_byte(0x22));
+        assert!(parsed.is_success());
+        assert_eq!(parsed.block_number.map(|n| n.to::<u64>()), Some(42));
+        assert_eq!(parsed.block_hash, Some(B256::repeat_byte(0x44)));
+        assert_eq!(parsed.gas_used, U256::from(21_000));
+        assert_eq!(parsed.effective_gas_price, Some(U256::from(1_000_000_000u64)));
+
+        let failed: MinimalBlockReceipt = serde_json::from_value(json!({
+            "transactionHash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "from": "0x2222222222222222222222222222222222222222",
+            "status": "0x0",
+            "gasUsed": "0x5208"
+        }))
+        .unwrap();
+        assert!(!failed.is_success());
+        assert_eq!(failed.effective_gas_price, None);
     }
 
     #[test]
