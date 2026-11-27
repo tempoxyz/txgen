@@ -663,6 +663,96 @@ impl<W: Write + Send> Reporter for JsonReporter<W> {
     }
 }
 
+const PARALLEL_GZIP_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const PARALLEL_GZIP_MAX_WORKERS: usize = 16;
+
+struct ParallelGzipWriter<W: Write> {
+    inner: W,
+    pending: Vec<Vec<u8>>,
+    current: Vec<u8>,
+    workers: usize,
+}
+
+impl<W: Write> ParallelGzipWriter<W> {
+    fn new(inner: W) -> Self {
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .clamp(1, PARALLEL_GZIP_MAX_WORKERS);
+        Self {
+            inner,
+            pending: Vec::with_capacity(workers),
+            current: Vec::with_capacity(PARALLEL_GZIP_CHUNK_BYTES),
+            workers,
+        }
+    }
+
+    fn flush_pending(&mut self) -> std::io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let chunks = std::mem::take(&mut self.pending);
+        let compressed: Vec<std::io::Result<Vec<u8>>> = if chunks.len() == 1 {
+            vec![compress_gzip_member(&chunks[0])]
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = chunks
+                    .iter()
+                    .map(|chunk| scope.spawn(move || compress_gzip_member(chunk)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(std::io::Error::other("gzip worker thread panicked"))
+                        })
+                    })
+                    .collect()
+            })
+        };
+        for member in compressed {
+            self.inner.write_all(&member?)?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> std::io::Result<W> {
+        if !self.current.is_empty() {
+            let tail = std::mem::take(&mut self.current);
+            self.pending.push(tail);
+        }
+        self.flush_pending()?;
+        self.inner.flush()?;
+        Ok(self.inner)
+    }
+}
+
+fn compress_gzip_member(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 6), Compression::fast());
+    encoder.write_all(data)?;
+    encoder.finish()
+}
+
+impl<W: Write> Write for ParallelGzipWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.current.extend_from_slice(buf);
+        if self.current.len() >= PARALLEL_GZIP_CHUNK_BYTES {
+            let chunk = std::mem::replace(
+                &mut self.current,
+                Vec::with_capacity(PARALLEL_GZIP_CHUNK_BYTES),
+            );
+            self.pending.push(chunk);
+            if self.pending.len() >= self.workers {
+                self.flush_pending()?;
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn copy_and_gzip_samples_ndjson(report: &FinalReport, path: &Path) -> Result<usize> {
     let Some(archive) = report.sample_archive.as_ref() else {
         return Ok(0);
@@ -671,8 +761,8 @@ fn copy_and_gzip_samples_ndjson(report: &FinalReport, path: &Path) -> Result<usi
     let output = File::create(path)
         .wrap_err_with(|| format!("failed to create samples file {}", path.display()))?;
 
-    let writer = BufWriter::new(output);
-    let mut encoder = GzEncoder::new(writer, Compression::default());
+    let writer = BufWriter::with_capacity(1024 * 1024, output);
+    let mut encoder = ParallelGzipWriter::new(writer);
 
     let count = archive.write_ndjson_to(&mut encoder).wrap_err_with(|| {
         format!(
@@ -681,7 +771,7 @@ fn copy_and_gzip_samples_ndjson(report: &FinalReport, path: &Path) -> Result<usi
             path.display()
         )
     })?;
-    encoder.finish()?.flush()?;
+    encoder.finish()?;
     Ok(count)
 }
 
@@ -872,8 +962,8 @@ impl ClickHouseReporter {
             .collect()
     }
 
-    /// Build metric sample rows for insertion.
-    fn build_sample_rows<'a>(&self, samples: &'a [Sample]) -> Vec<ClickHouseMetricSampleRow<'a>> {
+    /// Build owned metric sample rows for insertion.
+    fn build_sample_rows(&self, samples: &[Sample]) -> Vec<ClickHouseMetricSampleRow> {
         samples
             .iter()
             .filter(|sample| {
@@ -885,7 +975,7 @@ impl ClickHouseReporter {
                     run_id: self.config.run_id,
                     offset_ms: s.offset_ms,
                     unix_ms: s.unix_ms,
-                    metric_name: &s.name,
+                    metric_name: s.name.clone(),
                     labels_json: serde_json::to_string(&s.labels).unwrap_or_default(),
                     source,
                     value: s.value,
@@ -894,16 +984,49 @@ impl ClickHouseReporter {
             .collect()
     }
 
-    /// Insert one metric sample batch.
-    fn insert_sample_batch(&self, samples: &[Sample]) -> Result<usize> {
-        let sample_rows = self.build_sample_rows(samples);
-        if sample_rows.is_empty() {
-            return Ok(0);
-        }
+    /// Stream filtered metric samples in full batches with bounded concurrency.
+    fn insert_all_samples(&self, report: &FinalReport) -> Result<usize> {
+        const CLICKHOUSE_SAMPLE_CONCURRENCY: usize = 6;
+        let batch_size = self.config.sample_batch_size.max(1);
+        let mut inserted_samples = 0usize;
+        let mut pending_rows: Vec<ClickHouseMetricSampleRow> = Vec::with_capacity(batch_size);
+        let mut ready_batches: Vec<Vec<ClickHouseMetricSampleRow>> =
+            Vec::with_capacity(CLICKHOUSE_SAMPLE_CONCURRENCY);
 
-        let count = sample_rows.len();
-        self.client.insert_rows_synchronous("txgen_metric_samples", &sample_rows)?;
-        Ok(count)
+        for chunk in report.sample_chunks(batch_size)? {
+            let filtered = self.build_sample_rows(&chunk?);
+            for row in filtered {
+                pending_rows.push(row);
+                if pending_rows.len() >= batch_size {
+                    inserted_samples += pending_rows.len();
+                    let batch = std::mem::replace(&mut pending_rows, Vec::with_capacity(batch_size));
+                    ready_batches.push(batch);
+                    if ready_batches.len() >= CLICKHOUSE_SAMPLE_CONCURRENCY {
+                        let to_send = std::mem::replace(
+                            &mut ready_batches,
+                            Vec::with_capacity(CLICKHOUSE_SAMPLE_CONCURRENCY),
+                        );
+                        self.client.insert_batches_synchronous(
+                            "txgen_metric_samples",
+                            to_send,
+                            CLICKHOUSE_SAMPLE_CONCURRENCY,
+                        )?;
+                    }
+                }
+            }
+        }
+        if !pending_rows.is_empty() {
+            inserted_samples += pending_rows.len();
+            ready_batches.push(pending_rows);
+        }
+        if !ready_batches.is_empty() {
+            self.client.insert_batches_synchronous(
+                "txgen_metric_samples",
+                ready_batches,
+                CLICKHOUSE_SAMPLE_CONCURRENCY,
+            )?;
+        }
+        Ok(inserted_samples)
     }
 }
 
@@ -924,12 +1047,9 @@ impl Reporter for ClickHouseReporter {
         let block_rows = self.build_block_rows(report);
         self.client.insert_rows_synchronous("txgen_blocks", &block_rows)?;
 
-        // Insert metric samples in bounded chunks. The report is backed by a
-        // disk archive, so do not collect all rows at once.
-        let mut inserted_samples = 0usize;
-        for chunk in report.sample_chunks(self.config.sample_batch_size)? {
-            inserted_samples += self.insert_sample_batch(&chunk?)?;
-        }
+        // Buffer filtered samples into full batches before posting so an
+        // allowlist does not turn into hundreds of tiny synchronous HTTP calls.
+        let inserted_samples = self.insert_all_samples(report)?;
 
         insert_receipt_gas_records(
             &self.client,
@@ -992,11 +1112,11 @@ struct ClickHouseBlockRow {
 
 /// Row for `txgen_metric_samples` table.
 #[derive(serde::Serialize)]
-struct ClickHouseMetricSampleRow<'a> {
+struct ClickHouseMetricSampleRow {
     run_id: uuid::Uuid,
     offset_ms: u64,
     unix_ms: u64,
-    metric_name: &'a str,
+    metric_name: String,
     labels_json: String,
     source: &'static str,
     value: f64,
@@ -1506,5 +1626,22 @@ mod tests {
         assert_eq!(sample.name, "m1");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parallel_gzip_writer_produces_valid_multi_member_gzip() {
+        use flate2::read::MultiGzDecoder;
+        use std::io::Read;
+        let payload: Vec<u8> = (0..10_000_000usize).map(|i| b"abcdefghijklmnopqrstuvwxyz0123456789
+"[i % 37]).collect();
+        let mut out = Vec::new();
+        let mut writer = ParallelGzipWriter::new(&mut out);
+        for chunk in payload.chunks(65_536) {
+            writer.write_all(chunk).unwrap();
+        }
+        writer.finish().unwrap();
+        let mut decoded = Vec::new();
+        MultiGzDecoder::new(out.as_slice()).read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
     }
 }

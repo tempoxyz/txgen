@@ -322,6 +322,17 @@ impl BlockReceiptCollector {
         start_block: u64,
         end_block: u64,
     ) -> Result<ReceiptCollection> {
+        self.finish_with_providers(std::slice::from_ref(provider), start_block, end_block).await
+    }
+
+    /// Finish receipt collection, fanning out block-receipt RPCs across all
+    /// provided endpoints so multi-validator runs do not bottleneck on one node.
+    pub async fn finish_with_providers(
+        self,
+        providers: &[DynProvider<AnyNetwork>],
+        start_block: u64,
+        end_block: u64,
+    ) -> Result<ReceiptCollection> {
         let Self { handle, mut receiver } = self;
         drop(handle);
 
@@ -333,29 +344,28 @@ impl BlockReceiptCollector {
             }
         }
 
-        collect_block_receipts(provider, start_block, end_block, tracked).await
+        collect_block_receipts(providers, start_block, end_block, tracked).await
     }
 }
 
-/// Fetch all block receipts in a range and aggregate non-system transactions.
-///
-/// The block range is assumed to contain only the benchmark workload and
-/// protocol system transactions. No transaction-hash filter is applied. Tempo
-/// system transactions consume zero gas and are excluded by their zero
-/// `gasUsed` receipt.
 async fn collect_block_receipts(
-    provider: &DynProvider<AnyNetwork>,
+    providers: &[DynProvider<AnyNetwork>],
     start_block: u64,
     end_block: u64,
     mut tracked: BTreeMap<TxHash, Vec<ReceiptRequest>>,
 ) -> Result<ReceiptCollection> {
-    if start_block > end_block {
+    if start_block > end_block || providers.is_empty() {
         return Ok(ReceiptCollection::default());
     }
 
-    let mut blocks = stream::iter(start_block..=end_block)
-        .map(|number| fetch_block_receipts(provider, number))
-        .buffer_unordered(BLOCK_RECEIPT_FETCH_CONCURRENCY);
+    let concurrency =
+        providers.len().saturating_mul(4).clamp(BLOCK_RECEIPT_FETCH_CONCURRENCY, 64);
+    let mut blocks = stream::iter((start_block..=end_block).enumerate())
+        .map(|(idx, number)| {
+            let provider = &providers[idx % providers.len()];
+            fetch_block_receipts(provider, number)
+        })
+        .buffer_unordered(concurrency);
 
     let mut records = Vec::new();
     while let Some(block_receipts) = blocks.next().await {

@@ -6,15 +6,9 @@ use serde::Serialize;
 
 /// Default number of granular receipt rows written per ClickHouse insert.
 pub const DEFAULT_CLICKHOUSE_RECEIPT_BATCH_SIZE: usize = 50_000;
+const DEFAULT_CLICKHOUSE_RECEIPT_CONCURRENCY: usize = 6;
 
-/// Insert granular receipt gas records into `txgen_receipt_gas` in synchronous batches.
-///
-/// Gas quantities are encoded as decimal strings so JSON serialization does not
-/// lose precision before ClickHouse parses them as `UInt256` values.
-///
-/// Submission and inclusion timing columns are omitted from rows that lack
-/// them, so scenario runs keep writing to tables without migration `010`;
-/// `bench send` rows need it.
+/// Insert granular receipt gas records into txgen_receipt_gas in synchronous batches.
 pub fn insert_receipt_gas_records(
     client: &ClickHouseClient,
     run_id: uuid::Uuid,
@@ -24,18 +18,21 @@ pub fn insert_receipt_gas_records(
     if batch_size == 0 {
         bail!("ClickHouse receipt gas batch size must be greater than zero");
     }
+    if records.is_empty() {
+        return Ok(());
+    }
 
-    for (batch_index, records) in records.chunks(batch_size).enumerate() {
-        let rows = records
+    let concurrency = if records.len() >= 1_000 { DEFAULT_CLICKHOUSE_RECEIPT_CONCURRENCY } else { 1 };
+    let mut batches = Vec::with_capacity(records.len().div_ceil(batch_size));
+    for chunk in records.chunks(batch_size) {
+        let rows = chunk
             .iter()
             .map(|record| ReceiptGasRow::new(run_id, record))
             .collect::<Result<Vec<_>>>()?;
-        client.insert_rows_synchronous("txgen_receipt_gas", &rows).wrap_err_with(|| {
-            format!("failed to insert ClickHouse receipt gas batch {batch_index}")
-        })?;
+        batches.push(rows);
     }
 
-    Ok(())
+    client.insert_batches_synchronous("txgen_receipt_gas", batches, concurrency)
 }
 
 #[derive(Debug, Serialize)]
