@@ -26,6 +26,10 @@ use txgen_core::{
 
 const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const GAS_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+/// Entries per gas refresh. Building a probe copies the nonce tracker, so building every probe of
+/// a large mix at once paused generation for seconds; a pass goes through the mix this many at a
+/// time instead.
+const GAS_SAMPLE_BATCH: usize = 64;
 const NONCE_FETCH_CONCURRENCY: usize = 32;
 
 #[derive(Args)]
@@ -890,6 +894,7 @@ struct GenerationConfig<'a> {
     signing_workers: usize,
     gas_sample_rpc: Option<&'a str>,
     gas_sample_interval: Duration,
+    gas_sample_batch: usize,
 }
 
 fn generate_loop<A>(
@@ -940,6 +945,7 @@ where
             signing_workers: ctx.signing_workers,
             gas_sample_rpc: ctx.gas_sample_rpc.as_deref(),
             gas_sample_interval: GAS_SAMPLE_INTERVAL,
+            gas_sample_batch: GAS_SAMPLE_BATCH,
         },
         &setup_bindings,
         &mut build_ctx,
@@ -1076,6 +1082,8 @@ enum ResolvedBinding {
 }
 
 struct WeightedWorkloadItem {
+    /// Position in the spec's mix; pruning keeps entries in this order.
+    id: usize,
     item: MixItem,
     tx_count: u64,
     weight: u64,
@@ -1106,7 +1114,7 @@ impl WorkloadSelector {
         if remaining_txs == 0 {
             return Ok(selector);
         }
-        for entry in &spec.mix {
+        for (id, entry) in spec.mix.iter().enumerate() {
             let tx_count = workload_item_tx_count(spec, &entry.item)?;
             if tx_count > 0 && tx_count <= remaining_txs && entry.weight > 0 {
                 selector.total_weight = selector
@@ -1115,6 +1123,7 @@ impl WorkloadSelector {
                     .ok_or_else(|| eyre::eyre!("mix weights overflowed u64"))?;
                 selector.max_tx_count = selector.max_tx_count.max(tx_count);
                 selector.entries.push(WeightedWorkloadItem {
+                    id,
                     item: entry.item.clone(),
                     tx_count,
                     weight: entry.weight,
@@ -1156,36 +1165,61 @@ impl WorkloadSelector {
         Some(&self.entries[index].item)
     }
 
-    /// Apply estimates sampled before entries may have been pruned. Pruning keeps the order,
-    /// so each remaining entry matches the next sampled item equal to it.
-    fn set_sampled_gas_estimates(&mut self, sampled: &[(MixItem, u64)]) -> Result<()> {
-        let mut sampled = sampled.iter();
-        let estimates = self
-            .entries
-            .iter()
-            .map(|entry| {
-                sampled
-                    .by_ref()
-                    .find(|(item, _)| *item == entry.item)
-                    .map(|(_, gas)| *gas)
-                    .ok_or_else(|| eyre::eyre!("gas sampling is missing {:?}", entry.item))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.set_gas_estimates(&estimates)
+    /// Up to `batch` entries from the entry id `cursor`, and the cursor after them: 0 once the
+    /// window reaches the last entry, which ends a refresh pass.
+    fn gas_refresh_window(&self, cursor: usize, batch: usize) -> (&[WeightedWorkloadItem], usize) {
+        let start = self.entries.partition_point(|entry| entry.id < cursor);
+        let end = start.saturating_add(batch.max(1)).min(self.entries.len());
+        let next = self.entries.get(end).map_or(0, |entry| entry.id);
+        (&self.entries[start..end], next)
     }
 
+    /// Apply estimates by entry id and keep the rest. Entries may have been pruned since they
+    /// were sampled; pruning keeps ids in order, so their samples are skipped. The first sample
+    /// must cover every entry.
+    fn set_sampled_gas_estimates(&mut self, sampled: &[(usize, u64)]) -> Result<()> {
+        let mut sampled = sampled.iter().peekable();
+        let mut updates = Vec::with_capacity(sampled.len());
+        for (index, entry) in self.entries.iter().enumerate() {
+            while sampled.next_if(|(id, _)| *id < entry.id).is_some() {}
+            let Some(&(_, gas)) = sampled.next_if(|(id, _)| *id == entry.id) else {
+                if !self.gas_weighted {
+                    bail!("gas sampling is missing {:?}", entry.item);
+                }
+                continue;
+            };
+            updates.push((index, gas));
+        }
+        if updates.iter().any(|(_, gas)| *gas == 0) {
+            bail!("gas sampling must return positive gas usage for each workload item");
+        }
+        for (index, gas) in updates {
+            let entry = &mut self.entries[index];
+            entry.gas_weight = entry.weight as f64 / gas as f64;
+        }
+        self.accumulate_gas_weights();
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn set_gas_estimates(&mut self, estimates: &[u64]) -> Result<()> {
         if estimates.len() != self.entries.len() || estimates.contains(&0) {
             bail!("gas sampling must return positive gas usage for each workload item");
         }
-        self.total_gas_weight = 0.0;
         for (entry, gas) in self.entries.iter_mut().zip(estimates) {
             entry.gas_weight = entry.weight as f64 / *gas as f64;
+        }
+        self.accumulate_gas_weights();
+        Ok(())
+    }
+
+    fn accumulate_gas_weights(&mut self) {
+        self.total_gas_weight = 0.0;
+        for entry in &mut self.entries {
             self.total_gas_weight += entry.gas_weight;
             entry.cumulative_gas_weight = self.total_gas_weight;
         }
         self.gas_weighted = true;
-        Ok(())
     }
 }
 
@@ -1723,7 +1757,13 @@ where
     <A::Network as Network>::TxEnvelope:
         From<Signed<<A::Network as Network>::UnsignedTx>> + Encodable2718,
 {
-    let GenerationConfig { limit, signing_workers, gas_sample_rpc, gas_sample_interval } = config;
+    let GenerationConfig {
+        limit,
+        signing_workers,
+        gas_sample_rpc,
+        gas_sample_interval,
+        gas_sample_batch,
+    } = config;
     let mut selector = WorkloadSelector::new(spec, limit.count.unwrap_or(u64::MAX))?;
     let gas_client = gas_sample_rpc
         .map(|rpc| {
@@ -1734,14 +1774,17 @@ where
         .transpose()?;
     let runtime = tokio::runtime::Handle::current();
     // The first sample sets the mix before any workload is emitted. Later samples run on the
-    // runtime while generation continues, and their weights apply once they all return.
+    // runtime while generation continues, a window of entries at a time, and each window's
+    // weights apply once all of its calls return.
     if let Some(client) = &gas_client {
-        let samples = gas_samples(adapter, spec, setup_bindings, ctx, &selector)?;
+        let samples = gas_samples(adapter, spec, setup_bindings, ctx, &selector.entries)?;
         let estimates = runtime.block_on(simulate_gas_samples(client.clone(), samples))?;
         selector.set_sampled_gas_estimates(&estimates)?;
     }
     let mut last_gas_sample = Instant::now();
     let mut gas_refresh: Option<GasRefresh> = None;
+    // The next entry id to sample; 0 between refresh passes.
+    let mut gas_refresh_cursor = 0;
     let mut signing_pool = SigningPool::new(signing_workers)?;
     let mut written = 0u64;
     let mut sequence_instances = 0u64;
@@ -1765,13 +1808,20 @@ where
                 Err(error) => eprintln!("gas sampling refresh failed; keeping weights: {error:#}"),
             }
         }
+        // A pass starts each interval and samples the mix a window at a time, starting the next
+        // window as soon as the previous one returns.
         if let Some(client) = &gas_client &&
             gas_refresh.is_none() &&
-            last_gas_sample.elapsed() >= gas_sample_interval
+            (gas_refresh_cursor > 0 || last_gas_sample.elapsed() >= gas_sample_interval)
         {
-            let samples = gas_samples(adapter, spec, setup_bindings, ctx, &selector)?;
+            if gas_refresh_cursor == 0 {
+                last_gas_sample = Instant::now();
+            }
+            let (window, next_cursor) =
+                selector.gas_refresh_window(gas_refresh_cursor, gas_sample_batch);
+            let samples = gas_samples(adapter, spec, setup_bindings, ctx, window)?;
             gas_refresh = Some(runtime.spawn(simulate_gas_samples(client.clone(), samples)));
-            last_gas_sample = Instant::now();
+            gas_refresh_cursor = next_cursor;
         }
 
         let remaining = limit.count.map(|count| count - written).unwrap_or(u64::MAX);
@@ -2285,29 +2335,30 @@ fn simulation_gas(response: &serde_json::Value, expected_calls: usize) -> Result
     Ok(gas)
 }
 
-/// A background gas refresh: each sampled item with its block gas.
-type GasRefresh = tokio::task::JoinHandle<Result<Vec<(MixItem, u64)>>>;
+/// A background gas refresh: each sampled entry's id with its block gas.
+type GasRefresh = tokio::task::JoinHandle<Result<Vec<(usize, u64)>>>;
 
 /// One workload item's gas sample: the eth_simulateV1 calls of one instance.
 struct GasSample {
+    id: usize,
     item: MixItem,
     weight: u64,
     calls: Vec<serde_json::Value>,
 }
 
-/// Build every mix item's simulation calls from the current generation state.
+/// Build each entry's simulation calls from the current generation state.
 fn gas_samples<A: NetworkAdapter>(
     adapter: &A,
     spec: &WorkloadSpec,
     setup_bindings: &std::collections::HashMap<String, ResolvedBinding>,
     ctx: &mut BuildContext<'_>,
-    selector: &WorkloadSelector,
+    entries: &[WeightedWorkloadItem],
 ) -> Result<Vec<GasSample>> {
-    selector
-        .entries
+    entries
         .iter()
         .map(|entry| {
             Ok(GasSample {
+                id: entry.id,
                 item: entry.item.clone(),
                 weight: entry.weight,
                 calls: sample_workload_calls(adapter, spec, &entry.item, setup_bindings, ctx)?,
@@ -2339,7 +2390,7 @@ fn refresh_expiry(calls: &mut [serde_json::Value], now: u64) {
 async fn simulate_gas_samples(
     client: alloy_rpc_client::RpcClient,
     samples: Vec<GasSample>,
-) -> Result<Vec<(MixItem, u64)>> {
+) -> Result<Vec<(usize, u64)>> {
     let mut estimates = Vec::with_capacity(samples.len());
     for mut sample in samples {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
@@ -2360,7 +2411,7 @@ async fn simulate_gas_samples(
             "gas sample: item={:?} block_gas={gas} target_weight={}",
             sample.item, sample.weight
         );
-        estimates.push((sample.item, gas));
+        estimates.push((sample.id, gas));
     }
     Ok(estimates)
 }
@@ -2928,6 +2979,7 @@ mix: [{template: transfer, weight: 1}]
                     signing_workers: 1,
                     gas_sample_rpc: Some(&rpc),
                     gas_sample_interval: GAS_SAMPLE_INTERVAL,
+                    gas_sample_batch: GAS_SAMPLE_BATCH,
                 },
                 &HashMap::new(),
                 &mut ctx,
@@ -2978,6 +3030,7 @@ mix: [{template: transfer, weight: 1}]
                     signing_workers: 1,
                     gas_sample_rpc: Some(&rpc),
                     gas_sample_interval: Duration::ZERO,
+                    gas_sample_batch: GAS_SAMPLE_BATCH,
                 },
                 &HashMap::new(),
                 &mut ctx,
@@ -2997,14 +3050,131 @@ mix: [{template: transfer, weight: 1}]
         let mut spec = selector_spec();
         spec.mix.retain(|entry| entry.weight > 0);
         let mut selector = WorkloadSelector::new(&spec, 100)?;
-        let sampled: Vec<_> =
-            selector.entries.iter().map(|entry| (entry.item.clone(), 10)).collect();
+        let sampled: Vec<_> = selector.entries.iter().map(|entry| (entry.id, 10)).collect();
         let mut rng = StdRng::seed_from_u64(3);
         assert!(selector.pick(&mut rng, 1).is_some());
         assert!(selector.entries.len() < sampled.len());
         selector.set_sampled_gas_estimates(&sampled)?;
         assert!(selector.gas_weighted);
         assert!(selector.set_gas_estimates(&[10; 5]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn gas_refresh_windows_cover_every_entry_once_per_pass() -> Result<()> {
+        let selector = WorkloadSelector::new(&selector_spec(), u64::MAX)?;
+        let ids: Vec<_> = selector.entries.iter().map(|entry| entry.id).collect();
+        let mut cursor = 0;
+        let mut sampled = Vec::new();
+        loop {
+            let (window, next) = selector.gas_refresh_window(cursor, 2);
+            assert!(!window.is_empty() && window.len() <= 2);
+            sampled.extend(window.iter().map(|entry| entry.id));
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+        assert_eq!(sampled, ids);
+        // A mix that fits in one window refreshes whole every pass.
+        let (window, next) = selector.gas_refresh_window(0, GAS_SAMPLE_BATCH);
+        assert_eq!(window.len(), ids.len());
+        assert_eq!(next, 0);
+
+        // Pruning mid-pass resumes at the next remaining entry.
+        let mut pruned = WorkloadSelector::new(&selector_spec(), 100)?;
+        assert!(pruned.pick(&mut StdRng::seed_from_u64(3), 1).is_some());
+        let (window, next) = pruned.gas_refresh_window(3, 2);
+        assert_eq!(window.iter().map(|entry| entry.id).collect::<Vec<_>>(), [4, 5]);
+        assert_eq!(next, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn gas_refresh_window_updates_only_its_entries() -> Result<()> {
+        let mut selector = WorkloadSelector::new(&selector_spec(), u64::MAX)?;
+        let all: Vec<_> = selector.entries.iter().map(|entry| (entry.id, 10)).collect();
+        assert!(selector.set_sampled_gas_estimates(&all[1..]).is_err(), "first sample was partial");
+        assert!(!selector.gas_weighted);
+        selector.set_sampled_gas_estimates(&all)?;
+
+        let (window, _) = selector.gas_refresh_window(0, 2);
+        let refreshed: Vec<_> = window.iter().map(|entry| (entry.id, 100)).collect();
+        selector.set_sampled_gas_estimates(&refreshed)?;
+        for entry in &selector.entries {
+            let gas = if refreshed.iter().any(|(id, _)| *id == entry.id) { 100.0 } else { 10.0 };
+            assert!((entry.gas_weight - entry.weight as f64 / gas).abs() < f64::EPSILON);
+        }
+        let total: f64 = selector.entries.iter().map(|entry| entry.gas_weight).sum();
+        assert!((selector.total_gas_weight - total).abs() < 1e-12);
+        assert_eq!(
+            selector.entries.last().unwrap().cumulative_gas_weight,
+            selector.total_gas_weight
+        );
+        assert!(selector.set_sampled_gas_estimates(&[(all[0].0, 0)]).is_err());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gas_refresh_windows_smaller_than_the_mix_keep_generating() -> Result<()> {
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = requests.clone();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": [{"gasUsed": "0x5208", "calls": [{"status": "0x1"}]}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let rpc = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let written = tokio::task::spawn_blocking(move || {
+            // Three entries, so a pass of one-entry windows takes three refreshes.
+            let mut spec = sampling_spec()?;
+            spec.mix = [2, 1, 1]
+                .into_iter()
+                .map(|weight| txgen_core::MixEntry {
+                    item: MixItem::Template("transfer".to_string()),
+                    weight,
+                })
+                .collect();
+            let accounts = AccountManager::from_spec(&spec.accounts)?;
+            let artifacts = ArtifactManager::empty();
+            let mut nonces = NonceTracker::new();
+            let mut rng = StdRng::seed_from_u64(42);
+            let mut ctx =
+                BuildContext::new(1, &spec.gas, &accounts, &artifacts, &mut nonces, &mut rng);
+            let mut output = NdjsonWriter::new(Vec::new());
+            generate_txs(
+                &SamplingAdapter,
+                &spec,
+                GenerationConfig {
+                    limit: GenerationLimit {
+                        count: None,
+                        duration: Some(Duration::from_millis(500)),
+                    },
+                    signing_workers: 1,
+                    gas_sample_rpc: Some(&rpc),
+                    gas_sample_interval: Duration::ZERO,
+                    gas_sample_batch: 1,
+                },
+                &HashMap::new(),
+                &mut ctx,
+                &mut output,
+            )
+        })
+        .await??;
+        assert!(written > 0);
+        // The first sample covers all three entries; a pass then takes three one-entry windows.
+        assert!(
+            requests.load(std::sync::atomic::Ordering::SeqCst) >= 6,
+            "no refresh pass finished"
+        );
+        server.abort();
         Ok(())
     }
 
@@ -3059,6 +3229,7 @@ mix: [{template: transfer, weight: 1}]
                     signing_workers: 1,
                     gas_sample_rpc: Some(&rpc),
                     gas_sample_interval: Duration::ZERO,
+                    gas_sample_batch: GAS_SAMPLE_BATCH,
                 },
                 &HashMap::new(),
                 &mut ctx,
